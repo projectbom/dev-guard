@@ -1,7 +1,17 @@
 import { classifyTaskType, taskTypeStrategyNotes } from "./task-router.js";
 import { buildTaskCompletionCriteria, formatCompletionCriteria } from "./completion.js";
 import { analyzeSemanticDrift, defaultContextPriority } from "./drift.js";
-import type { AIProvider, FileSummary, GenerateTextInput, ProjectIndexEntry, TaskAIContext, TaskAIFileCandidate, TaskMarkdownResult, TaskTypeResult } from "./types.js";
+import type {
+  AIProvider,
+  CodeGraphEntry,
+  FileSummary,
+  GenerateTextInput,
+  ProjectIndexEntry,
+  TaskAIContext,
+  TaskAIFileCandidate,
+  TaskMarkdownResult,
+  TaskTypeResult
+} from "./types.js";
 
 interface OpenAIResponsesResult {
   output_text?: string;
@@ -112,14 +122,16 @@ export function analyzeFileRelevance(
     index?: ProjectIndexEntry[];
     summaries?: FileSummary[];
     runTargetFiles?: string[];
+    codeGraph?: CodeGraphEntry[];
   } = {}
 ): TaskAIFileCandidate[] {
   const explicitRoutes = inferExplicitRouteTargets(requirement);
   const tokens = extractRelevanceTokens(requirement);
   const indexByPath = new Map((metadata.index ?? []).map((entry) => [entry.path, entry]));
   const summaryByPath = new Map((metadata.summaries ?? []).map((summary) => [summary.path, summary]));
+  const graphByPath = new Map((metadata.codeGraph ?? []).map((entry) => [entry.file, entry]));
   const runTargets = new Set((metadata.runTargetFiles ?? []).filter((file) => requestMatchesFile(requirement, file)));
-  const candidates: TaskAIFileCandidate[] = [];
+  const candidateByPath = new Map<string, TaskAIFileCandidate>();
   const seen = new Set(projectFiles);
   for (const route of explicitRoutes.modifyTargets) {
     if (!seen.has(route.path)) {
@@ -131,12 +143,15 @@ export function analyzeFileRelevance(
   for (const file of projectFiles) {
     const index = indexByPath.get(file);
     const summary = summaryByPath.get(file);
-    const scored = scoreFileRelevance(file, requirement, tokens, explicitRoutes, { index, summary, runTargets });
+    const graph = graphByPath.get(file);
+    const scored = scoreFileRelevance(file, requirement, tokens, explicitRoutes, { index, summary, runTargets, graph });
 
-    candidates.push(scored);
+    candidateByPath.set(file, scored);
   }
 
-  return candidates
+  applyGraphImpactScoring(candidateByPath, graphByPath, tokens);
+
+  return [...candidateByPath.values()]
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
     .slice(0, 30);
 }
@@ -228,6 +243,9 @@ ${formatListOrNeedsCheck(relatedFileCandidates)}
 
 점수 기반 후보 분리:
 ${formatScoredCandidates(fileCandidates)}
+
+영향도 힌트:
+${formatTaskImpactHints(context.impactHints ?? [])}
 
 관련 코드 컨텍스트:
 ${formatCodeContexts(context.codeContexts ?? [])}
@@ -445,6 +463,16 @@ function formatCodeContexts(codeContexts: NonNullable<TaskAIContext["codeContext
     .join("\n\n");
 }
 
+function formatTaskImpactHints(impactHints: NonNullable<TaskAIContext["impactHints"]>): string {
+  if (impactHints.length === 0) {
+    return "- 영향도 힌트 없음";
+  }
+  return impactHints
+    .slice(0, 5)
+    .map((hint) => `- ${hint.file}: imported by ${hint.importedByCount}; affected ${hint.affectedAreas.join(", ") || "unknown"}`)
+    .join("\n");
+}
+
 function extractRequirementTokens(requirement: string): string[] {
   return [...new Set(requirement.toLowerCase().match(/[a-z0-9가-힣]{3,}/g) ?? [])].slice(0, 12);
 }
@@ -489,6 +517,7 @@ function scoreFileRelevance(
     index?: ProjectIndexEntry;
     summary?: FileSummary;
     runTargets: Set<string>;
+    graph?: CodeGraphEntry;
   }
 ): TaskAIFileCandidate {
   const reasons: string[] = [];
@@ -503,6 +532,8 @@ function scoreFileRelevance(
   const categoryTokens = new Set(tokenizeText(metadata.index?.category ?? ""));
   const featureTokens = new Set((metadata.summary?.features ?? []).flatMap(tokenizeText));
   const routeTokens = new Set(extractRouteSegments(file).flatMap(tokenizeText));
+  const exportTokens = new Set((metadata.graph?.exports ?? []).flatMap(tokenizeText));
+  const usageTokens = new Set((metadata.graph?.usageHints ?? []).flatMap(tokenizeText));
 
   for (const token of tokens) {
     if (pathTokens.has(token)) {
@@ -532,6 +563,16 @@ function scoreFileRelevance(
       score += 6;
       reasons.push(`related feature:${token}`);
     }
+
+    if (exportTokens.has(token)) {
+      score += 7;
+      reasons.push(`export:${token}`);
+    }
+
+    if (usageTokens.has(token)) {
+      score += 4;
+      reasons.push(`usage hint:${token}`);
+    }
   }
 
   if (metadata.runTargets.has(file)) {
@@ -559,6 +600,60 @@ function scoreFileRelevance(
     negativeReasons: [...new Set(negativeReasons)].slice(0, 6),
     role
   };
+}
+
+function applyGraphImpactScoring(
+  candidates: Map<string, TaskAIFileCandidate>,
+  graphByPath: Map<string, CodeGraphEntry>,
+  tokens: string[]
+): void {
+  const directMatches = [...candidates.values()].filter((candidate) => candidate.score >= 12);
+  for (const candidate of directMatches) {
+    const graph = graphByPath.get(candidate.path);
+    if (!graph) {
+      continue;
+    }
+    for (const importer of graph.importedBy.slice(0, 12)) {
+      bumpGraphCandidate(candidates, importer, 7, `reverse dependency of ${candidate.path}`);
+    }
+    for (const imported of graph.imports.slice(0, 8)) {
+      bumpGraphCandidate(candidates, imported, 4, `dependency of ${candidate.path}`);
+    }
+  }
+
+  for (const [path, graph] of graphByPath.entries()) {
+    const haystack = [path, graph.category, ...graph.exports, ...graph.usageHints].join(" ").toLowerCase();
+    if (tokens.some((token) => haystack.includes(token))) {
+      continue;
+    }
+    const sameCluster = [...candidates.values()].some((candidate) => {
+      const candidateGraph = graphByPath.get(candidate.path);
+      return candidate.score >= 12 && candidateGraph?.category === graph.category;
+    });
+    if (sameCluster) {
+      bumpGraphCandidate(candidates, path, 2, `same feature cluster:${graph.category}`);
+    }
+  }
+}
+
+function bumpGraphCandidate(candidates: Map<string, TaskAIFileCandidate>, path: string, delta: number, reason: string): void {
+  const current =
+    candidates.get(path) ??
+    ({
+      path,
+      score: 0,
+      reasons: [],
+      negativeReasons: [],
+      role: "ignored"
+    } satisfies TaskAIFileCandidate);
+  current.score += delta;
+  current.reasons = [...new Set([...current.reasons, reason])].slice(0, 8);
+  if (current.score >= 12) {
+    current.role = "edit";
+  } else if (current.score >= 5 && current.role !== "edit") {
+    current.role = "reference";
+  }
+  candidates.set(path, current);
 }
 
 function tokenizePath(path: string): Set<string> {

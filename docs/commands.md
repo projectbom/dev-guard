@@ -39,6 +39,10 @@ dev-guard done
 - `dev-guard configure ai`: configure provider/model.
 - `dev-guard config set`: change provider/model/temperature/max token settings.
 
+## Local Files
+
+Generated `.devguard/` files are local-only by default. `task.md`, `runs/`, memory cache, `code-graph.json`, and telemetry are ignored. Keep examples in docs instead of committing local `.devguard` runtime files.
+
 ## Development Workflow
 
 These commands are mainly for developing dev-guard itself:

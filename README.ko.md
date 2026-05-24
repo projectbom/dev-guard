@@ -9,7 +9,7 @@ dev-guard는 AI/Codex 작업 흐름을 위한 Alpha 단계 CLI guardrail입니�
 ```bash
 dev-guard init
 dev-guard status
-dev-guard "이전 문제로 돌아가면 다른 문제로 바뀌는 버그 수정"
+dev-guard "로딩 깜빡임 수정"
 dev-guard done
 ```
 
@@ -19,6 +19,7 @@ dev-guard done
 
 - `.devguard/` 아래에 프로젝트별 guard 파일을 만든다.
 - 프로젝트 타입, package manager, runtime, git baseline, 변경 파일을 감지한다.
+- import/reverse dependency 기반의 lightweight impact hint를 포함해 프로젝트 메모리를 만든다.
 - 현재 요구사항을 Codex에 전달하기 좋은 compact prompt로 만든다.
 - API key 없이도 local heuristic check/review를 실행한다.
 - 필요하면 OpenAI provider를 연결해 task/review 품질을 높인다.
@@ -44,10 +45,12 @@ dev-guard --help
 
 ## 빠른 시작
 
+기본 흐름은 30초 안에 이해할 수 있어야 합니다.
+
 ```bash
 dev-guard init
 dev-guard status
-dev-guard "이전 문제로 돌아가면 다른 문제로 바뀌는 버그 수정"
+dev-guard "로딩 깜빡임 수정"
 # 출력된 prompt를 Codex에 전달하고 Codex가 파일을 수정하게 한다
 dev-guard done
 ```
@@ -57,7 +60,7 @@ dev-guard done
 ```bash
 pnpm cli init
 pnpm cli status
-pnpm cli "이전 문제로 돌아가면 다른 문제로 바뀌는 버그 수정"
+pnpm cli "로딩 깜빡임 수정"
 pnpm cli done
 ```
 
@@ -138,6 +141,12 @@ dev-guard help advanced
 
 `watch`는 선택 사항입니다. 파일 변경 중 project memory를 최신화하지만, 기본값으로 코드 수정이나 docs write를 자동 실행하지 않습니다.
 
+## 예시
+
+- [Bugfix workflow](./examples/bugfix.md)
+- [i18n workflow](./examples/i18n.md)
+- [Architecture workflow](./examples/architecture.md)
+
 ## AI Provider 설정
 
 API key가 없어도 local heuristic 기능은 동작합니다. AI 기반 task/review가 필요할 때만 provider를 설정합니다.
@@ -165,6 +174,7 @@ dev-guard config show
 - `dev-guard update`는 파일을 수정하지 않는다.
 - `dev-guard update --write`만 managed block을 갱신한다.
 - `.devguard` cache/run 파일은 일반 변경 요약에서 제외된다.
+- `.devguard/` runtime 파일은 기본적으로 local-only다. 예시는 [configuration docs](./docs/configuration.md)에 둔다.
 - provider/API key는 필수가 아니다.
 - watch는 memory refresh만 자동 수행하고 source edit은 하지 않는다.
 
@@ -186,6 +196,9 @@ npm pack --dry-run --cache /private/tmp/dev-guard-npm-cache
 
 Alpha 제한사항:
 
+- TypeScript/Node 프로젝트에 최적화되어 있다.
+- 휴리스틱 중심이며 full AST semantic engine이 아니다.
+- drift detection은 확률적 신호이므로 review를 보조하는 용도로 봐야 한다.
 - AI review 품질은 provider 설정에 좌우된다.
 - local heuristic review는 의미 있는 guardrail이지만 완전한 semantic code review는 아니다.
 - initial commit 전에는 untracked file warning이 많을 수 있다.
@@ -194,6 +207,8 @@ Alpha 제한사항:
 ## 상세 문서
 
 - [명령어 reference](./docs/commands.md)
+- [Configuration and tracking policy](./docs/configuration.md)
+- [Release checklist](./docs/release-checklist.md)
 - [Architecture notes](./docs/architecture.md)
 - [Task AI와 prompt 생성](./docs/task-ai.md)
 - [Review, drift, local heuristics](./docs/review-and-drift.md)

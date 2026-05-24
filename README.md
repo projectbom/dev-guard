@@ -9,7 +9,7 @@ It is designed for teams that want a lightweight loop:
 ```bash
 dev-guard init
 dev-guard status
-dev-guard "Fix the previous question changing when going back"
+dev-guard "Fix loading flicker"
 dev-guard done
 ```
 
@@ -19,6 +19,7 @@ dev-guard supports Korean and English natural-language requirements. The public 
 
 - Creates project-local guard files under `.devguard/`.
 - Detects project type, package manager, runtime, git baseline, and pending changes.
+- Builds lightweight project memory, including import/reverse-dependency impact hints.
 - Generates compact Codex-ready prompts from your current requirement.
 - Runs local heuristic checks and review without requiring an API provider.
 - Optionally uses an AI provider for richer task generation and review.
@@ -44,10 +45,12 @@ dev-guard --help
 
 ## Quick Start
 
+The basic loop should be understandable in under a minute:
+
 ```bash
 dev-guard init
 dev-guard status
-dev-guard "Fix the previous question changing when going back"
+dev-guard "Fix loading flicker"
 # paste the generated prompt into Codex, then let Codex edit files
 dev-guard done
 ```
@@ -57,7 +60,7 @@ If you are running inside this monorepo before linking:
 ```bash
 pnpm cli init
 pnpm cli status
-pnpm cli "Fix the previous question changing when going back"
+pnpm cli "Fix loading flicker"
 pnpm cli done
 ```
 
@@ -138,6 +141,12 @@ dev-guard help advanced
 
 `watch` is optional. It refreshes project memory while you edit, but does not auto-fix code or write docs by default.
 
+## Examples
+
+- [Bugfix workflow](./examples/bugfix.md)
+- [i18n workflow](./examples/i18n.md)
+- [Architecture workflow](./examples/architecture.md)
+
 ## AI Provider Setup
 
 dev-guard works without an API key by using local heuristics. AI features are optional.
@@ -167,6 +176,7 @@ dev-guard config show
 - `dev-guard update` does not modify files.
 - `dev-guard update --write` only updates managed blocks.
 - Context/cache files are excluded from normal changed-file summaries.
+- `.devguard/` runtime files are local-only by default; see [configuration docs](./docs/configuration.md) for examples.
 - Provider/API configuration is optional.
 - Watch mode auto-refreshes memory only; it does not apply source edits.
 
@@ -184,6 +194,9 @@ npm pack --dry-run --cache /private/tmp/dev-guard-npm-cache
 
 Alpha limitations:
 
+- Optimized for TypeScript/Node projects.
+- Heuristic-heavy by design; not a full AST semantic engine.
+- Drift detection is probabilistic and should support, not replace, review.
 - AI review quality depends on provider configuration.
 - Local heuristic review is useful but not a full semantic code review.
 - Initial repositories without a git baseline can produce noisy untracked-file warnings.
@@ -192,6 +205,8 @@ Alpha limitations:
 ## Advanced Docs
 
 - [Command reference](./docs/commands.md)
+- [Configuration and tracking policy](./docs/configuration.md)
+- [Release checklist](./docs/release-checklist.md)
 - [Architecture notes](./docs/architecture.md)
 - [Task AI and prompt generation](./docs/task-ai.md)
 - [Review, drift, and local heuristics](./docs/review-and-drift.md)

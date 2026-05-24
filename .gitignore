@@ -1,3 +1,7 @@
 node_modules
 dist
 *.tsbuildinfo
+
+# dev-guard generated local context/cache.
+# Keep project-local task/runs/cache out of GitHub.
+.devguard/*

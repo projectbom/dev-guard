@@ -2,6 +2,7 @@ import { mergeConfig } from "./defaults.js";
 import { filterDevGuardContextFiles } from "./context-files.js";
 import { analyzeCompletionPostChecks } from "./completion.js";
 import { analyzeGeneratedDiffDrift, scoreWorkflowQuality } from "./drift.js";
+import { buildImpactHints } from "./scan.js";
 import type { ChangeFile, DiffInput, GuardFinding, GuardReport } from "./types.js";
 
 export function analyzeDiff(input: DiffInput): GuardReport {
@@ -17,6 +18,7 @@ export function analyzeDiff(input: DiffInput): GuardReport {
   const unrelatedFiles = findUnrelatedFiles(riskFiles, allowedPaths, config.docPaths);
   const protectedFiles = riskFiles.filter((file) => matchesAny(file, config.protectedPaths));
   const docsUpdateNeeded = sourceFiles.length > 0 && docFiles.length === 0;
+  const impactHints = buildImpactHints(changedFiles, input.codeGraph ?? []);
 
   if (allChangeFiles.length > 0 && changeFiles.length === 0) {
     findings.push({
@@ -69,6 +71,16 @@ export function analyzeDiff(input: DiffInput): GuardReport {
       title: "Protected or high-impact paths changed",
       message: "High-impact paths changed. Confirm this was explicitly required by the task.",
       files: protectedFiles
+    });
+  }
+
+  for (const hint of impactHints.filter((item) => item.importedByCount >= 5)) {
+    findings.push({
+      severity: "warning",
+      code: "potential_impact",
+      title: "Potential dependency impact",
+      message: `Changed file is imported by ${hint.importedByCount} files. Affected areas: ${hint.affectedAreas.join(", ") || "unknown"}.`,
+      files: [hint.file, ...hint.importedBy.slice(0, 5)]
     });
   }
 

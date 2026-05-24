@@ -1,6 +1,6 @@
-import { analyzeDiff, analyzeGeneratedDiffDrift } from "@dev-guard/core";
+import { analyzeDiff, analyzeGeneratedDiffDrift, type CodeGraphEntry } from "@dev-guard/core";
 import { recordDriftTelemetry } from "./drift-telemetry.js";
-import { fromRoot, readTextFile } from "./fs.js";
+import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
 import { getGitChanges, hasGitBaseline } from "./git.js";
 import { loadConfig } from "./config.js";
 
@@ -10,12 +10,13 @@ interface CheckOptions {
 }
 
 export async function runCheck(root: string, options: CheckOptions): Promise<void> {
-  const [gitChanges, taskText, rulesText, resolvedConfig, baseline] = await Promise.all([
+  const [gitChanges, taskText, rulesText, resolvedConfig, baseline, codeGraph] = await Promise.all([
     getGitChanges(root),
     readTextFile(fromRoot(root, ".devguard/task.md")),
     readTextFile(fromRoot(root, ".devguard/rules.md")),
     loadConfig(root),
-    hasGitBaseline(root)
+    hasGitBaseline(root),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
 
   const report = analyzeDiff({
@@ -25,7 +26,8 @@ export async function runCheck(root: string, options: CheckOptions): Promise<voi
     taskText,
     rulesText,
     config: resolvedConfig.config,
-    includeContextFiles: options.includeContextFiles
+    includeContextFiles: options.includeContextFiles,
+    codeGraph
   });
   await recordDriftTelemetry(root, {
     result: analyzeGeneratedDiffDrift({

@@ -1,6 +1,8 @@
-import { extname } from "node:path";
+import { dirname, extname, posix } from "node:path";
 import type {
+  CodeGraphEntry,
   FileSummary,
+  ImpactHint,
   ProjectIndexEntry,
   ProjectRefreshInput,
   ProjectRefreshResult,
@@ -11,11 +13,13 @@ import type {
 export function buildProjectScan(files: ProjectScanInputFile[]): ProjectScanResult {
   const index = files.map(buildProjectIndexEntry).sort((a, b) => a.path.localeCompare(b.path));
   const summaries = buildFileSummaries(index);
+  const codeGraph = buildCodeGraph(files, index);
 
   return {
     index,
     summaries,
-    projectMapMarkdown: buildProjectMapMarkdown(index, summaries)
+    projectMapMarkdown: buildProjectMapMarkdown(index, summaries),
+    codeGraph
   };
 }
 
@@ -28,15 +32,185 @@ export function refreshProjectScan(input: ProjectRefreshInput): ProjectRefreshRe
     ...updatedEntries
   ].sort((a, b) => a.path.localeCompare(b.path));
   const summaries = buildFileSummaries(index);
+  const codeGraph = refreshCodeGraph(input.existingCodeGraph ?? [], input.updatedFiles, index, removed);
 
   return {
     index,
     summaries,
     projectMapMarkdown: buildProjectMapMarkdown(index, summaries),
+    codeGraph,
     updatedPaths: [...updatedPaths].sort(),
     removedPaths: [...removed].sort(),
     unchangedCount: input.existingIndex.filter((entry) => !removed.has(entry.path) && !updatedPaths.has(entry.path)).length
   };
+}
+
+export function buildCodeGraph(files: ProjectScanInputFile[], index: ProjectIndexEntry[] = files.map(buildProjectIndexEntry)): CodeGraphEntry[] {
+  const fileSet = new Set(files.map((file) => file.path));
+  const indexByPath = new Map(index.map((entry) => [entry.path, entry]));
+  const entries = files.map((file) => buildCodeGraphEntry(file, fileSet, indexByPath));
+  return attachReverseDependencies(entries);
+}
+
+export function buildImpactHints(changedFiles: string[], codeGraph: CodeGraphEntry[], limit = 5): ImpactHint[] {
+  const graphByFile = new Map(codeGraph.map((entry) => [entry.file, entry]));
+  return [...new Set(changedFiles)]
+    .map((file) => {
+      const entry = graphByFile.get(file);
+      if (!entry || entry.importedBy.length === 0) {
+        return undefined;
+      }
+      const affectedAreas = [...new Set(entry.importedBy.map((importer) => graphByFile.get(importer)?.category ?? areaFromPath(importer)))].slice(0, 6);
+      return {
+        file,
+        importedByCount: entry.importedBy.length,
+        importedBy: entry.importedBy.slice(0, limit),
+        impactCandidates: entry.impactCandidates.slice(0, limit),
+        affectedAreas
+      };
+    })
+    .filter((hint): hint is ImpactHint => Boolean(hint))
+    .sort((a, b) => b.importedByCount - a.importedByCount || a.file.localeCompare(b.file))
+    .slice(0, limit);
+}
+
+function refreshCodeGraph(
+  existingCodeGraph: CodeGraphEntry[],
+  updatedFiles: ProjectScanInputFile[],
+  index: ProjectIndexEntry[],
+  removed: Set<string>
+): CodeGraphEntry[] {
+  const updatedPaths = new Set(updatedFiles.map((file) => file.path));
+  const existingFiles = new Set([
+    ...existingCodeGraph.map((entry) => entry.file),
+    ...updatedFiles.map((file) => file.path),
+    ...index.map((entry) => entry.path)
+  ].filter((path) => !removed.has(path)));
+  const indexByPath = new Map(index.map((entry) => [entry.path, entry]));
+  const retained = existingCodeGraph
+    .filter((entry) => !removed.has(entry.file) && !updatedPaths.has(entry.file))
+    .map((entry) => ({
+      ...entry,
+      imports: entry.imports.filter((file) => existingFiles.has(file)),
+      importedBy: []
+    }));
+  const updated = updatedFiles.map((file) => buildCodeGraphEntry(file, existingFiles, indexByPath));
+
+  return attachReverseDependencies([...retained, ...updated]);
+}
+
+function buildCodeGraphEntry(
+  file: ProjectScanInputFile,
+  fileSet: Set<string>,
+  indexByPath: Map<string, ProjectIndexEntry>
+): CodeGraphEntry {
+  const imports = extractImportSpecifiers(file.content)
+    .filter((specifier) => specifier.startsWith("."))
+    .map((specifier) => resolveImportPath(file.path, specifier, fileSet))
+    .filter((path): path is string => Boolean(path));
+  const exports = extractExportHints(file.content);
+  const index = indexByPath.get(file.path);
+  const category = index?.category ?? categorize(file.path, index?.keywords ?? []);
+
+  return {
+    file: file.path,
+    imports: [...new Set(imports)].sort(),
+    importedBy: [],
+    exports,
+    category,
+    impactCandidates: [],
+    usageHints: buildUsageHints(file.path, category, exports)
+  };
+}
+
+function attachReverseDependencies(entries: CodeGraphEntry[]): CodeGraphEntry[] {
+  const entryByFile = new Map(entries.map((entry) => [entry.file, { ...entry, importedBy: [] as string[] }]));
+  for (const entry of entryByFile.values()) {
+    for (const imported of entry.imports) {
+      const target = entryByFile.get(imported);
+      if (target) {
+        target.importedBy.push(entry.file);
+      }
+    }
+  }
+
+  return [...entryByFile.values()]
+    .map((entry) => {
+      const importedBy = [...new Set(entry.importedBy)].sort();
+      const impactCandidates = [...new Set([...importedBy, ...entry.imports])].slice(0, 12);
+      return {
+        ...entry,
+        importedBy,
+        impactCandidates,
+        usageHints: [
+          ...entry.usageHints,
+          importedBy.length > 0 ? `used by ${importedBy.length} file(s)` : ""
+        ].filter(Boolean)
+      };
+    })
+    .sort((a, b) => a.file.localeCompare(b.file));
+}
+
+function extractImportSpecifiers(content: string): string[] {
+  const patterns = [
+    /\bimport\s+(?:type\s+)?(?:[^'"]+\s+from\s+)?["']([^"']+)["']/g,
+    /\bexport\s+(?:type\s+)?[^'"]+\s+from\s+["']([^"']+)["']/g,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+    /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g
+  ];
+
+  return [...new Set(patterns.flatMap((pattern) => [...content.matchAll(pattern)].map((match) => match[1]).filter(Boolean)))];
+}
+
+function extractExportHints(content: string): string[] {
+  const named = [
+    ...content.matchAll(/\bexport\s+(?:async\s+)?(?:function|const|class|interface|type|enum)\s+([A-Za-z0-9_]+)/g),
+    ...content.matchAll(/\bexport\s+default\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)/g)
+  ].map((match) => match[1]);
+  const grouped = [...content.matchAll(/\bexport\s*\{([^}]+)\}/g)].flatMap((match) =>
+    (match[1] ?? "")
+      .split(",")
+      .map((item) => item.replace(/\s+as\s+.+$/i, "").trim())
+      .filter(Boolean)
+  );
+  return [...new Set([...named, ...grouped].map(cleanKeyword).filter(Boolean))].slice(0, 30);
+}
+
+function resolveImportPath(fromFile: string, specifier: string, fileSet: Set<string>): string | undefined {
+  const base = posix.normalize(posix.join(dirname(fromFile), specifier));
+  const withoutJsExtension = base.replace(/\.(?:js|jsx|mjs|cjs)$/, "");
+  const candidates = [
+    base,
+    withoutJsExtension,
+    ...[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"].map((extension) => `${withoutJsExtension}${extension}`),
+    ...[".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"].map((extension) => `${base}${extension}`),
+    ...["index.ts", "index.tsx", "index.js", "index.jsx"].map((indexFile) => posix.join(base, indexFile))
+  ];
+  return candidates.find((candidate) => fileSet.has(candidate));
+}
+
+function buildUsageHints(file: string, category: string, exports: string[]): string[] {
+  const hints = [`category:${category}`];
+  if (/^(app|pages)\//.test(file)) {
+    hints.push(`route:${routeFromPath(file)}`);
+  }
+  const components = exports.filter((name) => /^[A-Z]/.test(name)).slice(0, 3);
+  if (components.length > 0) {
+    hints.push(`component:${components.join(",")}`);
+  }
+  return hints;
+}
+
+function routeFromPath(file: string): string {
+  return `/${file
+    .replace(/^(app|pages)\//, "")
+    .replace(/\/(page|route|index)\.[^.]+$/, "")
+    .replace(/\.[^.]+$/, "")}`;
+}
+
+function areaFromPath(file: string): string {
+  const parts = file.split("/");
+  return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : parts[0] || "general";
 }
 
 export function selectRelatedFilesFromScan(requirement: string, index: ProjectIndexEntry[], summaries: FileSummary[]): string[] {

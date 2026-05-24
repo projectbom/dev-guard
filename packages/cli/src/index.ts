@@ -246,9 +246,11 @@ async function runDone(root: string): Promise<void> {
 
 async function runStatus(root: string): Promise<void> {
   console.log("dev-guard status");
-  await runDoctor(root);
-  console.log("");
-  await runReport(root, ["--compact"]);
+  const doctorOutput = await captureConsole(() => runDoctor(root));
+  const reportOutput = await captureConsole(() => runReport(root, ["--compact"]));
+  for (const line of summarizeStatusOutput(doctorOutput, reportOutput)) {
+    console.log(line);
+  }
 }
 
 function errorMessage(error: unknown): string {
@@ -287,7 +289,7 @@ function summarizeStepOutput(name: string, lines: string[]): string[] {
   }
 
   if (name === "review --heuristic") {
-    return pickLines(lines, ["status:", "Requirement Alignment Score:", "Drift Risk:", "Scope Safety:", "커밋 가능 여부"]);
+    return summarizeReviewOutput(lines);
   }
 
   if (name === "report --compact") {
@@ -295,7 +297,7 @@ function summarizeStepOutput(name: string, lines: string[]): string[] {
   }
 
   if (name === "update preview") {
-    return pickLines(lines, ["Mode:", "Summary:", "No files were modified."]);
+    return summarizeUpdatePreviewOutput(lines);
   }
 
   return lines.slice(0, 5);
@@ -314,6 +316,81 @@ function pickLines(lines: string[], patterns: string[]): string[] {
 
 function countMatching(lines: string[], pattern: string): number {
   return lines.filter((line) => line.includes(pattern)).length;
+}
+
+function summarizeStatusOutput(doctorOutput: string[], reportOutput: string[]): string[] {
+  const provider = valueAfter(doctorOutput, "Provider:") ?? "unknown";
+  const model = valueAfter(doctorOutput, "Model:") ?? "unknown";
+  const apiKey = valueAfter(doctorOutput, "API Key:") ?? "unknown";
+  const baseline = valueAfter(doctorOutput, "Git Baseline:") ?? "unknown";
+  const framework = valueAfter(doctorOutput, "Framework:") ?? "(unknown)";
+  const runtime = valueAfter(doctorOutput, "Runtime:") ?? "(unknown)";
+  const packageManager = valueAfter(doctorOutput, "Package Manager:") ?? "(unknown)";
+  const memory = valueAfter(doctorOutput, "Project Memory:") ?? "unknown";
+  const task = valueAfter(reportOutput, "Task:") ?? "현재 task 없음";
+  const changed = valueAfter(reportOutput, "Changed:") ?? "none";
+  const check = valueAfter(reportOutput, "Check:") ?? "none";
+  const review = valueAfter(reportOutput, "Review:") ?? "none";
+  const next = valueAfter(reportOutput, "Next:") ?? valueAfter(doctorOutput, "Next:") ?? "dev-guard \"describe the next change\"";
+  const lines = [
+    `Project: ${framework}; runtime=${runtime}; package_manager=${packageManager}`,
+    `Provider: ${provider}; model=${model}; api_key=${apiKey}`,
+    `Git baseline: ${baseline}`,
+    `Memory: ${memory}`,
+    `Task: ${task}`,
+    `Changed: ${changed}`,
+    `Check: ${check}`,
+    `Review: ${review}`
+  ];
+  if (baseline === "missing") {
+    lines.push('Warning: initial git baseline missing; run `git add . && git commit -m "initial commit"` to reduce noise.');
+  }
+  lines.push("");
+  lines.push("Next:");
+  lines.push(`  ${next}`);
+  return lines;
+}
+
+function summarizeReviewOutput(lines: string[]): string[] {
+  const status = valueAfter(lines, "status:") ?? "unknown";
+  const alignment = valueAfter(lines, "- Requirement Alignment Score:") ?? valueAfter(lines, "Requirement Alignment Score:");
+  const drift = valueAfter(lines, "- Drift Risk:") ?? valueAfter(lines, "Drift Risk:");
+  const scope = valueAfter(lines, "- Scope Safety:") ?? valueAfter(lines, "Scope Safety:");
+  const commitIndex = lines.findIndex((line) => line.includes("커밋 가능 여부"));
+  const commit = commitIndex >= 0 ? lines.slice(commitIndex + 1).find((line) => line.trim().startsWith("- "))?.trim() : undefined;
+  return [
+    `status: ${status}`,
+    alignment ? `requirement alignment: ${alignment}` : undefined,
+    drift ? `drift risk: ${drift}` : undefined,
+    scope ? `scope safety: ${scope}` : undefined,
+    commit ? `commit: ${commit.replace(/^- /, "")}` : undefined
+  ].filter((line): line is string => Boolean(line));
+}
+
+function summarizeUpdatePreviewOutput(lines: string[]): string[] {
+  const summary = pickLines(lines, ["Mode:", "Summary:"]);
+  const docsIndex = lines.findIndex((line) => line.includes("Docs Update Preview:"));
+  const docLines =
+    docsIndex >= 0
+      ? lines
+          .slice(docsIndex + 1)
+          .filter((line) => /^- docs\//.test(line.trim()) || /^  - /.test(line))
+          .slice(0, 8)
+      : [];
+  const modified = lines.find((line) => line.includes("No files were modified."));
+  const applyIndex = lines.findIndex((line) => line.trim() === "Apply:");
+  const apply = applyIndex >= 0 ? lines[applyIndex + 1]?.trim() : undefined;
+  return [...summary, "Docs Update Preview:", ...docLines, modified, apply ? `Apply: ${apply}` : undefined].filter(
+    (line): line is string => Boolean(line)
+  );
+}
+
+function valueAfter(lines: string[], prefix: string): string | undefined {
+  const line = lines.find((candidate) => candidate.trim().startsWith(prefix));
+  if (!line) {
+    return undefined;
+  }
+  return line.trim().slice(prefix.length).trim();
 }
 
 main().catch((error: unknown) => {

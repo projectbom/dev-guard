@@ -2,13 +2,17 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   analyzeFileRelevance,
+  buildImpactHints,
   buildTaskCompletionCriteria,
   classifyTaskType,
   formatCompletionCriteria,
-  generateCodexPrompt
+  generateCodexPrompt,
+  type CodeGraphEntry,
+  type FileSummary,
+  type ProjectIndexEntry
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
-import { fromRoot, writeTextFile } from "./fs.js";
+import { fromRoot, readJsonFile, writeTextFile } from "./fs.js";
 import { getGitChanges, getProjectFiles } from "./git.js";
 import { refreshProjectMemory } from "./refresh.js";
 import { runCheck } from "./check.js";
@@ -22,6 +26,7 @@ interface SelfOptions {
   requirement: string;
   copy: boolean;
   check: boolean;
+  debugContext: boolean;
 }
 
 export async function runSelf(root: string, args: string): Promise<void>;
@@ -32,7 +37,14 @@ export async function runSelf(root: string, args: string | string[]): Promise<vo
   await refreshProjectMemory(root, { full: false, ai: false, dryRun: false });
 
   try {
-    await runTaskAI(root, [options.requirement, "--write", "--prompt", "--save-run", ...(options.copy ? ["--copy"] : [])]);
+    await runTaskAI(root, [
+      options.requirement,
+      "--write",
+      "--prompt",
+      "--save-run",
+      ...(options.copy ? ["--copy"] : []),
+      ...(options.debugContext ? ["--debug-context"] : [])
+    ]);
   } catch (error) {
     if (!isProviderUnavailable(error)) {
       throw error;
@@ -47,21 +59,24 @@ export async function runSelf(root: string, args: string | string[]): Promise<vo
 }
 
 export async function runSelfCheck(root: string): Promise<void> {
-  const results: Array<{ name: string; ok: boolean; reason?: string }> = [];
+  const results: Array<{ name: string; ok: boolean; reason?: string; output: string[] }> = [];
   for (const step of [
     { name: "pnpm run build", run: () => execFileAsync("pnpm", ["run", "build"], { cwd: root }) },
     { name: "dev-guard check --local", run: () => runCheck(root, { includeContextFiles: false, local: true }) },
     { name: "dev-guard review --heuristic", run: () => runReview(root, ["--heuristic"]) },
     { name: "dev-guard doctor", run: () => runDoctor(root) }
   ]) {
-    console.error(`dev-guard self-check: running ${step.name}`);
+    console.log(`dev-guard self-check: running ${step.name}`);
     try {
-      await step.run();
-      results.push({ name: step.name, ok: true });
+      const output = await captureConsole(step.run);
+      results.push({ name: step.name, ok: true, output });
+      for (const line of summarizeSelfCheckStep(step.name, output)) {
+        console.log(`  ${line}`);
+      }
     } catch (error) {
       const reason = errorMessage(error);
-      console.error(`dev-guard self-check: ${step.name} failed (${reason})`);
-      results.push({ name: step.name, ok: false, reason });
+      console.log(`dev-guard self-check: ${step.name} failed (${reason})`);
+      results.push({ name: step.name, ok: false, reason, output: [] });
     }
   }
 
@@ -75,13 +90,36 @@ export async function runSelfCheck(root: string): Promise<void> {
 }
 
 async function runLocalSelfTask(root: string, options: SelfOptions): Promise<void> {
-  const [projectFiles, gitChanges] = await Promise.all([getProjectFiles(root), getGitChanges(root)]);
+  const [projectFiles, gitChanges, index, summaries, codeGraph] = await Promise.all([
+    getProjectFiles(root),
+    getGitChanges(root),
+    readJsonFile<ProjectIndexEntry[]>(fromRoot(root, ".devguard/project-index.json"), []),
+    readJsonFile<FileSummary[]>(fromRoot(root, ".devguard/file-summaries.json"), []),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
+  ]);
   const taskType = classifyTaskType(options.requirement);
   const criteria = buildTaskCompletionCriteria(taskType);
-  const candidates = analyzeFileRelevance(options.requirement, projectFiles)
+  const candidates = analyzeFileRelevance(options.requirement, projectFiles, { index, summaries, codeGraph })
     .filter((candidate) => candidate.role === "edit" || candidate.role === "reference")
     .slice(0, 8);
   const selectedFiles = candidates.map((candidate) => candidate.path);
+  const impactHints = buildImpactHints([...gitChanges.changedFiles, ...selectedFiles], codeGraph);
+  if (options.debugContext) {
+    console.error("dev-guard self debug context");
+    console.error(`- requirement anchor: ${options.requirement}`);
+    console.error(`- task type: ${taskType.type}${taskType.subtype ? ` / ${taskType.subtype}` : ""}`);
+    console.error(`- scored candidates (${candidates.length}):`);
+    for (const candidate of candidates) {
+      console.error(`  - ${candidate.path}`);
+      console.error(`    score: ${candidate.score}`);
+      console.error(`    role: ${candidate.role}`);
+      console.error(`    reasons: ${candidate.reasons.join("; ") || "none"}`);
+    }
+    console.error(`- impact hints (${impactHints.length}):`);
+    for (const hint of impactHints.slice(0, 5)) {
+      console.error(`  - ${hint.file}: imported by ${hint.importedByCount}; affected ${hint.affectedAreas.join(", ") || "unknown"}`);
+    }
+  }
   const taskMarkdown = [
     "## 목표",
     options.requirement,
@@ -130,7 +168,8 @@ async function runLocalSelfTask(root: string, options: SelfOptions): Promise<voi
     diffText: gitChanges.diffText,
     compact: true,
     density: "ultra",
-    maxPromptTokens: 2500
+    maxPromptTokens: 2500,
+    impactHints
   }).promptText;
 
   if (options.copy) {
@@ -151,11 +190,12 @@ async function runLocalSelfTask(root: string, options: SelfOptions): Promise<voi
 function parseSelfOptions(args: string[]): SelfOptions {
   const copy = args.includes("--copy");
   const check = args.includes("--check");
+  const debugContext = args.includes("--debug-context");
   const requirement = args.filter((arg) => !arg.startsWith("--")).join(" ").trim();
   if (!requirement) {
     throw new Error('요구사항을 입력해 주세요. 예: dev-guard self "prompt density 안전성 보강"');
   }
-  return { requirement, copy, check };
+  return { requirement, copy, check, debugContext };
 }
 
 function isProviderUnavailable(error: unknown): boolean {
@@ -165,4 +205,57 @@ function isProviderUnavailable(error: unknown): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function captureConsole(run: () => Promise<unknown>): Promise<string[]> {
+  const originalLog = console.log;
+  const originalError = console.error;
+  const lines: string[] = [];
+  console.log = (...args: unknown[]) => {
+    lines.push(...args.map(String).join(" ").split(/\r?\n/));
+  };
+  console.error = (...args: unknown[]) => {
+    lines.push(...args.map(String).join(" ").split(/\r?\n/));
+  };
+  try {
+    await run();
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+  return lines;
+}
+
+function summarizeSelfCheckStep(name: string, lines: string[]): string[] {
+  if (name === "pnpm run build") {
+    return ["build completed"];
+  }
+  if (name === "dev-guard check --local") {
+    return [`findings: ${countMatching(lines, "[warning]")} warning(s), ${countMatching(lines, "[info]")} info`];
+  }
+  if (name === "dev-guard review --heuristic") {
+    const status = valueAfter(lines, "status:") ?? "unknown";
+    const alignment = valueAfter(lines, "- Requirement Alignment Score:") ?? valueAfter(lines, "Requirement Alignment Score:");
+    const drift = valueAfter(lines, "- Drift Risk:") ?? valueAfter(lines, "Drift Risk:");
+    return [`status: ${status}`, alignment ? `requirement alignment: ${alignment}` : undefined, drift ? `drift risk: ${drift}` : undefined].filter(
+      (line): line is string => Boolean(line)
+    );
+  }
+  if (name === "dev-guard doctor") {
+    return [
+      `provider: ${valueAfter(lines, "Provider:") ?? "unknown"}`,
+      `git baseline: ${valueAfter(lines, "Git Baseline:") ?? "unknown"}`,
+      `project memory: ${valueAfter(lines, "Project Memory:") ?? "unknown"}`
+    ];
+  }
+  return lines.slice(0, 3);
+}
+
+function valueAfter(lines: string[], prefix: string): string | undefined {
+  const line = lines.find((candidate) => candidate.trim().startsWith(prefix));
+  return line ? line.trim().slice(prefix.length).trim() : undefined;
+}
+
+function countMatching(lines: string[], pattern: string): number {
+  return lines.filter((line) => line.includes(pattern)).length;
 }

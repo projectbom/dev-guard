@@ -47,6 +47,7 @@ export interface DiffInput {
   rulesText: string;
   config?: DevGuardConfig;
   includeContextFiles?: boolean;
+  codeGraph?: CodeGraphEntry[];
 }
 
 export interface GuardFinding {
@@ -97,6 +98,7 @@ export interface CodexPromptInput {
   density?: "ultra" | "compact" | "verbose";
   maxPromptTokens?: number;
   includeContextFiles?: boolean;
+  impactHints?: ImpactHint[];
 }
 
 export interface CodexPrompt {
@@ -134,6 +136,8 @@ export interface TaskAIContext {
   codeContexts?: TaskAICodeContext[];
   taskType?: TaskTypeResult;
   completionCriteria?: TaskCompletionCriteria;
+  codeGraph?: CodeGraphEntry[];
+  impactHints?: ImpactHint[];
 }
 
 export interface TaskMarkdownResult {
@@ -260,6 +264,7 @@ export interface ReviewContext {
   projectMapMarkdown?: string;
   runLog?: DevGuardRunLog;
   runSelectionSummary?: string;
+  impactHints?: ImpactHint[];
 }
 
 export interface ReviewResult {
@@ -323,6 +328,24 @@ export interface FileSummary {
   relatedFiles: string[];
 }
 
+export interface CodeGraphEntry {
+  file: string;
+  imports: string[];
+  importedBy: string[];
+  exports: string[];
+  category: string;
+  impactCandidates: string[];
+  usageHints: string[];
+}
+
+export interface ImpactHint {
+  file: string;
+  importedByCount: number;
+  importedBy: string[];
+  impactCandidates: string[];
+  affectedAreas: string[];
+}
+
 export interface ProjectScanInputFile {
   path: string;
   content: string;
@@ -335,11 +358,13 @@ export interface ProjectScanResult {
   index: ProjectIndexEntry[];
   summaries: FileSummary[];
   projectMapMarkdown: string;
+  codeGraph: CodeGraphEntry[];
 }
 
 export interface ProjectRefreshInput {
   existingIndex: ProjectIndexEntry[];
   existingSummaries: FileSummary[];
+  existingCodeGraph?: CodeGraphEntry[];
   updatedFiles: ProjectScanInputFile[];
   removedPaths: string[];
 }

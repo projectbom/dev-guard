@@ -24,10 +24,13 @@ packages/
 
 - `project-index.json`
 - `file-summaries.json`
+- `code-graph.json`
 - `project-map.md`
 - `project-identity.json`
 
 Project identity includes the project root, package name, git remote, framework/runtime hints, and fingerprint. This is used to reduce cross-project context contamination.
+
+`code-graph.json` is a lightweight, heuristic graph for TypeScript/Node-style projects. It stores resolved relative imports, export hints, reverse dependencies, and compact impact candidates. It is not a full AST or compiler-backed graph.
 
 ## Context Selection
 

@@ -97,18 +97,66 @@ function printUpdatePreview(suggestions: ReturnType<typeof generateUpdateSuggest
   console.log(`Summary: ${suggestions.summary}`);
   console.log("");
 
-  console.log(`# ${targetDocs.projectStateSuggestion}`);
-  console.log(suggestions.projectStateSuggestion);
-  console.log(`# ${targetDocs.currentTaskSuggestion}`);
-  console.log(suggestions.currentTaskSuggestion);
-  console.log(`# ${targetDocs.decisionsSuggestion}`);
-  console.log(suggestions.decisionsSuggestion);
-  console.log(`# ${targetDocs.doNotRepeatSuggestion}`);
-  console.log(suggestions.doNotRepeatSuggestion);
+  console.log("Docs Update Preview:");
+  printDocSummary(targetDocs.projectStateSuggestion, suggestions.projectStateSuggestion);
+  printDocSummary(targetDocs.currentTaskSuggestion, suggestions.currentTaskSuggestion);
+  printDocSummary(targetDocs.decisionsSuggestion, suggestions.decisionsSuggestion);
+  printDocSummary(targetDocs.doNotRepeatSuggestion, suggestions.doNotRepeatSuggestion);
+  console.log("");
 
   if (!options.write) {
-    console.log("No files were modified. Re-run with --write to append these suggestions.");
+    console.log("No files were modified.");
+    console.log("Apply:");
+    console.log("  dev-guard update --write");
   } else {
     console.log("Updated managed dev-guard blocks. User-written content outside the markers was preserved.");
   }
+}
+
+function printDocSummary(path: string, suggestion: string): void {
+  const items = extractActionItems(suggestion);
+  console.log(`- ${path}`);
+  for (const item of items.slice(0, 4)) {
+    console.log(`  - ${item}`);
+  }
+  if (items.length > 4) {
+    console.log(`  - ... ${items.length - 4} more`);
+  }
+  if (items.length === 0) {
+    console.log("  - No notable candidate inferred.");
+  }
+}
+
+function extractActionItems(markdown: string): string[] {
+  const lines = markdown.split(/\r?\n/);
+  const headings = new Set([
+    "### State notes",
+    "### Remaining review",
+    "### Decision candidates",
+    "### Cautions",
+    "### Repeat prevention candidates",
+    "### Rule hygiene candidates",
+    "### Task reference",
+    "### Run reference"
+  ]);
+  const ignoredPrefixes = ["- Date/time:", "- .gitignore", "- package.json", "- README.md"];
+  const items: string[] = [];
+  let inRelevantSection = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (line.startsWith("### ")) {
+      inRelevantSection = headings.has(line);
+      continue;
+    }
+    if (!inRelevantSection || !line.startsWith("- ")) {
+      continue;
+    }
+    if (ignoredPrefixes.some((prefix) => line.startsWith(prefix))) {
+      continue;
+    }
+    items.push(line.slice(2));
+  }
+
+  return [...new Set(items)];
 }

@@ -1,0 +1,13 @@
+.devguard
+.git
+.pnpm-store
+node_modules
+
+packages/*/src
+packages/*/tsconfig.json
+packages/*/*.tsbuildinfo
+
+*.tsbuildinfo
+tsconfig.json
+tsconfig.base.json
+pnpm-lock.yaml

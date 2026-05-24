@@ -23,6 +23,7 @@ Local checks can detect:
 - managed-marker corruption
 - obvious i18n omissions
 - generated diff drift signals
+- high-impact dependency changes from the lightweight code graph
 
 ## Drift Review
 

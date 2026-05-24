@@ -1,6 +1,7 @@
 import {
   buildProjectScan,
   refreshProjectScan,
+  type CodeGraphEntry,
   type DevGuardConfig,
   type FileSummary,
   type ProjectIndexEntry
@@ -38,12 +39,13 @@ export async function refreshProjectMemory(root: string, options: RefreshOptions
   for (const warning of resolvedConfig.warnings) {
     console.error(`dev-guard refresh: warning: ${warning}`);
   }
-  const [existingIndex, existingSummaries] = await Promise.all([
+  const [existingIndex, existingSummaries, existingCodeGraph] = await Promise.all([
     readJsonFile<ProjectIndexEntry[]>(fromRoot(root, ".devguard/project-index.json"), []),
-    readJsonFile<FileSummary[]>(fromRoot(root, ".devguard/file-summaries.json"), [])
+    readJsonFile<FileSummary[]>(fromRoot(root, ".devguard/file-summaries.json"), []),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
 
-  if (options.full || existingIndex.length === 0) {
+  if (options.full || existingIndex.length === 0 || existingCodeGraph.length === 0) {
     return runFullRefresh(root, options, config);
   }
 
@@ -111,11 +113,12 @@ export async function refreshProjectMemory(root: string, options: RefreshOptions
   const refreshed = refreshProjectScan({
     existingIndex,
     existingSummaries,
+    existingCodeGraph,
     updatedFiles,
     removedPaths: removed
   });
 
-  await writeMemoryFiles(root, refreshed.index, refreshed.summaries, refreshed.projectMapMarkdown);
+  await writeMemoryFiles(root, refreshed.index, refreshed.summaries, refreshed.projectMapMarkdown, refreshed.codeGraph);
   return result;
 }
 
@@ -145,15 +148,22 @@ async function runFullRefresh(root: string, options: RefreshOptions, config: Dev
     return result;
   }
 
-  await writeMemoryFiles(root, scan.index, scan.summaries, scan.projectMapMarkdown);
+  await writeMemoryFiles(root, scan.index, scan.summaries, scan.projectMapMarkdown, scan.codeGraph);
   return result;
 }
 
-async function writeMemoryFiles(root: string, index: ProjectIndexEntry[], summaries: FileSummary[], projectMapMarkdown: string): Promise<void> {
+async function writeMemoryFiles(
+  root: string,
+  index: ProjectIndexEntry[],
+  summaries: FileSummary[],
+  projectMapMarkdown: string,
+  codeGraph: CodeGraphEntry[]
+): Promise<void> {
   const identity = await loadCurrentProjectIdentity(root, index.map((entry) => entry.path));
   await Promise.all([
     writeTextFile(fromRoot(root, ".devguard/project-index.json"), `${JSON.stringify(index, null, 2)}\n`),
     writeTextFile(fromRoot(root, ".devguard/file-summaries.json"), `${JSON.stringify(summaries, null, 2)}\n`),
+    writeTextFile(fromRoot(root, ".devguard/code-graph.json"), `${JSON.stringify(codeGraph, null, 2)}\n`),
     writeTextFile(fromRoot(root, ".devguard/project-map.md"), projectMapMarkdown),
     writeProjectIdentity(root, identity)
   ]);
@@ -174,7 +184,7 @@ function printRefreshPlan(plan: {
   console.log(`- updated summaries: ${plan.updatedPaths.length}`);
   console.log(`- removed summaries: ${plan.removedPaths.length}`);
   console.log(`- unchanged files skipped: ${plan.unchangedCount}`);
-  console.log("- writes: .devguard/project-index.json, .devguard/file-summaries.json, .devguard/project-map.md, .devguard/project-identity.json");
+  console.log("- writes: .devguard/project-index.json, .devguard/file-summaries.json, .devguard/code-graph.json, .devguard/project-map.md, .devguard/project-identity.json");
   console.log("- reason: keep project memory current for task-ai/review/report");
 
   if (plan.updatedPaths.length > 0) {

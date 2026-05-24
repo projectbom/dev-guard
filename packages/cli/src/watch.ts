@@ -41,6 +41,7 @@ const ignoredDirectoryNames = new Set(["node_modules", ".next", "dist", "build",
 const ignoredExactFiles = new Set([
   ".devguard/project-index.json",
   ".devguard/file-summaries.json",
+  ".devguard/code-graph.json",
   ".devguard/project-map.md",
   ".devguard/project-identity.json",
   "pnpm-lock.yaml",

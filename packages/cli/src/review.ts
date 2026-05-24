@@ -4,11 +4,13 @@ import {
   scoreWorkflowQuality,
   filterDevGuardContextFiles,
   buildReviewFixPrompt,
+  buildImpactHints,
   generateReviewResult,
   isAlwaysIgnoredContextPath,
   NoneAIProvider,
   OpenAIProvider,
   type DevGuardRunLog,
+  type CodeGraphEntry,
   type FileSummary,
   type ProjectIdentity,
   type ReviewResult,
@@ -202,15 +204,17 @@ async function executeReview(
   const model = config.ai?.model ?? defaultConfig.ai.model ?? "gpt-4o-mini";
   const currentIdentity = await loadCurrentProjectIdentity(root).catch(() => undefined);
 
-  const [taskMarkdown, rulesMarkdown, mistakesMarkdown, projectStateMarkdown, decisionsMarkdown, memory, diffText] = await Promise.all([
+  const [taskMarkdown, rulesMarkdown, mistakesMarkdown, projectStateMarkdown, decisionsMarkdown, memory, diffText, codeGraph] = await Promise.all([
     readTextFile(fromRoot(root, ".devguard/task.md")),
     readTextFile(fromRoot(root, ".devguard/rules.md")),
     readTextFile(fromRoot(root, ".devguard/mistakes.md")),
     readTextFile(fromRoot(root, "docs/PROJECT_STATE.md")),
     readTextFile(fromRoot(root, "docs/DECISIONS.md")),
     loadReviewMemory(root, reviewChangedFiles, currentIdentity),
-    getDiffForChangeFiles(root, reviewChangeFiles, { stagedOnly: options.staged, commitRef: options.commit })
+    getDiffForChangeFiles(root, reviewChangeFiles, { stagedOnly: options.staged, commitRef: options.commit }),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
+  const impactHints = buildImpactHints(reviewChangedFiles, codeGraph);
   const ruleRelevanceText = [taskMarkdown, reviewChangedFiles.join("\n"), projectStateMarkdown, decisionsMarkdown].join("\n");
   const filteredRules = filterRelevantMarkdown(rulesMarkdown, ruleRelevanceText, currentIdentity);
   const filteredMistakes = filterRelevantMarkdown(mistakesMarkdown, ruleRelevanceText, currentIdentity);
@@ -236,7 +240,8 @@ async function executeReview(
       changeFiles: reviewChangeFiles,
       diffText,
       taskMarkdown,
-      untrackedFileContexts
+      untrackedFileContexts,
+      impactHints
     });
     const drift = analyzeGeneratedDiffDrift({
       requirementText: taskMarkdown,
@@ -293,7 +298,8 @@ async function executeReview(
       memorySummaries: memory.summaries,
       projectMapMarkdown: memory.projectMapMarkdown,
       runLog: runSelection.run,
-      runSelectionSummary: formatRunSelectionSummary(runSelection)
+      runSelectionSummary: formatRunSelectionSummary(runSelection),
+      impactHints
     },
     model
   );
@@ -567,6 +573,7 @@ function generateHeuristicReview(input: {
   diffText: string;
   taskMarkdown: string;
   untrackedFileContexts: ReviewFileContext[];
+  impactHints: ReturnType<typeof buildImpactHints>;
 }): ReviewResult {
   const findings: Array<{ severity: "info" | "warning" | "critical"; text: string }> = [];
   const drift = analyzeGeneratedDiffDrift({
@@ -623,6 +630,12 @@ function generateHeuristicReview(input: {
       text: `Potential drift detected: ${drift.reasons.join("; ") || "domain mismatch"} (score ${drift.driftScore})`
     });
   }
+  for (const hint of input.impactHints.filter((item) => item.importedByCount >= 5)) {
+    findings.push({
+      severity: "warning",
+      text: `dependency impact: ${hint.file} is imported by ${hint.importedByCount} files (${hint.affectedAreas.join(", ") || "unknown"}).`
+    });
+  }
 
   const status = findings.some((finding) => finding.severity === "critical")
     ? "needs_changes"
@@ -666,6 +679,9 @@ ${findingLines}
 - requirement zones: ${drift.requirementZones.join(", ") || "none"}
 - diff zones: ${drift.generatedZones.join(", ") || "none"}
 - reasons: ${drift.reasons.join("; ") || "none"}
+
+## Impact 분석
+${formatReviewImpactHints(input.impactHints)}
 
 ## Workflow Quality Score
 - Requirement Alignment Score: ${quality.requirementAlignment}
@@ -711,6 +727,16 @@ function detectDuplicateMarkdownHeadings(lines: string[]): string[] {
     seen.add(heading);
   }
   return [...duplicates];
+}
+
+function formatReviewImpactHints(impactHints: ReturnType<typeof buildImpactHints>): string {
+  if (impactHints.length === 0) {
+    return "- dependency impact hint 없음";
+  }
+  return impactHints
+    .slice(0, 5)
+    .map((hint) => `- ${hint.file}: imported by ${hint.importedByCount}; affected areas: ${hint.affectedAreas.join(", ") || "unknown"}`)
+    .join("\n");
 }
 
 async function loadReviewGitChanges(root: string, options: ReviewTargetOptions): Promise<GitChanges> {

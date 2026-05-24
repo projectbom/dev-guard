@@ -10,6 +10,7 @@ const devGuardDocPaths = new Set([
 const devGuardCachePaths = new Set([
   ".devguard/project-index.json",
   ".devguard/file-summaries.json",
+  ".devguard/code-graph.json",
   ".devguard/project-map.md"
 ]);
 

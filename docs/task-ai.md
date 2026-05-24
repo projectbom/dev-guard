@@ -36,6 +36,7 @@ File selection uses generic relevance scoring:
 - category and route segment matches
 - component/function/export names
 - related features from scan cache
+- lightweight import/reverse-dependency hints from `code-graph.json`
 - scoped recent memory when relevant
 
 Debug output can show scores and reasons:

@@ -1,6 +1,6 @@
-import { filterDevGuardContextFiles, generateCodexPrompt } from "@dev-guard/core";
+import { buildImpactHints, filterDevGuardContextFiles, generateCodexPrompt, type CodeGraphEntry } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
-import { fromRoot, readTextFile, writeTextFile } from "./fs.js";
+import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges } from "./git.js";
 import { loadCurrentProjectIdentity } from "./project-identity.js";
 import { filterRelevantMarkdown } from "./rule-filter.js";
@@ -24,15 +24,17 @@ interface MarkdownReadResult {
 }
 
 export async function runPrompt(root: string, options: PromptOptions): Promise<void> {
-  const [gitChanges, task, rules, mistakes, projectState, decisions, identity] = await Promise.all([
+  const [gitChanges, task, rules, mistakes, projectState, decisions, identity, codeGraph] = await Promise.all([
     getGitChanges(root),
     readMarkdown(root, ".devguard/task.md"),
     readMarkdown(root, ".devguard/rules.md"),
     readMarkdown(root, ".devguard/mistakes.md"),
     readMarkdown(root, "docs/PROJECT_STATE.md"),
     readMarkdown(root, "docs/DECISIONS.md"),
-    loadCurrentProjectIdentity(root).catch(() => undefined)
+    loadCurrentProjectIdentity(root).catch(() => undefined),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
+  const impactHints = buildImpactHints(gitChanges.changedFiles, codeGraph);
 
   const missingFiles = [task, rules, mistakes, projectState, decisions].filter((result) => result.missing);
   for (const file of missingFiles) {
@@ -55,7 +57,8 @@ export async function runPrompt(root: string, options: PromptOptions): Promise<v
     ultraCompact: options.ultraCompact,
     density: options.density,
     maxPromptTokens: options.maxPromptTokens,
-    includeContextFiles: options.includeContextFiles
+    includeContextFiles: options.includeContextFiles,
+    impactHints
   });
 
   if (options.output) {

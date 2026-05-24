@@ -24,6 +24,7 @@ export async function runScan(root: string, args: string[]): Promise<void> {
   await Promise.all([
     writeTextFile(fromRoot(root, ".devguard/project-index.json"), `${JSON.stringify(scan.index, null, 2)}\n`),
     writeTextFile(fromRoot(root, ".devguard/file-summaries.json"), `${JSON.stringify(scan.summaries, null, 2)}\n`),
+    writeTextFile(fromRoot(root, ".devguard/code-graph.json"), `${JSON.stringify(scan.codeGraph, null, 2)}\n`),
     writeTextFile(fromRoot(root, ".devguard/project-map.md"), scan.projectMapMarkdown),
     writeProjectIdentity(root, identity)
   ]);
@@ -45,6 +46,7 @@ export async function runScan(root: string, args: string[]): Promise<void> {
   console.log(`- summaries: ${options.ai && config.ai?.provider !== "none" ? "rule-based (AI summary hook reserved)" : "rule-based"}`);
   console.log("- wrote: .devguard/project-index.json");
   console.log("- wrote: .devguard/file-summaries.json");
+  console.log("- wrote: .devguard/code-graph.json");
   console.log("- wrote: .devguard/project-map.md");
   console.log("- wrote: .devguard/project-identity.json");
   console.log("- reason: refresh project memory for task-ai/review/report");

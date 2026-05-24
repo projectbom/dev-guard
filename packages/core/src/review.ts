@@ -67,6 +67,9 @@ ${formatChangeFiles(context.changeFiles, context.changedFiles)}
 git diff:
 ${trimToLimit(context.diffText || "(diff 본문 없음)", 45000)}
 
+영향도 힌트:
+${formatImpactHints(context.impactHints ?? [])}
+
 untracked 파일 내용 일부:
 ${formatUntrackedContexts(context.untrackedFileContexts ?? [])}
 
@@ -81,6 +84,7 @@ ${formatMemorySummaries(context.memorySummaries ?? [], context.projectMapMarkdow
 - 원래 userRequest, generatedTaskMarkdown, generatedCodexPrompt가 run 기록에 있으면 이것을 최우선 기준으로 현재 diff와 비교하세요.
 - run match score가 낮거나 latest run does not match current diff 경고가 있으면, 오래된 run 기준으로 pass를 쉽게 내지 말고 현재 task.md와 실제 diff를 우선하세요.
 - 실제 diff에 나온 파일명, 수정된 문자열, 컴포넌트명, 조건문, import/export 변경을 먼저 근거로 쓰세요.
+- 영향도 힌트가 있으면 변경 파일의 reverse dependency를 참고해 필요한 검증 범위를 짚으세요.
 - 가능하면 수정된 문구 자체를 짧게 인용하세요. 단, 긴 코드는 인용하지 말고 요약하세요.
 - task.md 수정 범위 밖 파일이 바뀌었는지 확인하세요.
 - untracked 파일은 새로 생성된 파일입니다. untracked 파일 내용 일부가 제공되면 해당 excerpt를 실제 검토 근거로 사용하세요.
@@ -206,6 +210,16 @@ function reviewSystemPrompt(): string {
     "For needs_changes, risky, or critical, the fix prompt must name files, concrete mismatches, exact edits, and protected files or logic. Do not write a vague prompt.",
     "Use natural concise Korean. Avoid generic or awkward phrases."
   ].join("\n");
+}
+
+function formatImpactHints(impactHints: NonNullable<ReviewContext["impactHints"]>): string {
+  if (impactHints.length === 0) {
+    return "- 영향도 힌트 없음";
+  }
+  return impactHints
+    .slice(0, 5)
+    .map((hint) => `- ${hint.file}: imported by ${hint.importedByCount}; affected areas ${hint.affectedAreas.join(", ") || "unknown"}; examples ${hint.importedBy.slice(0, 3).join(", ") || "none"}`)
+    .join("\n");
 }
 
 function normalizeReviewMarkdown(markdown: string): string {

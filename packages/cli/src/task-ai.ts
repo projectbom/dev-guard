@@ -2,6 +2,7 @@ import {
   defaultConfig,
   analyzeFileRelevance,
   analyzeSemanticDrift,
+  buildImpactHints,
   buildTaskCompletionCriteria,
   classifyTaskType,
   detectRequirementMismatch,
@@ -15,7 +16,9 @@ import {
   NoneAIProvider,
   OpenAIProvider,
   selectRelatedFilesFromScan,
+  type CodeGraphEntry,
   type FileSummary,
+  type ImpactHint,
   type ProjectIndexEntry,
   type ProjectIdentity,
   type TaskAICodeContext,
@@ -91,11 +94,13 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
   const relevanceCandidates = analyzeFileRelevance(options.requirement, projectMemory.projectFiles, {
     index: projectMemory.index,
     summaries: projectMemory.summaries,
-    runTargetFiles: scopedMemory.targetFiles
+    runTargetFiles: scopedMemory.targetFiles,
+    codeGraph: projectMemory.codeGraph
   }).filter((candidate) => !isAlwaysIgnoredContextPath(candidate.path));
   const routedCandidates = routeCandidateFiles(taskType, options.requirement, projectMemory.projectFiles, relevanceCandidates, projectMemory);
   const relatedFileCandidates = routedCandidates.relatedFileCandidates;
   const scoredCandidates = routedCandidates.scoredCandidates;
+  const impactHints = buildImpactHints([...taskChangedFiles, ...relatedFileCandidates], projectMemory.codeGraph);
   if (taskType.requiresPhasing) {
     console.error(`dev-guard task-ai: ${taskType.type}/large-task decomposition enabled. Strategy: ${taskType.strategy}.`);
   }
@@ -114,6 +119,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
       relatedFileCandidates,
       codeContextFiles: codeContexts.map((context) => context.path),
       scoredCandidates,
+      impactHints,
       taskType,
       completionCriteria,
       requirementAnchor: options.requirement,
@@ -173,6 +179,8 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
       projectFiles: projectMemory.projectFiles,
       relatedFileCandidates,
       fileCandidates: scoredCandidates,
+      codeGraph: projectMemory.codeGraph,
+      impactHints,
       codeContexts,
       taskType,
       completionCriteria
@@ -205,7 +213,8 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
           diffText: buildFilteredDiffSummary(gitChanges.diffText, taskChangedFiles),
           compact: true,
           density: "ultra",
-          maxPromptTokens: 2500
+          maxPromptTokens: 2500,
+          impactHints
         }).promptText
       : undefined;
 
@@ -347,6 +356,7 @@ function printDebugContext(debug: {
   relatedFileCandidates: string[];
   codeContextFiles: string[];
   scoredCandidates: TaskAIFileCandidate[];
+  impactHints: ImpactHint[];
   taskType: TaskTypeResult;
   completionCriteria: ReturnType<typeof buildTaskCompletionCriteria>;
   requirementAnchor: string;
@@ -412,6 +422,13 @@ function printDebugContext(debug: {
     console.error(`    reasons: ${candidate.reasons.length > 0 ? candidate.reasons.join("; ") : "none"}`);
     console.error(`    negative reasons: ${candidate.negativeReasons.length > 0 ? candidate.negativeReasons.join("; ") : "none"}`);
   }
+  console.error(`- impact hints (${debug.impactHints.length}):`);
+  for (const hint of debug.impactHints.slice(0, 8)) {
+    console.error(`  - ${hint.file}`);
+    console.error(`    imported by: ${hint.importedByCount}`);
+    console.error(`    affected areas: ${hint.affectedAreas.join(", ") || "unknown"}`);
+    console.error(`    examples: ${hint.importedBy.slice(0, 4).join(", ") || "none"}`);
+  }
   console.error(`- code context files (${debug.codeContextFiles.length}):`);
   for (const file of debug.codeContextFiles) {
     console.error(`  - ${file}`);
@@ -440,12 +457,14 @@ async function loadProjectMemory(
   index: ProjectIndexEntry[];
   summaries: FileSummary[];
   projectMapMarkdown: string;
+  codeGraph: CodeGraphEntry[];
 }> {
   if (!noCache) {
-    const [index, summaries, projectMapMarkdown, storedIdentity] = await Promise.all([
+    const [index, summaries, projectMapMarkdown, codeGraph, storedIdentity] = await Promise.all([
       readJsonFile<ProjectIndexEntry[]>(fromRoot(root, ".devguard/project-index.json"), []),
       readJsonFile<FileSummary[]>(fromRoot(root, ".devguard/file-summaries.json"), []),
       readTextFile(fromRoot(root, ".devguard/project-map.md")),
+      readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), []),
       readStoredProjectIdentity(root)
     ]);
 
@@ -466,7 +485,8 @@ async function loadProjectMemory(
           projectFiles,
           index: index.filter((entry) => !isAlwaysIgnoredContextPath(entry.path)),
           summaries: summaries.filter((summary) => !isAlwaysIgnoredContextPath(summary.path)),
-          projectMapMarkdown
+          projectMapMarkdown,
+          codeGraph: codeGraph.filter((entry) => !isAlwaysIgnoredContextPath(entry.file))
         };
       }
     }
@@ -478,7 +498,8 @@ async function loadProjectMemory(
     projectFiles,
     index: [],
     summaries: [],
-    projectMapMarkdown: ""
+    projectMapMarkdown: "",
+    codeGraph: []
   };
 }
 

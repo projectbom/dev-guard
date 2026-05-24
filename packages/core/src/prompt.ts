@@ -1,5 +1,5 @@
 import { filterDevGuardContextFiles } from "./context-files.js";
-import type { ChangeFile, CodexPrompt, CodexPromptInput } from "./types.js";
+import type { ChangeFile, CodexPrompt, CodexPromptInput, ImpactHint } from "./types.js";
 
 export function generateCodexPrompt(input: CodexPromptInput): CodexPrompt {
   const changeFiles = normalizeChangeFiles(input.changeFiles, input.changedFiles);
@@ -29,6 +29,7 @@ function buildFullPrompt(input: CodexPromptInput, changeFiles: ChangeFile[], cha
     ["최근 결정", fallbackMarkdown(input.decisionsMarkdown, "결정 문서가 비어 있습니다.")],
     ["핵심 Guard", formatSymbolicProtection(taskSections, input.rulesMarkdown, input.mistakesMarkdown)],
     ["현재 변경 파일", formatChangedFiles(changeFiles)],
+    ["영향도 힌트", formatImpactHints(input.impactHints ?? [])],
     ["Codex 작업 지시", codexInstruction()],
     ["완료 조건", completionConditions()],
     ["검증 명령어", verificationCommands(changedFiles)]
@@ -54,6 +55,7 @@ function buildCompactPrompt(
     ["작업", compactTaskSummary(taskSections)],
     ["작업 유형", taskSections.taskType || "type 확인 필요"],
     ["관련 파일", formatCompactRelatedFiles(changeFiles, taskSections)],
+    ["영향도", formatImpactHints(input.impactHints ?? [])],
     ["보호/금지", compactProtection(taskSections, input.rulesMarkdown, input.mistakesMarkdown)],
     ["완료 기준", taskSections.completionCriteria || taskSections.completionConditions || completionConditions()],
     ["검증 명령어", verificationCommands(changedFiles)]
@@ -75,6 +77,7 @@ function buildUltraCompactPrompt(input: CodexPromptInput, changeFiles: ChangeFil
     ["TASK", oneLine([taskSections.goal, taskSections.problem].filter(Boolean).join(" | ")) || "Complete requested scoped task."],
     ["TYPE", oneLine(taskSections.taskType) || "unknown"],
     ["FILES", formatUltraFiles(changeFiles, taskSections)],
+    ["IMPACT", formatUltraImpactHints(input.impactHints ?? [])],
     ["PROTECT", formatSymbolicProtection(taskSections, input.rulesMarkdown, input.mistakesMarkdown)],
     ["SUCCESS", limitLines(taskSections.completionCriteria || taskSections.completionConditions || completionConditions(), 5)],
     ["VERIFY", verificationCommands(changedFiles)]
@@ -102,7 +105,7 @@ function renderBudgetedPrompt(
   sections: ReadonlyArray<readonly [string, string]>,
   maxPromptTokens?: number
 ): string {
-  const priority = ["작업", "작업 유형", "완료 기준", "보호/금지", "검증 명령어", "관련 파일"];
+  const priority = ["작업", "작업 유형", "완료 기준", "보호/금지", "검증 명령어", "관련 파일", "영향도"];
   let active = [...sections];
   let prompt = renderPrompt(title, summary, active);
   while (maxPromptTokens && estimateTokens(prompt) > maxPromptTokens && active.length > 5) {
@@ -123,7 +126,7 @@ function renderBudgetedUltraPrompt(
   sections: ReadonlyArray<readonly [string, string]>,
   maxPromptTokens: number
 ): string {
-  const priority = ["TASK", "TYPE", "SUCCESS", "PROTECT", "VERIFY", "FILES"];
+  const priority = ["TASK", "TYPE", "SUCCESS", "PROTECT", "VERIFY", "FILES", "IMPACT"];
   let active = [...sections];
   const build = (items: ReadonlyArray<readonly [string, string]>, trimmed = false) =>
     `# dev-guard ultra-compact\nSUMMARY: ${summary}${trimmed ? "; budget_trimmed=true" : ""}\n${items
@@ -314,6 +317,41 @@ function formatUltraFiles(changeFiles: ChangeFile[], taskSections: TaskSections)
     return "none; see task scope";
   }
   return groupFilePaths(changeFiles.map((file) => file.path)).slice(0, 8).join(", ");
+}
+
+function formatImpactHints(impactHints: ImpactHint[]): string {
+  if (impactHints.length === 0) {
+    return "- none";
+  }
+  return impactHints
+    .slice(0, 5)
+    .map((hint) => {
+      const usedBy = hint.importedBy.slice(0, 3).join(", ") || "unknown";
+      const areas = hint.affectedAreas.slice(0, 4).join(", ") || "unknown";
+      return `- ${hint.file}: imported by ${hint.importedByCount}; used by ${usedBy}; areas ${areas}`;
+    })
+    .join("\n");
+}
+
+function formatUltraImpactHints(impactHints: ImpactHint[]): string {
+  if (impactHints.length === 0) {
+    return "none";
+  }
+  return impactHints
+    .slice(0, 3)
+    .map((hint) => `${compactImpactPath(hint.file)} used_by=${hint.importedByCount}`)
+    .join("; ");
+}
+
+function compactImpactPath(path: string): string {
+  if (path.length <= 56) {
+    return path;
+  }
+  const parts = path.split("/");
+  if (parts.length <= 2) {
+    return `...${path.slice(-53)}`;
+  }
+  return `${parts[0]}/.../${parts.at(-1)}`;
 }
 
 function compactFileLines(text: string, max: number): string[] {

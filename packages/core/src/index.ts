@@ -24,7 +24,14 @@ export { filterDevGuardContextFiles, isAlwaysIgnoredContextPath, isDevGuardConte
 export { generateCodexPrompt } from "./prompt.js";
 export { generateCompactReport } from "./report.js";
 export { buildReviewFixPrompt, buildReviewPrompt, generateReviewResult } from "./review.js";
-export { buildProjectMapMarkdown, buildProjectScan, refreshProjectScan, selectRelatedFilesFromScan } from "./scan.js";
+export {
+  buildCodeGraph,
+  buildImpactHints,
+  buildProjectMapMarkdown,
+  buildProjectScan,
+  refreshProjectScan,
+  selectRelatedFilesFromScan
+} from "./scan.js";
 export { classifyTaskType, taskTypeStrategyNotes } from "./task-router.js";
 export { generateUpdateSuggestions } from "./update.js";
 export {
@@ -44,12 +51,14 @@ export type {
   ChangeFile,
   ChangeFileSource,
   ChangeFileStatus,
+  CodeGraphEntry,
   DevGuardConfig,
   DevGuardRunLog,
   DiffInput,
   GuardFinding,
   GuardReport,
   GenerateTextInput,
+  ImpactHint,
   Severity
 } from "./types.js";
 export type { UpdateSuggestionInput, UpdateSuggestions } from "./types.js";
