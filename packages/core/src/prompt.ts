@@ -79,7 +79,7 @@ function buildUltraCompactPrompt(input: CodexPromptInput, changeFiles: ChangeFil
     ["FILES", formatUltraFiles(changeFiles, taskSections)],
     ["IMPACT", formatUltraImpactHints(input.impactHints ?? [])],
     ["PROTECT", formatSymbolicProtection(taskSections, input.rulesMarkdown, input.mistakesMarkdown)],
-    ["SUCCESS", limitLines(taskSections.completionCriteria || taskSections.completionConditions || completionConditions(), 5)],
+    ["SUCCESS", formatUltraSuccess(taskSections)],
     ["VERIFY", verificationCommands(changedFiles)]
   ] as const;
   const promptText = addTokenEstimate(
@@ -352,6 +352,46 @@ function compactImpactPath(path: string): string {
     return `...${path.slice(-53)}`;
   }
   return `${parts[0]}/.../${parts.at(-1)}`;
+}
+
+function formatUltraSuccess(taskSections: TaskSections): string {
+  const source = [taskSections.goal, taskSections.problem, taskSections.taskType, taskSections.completionCriteria, taskSections.completionConditions]
+    .join("\n")
+    .toLowerCase();
+  const flags = new Set<string>();
+
+  if (/cli_output_polish|명령|command|출력|output|요약|summary|preview|done|status|help/.test(source)) {
+    flags.add("cli_output_clear=true");
+  }
+  if (/done/.test(source)) {
+    flags.add("done_output_clear=true");
+  }
+  if (/update\s*preview|preview|업데이트/.test(source)) {
+    flags.add("update_preview_summary_visible=true");
+  }
+  if (/update|preview|write|자동/.test(source)) {
+    flags.add("no_auto_write=true");
+  }
+  if (/i18n|locale|translation|영어|영문/.test(source)) {
+    flags.add("inventory_required=true");
+    flags.add("key_parity=true");
+    flags.add("hardcoded_text_check=true");
+  }
+  if (/architecture|migration|마이그레이션|아키텍처/.test(source)) {
+    flags.add("migration_plan_required=true");
+    flags.add("rollback_or_verification_required=true");
+  }
+
+  if (flags.size > 0) {
+    return [...flags].slice(0, 6).join(", ");
+  }
+
+  const lines = (taskSections.completionCriteria || taskSections.completionConditions || completionConditions())
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("- "))
+    .slice(0, 3);
+  return lines.length > 0 ? lines.join("; ") : "requested_outcome_verified=true";
 }
 
 function compactFileLines(text: string, max: number): string[] {

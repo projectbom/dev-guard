@@ -2,6 +2,18 @@ import type { GuardFinding, TaskCompletionCriteria, TaskType, TaskTypeResult } f
 
 export function buildTaskCompletionCriteria(taskType: TaskTypeResult): TaskCompletionCriteria {
   const criteria = criteriaByType[taskType.type];
+  if (taskType.subtype === "cli_output_polish") {
+    return {
+      requiredChecks: [
+        "대상 CLI 명령의 출력에서 핵심 요약이 먼저 보인다.",
+        "preview/write 정책이 출력에서 명확히 구분된다.",
+        "기존 명령 동작과 자동 write 정책은 유지된다."
+      ],
+      forbiddenPatterns: ["새 기능 추가로 범위 확대", "update --write 자동 실행", "긴 로그를 기본 출력에 추가"],
+      reviewHints: ["대상 command handler와 관련 preview 출력만 확인한다.", "기본 출력이 compact한지 확인한다."],
+      blockingFailures: ["대상 명령 출력 개선 누락", "preview 명령이 파일을 수정함", "기존 command flow 훼손"]
+    };
+  }
   return {
     requiredChecks: criteria.requiredChecks,
     forbiddenPatterns: criteria.forbiddenPatterns,

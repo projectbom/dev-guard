@@ -77,7 +77,10 @@ const rules: TypeRule[] = [
     strategy: "minimal-ui-polish",
     riskLevel: "low",
     requiresPhasing: false,
-    patterns: [/자연스럽|부자연|어색|뜬금|위화감|시각적\s*위계|배치|더\s*매끄럽|다듬|polish|ux|ui/i]
+    patterns: [
+      /자연스럽|부자연|어색|뜬금|위화감|시각적\s*위계|배치|더\s*매끄럽|다듬|polish|ux|ui/i,
+      /(명령|command).*(출력|output|요약|summary)|출력.*(명확|요약|정리)|요약.*(명확|보여)|더\s*명확|명확하게|help|status|done|preview/i
+    ]
   },
   {
     type: "styling",
@@ -253,6 +256,9 @@ function inferSubtype(type: TaskType, requirement: string): string | undefined {
     return "ui_text_cleanup.wording";
   }
   if (type === "ui_polish") {
+    if (/(명령|command|출력|output|요약|summary|help|status|done|preview|watch|review|check|task-ai|prompt|doctor|update)/i.test(requirement)) {
+      return "cli_output_polish";
+    }
     return "ui_polish.integration";
   }
   return undefined;

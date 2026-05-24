@@ -12,6 +12,7 @@ import {
   type ProjectIndexEntry
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
+import { filterCommandTargetCandidates, inferCommandTargetFiles, mergeCommandTargetCandidates } from "./command-targets.js";
 import { fromRoot, readJsonFile, writeTextFile } from "./fs.js";
 import { getGitChanges, getProjectFiles } from "./git.js";
 import { refreshProjectMemory } from "./refresh.js";
@@ -33,7 +34,7 @@ export async function runSelf(root: string, args: string): Promise<void>;
 export async function runSelf(root: string, args: string[]): Promise<void>;
 export async function runSelf(root: string, args: string | string[]): Promise<void> {
   const options = parseSelfOptions(Array.isArray(args) ? args : [args]);
-  console.error("dev-guard self: refreshing project memory");
+  console.error(options.debugContext ? "dev-guard self: refreshing project memory" : "dev-guard: refreshing project memory");
   await refreshProjectMemory(root, { full: false, ai: false, dryRun: false });
 
   try {
@@ -49,7 +50,7 @@ export async function runSelf(root: string, args: string | string[]): Promise<vo
     if (!isProviderUnavailable(error)) {
       throw error;
     }
-    console.error("dev-guard self: provider unavailable; using local heuristic task fallback");
+    console.error(options.debugContext ? "dev-guard self: provider unavailable; using local heuristic task fallback" : "dev-guard: provider unavailable; using local heuristic fallback");
     await runLocalSelfTask(root, options);
   }
 
@@ -99,10 +100,14 @@ async function runLocalSelfTask(root: string, options: SelfOptions): Promise<voi
   ]);
   const taskType = classifyTaskType(options.requirement);
   const criteria = buildTaskCompletionCriteria(taskType);
-  const candidates = analyzeFileRelevance(options.requirement, projectFiles, { index, summaries, codeGraph })
+  const commandTarget = inferCommandTargetFiles(options.requirement, projectFiles);
+  const relevanceCandidates = filterCommandTargetCandidates(analyzeFileRelevance(options.requirement, projectFiles, { index, summaries, codeGraph }), commandTarget);
+  const candidates = mergeCommandTargetCandidates(relevanceCandidates, commandTarget)
     .filter((candidate) => candidate.role === "edit" || candidate.role === "reference")
     .slice(0, 8);
-  const selectedFiles = candidates.map((candidate) => candidate.path);
+  const editFiles = candidates.filter((candidate) => candidate.role === "edit").map((candidate) => candidate.path);
+  const referenceFiles = candidates.filter((candidate) => candidate.role === "reference").map((candidate) => candidate.path);
+  const selectedFiles = [...editFiles, ...referenceFiles];
   const impactHints = buildImpactHints([...gitChanges.changedFiles, ...selectedFiles], codeGraph);
   if (options.debugContext) {
     console.error("dev-guard self debug context");
@@ -137,7 +142,10 @@ async function runLocalSelfTask(root: string, options: SelfOptions): Promise<voi
     taskType.subtype ? `- subtype: ${taskType.subtype}` : "",
     "",
     "## 수정 대상",
-    selectedFiles.length > 0 ? selectedFiles.map((file) => `- ${file} (후보)`).join("\n") : "- 관련 파일 확인 필요",
+    editFiles.length > 0 ? editFiles.map((file) => `- ${file} (후보)`).join("\n") : "- 관련 파일 확인 필요",
+    "",
+    "## 참고 대상",
+    referenceFiles.length > 0 ? referenceFiles.map((file) => `- ${file} (참고)`).join("\n") : "- 없음",
     "",
     "## 보호 대상",
     "- scope_lock=true",
@@ -174,16 +182,16 @@ async function runLocalSelfTask(root: string, options: SelfOptions): Promise<voi
 
   if (options.copy) {
     const result = await copyTextToClipboard(prompt);
-    console.error(result.ok ? "dev-guard self: copied Codex prompt to clipboard." : `dev-guard self: clipboard copy failed (${result.reason}).`);
+    console.error(result.ok ? "dev-guard: copied Codex prompt to clipboard." : `dev-guard: clipboard copy failed (${result.reason}).`);
   }
 
-  console.error("dev-guard self summary");
+  console.error(options.debugContext ? "dev-guard self summary" : "dev-guard prompt summary");
   console.error(`- density: ${prompt.match(/density=([^;\n]+)/)?.[1] ?? "ultra"}`);
   console.error(`- estimated_tokens: ${prompt.match(/estimated_tokens=~(\d+)/)?.[1] ?? "unknown"}`);
   console.error(`- selected files: ${selectedFiles.length > 0 ? selectedFiles.join(", ") : "none"}`);
   console.error("- prompt path: stdout");
   console.error("- task path: .devguard/task.md");
-  console.error("- next command: pnpm cli self-check");
+  console.error("- next command: dev-guard done");
   console.log(prompt);
 }
 

@@ -26,6 +26,7 @@ import {
   type TaskTypeResult
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
+import { filterCommandTargetCandidates, inferCommandTargetFiles, mergeCommandTargetCandidates } from "./command-targets.js";
 import { loadConfig } from "./config.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges, getProjectFiles } from "./git.js";
@@ -535,6 +536,7 @@ function routeCandidateFiles(
   relevanceCandidates: TaskAIFileCandidate[],
   projectMemory: { fromCache: boolean; index: ProjectIndexEntry[]; summaries: FileSummary[] }
 ): { relatedFileCandidates: string[]; scoredCandidates: TaskAIFileCandidate[] } {
+  const commandTarget = inferCommandTargetFiles(requirement, projectFiles);
   const genericCandidates = filterCandidateFiles(
     mergeCandidates(
       relevanceCandidates.filter((candidate) => candidate.role !== "ignored").map((candidate) => candidate.path),
@@ -556,6 +558,17 @@ function routeCandidateFiles(
     return {
       relatedFileCandidates,
       scoredCandidates: scoreTaskTypeCandidates(taskType, relatedFileCandidates, projectFiles)
+    };
+  }
+
+  if (commandTarget && (taskType.subtype === "cli_output_polish" || /명령|command|출력|output|요약|summary|preview/i.test(requirement))) {
+    const commandRelated = [...commandTarget.edit, ...commandTarget.reference];
+    const nonCommandGeneric = genericCandidates.filter((file) => !/(^|\/)update\.ts$/.test(file) || commandRelated.includes(file));
+    const scopedRelevanceCandidates = filterCommandTargetCandidates(relevanceCandidates, commandTarget);
+    const scoredCandidates = mergeCommandTargetCandidates(mergeScoredCandidates(scopedRelevanceCandidates, nonCommandGeneric), commandTarget);
+    return {
+      relatedFileCandidates: filterCandidateFiles(scoredCandidates.filter((candidate) => candidate.role !== "ignored").map((candidate) => candidate.path)),
+      scoredCandidates
     };
   }
 
