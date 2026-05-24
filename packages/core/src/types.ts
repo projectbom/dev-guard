@@ -346,6 +346,30 @@ export interface ImpactHint {
   affectedAreas: string[];
 }
 
+export interface InferredDiffIntent {
+  type: string;
+  subtype?: string;
+  targetCommand?: string;
+  scope: string[];
+  confidence: TaskTypeConfidence;
+  evidence: string[];
+  changedFiles: string[];
+  riskSignals: string[];
+  supportingFiles: string[];
+}
+
+export interface InferredDiffIntentClusters {
+  primaryIntent: InferredDiffIntent;
+  secondaryIntents: InferredDiffIntent[];
+  secondaryDetails: Array<{
+    intent: InferredDiffIntent;
+    severity: "info" | "caution" | "warning" | "high";
+    reason: string;
+  }>;
+  mixedRisk: "low" | "medium" | "high";
+  unrelatedFiles: string[];
+}
+
 export interface ProjectScanInputFile {
   path: string;
   content: string;

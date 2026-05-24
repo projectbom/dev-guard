@@ -2,6 +2,7 @@ import { mergeConfig } from "./defaults.js";
 import { filterDevGuardContextFiles } from "./context-files.js";
 import { analyzeCompletionPostChecks } from "./completion.js";
 import { analyzeGeneratedDiffDrift, scoreWorkflowQuality } from "./drift.js";
+import { filterDiffTextForFiles, formatInferredDiffIntentClusters, inferDiffIntentClusters, inferredIntentToRequirement, inferredIntentToTaskType } from "./diff-intent.js";
 import { buildImpactHints } from "./scan.js";
 import type { ChangeFile, DiffInput, GuardFinding, GuardReport } from "./types.js";
 
@@ -19,6 +20,15 @@ export function analyzeDiff(input: DiffInput): GuardReport {
   const protectedFiles = riskFiles.filter((file) => matchesAny(file, config.protectedPaths));
   const docsUpdateNeeded = sourceFiles.length > 0 && docFiles.length === 0;
   const impactHints = buildImpactHints(changedFiles, input.codeGraph ?? []);
+  const taskAvailable = hasTaskContext(input.taskText);
+  const inferredClusters = inferDiffIntentClusters({
+    changedFiles,
+    changeFiles,
+    diffText: input.diffText,
+    codeGraph: input.codeGraph,
+    taskText: taskAvailable ? input.taskText : undefined
+  });
+  const inferredIntent = inferredClusters.primaryIntent;
 
   if (allChangeFiles.length > 0 && changeFiles.length === 0) {
     findings.push({
@@ -43,6 +53,27 @@ export function analyzeDiff(input: DiffInput): GuardReport {
       title: "Untracked files detected",
       message: "Untracked files are included in this check. Review whether they should be committed or ignored.",
       files: changeFiles.filter((file) => file.source === "untracked").map((file) => file.path)
+    });
+  }
+
+  if (!taskAvailable && changedFiles.length > 0) {
+    findings.push({
+      severity: "info",
+      code: "diff_intent_inferred",
+      title: "Diff intent inferred",
+      message: `${formatInferredDiffIntentClusters(inferredClusters)}${inferredIntent.confidence === "low" ? ' Run dev-guard "<requirement>" before the next edit for stronger context.' : ""}`,
+      files: inferredClusters.unrelatedFiles.length > 0 ? inferredClusters.unrelatedFiles.slice(0, 5) : undefined
+    });
+  }
+
+  const actionableMixedDetails = inferredClusters.secondaryDetails.filter((detail) => detail.severity !== "info");
+  if (taskAvailable && actionableMixedDetails.length > 0) {
+    findings.push({
+      severity: "warning",
+      code: "mixed_diff_clusters",
+      title: "Mixed diff clusters detected",
+      message: formatInferredDiffIntentClusters(inferredClusters),
+      files: actionableMixedDetails.flatMap((detail) => detail.intent.changedFiles).slice(0, 8)
     });
   }
 
@@ -112,11 +143,12 @@ export function analyzeDiff(input: DiffInput): GuardReport {
   );
 
   const drift = analyzeGeneratedDiffDrift({
-    requirementText: input.taskText,
-    taskMarkdown: input.taskText,
-    diffText: input.diffText,
-    changedFiles,
-    changeFiles
+    requirementText: taskAvailable ? input.taskText : inferredIntentToRequirement(inferredIntent),
+    taskMarkdown: taskAvailable ? input.taskText : "",
+    diffText: filterDiffTextForFiles(input.diffText, inferredIntent.changedFiles),
+    changedFiles: inferredIntent.changedFiles,
+    changeFiles: changeFiles.filter((file) => inferredIntent.changedFiles.includes(file.path)),
+    taskType: taskAvailable ? undefined : inferredIntentToTaskType(inferredIntent)
   });
   const quality = scoreWorkflowQuality({
     drift,
@@ -140,6 +172,11 @@ export function analyzeDiff(input: DiffInput): GuardReport {
     findings,
     docsUpdateNeeded
   };
+}
+
+function hasTaskContext(taskText: string): boolean {
+  const text = taskText.trim();
+  return text.length > 0 && !/^#?\s*Current task/i.test(text) && !/Describe the requested change/i.test(text);
 }
 
 function normalizeChangeFiles(changeFiles: ChangeFile[] | undefined, changedFiles: string[]): ChangeFile[] {

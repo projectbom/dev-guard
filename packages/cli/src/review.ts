@@ -1,6 +1,11 @@
 import {
   defaultConfig,
   analyzeGeneratedDiffDrift,
+  filterDiffTextForFiles,
+  formatInferredDiffIntentClusters,
+  inferDiffIntentClusters,
+  inferredIntentToRequirement,
+  inferredIntentToTaskType,
   scoreWorkflowQuality,
   filterDevGuardContextFiles,
   buildReviewFixPrompt,
@@ -215,6 +220,10 @@ async function executeReview(
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
   const impactHints = buildImpactHints(reviewChangedFiles, codeGraph);
+  const taskAvailable = hasTaskContext(taskMarkdown);
+  const inferredClusters = inferDiffIntentClusters({ changedFiles: reviewChangedFiles, changeFiles: reviewChangeFiles, diffText, codeGraph, taskText: taskAvailable ? taskMarkdown : undefined });
+  const inferredIntent = inferredClusters.primaryIntent;
+  const effectiveTaskMarkdown = taskAvailable ? taskMarkdown : `## Diff Intent\n${formatInferredDiffIntentClusters(inferredClusters)}\n\n${inferredIntentToRequirement(inferredIntent)}\n`;
   const ruleRelevanceText = [taskMarkdown, reviewChangedFiles.join("\n"), projectStateMarkdown, decisionsMarkdown].join("\n");
   const filteredRules = filterRelevantMarkdown(rulesMarkdown, ruleRelevanceText, currentIdentity);
   const filteredMistakes = filterRelevantMarkdown(mistakesMarkdown, ruleRelevanceText, currentIdentity);
@@ -239,16 +248,19 @@ async function executeReview(
       changedFiles: reviewChangedFiles,
       changeFiles: reviewChangeFiles,
       diffText,
-      taskMarkdown,
+      taskMarkdown: effectiveTaskMarkdown,
+      inferredClusters,
+      taskAvailable,
       untrackedFileContexts,
       impactHints
     });
     const drift = analyzeGeneratedDiffDrift({
-      requirementText: taskMarkdown,
-      taskMarkdown,
-      diffText,
-      changedFiles: reviewChangedFiles,
-      changeFiles: reviewChangeFiles
+      requirementText: taskAvailable ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
+      taskMarkdown: taskAvailable ? taskMarkdown : "",
+      diffText: filterDiffTextForFiles(diffText, inferredIntent.changedFiles),
+      changedFiles: inferredIntent.changedFiles,
+      changeFiles: reviewChangeFiles.filter((file) => inferredIntent.changedFiles.includes(file.path)),
+      taskType: taskAvailable ? undefined : inferredIntentToTaskType(inferredIntent)
     });
     await recordDriftTelemetry(root, {
       result: drift,
@@ -304,11 +316,12 @@ async function executeReview(
     model
   );
   const drift = analyzeGeneratedDiffDrift({
-    requirementText: taskMarkdown,
-    taskMarkdown,
-    diffText,
-    changedFiles: reviewChangedFiles,
-    changeFiles: reviewChangeFiles
+    requirementText: taskAvailable ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
+    taskMarkdown: taskAvailable ? taskMarkdown : "",
+    diffText: filterDiffTextForFiles(diffText, inferredIntent.changedFiles),
+    changedFiles: inferredIntent.changedFiles,
+    changeFiles: reviewChangeFiles.filter((file) => inferredIntent.changedFiles.includes(file.path)),
+    taskType: taskAvailable ? undefined : inferredIntentToTaskType(inferredIntent)
   });
   await recordDriftTelemetry(root, {
     result: drift,
@@ -323,6 +336,11 @@ async function executeReview(
     changeFiles: reviewChangeFiles,
     runLog: runSelection.run
   };
+}
+
+function hasTaskContext(taskMarkdown: string): boolean {
+  const text = taskMarkdown.trim();
+  return text.length > 0 && !/^#?\s*Current task/i.test(text) && !/Describe the requested change/i.test(text);
 }
 
 interface RunSelection {
@@ -572,22 +590,28 @@ function generateHeuristicReview(input: {
   changeFiles: GitChanges["changeFiles"];
   diffText: string;
   taskMarkdown: string;
+  inferredClusters?: ReturnType<typeof inferDiffIntentClusters>;
+  taskAvailable?: boolean;
   untrackedFileContexts: ReviewFileContext[];
   impactHints: ReturnType<typeof buildImpactHints>;
 }): ReviewResult {
   const findings: Array<{ severity: "info" | "warning" | "critical"; text: string }> = [];
+  const primaryFiles = input.inferredClusters?.primaryIntent.changedFiles ?? input.changedFiles;
+  const primaryChangeFiles = input.changeFiles.filter((file) => primaryFiles.includes(file.path));
+  const primaryDiff = input.inferredClusters ? filterDiffTextForFiles(input.diffText, primaryFiles) : input.diffText;
   const drift = analyzeGeneratedDiffDrift({
-    requirementText: input.taskMarkdown,
-    taskMarkdown: input.taskMarkdown,
-    diffText: input.diffText,
-    changedFiles: input.changedFiles,
-    changeFiles: input.changeFiles
+    requirementText: input.taskAvailable || !input.inferredClusters ? input.taskMarkdown : inferredIntentToRequirement(input.inferredClusters.primaryIntent),
+    taskMarkdown: input.taskAvailable || !input.inferredClusters ? input.taskMarkdown : "",
+    diffText: primaryDiff,
+    changedFiles: primaryFiles,
+    changeFiles: primaryChangeFiles,
+    taskType: input.taskAvailable || !input.inferredClusters ? undefined : inferredIntentToTaskType(input.inferredClusters.primaryIntent)
   });
   const quality = scoreWorkflowQuality({
     drift,
-    changedFiles: input.changedFiles,
-    diffText: input.diffText,
-    changeFiles: input.changeFiles
+    changedFiles: primaryFiles,
+    diffText: primaryDiff,
+    changeFiles: primaryChangeFiles
   });
   const addedLines = input.diffText
     .split("\n")
@@ -630,6 +654,13 @@ function generateHeuristicReview(input: {
       text: `Potential drift detected: ${drift.reasons.join("; ") || "domain mismatch"} (score ${drift.driftScore})`
     });
   }
+  const actionableMixedDetails = input.inferredClusters?.secondaryDetails.filter((detail) => detail.severity !== "info") ?? [];
+  if (input.inferredClusters && actionableMixedDetails.length > 0) {
+    findings.push({
+      severity: input.inferredClusters.mixedRisk === "high" ? "warning" : "info",
+      text: `mixed diff clusters: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+    });
+  }
   for (const hint of input.impactHints.filter((item) => item.importedByCount >= 5)) {
     findings.push({
       severity: "warning",
@@ -664,6 +695,7 @@ ${status === "pass" ? "로컬 휴리스틱 기준으로 커밋을 막을 명확�
 ## 요구사항 충족 여부
 - AI semantic review는 실행하지 않았습니다.
 - 현재 결과는 diff/static heuristic 기준입니다.
+${input.inferredClusters ? (input.taskAvailable ? `- task.md 기준으로 검토했습니다. diff clusters: ${formatInferredDiffIntentClusters(input.inferredClusters)}` : `- 원본 task prompt 없이 diff intent를 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`) : "- task.md 기준으로 검토했습니다."}
 
 ## 범위 초과 수정
 ${largeChange ? "- broad diff입니다. task scope와 변경 파일을 다시 비교하세요." : "- 뚜렷한 broad scope 신호는 없습니다."}

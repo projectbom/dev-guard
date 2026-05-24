@@ -19,6 +19,15 @@ export {
   inferSemanticZones,
   scoreWorkflowQuality
 } from "./drift.js";
+export {
+  formatInferredDiffIntent,
+  formatInferredDiffIntentClusters,
+  filterDiffTextForFiles,
+  inferDiffIntent,
+  inferDiffIntentClusters,
+  inferredIntentToRequirement,
+  inferredIntentToTaskType
+} from "./diff-intent.js";
 export { analyzeCompletionPostChecks, buildTaskCompletionCriteria, formatCompletionCriteria } from "./completion.js";
 export { filterDevGuardContextFiles, isAlwaysIgnoredContextPath, isDevGuardContextFile, normalizeContextPath } from "./context-files.js";
 export { generateCodexPrompt } from "./prompt.js";
@@ -59,6 +68,8 @@ export type {
   GuardReport,
   GenerateTextInput,
   ImpactHint,
+  InferredDiffIntent,
+  InferredDiffIntentClusters,
   Severity
 } from "./types.js";
 export type { UpdateSuggestionInput, UpdateSuggestions } from "./types.js";
