@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { formatInferredDiffIntentClusters, inferDiffIntentClusters, type CodeGraphEntry } from "@dev-guard/core";
 import { runCheck } from "./check.js";
 import { runConfigure } from "./configure.js";
 import { runDoctor } from "./doctor.js";
@@ -13,6 +14,8 @@ import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
+import { fromRoot, readJsonFile } from "./fs.js";
+import { getGitChanges } from "./git.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -172,7 +175,7 @@ Usage:
   dev-guard config show
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
-  dev-guard watch [--check] [--review] [--debounce <ms>] [--once]
+  dev-guard watch [--interval <ms>] [--stable-after <sec>] [--compact|--ultra] [--check] [--review] [--once]
   dev-guard doctor
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
@@ -193,7 +196,7 @@ Commands:
   configure Configure dev-guard settings
   scan   Cache project structure and file summaries into .devguard
   refresh Incrementally update project memory cache
-  watch  Refresh project memory automatically when source files change
+  watch  Monitor git diff intent and suggest when to run done
   doctor Print config, provider, git, memory, and telemetry diagnostics
   telemetry Print privacy-safe drift telemetry summary
   report Print a compact current-work summary for ChatGPT/Codex handoff
@@ -211,6 +214,7 @@ async function runDone(root: string): Promise<void> {
   const results: Array<{ name: string; ok: boolean; reason?: string; output: string[] }> = [];
   console.log("dev-guard done");
   console.log("policy: preview only; docs are not modified unless you run dev-guard update --write");
+  await printDoneInferredIntent(root).catch(() => undefined);
 
   for (const step of [
     { name: "refresh", run: () => runRefresh(root, []) },
@@ -241,6 +245,27 @@ async function runDone(root: string): Promise<void> {
   console.log(`Next: ${failed.length > 0 ? "fix failed checks, then rerun dev-guard done" : "review warnings, then commit or run dev-guard update --write if docs should be updated"}`);
   if (failed.length > 0) {
     process.exitCode = 1;
+  }
+}
+
+async function printDoneInferredIntent(root: string): Promise<void> {
+  const [gitChanges, codeGraph] = await Promise.all([
+    getGitChanges(root),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
+  ]);
+  if (gitChanges.changedFiles.length === 0) {
+    return;
+  }
+  const clusters = inferDiffIntentClusters({
+    changedFiles: gitChanges.changedFiles,
+    changeFiles: gitChanges.changeFiles,
+    diffText: gitChanges.diffText,
+    codeGraph
+  });
+  console.log(`self: inferred from diff`);
+  console.log(`  ${formatInferredDiffIntentClusters(clusters)}`);
+  if (clusters.primaryIntent.confidence === "low") {
+    console.log('  hint: run dev-guard "<requirement>" before the next edit for stronger context');
   }
 }
 

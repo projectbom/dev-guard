@@ -1,426 +1,251 @@
-import { analyzeGeneratedDiffDrift, scoreWorkflowQuality } from "@dev-guard/core";
-import { readdir, stat } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
-import { runCheck } from "./check.js";
-import { loadConfig } from "./config.js";
-import { fromRoot, readTextFile } from "./fs.js";
+import {
+  formatInferredDiffIntentClusters,
+  inferDiffIntentClusters,
+  type CodeGraphEntry,
+  type InferredDiffIntentClusters
+} from "@dev-guard/core";
+import { createHash } from "node:crypto";
+import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
 import { getGitChanges } from "./git.js";
-import { refreshProjectMemory } from "./refresh.js";
+import { runCheck } from "./check.js";
 import { runReview } from "./review.js";
+
+type WatchStatus = "idle" | "active" | "stable" | "ready_for_done" | "mixed_warning";
 
 interface WatchOptions {
   check: boolean;
   review: boolean;
   once: boolean;
-  debounceMs: number;
+  intervalMs: number;
+  stableAfterMs: number;
+  density: "compact" | "ultra";
 }
 
-const defaultDebounceMs = 800;
-const pollIntervalMs = 500;
-const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages"];
-const watchRootFiles = [
-  "AGENTS.md",
-  "CLAUDE.md",
-  "README.md",
-  "package.json",
-  "pnpm-workspace.yaml",
-  "tsconfig.json",
-  "tsconfig.base.json",
-  ".devguard/task.md",
-  ".devguard/rules.md",
-  ".devguard/mistakes.md",
-  ".devguard/config.json",
-  ".devguardrc",
-  "devguard.config.json",
-  "docs/PROJECT_STATE.md",
-  "docs/CURRENT_TASK.md",
-  "docs/DECISIONS.md",
-  "docs/DO_NOT_REPEAT.md"
-];
-const ignoredDirectoryNames = new Set(["node_modules", ".next", "dist", "build", "coverage", ".git"]);
-const ignoredExactFiles = new Set([
-  ".devguard/project-index.json",
-  ".devguard/file-summaries.json",
-  ".devguard/code-graph.json",
-  ".devguard/project-map.md",
-  ".devguard/project-identity.json",
-  "pnpm-lock.yaml",
-  "package-lock.json",
-  "yarn.lock"
-]);
-const ignoredBinaryExtensions = /\.(png|jpe?g|gif|webp|avif|ico|svg|ttf|otf|woff2?|mp4|mov|mp3|wav|pdf|zip|gz|tar|br|wasm)$/i;
-const ignoredCacheExtensions = /\.(tsbuildinfo|tmp|temp)$/i;
+interface WatchRenderState {
+  status: WatchStatus;
+  lastDiffHash: string;
+  stableDurationMs: number;
+  primaryIntent?: InferredDiffIntentClusters["primaryIntent"];
+  secondaryIntents?: InferredDiffIntentClusters["secondaryIntents"];
+}
+
+const defaultIntervalMs = 1000;
+const defaultStableAfterMs = 30_000;
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   const options = parseWatchOptions(args);
+  console.log("watching changes...");
+  console.log(`interval=${options.intervalMs}ms; stable_after=${Math.round(options.stableAfterMs / 1000)}s; density=${options.density}`);
+  console.log("policy: suggestion only; done/update/write/commit are never run automatically");
+  console.log("stop: Ctrl+C");
 
+  let lastSignature = "";
+  let lastRenderKey = "";
+  let lastOptionalKey = "";
+  let lastHashChangeAt = Date.now();
+  let running = false;
+
+  const tick = async () => {
+    if (running) {
+      return;
+    }
+    running = true;
+    try {
+      const next = await buildWatchState(root, options, lastSignature, lastHashChangeAt);
+      if (next.diffHash !== lastSignature) {
+        lastSignature = next.diffHash;
+        lastHashChangeAt = Date.now();
+      }
+      const stableDurationMs = next.diffHash ? Date.now() - lastHashChangeAt : 0;
+      const state = toRenderState(next.clusters, next.diffHash, stableDurationMs, options);
+      if (lastRenderKey !== next.renderKey) {
+        printWatchState(state, next.clusters, options);
+        lastRenderKey = next.renderKey;
+      }
+
+      const optionalKey = `${next.diffHash}:${state.status}`;
+      if ((state.status === "stable" || state.status === "ready_for_done" || state.status === "mixed_warning") && lastOptionalKey !== optionalKey) {
+        await runOptionalChecks(root, options, state);
+        lastOptionalKey = optionalKey;
+      }
+    } catch (error) {
+      console.error(`watch warning: ${errorMessage(error)}`);
+    } finally {
+      running = false;
+    }
+  };
+
+  await tick();
   if (options.once) {
-    console.log("dev-guard watch --once");
-    printWatchStartup(options);
-    await runWatchCycle(root, options, []);
     return;
   }
 
-  console.log("dev-guard watch started");
-  printWatchStartup(options);
-
-  const state = {
-    snapshot: await scanWatchedFiles(root),
-    pendingChanges: new Set<string>(),
-    timer: undefined as NodeJS.Timeout | undefined,
-    running: false,
-    rerunRequested: false,
-    configSignature: await loadConfigSignature(root)
-  };
-
-  const scheduleCycle = () => {
-    if (state.timer) {
-      clearTimeout(state.timer);
-    }
-
-    state.timer = setTimeout(async () => {
-      if (state.running) {
-        state.rerunRequested = true;
-        console.log("refresh already running -> merge pending changes");
-        return;
-      }
-
-      const changed = [...state.pendingChanges].sort();
-      state.pendingChanges.clear();
-      state.running = true;
-      try {
-        state.configSignature = await maybeReloadConfig(root, changed, state.configSignature);
-        await runWatchCycle(root, options, changed);
-        state.snapshot = await scanWatchedFiles(root);
-      } catch (error) {
-        console.error(`dev-guard watch: warning: ${errorMessage(error)}`);
-      } finally {
-        state.running = false;
-        if (state.rerunRequested || state.pendingChanges.size > 0) {
-          state.rerunRequested = false;
-          scheduleCycle();
-        }
-      }
-    }, options.debounceMs);
-  };
-
-  const interval = setInterval(async () => {
-    try {
-      const nextSnapshot = await scanWatchedFiles(root);
-      const changed = diffSnapshots(state.snapshot, nextSnapshot);
-      state.snapshot = nextSnapshot;
-
-      if (changed.length === 0) {
-        return;
-      }
-
-      for (const path of changed) {
-        state.pendingChanges.add(path);
-      }
-      scheduleCycle();
-    } catch (error) {
-      console.error(`dev-guard watch: warning: ${errorMessage(error)}`);
-    }
-  }, pollIntervalMs);
-
+  const interval = setInterval(tick, options.intervalMs);
   process.on("SIGINT", () => {
     clearInterval(interval);
     console.log("\ndev-guard watch stopped");
     process.exit(0);
   });
-
   await new Promise<void>(() => {
-    // Keep the process alive until SIGINT.
+    // Keep process alive until SIGINT.
   });
 }
 
-function printWatchStartup(options: WatchOptions): void {
-  console.log(`watching directories: ${watchRoots.join(", ")}`);
-  console.log(`watching root/context files: ${watchRootFiles.join(", ")}`);
-  console.log("excluded: node_modules, .git, .next, dist, build, coverage, lockfiles, binary assets, .devguard cache files");
-  console.log("action: auto-refresh project memory only; user docs/source files are not overwritten");
-  console.log(`debounce: ${options.debounceMs}ms`);
-  console.log("stop: press Ctrl+C");
+async function buildWatchState(root: string, options: WatchOptions, previousHash: string, lastHashChangeAt: number): Promise<{
+  diffHash: string;
+  clusters: InferredDiffIntentClusters;
+  renderKey: string;
+}> {
+  const [gitChanges, taskMarkdown, codeGraph] = await Promise.all([
+    getGitChanges(root),
+    readTextFile(fromRoot(root, ".devguard/task.md")),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
+  ]);
+  const diffHash = hashDiff([gitChanges.changedFiles.join("\n"), gitChanges.diffText].join("\n"));
+  const clusters = inferDiffIntentClusters({
+    changedFiles: gitChanges.changedFiles,
+    changeFiles: gitChanges.changeFiles,
+    diffText: gitChanges.diffText,
+    codeGraph,
+    taskText: hasTaskContext(taskMarkdown) ? taskMarkdown : undefined
+  });
+  const stableDurationMs = diffHash === previousHash ? Date.now() - lastHashChangeAt : 0;
+  const status = toWatchStatus(clusters, diffHash, stableDurationMs, options);
+  const renderKey = [diffHash, status, formatInferredDiffIntentClusters(clusters)].join("|");
+  return { diffHash, clusters, renderKey };
+}
+
+function toRenderState(
+  clusters: InferredDiffIntentClusters,
+  diffHash: string,
+  stableDurationMs: number,
+  options: WatchOptions
+): WatchRenderState {
+  return {
+    status: toWatchStatus(clusters, diffHash, stableDurationMs, options),
+    lastDiffHash: diffHash,
+    stableDurationMs,
+    primaryIntent: clusters.primaryIntent,
+    secondaryIntents: clusters.secondaryIntents
+  };
+}
+
+function toWatchStatus(clusters: InferredDiffIntentClusters, diffHash: string, stableDurationMs: number, options: WatchOptions): WatchStatus {
+  if (!diffHash || clusters.primaryIntent.changedFiles.length === 0) {
+    return "idle";
+  }
+  if (stableDurationMs < options.stableAfterMs) {
+    return "active";
+  }
+  if (clusters.mixedRisk !== "low") {
+    return "mixed_warning";
+  }
+  if (clusters.primaryIntent.confidence === "high") {
+    return "ready_for_done";
+  }
+  return "stable";
+}
+
+function printWatchState(state: WatchRenderState, clusters: InferredDiffIntentClusters, options: WatchOptions): void {
+  if (state.status === "idle") {
+    console.log("STATUS: idle");
+    console.log("NEXT: edit files or run dev-guard \"requirement\"");
+    return;
+  }
+
+  const primary = clusters.primaryIntent;
+  console.log("");
+  console.log(`INTENT: ${primary.subtype ?? primary.type}${primary.targetCommand ? `(${primary.targetCommand})` : ""}`);
+  console.log(`SCOPE: ${primary.scope.join(", ") || "changed files"}`);
+  if (clusters.secondaryDetails.length > 0) {
+    const mixed = clusters.secondaryDetails
+      .slice(0, 2)
+      .map((detail) => {
+        const target = detail.intent.targetCommand ? `(${detail.intent.targetCommand})` : "";
+        return `${detail.intent.subtype ?? detail.intent.type}${target}(${detail.intent.changedFiles.length}) ${shortSeverity(detail.severity)}`;
+      })
+      .join(", ");
+    const remaining = clusters.secondaryDetails.length - Math.min(2, clusters.secondaryDetails.length);
+    console.log(`MIXED: ${mixed}${remaining > 0 ? `, +${remaining} clusters` : ""}`);
+  }
+  console.log(`DRIFT: ${clusters.mixedRisk}`);
+  console.log(`STATUS: ${state.status}`);
+  if (state.status === "stable" || state.status === "ready_for_done" || state.status === "mixed_warning") {
+    console.log(`stable for ${Math.round(state.stableDurationMs / 1000)}s`);
+  }
+  if (state.status === "ready_for_done") {
+    console.log("NEXT: dev-guard done");
+  } else if (state.status === "mixed_warning") {
+    console.log("NEXT: inspect mixed files, then run dev-guard done");
+  } else if (primary.confidence === "low") {
+    console.log('NEXT: dev-guard "<requirement>" for stronger context');
+  }
+  if (options.density === "compact" && primary.evidence.length > 0) {
+    console.log(`EVIDENCE: ${primary.evidence.slice(0, 2).join("; ")}`);
+  }
+}
+
+async function runOptionalChecks(root: string, options: WatchOptions, state: WatchRenderState): Promise<void> {
+  if (state.status === "active" || state.status === "idle") {
+    return;
+  }
   if (options.check) {
-    console.log("after refresh: dev-guard check");
+    console.log("running: dev-guard check --local");
+    await runCheck(root, { includeContextFiles: false, local: true });
   }
   if (options.review) {
-    console.log("after refresh: dev-guard review (AI provider may incur API cost; falls back to heuristic when provider=none)");
+    console.log("running: dev-guard review --heuristic");
+    await runReview(root, ["--heuristic"]);
   }
 }
 
 function parseWatchOptions(args: string[]): WatchOptions {
-  const debounceIndex = args.indexOf("--debounce");
-  const debounceValue = debounceIndex >= 0 ? Number(args[debounceIndex + 1]) : defaultDebounceMs;
-  if (!Number.isFinite(debounceValue) || debounceValue <= 0) {
-    throw new Error("dev-guard watch --debounce requires a positive millisecond value.");
+  const intervalMs = readNumberOption(args, "--interval", defaultIntervalMs);
+  const debounceMs = readNumberOption(args, "--debounce", intervalMs);
+  const stableAfterSec = readNumberOption(args, "--stable-after", defaultStableAfterMs / 1000);
+  if (intervalMs <= 0 || debounceMs <= 0 || stableAfterSec <= 0) {
+    throw new Error("dev-guard watch interval/debounce/stable-after options must be positive numbers.");
   }
-
   return {
     check: args.includes("--check"),
     review: args.includes("--review"),
     once: args.includes("--once"),
-    debounceMs: debounceValue
+    intervalMs: debounceMs,
+    stableAfterMs: stableAfterSec * 1000,
+    density: args.includes("--ultra") ? "ultra" : "compact"
   };
 }
 
-async function runWatchCycle(root: string, options: WatchOptions, changedPaths: string[]): Promise<void> {
-  if (changedPaths.length > 0) {
-    console.log(`changed: ${changedPaths.join(", ")}`);
-  } else {
-    console.log("changed: none (single-run refresh)");
+function readNumberOption(args: string[], name: string, fallback: number): number {
+  const index = args.indexOf(name);
+  if (index < 0) {
+    return fallback;
   }
-
-  console.log("running: dev-guard refresh");
-  const result = await refreshProjectMemory(root, {
-    full: false,
-    ai: false,
-    dryRun: false
-  });
-
-  console.log(`refresh complete: updated ${result.updatedPaths.length}, removed ${result.removedPaths.length}, skipped ${result.unchangedCount}`);
-  console.log("writes: .devguard project memory cache only");
-
-  if (options.check) {
-    console.log("running: dev-guard check");
-    await runCheck(root, { includeContextFiles: false });
-  } else {
-    await printWatchDriftSummary(root);
+  const value = Number(args[index + 1]);
+  if (!Number.isFinite(value)) {
+    throw new Error(`${name} requires a number.`);
   }
-
-  if (options.review) {
-    try {
-      console.log("running: dev-guard review");
-      await runReview(root, ["--heuristic"]);
-    } catch (error) {
-      console.error(`dev-guard watch: review skipped: ${errorMessage(error)}`);
-    }
-  }
-
-  if (!options.check && !options.review) {
-    console.log("next: run dev-guard check before commit");
-  }
+  return value;
 }
 
-async function printWatchDriftSummary(root: string): Promise<void> {
-  try {
-    const [changes, taskMarkdown] = await Promise.all([
-      getGitChanges(root),
-      readTextFile(fromRoot(root, ".devguard/task.md"))
-    ]);
-    const drift = analyzeGeneratedDiffDrift({
-      requirementText: taskMarkdown,
-      taskMarkdown,
-      diffText: changes.diffText,
-      changedFiles: changes.changedFiles,
-      changeFiles: changes.changeFiles
-    });
-    if (drift.severity === "low") {
-      console.log("drift: no suspicious drift detected by local heuristic");
-      return;
-    }
-    const quality = scoreWorkflowQuality({
-      drift,
-      changedFiles: changes.changedFiles,
-      diffText: changes.diffText,
-      changeFiles: changes.changeFiles
-    });
-    console.log("possible drift detected:");
-    console.log(`- severity: ${drift.severity}`);
-    console.log(`- requirement alignment: ${quality.requirementAlignment}`);
-    console.log(`- drift risk: ${quality.driftRisk}`);
-    console.log(`- reasons: ${drift.reasons.slice(0, 3).join("; ") || "domain/zone mismatch"}`);
-    console.log("next: run dev-guard check --local or dev-guard review --heuristic");
-  } catch (error) {
-    console.error(`dev-guard watch: drift summary skipped: ${errorMessage(error)}`);
+function hashDiff(text: string): string {
+  const normalized = text.trim();
+  if (!normalized) {
+    return "";
   }
+  return createHash("sha1").update(normalized).digest("hex").slice(0, 12);
 }
 
-async function maybeReloadConfig(root: string, changedPaths: string[], previousSignature: string): Promise<string> {
-  if (!changedPaths.some(isConfigPath)) {
-    return previousSignature;
-  }
-  const nextSignature = await loadConfigSignature(root);
-  if (nextSignature === previousSignature) {
-    return previousSignature;
-  }
-  try {
-    const resolved = await loadConfig(root);
-    if (resolved.warnings.length > 0) {
-      console.error(`dev-guard watch: invalid config; keeping previous settings (${resolved.warnings.join("; ")})`);
-      return previousSignature;
-    }
-    console.log("config changed -> reloading provider settings");
-    console.log(`provider: ${resolved.config.ai?.provider ?? "none"}`);
-    console.log(`model: ${resolved.config.ai?.model ?? "gpt-4o-mini"}`);
-    console.log(`config source: ${resolved.source}`);
-    return nextSignature;
-  } catch (error) {
-    console.error(`dev-guard watch: invalid config; keeping previous settings (${errorMessage(error)})`);
-    return previousSignature;
-  }
+function shortSeverity(severity: InferredDiffIntentClusters["secondaryDetails"][number]["severity"]): string {
+  if (severity === "info") return "i";
+  if (severity === "caution") return "!";
+  if (severity === "warning") return "warning";
+  return "high";
 }
 
-async function loadConfigSignature(root: string): Promise<string> {
-  const parts = await Promise.all(
-    [".devguard/config.json", ".devguardrc", "devguard.config.json", "package.json"].map(async (path) => {
-      try {
-        const metadata = await stat(resolve(root, path));
-        return `${path}:${metadata.mtimeMs}:${metadata.size}`;
-      } catch {
-        return `${path}:missing`;
-      }
-    })
-  );
-  return parts.join("|");
-}
-
-async function scanWatchedFiles(root: string): Promise<Map<string, string>> {
-  const snapshot = new Map<string, string>();
-
-  for (const watchRoot of watchRoots) {
-    const absoluteRoot = resolve(root, watchRoot);
-    if (await isDirectory(absoluteRoot)) {
-      await collectFileSnapshot(root, absoluteRoot, snapshot);
-    }
-  }
-
-  await collectRootFileSnapshot(root, snapshot);
-
-  return snapshot;
-}
-
-async function collectRootFileSnapshot(root: string, snapshot: Map<string, string>): Promise<void> {
-  await Promise.all(
-    watchRootFiles.map(async (path) => {
-      if (!isWatchableRootFile(path)) {
-        return;
-      }
-      try {
-        const metadata = await stat(resolve(root, path));
-        if (metadata.isFile()) {
-          snapshot.set(path, `${metadata.mtimeMs}:${metadata.size}`);
-        }
-      } catch {
-        // Missing optional context files are ignored until they appear.
-      }
-    })
-  );
-}
-
-async function collectFileSnapshot(root: string, directory: string, snapshot: Map<string, string>): Promise<void> {
-  const relativeDirectory = normalizePath(relative(root, directory));
-  if (relativeDirectory && isIgnoredDirectoryPath(relativeDirectory)) {
-    return;
-  }
-
-  let entries;
-  try {
-    entries = await readdir(directory, { withFileTypes: true });
-  } catch {
-    return;
-  }
-
-  await Promise.all(
-    entries.map(async (entry) => {
-      const absolutePath = join(directory, entry.name);
-      const relativePath = normalizePath(relative(root, absolutePath));
-
-      if (entry.isDirectory()) {
-        await collectFileSnapshot(root, absolutePath, snapshot);
-        return;
-      }
-
-      if (!entry.isFile() || !isWatchablePath(relativePath)) {
-        return;
-      }
-
-      try {
-        const metadata = await stat(absolutePath);
-        snapshot.set(relativePath, `${metadata.mtimeMs}:${metadata.size}`);
-      } catch {
-        // File may have changed between readdir and stat; the next poll will see it.
-      }
-    })
-  );
-}
-
-function diffSnapshots(previous: Map<string, string>, next: Map<string, string>): string[] {
-  const changed = new Set<string>();
-
-  for (const [path, signature] of next.entries()) {
-    if (previous.get(path) !== signature) {
-      changed.add(path);
-    }
-  }
-
-  for (const path of previous.keys()) {
-    if (!next.has(path)) {
-      changed.add(path);
-    }
-  }
-
-  return [...changed].sort();
-}
-
-async function isDirectory(path: string): Promise<boolean> {
-  try {
-    return (await stat(path)).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function isWatchablePath(path: string): boolean {
-  const normalized = normalizePath(path);
-  if (!normalized || !watchRoots.some((root) => normalized === root || normalized.startsWith(`${root}/`))) {
-    return false;
-  }
-
-  if (
-    isIgnoredDirectoryPath(normalized) ||
-    ignoredExactFiles.has(normalized) ||
-    isLockfilePath(normalized) ||
-    ignoredBinaryExtensions.test(normalized) ||
-    ignoredCacheExtensions.test(normalized)
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-function isWatchableRootFile(path: string): boolean {
-  const normalized = normalizePath(path);
-  return (
-    watchRootFiles.includes(normalized) &&
-    !ignoredExactFiles.has(normalized) &&
-    !isLockfilePath(normalized) &&
-    !ignoredBinaryExtensions.test(normalized)
-  );
-}
-
-function isIgnoredDirectoryPath(path: string): boolean {
-  const parts = normalizePath(path).split("/");
-  if (parts.some((part) => ignoredDirectoryNames.has(part))) {
-    return true;
-  }
-
-  return path.startsWith(".devguard/runs/");
-}
-
-function normalizePath(path: string): string {
-  return path.split("\\").join("/").replace(/^\.\//, "");
-}
-
-function isLockfilePath(path: string): boolean {
-  const fileName = path.split("/").at(-1);
-  return fileName === "pnpm-lock.yaml" || fileName === "package-lock.json" || fileName === "yarn.lock";
-}
-
-function isConfigPath(path: string): boolean {
-  const normalized = normalizePath(path);
-  return normalized === ".devguard/config.json" || normalized === ".devguardrc" || normalized === "devguard.config.json" || normalized === "package.json";
+function hasTaskContext(taskMarkdown: string): boolean {
+  const text = taskMarkdown.trim();
+  return text.length > 0 && !/^#?\s*Current task/i.test(text) && !/Describe the requested change/i.test(text);
 }
 
 function errorMessage(error: unknown): string {

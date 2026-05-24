@@ -2,54 +2,39 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-Watch mode keeps project memory current while you edit.
+Watch mode monitors the current git diff while you edit and prints a compact intent summary.
 
 ```bash
 dev-guard watch
 ```
 
-It watches common source/config paths such as:
-
-- `app`
-- `components`
-- `lib`
-- `hooks`
-- `utils`
-- `constants`
-- `styles`
-- `supabase`
-- `src`
-- `packages`
-- selected root/context files
-
-It excludes generated or heavy paths such as:
-
-- `node_modules`
-- `.git`
-- `.next`
-- `dist`
-- `build`
-- `coverage`
-- lockfiles
-- binary/image/font files
-- `.devguard` cache files
+It polls git/worktree state instead of running as a background daemon.
 
 ## Behavior
 
-- Debounces change events.
-- Merges burst events.
-- Avoids concurrent refresh runs.
-- Reloads provider config when config files change.
+- Runs diff intent inference and clustering.
+- Prints only when the diff hash, inferred intent, or watch status changes.
+- Uses a stable-after timer so formatter/prettier save bursts do not spam the terminal.
 - Does not auto-apply source edits.
 - Does not write docs by default.
+- Does not run `done`, `update --write`, git commit, or any autonomous action.
+
+Status flow:
+
+```txt
+idle -> active -> stable -> ready_for_done
+                       -> mixed_warning
+```
 
 ## Options
 
 ```bash
 dev-guard watch --check
 dev-guard watch --review
-dev-guard watch --debounce 1500
+dev-guard watch --interval 1000
+dev-guard watch --stable-after 30
+dev-guard watch --ultra
 dev-guard watch --once
 ```
 
-`--review` can call the configured AI provider and may incur API cost. Without provider configuration, review can fall back to heuristic behavior where available.
+`--check` and `--review` run only after the diff reaches a stable state. `--review` uses heuristic review here and does not auto-fix code.
