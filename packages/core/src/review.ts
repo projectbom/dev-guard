@@ -80,6 +80,7 @@ ${formatMemorySummaries(context.memorySummaries ?? [], context.projectMapMarkdow
 - task.md 요구사항과 완료 조건을 기준으로 실제 diff가 충분한지 판단하세요.
 - task.md에 "완료 기준" 섹션이 있으면, 그것을 빌드 성공보다 우선하는 완료 정의로 사용하세요.
 - task type이 i18n이면 hardcoded user-facing strings, locale mix, missing translation keys, aria/title/placeholder/metadata 누락 가능성을 diff에서 확인하세요.
+- i18n에서 기존 컴포넌트의 한국어 문자열이 t("key") 호출로 바뀌고, ko/en locale resource가 함께 추가되며 default locale이 ko로 유지되면 정상 migration으로 보세요. 이 경우 한국어 copy 삭제나 영어 덮어쓰기로 판단하지 마세요.
 - task type이 ui_text_cleanup이면 wording consistency, duplicate phrasing, awkward CTA wording을 확인하세요.
 - 원래 userRequest, generatedTaskMarkdown, generatedCodexPrompt가 run 기록에 있으면 이것을 최우선 기준으로 현재 diff와 비교하세요.
 - run match score가 낮거나 latest run does not match current diff 경고가 있으면, 오래된 run 기준으로 pass를 쉽게 내지 말고 현재 task.md와 실제 diff를 우선하세요.

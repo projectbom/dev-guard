@@ -181,6 +181,7 @@ function analyzeI18nPostChecks(changedFiles: string[], diffText: string): GuardF
   const findings: GuardFinding[] = [];
   const hasEnglishResource = changedFiles.some((file) => /(^|\/)(en|en-US)\.(json|ts|tsx|js|yaml|yml)$/i.test(file) || /(^|\/)(messages|locales|translations|dictionaries)\/.*en/i.test(file));
   const hasKoreanResource = changedFiles.some((file) => /(^|\/)(ko|ko-KR)\.(json|ts|tsx|js|yaml|yml)$/i.test(file) || /(^|\/)(messages|locales|translations|dictionaries)\/.*ko/i.test(file));
+  const migration = analyzeI18nMigration(diffText, hasKoreanResource, hasEnglishResource);
   const hardcodedKoreanAdditions = extractAddedLines(diffText).filter((line) => containsKorean(line) && !looksLikeLocaleResourceLine(line));
   const ariaMetadataAdditions = hardcodedKoreanAdditions.filter((line) => /aria-label|title=|placeholder=|metadata|json-ld|description|openGraph/i.test(line));
 
@@ -211,7 +212,29 @@ function analyzeI18nPostChecks(changedFiles: string[], diffText: string): GuardF
     });
   }
 
+  if (migration.normal) {
+    findings.push({
+      severity: "info",
+      code: "i18n_locale_resource_migration",
+      title: "i18n locale resource migration detected",
+      message: "Korean copy moved to locale resource; default locale preserved."
+    });
+  }
+
   return findings;
+}
+
+function analyzeI18nMigration(diffText: string, hasKoreanResource: boolean, hasEnglishResource: boolean): { normal: boolean } {
+  const addedLines = extractAddedLines(diffText);
+  const removedLines = extractRemovedLines(diffText);
+  const removedKoreanCopy = removedLines.some((line) => containsKorean(line) && looksLikeUserFacingStringLine(line));
+  const koResourceCopy = addedLines.some((line) => containsKorean(line) && looksLikeLocaleResourceLine(line));
+  const tCallAdded = addedLines.some((line) => /\bt\(\s*["'][\w.-]+["']\s*\)|useTranslations|useI18n|getMessage|translate\(/i.test(line));
+  const defaultKo = /defaultLocale\s*[:=]\s*["']ko(?:-KR)?["']|fallbackLocale\s*[:=]\s*["']ko(?:-KR)?["']|locale\s*\?\?\s*["']ko(?:-KR)?["']/i.test(diffText);
+  const defaultEnAdded = addedLines.some((line) => /defaultLocale\s*[:=]\s*["']en(?:-US)?["']|fallbackLocale\s*[:=]\s*["']en(?:-US)?["']|locale\s*\?\?\s*["']en(?:-US)?["']/i.test(line));
+  return {
+    normal: hasKoreanResource && hasEnglishResource && removedKoreanCopy && koResourceCopy && tCallAdded && (defaultKo || !defaultEnAdded)
+  };
 }
 
 function extractAddedLines(diffText: string): string[] {
@@ -222,12 +245,24 @@ function extractAddedLines(diffText: string): string[] {
     .filter(Boolean);
 }
 
+function extractRemovedLines(diffText: string): string[] {
+  return diffText
+    .split("\n")
+    .filter((line) => line.startsWith("-") && !line.startsWith("---"))
+    .map((line) => line.slice(1).trim())
+    .filter(Boolean);
+}
+
 function containsKorean(value: string): boolean {
   return /[가-힣]/.test(value);
 }
 
 function looksLikeLocaleResourceLine(value: string): boolean {
-  return /messages|locales|translation|dictionary|ko\.|ko:|["']ko["']|한국어\s*원본|existing Korean copy/i.test(value);
+  return /messages|locales|translation|dictionary|ko\.|ko:|["']ko["']|한국어\s*원본|existing Korean copy|["'][\w.-]+["']\s*:\s*["'][^"']*[가-힣]/i.test(value);
+}
+
+function looksLikeUserFacingStringLine(value: string): boolean {
+  return /["'`][^"'`]*[가-힣][^"'`]*["'`]/.test(value);
 }
 
 function extractSection(markdown: string, title: string): string {

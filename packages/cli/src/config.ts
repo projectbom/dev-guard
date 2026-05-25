@@ -9,6 +9,15 @@ export interface ResolvedConfig {
   config: DevGuardConfig;
   source: string;
   warnings: string[];
+  env: EnvResolution;
+}
+
+export interface EnvResolution {
+  apiKey: {
+    checked: Array<{ name: "DEV_GUARD_OPENAI_API_KEY" | "OPENAI_API_KEY"; found: boolean }>;
+    selectedKey?: "DEV_GUARD_OPENAI_API_KEY" | "OPENAI_API_KEY";
+    found: boolean;
+  };
 }
 
 const configCandidates = [".devguard/config.json", ".devguardrc", "devguard.config.json"];
@@ -16,13 +25,22 @@ const configCandidates = [".devguard/config.json", ".devguardrc", "devguard.conf
 export async function loadConfig(root: string, cliAI: Partial<AIConfig> = {}): Promise<ResolvedConfig> {
   const warnings: string[] = [];
   const local = await loadLocalConfig(root, warnings);
-  const env = envConfig();
+  const envResolution = resolveOpenAIEnv();
+  const env = envConfig(envResolution);
   const merged = mergeDevGuardConfig(defaultConfig, env, local.config, { ai: cliAI });
+  if (envResolution.apiKey.found) {
+    merged.ai = {
+      ...(merged.ai ?? {}),
+      provider: "openai",
+      model: merged.ai?.model ?? defaultConfig.ai.model
+    };
+  }
 
   return {
     config: merged,
-    source: local.source,
-    warnings
+    source: sourceLabel(local.source, env),
+    warnings,
+    env: envResolution
   };
 }
 
@@ -48,6 +66,9 @@ export function printConfigSummary(label: string, resolved: ResolvedConfig): voi
     console.log(`- baseURL: ${ai.baseURL}`);
   }
   console.log(`- config source: ${resolved.source}`);
+  console.log(`- env DEV_GUARD_OPENAI_API_KEY: ${resolved.env.apiKey.checked[0]?.found ? "found" : "missing"}`);
+  console.log(`- env OPENAI_API_KEY: ${resolved.env.apiKey.checked[1]?.found ? "found" : "missing"}`);
+  console.log(`- selected API key source: ${resolved.env.apiKey.selectedKey ?? "none"}`);
   for (const warning of resolved.warnings) {
     console.log(`- warning: ${warning}`);
   }
@@ -75,13 +96,16 @@ async function loadLocalConfig(root: string, warnings: string[]): Promise<{ conf
   return { config: {}, source: "defaults/env" };
 }
 
-function envConfig(): DevGuardConfig {
+function envConfig(envResolution: EnvResolution): DevGuardConfig {
   const ai: AIConfig = {};
   if (process.env.DEV_GUARD_PROVIDER === "openai" || process.env.DEV_GUARD_PROVIDER === "none") {
     ai.provider = process.env.DEV_GUARD_PROVIDER;
   }
+  if (envResolution.apiKey.found) {
+    ai.provider = "openai";
+  }
   if (process.env.DEV_GUARD_MODEL) {
-    ai.model = process.env.DEV_GUARD_MODEL;
+    ai.model = process.env.DEV_GUARD_MODEL.trim();
   }
   if (process.env.DEV_GUARD_TEMPERATURE) {
     ai.temperature = Number(process.env.DEV_GUARD_TEMPERATURE);
@@ -96,6 +120,41 @@ function envConfig(): DevGuardConfig {
     ai.baseURL = process.env.DEV_GUARD_BASE_URL;
   }
   return Object.keys(ai).length > 0 ? { ai } : {};
+}
+
+export function resolveOpenAIEnv(env: NodeJS.ProcessEnv = process.env): EnvResolution {
+  const checked = [
+    { name: "DEV_GUARD_OPENAI_API_KEY" as const, found: hasNonEmptyEnv(env.DEV_GUARD_OPENAI_API_KEY) },
+    { name: "OPENAI_API_KEY" as const, found: hasNonEmptyEnv(env.OPENAI_API_KEY) }
+  ];
+  const selected = checked.find((entry) => entry.found);
+  return {
+    apiKey: {
+      checked,
+      selectedKey: selected?.name,
+      found: Boolean(selected)
+    }
+  };
+}
+
+export function readOpenAIApiKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const devGuardKey = env.DEV_GUARD_OPENAI_API_KEY?.trim();
+  if (devGuardKey) {
+    return devGuardKey;
+  }
+  const openAIKey = env.OPENAI_API_KEY?.trim();
+  return openAIKey || undefined;
+}
+
+function hasNonEmptyEnv(value: string | undefined): boolean {
+  return Boolean(value?.trim());
+}
+
+function sourceLabel(localSource: string, env: DevGuardConfig): string {
+  if (Object.keys(env.ai ?? {}).length === 0) {
+    return localSource;
+  }
+  return localSource.includes("env") ? localSource : `${localSource}+env`;
 }
 
 function mergeDevGuardConfig(...configs: DevGuardConfig[]): DevGuardConfig {

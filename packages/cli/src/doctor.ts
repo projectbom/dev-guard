@@ -20,13 +20,19 @@ export async function runDoctor(root: string): Promise<void> {
   const provider = resolved.config.ai?.provider ?? "none";
   const model = resolved.config.ai?.model ?? "gpt-4o-mini";
   const staleRuns = runs.filter((run) => isStale(run.createdAt)).length;
-  const apiKeyFound = provider === "openai" ? Boolean(process.env.OPENAI_API_KEY) : false;
+  const apiKeyFound = provider === "openai" ? resolved.env.apiKey.found : false;
 
   console.log("dev-guard doctor");
   console.log(`Provider: ${provider}`);
   console.log(`Model: ${model}`);
   console.log(`API Key: ${provider === "openai" ? (apiKeyFound ? "found" : "missing") : "not required"}`);
   console.log(`Config Source: ${resolved.source}`);
+  console.log("ENV:");
+  console.log(`- DEV_GUARD_OPENAI_API_KEY: ${resolved.env.apiKey.checked[0]?.found ? "found" : "missing"}`);
+  console.log(`- OPENAI_API_KEY: ${resolved.env.apiKey.checked[1]?.found ? "found" : "missing"}`);
+  console.log(`- selected provider: ${provider}`);
+  console.log(`- selected model: ${model}`);
+  console.log(`- selected API key source: ${resolved.env.apiKey.selectedKey ?? "none"}`);
   for (const warning of resolved.warnings) {
     console.log(`Config Warning: ${warning}`);
   }

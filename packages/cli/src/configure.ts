@@ -46,11 +46,24 @@ export async function runConfigure(root: string, args: string[]): Promise<void> 
   };
 
   await writeTextFile(configPath, `${JSON.stringify(next, null, 2)}\n`);
+  const resolved = await loadConfig(root);
+  const storedAI = next.ai ?? {};
+  const resolvedAI = resolved.config.ai ?? {};
   console.log("dev-guard configure ai");
-  console.log(`- provider: ${options.provider}`);
-  console.log(`- model: ${options.model}`);
+  console.log("Stored Config:");
+  console.log(`- provider: ${storedAI.provider ?? defaultConfig.ai.provider}`);
+  console.log(`- model: ${storedAI.model ?? defaultConfig.ai.model}`);
   console.log("- config source: .devguard/config.json");
-  console.log("- API key: not stored; read from OPENAI_API_KEY at runtime");
+  console.log("");
+  console.log("Runtime Resolution:");
+  console.log(`- resolved provider: ${resolvedAI.provider ?? defaultConfig.ai.provider}`);
+  console.log(`- resolved model: ${resolvedAI.model ?? defaultConfig.ai.model}`);
+  console.log(`- API key: ${resolved.env.apiKey.found ? "found" : "missing"}`);
+  console.log(`- API key source: ${resolved.env.apiKey.selectedKey ?? "none"}`);
+  console.log(`- config source: ${resolved.source}`);
+  console.log("");
+  console.log("Note:");
+  console.log("- API key is not stored. It is read from environment at runtime.");
 }
 
 function parseConfigureAIOptions(args: string[]): ConfigureAIOptions {

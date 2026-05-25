@@ -23,7 +23,7 @@ import {
   type ReviewMemorySummary
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, readOpenAIApiKey } from "./config.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getCommitGitChanges, getDiffForChangeFiles, getGitChanges, getStagedGitChanges, type GitChanges } from "./git.js";
 import {
@@ -207,6 +207,7 @@ async function executeReview(
   const config = resolvedConfig.config;
   const providerName = config.ai?.provider ?? defaultConfig.ai.provider ?? "none";
   const model = config.ai?.model ?? defaultConfig.ai.model ?? "gpt-4o-mini";
+  const openAIApiKey = readOpenAIApiKey();
   const currentIdentity = await loadCurrentProjectIdentity(root).catch(() => undefined);
 
   const [taskMarkdown, rulesMarkdown, mistakesMarkdown, projectStateMarkdown, decisionsMarkdown, memory, diffText, codeGraph] = await Promise.all([
@@ -241,6 +242,7 @@ async function executeReview(
     console.error(`- provider: ${providerName}`);
     console.error(`- model: ${model}`);
     console.error(`- config source: ${resolvedConfig.source}`);
+    console.error(`- API key source: ${resolvedConfig.env.apiKey.selectedKey ?? "none"}`);
     if (providerName === "none" && !options.heuristic) {
       console.error("- note: AI provider is none; using local heuristic fallback. Use --heuristic to request this explicitly.");
     }
@@ -252,7 +254,8 @@ async function executeReview(
       inferredClusters,
       taskAvailable,
       untrackedFileContexts,
-      impactHints
+      impactHints,
+      providerName
     });
     const drift = analyzeGeneratedDiffDrift({
       requirementText: taskAvailable ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
@@ -276,18 +279,18 @@ async function executeReview(
     };
   }
 
-  if (providerName === "openai" && !process.env.OPENAI_API_KEY) {
+  if (providerName === "openai" && !openAIApiKey) {
     if (options.heuristic) {
       // Unreachable because heuristic returns above, but keeps the error path explicit.
-      throw new Error("OPENAI_API_KEY 환경변수가 없습니다. heuristic review에는 API key가 필요 없습니다.");
+      throw new Error("OpenAI API key 환경변수가 없습니다. heuristic review에는 API key가 필요 없습니다.");
     }
-    throw new Error("OPENAI_API_KEY 환경변수가 없습니다. API key는 config에 저장하지 말고 `OPENAI_API_KEY=...`로 설정해 주세요. 로컬 검토는 `dev-guard review --heuristic`를 사용하세요.");
+    throw new Error("OpenAI API key 환경변수가 없습니다. API key는 config에 저장하지 말고 `DEV_GUARD_OPENAI_API_KEY` 또는 `OPENAI_API_KEY`로 설정해 주세요. 로컬 검토는 `dev-guard review --heuristic`를 사용하세요.");
   }
 
   const provider =
     providerName === "openai"
       ? new OpenAIProvider({
-          apiKey: process.env.OPENAI_API_KEY ?? "",
+          apiKey: openAIApiKey ?? "",
           model,
           temperature: config.ai?.temperature,
           maxTokens: config.ai?.maxTokens,
@@ -594,6 +597,7 @@ function generateHeuristicReview(input: {
   taskAvailable?: boolean;
   untrackedFileContexts: ReviewFileContext[];
   impactHints: ReturnType<typeof buildImpactHints>;
+  providerName: string;
 }): ReviewResult {
   const findings: Array<{ severity: "info" | "warning" | "critical"; text: string }> = [];
   const primaryFiles = input.inferredClusters?.primaryIntent.changedFiles ?? input.changedFiles;
@@ -624,10 +628,12 @@ function generateHeuristicReview(input: {
   const taskType = extractTaskType(input.taskMarkdown);
   const largeChange = input.changedFiles.length >= 12 || input.diffText.length > 30000;
   const hasMarkdownMarkerProblem = /dev-guard:update:start/.test(input.diffText) && !/dev-guard:update:end/.test(input.diffText);
+  const i18nMigration = taskType === "i18n" ? detectLocaleResourceMigration(input.changedFiles, input.diffText, addedLines, removedLines) : false;
   const addedKoreanOutsideLocale =
     taskType === "i18n" &&
     addedLines.some((line) => /[가-힣]/.test(line)) &&
-    !input.changedFiles.some((file) => /(^|\/)(messages|locales?|i18n)\//i.test(file));
+    !input.changedFiles.some((file) => /(^|\/)(messages|locales?|i18n)\//i.test(file)) &&
+    !i18nMigration;
   const duplicateHeadings = detectDuplicateMarkdownHeadings([...addedLines, ...input.untrackedFileContexts.map((context) => context.excerpt).join("\n")]);
 
   if (largeChange) {
@@ -638,6 +644,9 @@ function generateHeuristicReview(input: {
   }
   if (addedKoreanOutsideLocale) {
     findings.push({ severity: "critical", text: "i18n 작업에서 locale resource 밖에 한국어 사용자 노출 문자열이 추가된 정황이 있습니다." });
+  }
+  if (i18nMigration) {
+    findings.push({ severity: "info", text: "Korean copy moved to locale resource; default locale preserved." });
   }
   if (hasMarkdownMarkerProblem) {
     findings.push({ severity: "critical", text: "dev-guard managed markdown marker가 깨진 정황이 있습니다." });
@@ -722,7 +731,7 @@ ${formatReviewImpactHints(input.impactHints)}
 - Confidence: ${quality.confidence}
 
 ## 반복 실수 가능성
-- provider 없이 실행된 fallback review입니다. 의미 검토가 필요하면 provider 설정 후 AI review를 실행하세요.
+- ${input.providerName === "none" ? "provider 없이 실행된 fallback review입니다. 의미 검토가 필요하면 provider 설정 후 AI review를 실행하세요." : "명시적으로 요청한 heuristic review입니다. AI semantic review가 필요하면 --heuristic 없이 실행하세요."}
 
 ## 확인이 필요한 파일
 ${input.changedFiles.length > 0 ? input.changedFiles.slice(0, 20).map((file) => `- ${file}`).join("\n") : "- 없음"}
@@ -733,6 +742,17 @@ ${fixPrompt}
 ## 커밋 가능 여부
 ${status === "pass" ? "- 가능: build/check 결과를 추가 확인하세요." : "- 보류: 위 항목을 확인하세요."}`
   };
+}
+
+function detectLocaleResourceMigration(changedFiles: string[], diffText: string, addedLines: string[], removedLines: string[]): boolean {
+  const hasKoResource = changedFiles.some((file) => /(^|\/)(ko|ko-KR)\.(json|ts|tsx|js|yaml|yml)$/i.test(file) || /(^|\/)(messages|locales?|translations|dictionaries)\/.*ko/i.test(file));
+  const hasEnResource = changedFiles.some((file) => /(^|\/)(en|en-US)\.(json|ts|tsx|js|yaml|yml)$/i.test(file) || /(^|\/)(messages|locales?|translations|dictionaries)\/.*en/i.test(file));
+  const removedKoreanCopy = removedLines.some((line) => /["'`][^"'`]*[가-힣][^"'`]*["'`]/.test(line));
+  const koResourceCopy = addedLines.some((line) => /["'][\w.-]+["']\s*:\s*["'][^"']*[가-힣]/.test(line) || /ko\s*[:=]/i.test(line) && /[가-힣]/.test(line));
+  const tCallAdded = addedLines.some((line) => /\bt\(\s*["'][\w.-]+["']\s*\)|useTranslations|useI18n|getMessage|translate\(/i.test(line));
+  const defaultKo = /defaultLocale\s*[:=]\s*["']ko(?:-KR)?["']|fallbackLocale\s*[:=]\s*["']ko(?:-KR)?["']|locale\s*\?\?\s*["']ko(?:-KR)?["']/i.test(diffText);
+  const defaultEnAdded = addedLines.some((line) => /defaultLocale\s*[:=]\s*["']en(?:-US)?["']|fallbackLocale\s*[:=]\s*["']en(?:-US)?["']|locale\s*\?\?\s*["']en(?:-US)?["']/i.test(line));
+  return hasKoResource && hasEnResource && removedKoreanCopy && koResourceCopy && tCallAdded && (defaultKo || !defaultEnAdded);
 }
 
 function extractTaskType(markdown: string): string {

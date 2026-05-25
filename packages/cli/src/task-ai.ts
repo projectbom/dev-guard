@@ -27,7 +27,7 @@ import {
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
 import { filterCommandTargetCandidates, inferCommandTargetFiles, mergeCommandTargetCandidates } from "./command-targets.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, readOpenAIApiKey } from "./config.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges, getProjectFiles } from "./git.js";
 import {
@@ -62,6 +62,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
   const config = resolvedConfig.config;
   const providerName = config.ai?.provider ?? defaultConfig.ai.provider ?? "none";
   const model = config.ai?.model ?? defaultConfig.ai.model ?? "gpt-4o-mini";
+  const openAIApiKey = readOpenAIApiKey();
   const currentIdentity = await loadCurrentProjectIdentity(root).catch(() => undefined);
 
   const [gitChanges, projectMemory, rulesMarkdown, mistakesMarkdown, projectStateMarkdown, decisionsMarkdown] = await Promise.all([
@@ -142,6 +143,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
       provider: providerName,
       model,
       configSource: resolvedConfig.source,
+      envResolution: resolvedConfig.env,
       rulesFilter: filteredRules,
       mistakesFilter: filteredMistakes
     });
@@ -151,14 +153,14 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
     throw new Error("AI provider가 none입니다. `dev-guard configure ai --provider openai --model gpt-4o-mini`로 먼저 설정하세요.");
   }
 
-  if (providerName === "openai" && !process.env.OPENAI_API_KEY) {
-    throw new Error("OPENAI_API_KEY 환경변수가 없습니다. API key는 config에 저장하지 말고 `OPENAI_API_KEY=...`로 설정해 주세요.");
+  if (providerName === "openai" && !openAIApiKey) {
+    throw new Error("OpenAI API key 환경변수가 없습니다. API key는 config에 저장하지 말고 `DEV_GUARD_OPENAI_API_KEY` 또는 `OPENAI_API_KEY`로 설정해 주세요.");
   }
 
   const provider =
     providerName === "openai"
       ? new OpenAIProvider({
-          apiKey: process.env.OPENAI_API_KEY ?? "",
+          apiKey: openAIApiKey ?? "",
           model,
           temperature: config.ai?.temperature,
           maxTokens: config.ai?.maxTokens,
@@ -371,6 +373,7 @@ function printDebugContext(debug: {
   provider: string;
   model: string;
   configSource: string;
+  envResolution: Awaited<ReturnType<typeof loadConfig>>["env"];
   rulesFilter: MarkdownFilterResult;
   mistakesFilter: MarkdownFilterResult;
 }): void {
@@ -383,6 +386,10 @@ function printDebugContext(debug: {
   console.error(`- provider: ${debug.provider}`);
   console.error(`- model: ${debug.model}`);
   console.error(`- config source: ${debug.configSource}`);
+  console.error("- env resolution:");
+  console.error(`  DEV_GUARD_OPENAI_API_KEY: ${debug.envResolution.apiKey.checked[0]?.found ? "found" : "missing"}`);
+  console.error(`  OPENAI_API_KEY: ${debug.envResolution.apiKey.checked[1]?.found ? "found" : "missing"}`);
+  console.error(`  selected API key source: ${debug.envResolution.apiKey.selectedKey ?? "none"}`);
   console.error("- task type:");
   console.error(`  type: ${debug.taskType.type}`);
   if (debug.taskSubtype) {
