@@ -73,15 +73,20 @@ function buildCompactPrompt(
 
 function buildUltraCompactPrompt(input: CodexPromptInput, changeFiles: ChangeFile[], changedFiles: string[], summary: string): CodexPrompt {
   const taskSections = extractTaskSections(input.taskMarkdown);
-  const sections = [
+  const ultraIdeas = formatUltraIdeas(taskSections);
+  const sections: Array<[string, string]> = [
     ["TASK", oneLine([taskSections.goal, taskSections.problem].filter(Boolean).join(" | ")) || "Complete requested scoped task."],
     ["TYPE", oneLine(taskSections.taskType) || "unknown"],
     ["FILES", formatUltraFiles(changeFiles, taskSections)],
     ["IMPACT", formatUltraImpactHints(input.impactHints ?? [])],
     ["PROTECT", formatSymbolicProtection(taskSections, input.rulesMarkdown, input.mistakesMarkdown)],
     ["SUCCESS", formatUltraSuccess(taskSections)],
-    ["VERIFY", verificationCommands(changedFiles)]
-  ] as const;
+    ["VERIFY", formatUltraVerify(taskSections, changedFiles)]
+  ];
+  if (ultraIdeas !== "none") {
+    const successIdx = sections.findIndex(([key]) => key === "SUCCESS");
+    sections.splice(successIdx, 0, ["IDEAS", ultraIdeas]);
+  }
   const promptText = addTokenEstimate(
     renderBudgetedUltraPrompt(`${summary}; density=ultra`, sections, input.maxPromptTokens ?? 2500),
     "ultra"
@@ -126,7 +131,7 @@ function renderBudgetedUltraPrompt(
   sections: ReadonlyArray<readonly [string, string]>,
   maxPromptTokens: number
 ): string {
-  const priority = ["TASK", "TYPE", "SUCCESS", "PROTECT", "VERIFY", "FILES", "IMPACT"];
+  const priority = ["TASK", "TYPE", "SUCCESS", "IDEAS", "PROTECT", "VERIFY", "FILES", "IMPACT"];
   let active = [...sections];
   const build = (items: ReadonlyArray<readonly [string, string]>, trimmed = false) =>
     `# dev-guard ultra-compact\nSUMMARY: ${summary}${trimmed ? "; budget_trimmed=true" : ""}\n${items
@@ -309,6 +314,10 @@ function formatCompactRelatedFiles(changeFiles: ChangeFile[], taskSections: Task
 }
 
 function formatUltraFiles(changeFiles: ChangeFile[], taskSections: TaskSections): string {
+  if (/type:\s*product_strategy/i.test(taskSections.taskType)) {
+    const references = compactFileLines(taskSections.references, 3);
+    return references.length > 0 ? `none; REF: ${references.join(", ")}` : "none";
+  }
   const targets = compactFileLines(taskSections.targets, 8);
   if (targets.length > 0) {
     return targets.join(", ");
@@ -381,6 +390,12 @@ function formatUltraSuccess(taskSections: TaskSections): string {
     flags.add("migration_plan_required=true");
     flags.add("rollback_or_verification_required=true");
   }
+  if (/product_strategy|discovery-first|공유하고 싶은 이유|구현 전 정의/.test(source)) {
+    flags.add("hook_defined=true");
+    flags.add("share_reason=true");
+    flags.add("fun_factor=true");
+    flags.add("implementation_scope=true");
+  }
 
   if (flags.size > 0) {
     return [...flags].slice(0, 6).join(", ");
@@ -392,6 +407,63 @@ function formatUltraSuccess(taskSections: TaskSections): string {
     .filter((line) => line.startsWith("- "))
     .slice(0, 3);
   return lines.length > 0 ? lines.join("; ") : "requested_outcome_verified=true";
+}
+
+function toUltraExperimentKey(idea: string): string {
+  const mappings: Array<[RegExp, string]> = [
+    // more specific patterns first
+    [/친구가.*본|타인.*시선|비교.*요소/, "friend_view_comparison"],
+    [/비교.*포맷|점수.*비교|친구.*점수|내.*점수.*vs|비교.*유도|친구.*비교.*유도/, "share_comparison"],
+    [/blur.*처리|전체.*공개|blur.*공유/, "blur_reveal_share"],
+    [/공유.*버튼|감정.*반응.*유발|버튼.*문구/, "emotional_share_cta"],
+    [/상위.*%.*수치|자랑.*동기|수치.*추가/, "social_proof_score"],
+    [/희소성|상위.*%만|여기까지/, "scarcity_copy"],
+    [/재시도.*훅|답.*바꾸면|결과.*달라질/, "replay_trigger"],
+    [/기대감|거의.*다.*왔|마지막.*문항|진행.*중.*카피/, "suspense_progression"],
+    [/재방문|결과가.*바뀌|일정.*기간/, "time_retest_hook"],
+    [/한.*번.*더|재시작|완료.*직후/, "restart_entry"],
+    [/밈.*문법|유행.*밈|밈.*스타일/, "meme_copy"],
+    [/공감.*유머|유머.*추가|대화체/, "empathy_humor_copy"],
+    [/과장|감탄사|이모지.*감정|감정.*반응.*강화/, "emotional_result_reaction"],
+    [/TikTok|Threads|짧고.*강한|짧은.*문장/, "short_copy_format"],
+    [/정체성.*라벨|X형.*인간|라벨링/, "identity_label"],
+    [/결과.*제목.*공격|공격적.*스타일|밈.*교체|제목.*더.*공격|제목.*변경/, "stronger_result_titles"],
+    [/스크린샷|비주얼.*구조/, "screenshot_ready_copy"],
+    [/진입.*카피|왜.*해야|동기.*유발/, "hook_entry_copy"],
+    [/공유.*시.*친구|친구.*공유|공유.*유도/, "share_comparison"]
+  ];
+  for (const [pattern, key] of mappings) {
+    if (pattern.test(idea)) {
+      return key;
+    }
+  }
+  return idea
+    .replace(/^[-*]\s*/, "")
+    .replace(/['"''""\s]+/g, "_")
+    .replace(/[^a-z0-9_가-힣]/gi, "")
+    .slice(0, 28)
+    .toLowerCase();
+}
+
+function formatUltraIdeas(taskSections: TaskSections): string {
+  if (!taskSections.experimentIdeas) {
+    return "none";
+  }
+  const keys = taskSections.experimentIdeas
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("-") || line.startsWith("*"))
+    .map((line) => toUltraExperimentKey(line))
+    .filter(Boolean)
+    .slice(0, 5);
+  return keys.length > 0 ? keys.join(", ") : "none";
+}
+
+function formatUltraVerify(taskSections: TaskSections, changedFiles: string[]): string {
+  if (/type:\s*product_strategy/i.test(taskSections.taskType)) {
+    return "no code change required unless scope approved";
+  }
+  return verificationCommands(changedFiles);
 }
 
 function compactFileLines(text: string, max: number): string[] {
@@ -437,6 +509,7 @@ interface TaskSections {
   completionCriteria: string;
   completionConditions: string;
   cautions: string;
+  experimentIdeas: string;
 }
 
 function extractTaskSections(taskMarkdown: string): TaskSections {
@@ -452,7 +525,8 @@ function extractTaskSections(taskMarkdown: string): TaskSections {
     forbidden: cleanSectionContent(extractMarkdownSection(taskMarkdown, "건드리면 안 되는 것")),
     completionCriteria: cleanSectionContent(extractMarkdownSection(taskMarkdown, "완료 기준")),
     completionConditions: cleanSectionContent(extractMarkdownSection(taskMarkdown, "완료 조건")),
-    cautions: cleanSectionContent(extractMarkdownSection(taskMarkdown, "Codex에게 전달할 주의사항"))
+    cautions: cleanSectionContent(extractMarkdownSection(taskMarkdown, "Codex에게 전달할 주의사항")),
+    experimentIdeas: cleanSectionContent(extractMarkdownSection(taskMarkdown, "추천 실험 방향"))
   };
 }
 

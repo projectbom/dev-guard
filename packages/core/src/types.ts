@@ -167,6 +167,7 @@ export type TaskType =
   | "ui_polish"
   | "bugfix"
   | "feature_add"
+  | "product_strategy"
   | "architecture"
   | "i18n"
   | "refactor"

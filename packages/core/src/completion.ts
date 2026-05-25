@@ -82,6 +82,16 @@ const criteriaByType: Record<TaskType, TaskCompletionCriteria> = {
     reviewHints: ["새 기능 진입점과 기존 흐름 영향을 확인한다."],
     blockingFailures: ["핵심 기능 미구현", "보호 대상 변경"]
   },
+  product_strategy: {
+    requiredChecks: [
+      "사용자가 이 서비스를 굳이 써야 하는 한 문장 이유가 정의된다.",
+      "공유하고 싶거나 다시 써보고 싶은 이유가 코드 수정 전에 설명된다.",
+      "구현이 필요하면 최소 변경 범위와 검증 기준을 먼저 제안한다."
+    ],
+    forbiddenPatterns: ["바로 코드 수정 착수", "검증 없는 새 UI 섹션 추가", "결과 계산/저장/인증 로직 변경"],
+    reviewHints: ["product brief와 implementation proposal이 먼저 있는지 확인한다.", "reference 파일을 primary edit target으로 오해하지 않았는지 확인한다."],
+    blockingFailures: ["핵심 가치/후킹 정의 없이 UI만 추가", "승인 없는 코드 수정 범위 확정", "보호 로직 변경"]
+  },
   architecture: {
     requiredChecks: ["영향 범위가 단계별로 분해된다.", "dependency direction이 유지된다.", "마이그레이션 위험이 명시된다."],
     forbiddenPatterns: ["전체 구조 일괄 교체", "layer violation", "unrelated file modification"],

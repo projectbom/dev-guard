@@ -90,6 +90,15 @@ const rules: TypeRule[] = [
     patterns: [/스타일|css|색상|다크모드|dark\s*mode|라이트|theme|테마|spacing|margin|padding|font|폰트/i]
   },
   {
+    type: "product_strategy",
+    strategy: "discovery-first",
+    riskLevel: "high",
+    requiresPhasing: true,
+    patterns: [
+      /꼭\s*해야\s*할\s*이유|왜\s*써야|왜\s*해야|재미|유행|바이럴|공유하고\s*싶|다시\s*하고\s*싶|차별화|후킹|리텐션|매력|컨셉|포지셔닝|한\s*방|밈|친구에게\s*보내고\s*싶|심심|지루|공유.*느낌|이유.*모르|해야.*이유/i
+    ]
+  },
+  {
     type: "feature_add",
     strategy: "scope-first",
     riskLevel: "medium",
@@ -129,7 +138,7 @@ export function classifyTaskType(requirement: string): TaskTypeResult {
   return {
     type: selected.rule.type,
     subtype,
-    confidence: selected.rule.type === "i18n" ? "high" : confidenceFromScore(selected.score),
+    confidence: selected.rule.type === "i18n" || selected.rule.type === "product_strategy" ? "high" : confidenceFromScore(selected.score),
     reasons: [...selected.reasons.slice(0, 4), ...(subtype ? [`subtype ${subtype}`] : [])],
     strategy: selected.rule.strategy,
     riskLevel: selected.rule.riskLevel,
@@ -149,6 +158,11 @@ export function taskTypeStrategyNotes(result: TaskTypeResult): string[] {
       "기존 UI 흐름 안에서 최소 수정한다.",
       "새 섹션, 새 카드, 새 기능 추가를 피한다.",
       "상태/동작 로직은 보호한다."
+    ],
+    product_strategy: [
+      "바로 코드 수정하지 않고 product brief를 먼저 정의한다.",
+      "가치, 후킹, 공유 이유, 유지 이유를 구현 범위보다 먼저 정리한다.",
+      "관련 파일은 reference로만 보고 직접 수정 대상은 승인 전까지 비운다."
     ],
     bugfix: [
       "재현 조건, 원인 후보, 검증 방법을 포함한다.",
@@ -223,6 +237,7 @@ function rulePriority(type: TaskType): number {
     "docs",
     "ui_text_cleanup",
     "ui_polish",
+    "product_strategy",
     "styling",
     "refactor",
     "feature_add"
@@ -261,6 +276,27 @@ function inferSubtype(type: TaskType, requirement: string): string | undefined {
     }
     return "ui_polish.integration";
   }
+  if (type === "product_strategy") {
+    if (/(바이럴|공유하고 싶|친구에게 보내고 싶|공유성|공유.*느낌|share|viral)/i.test(requirement)) {
+      return "viral_loop";
+    }
+    if (/(다시 하고 싶|리텐션|retention|재방문|습관)/i.test(requirement)) {
+      return "retention_hook";
+    }
+    if (/(검증|validation|concept|컨셉)/i.test(requirement)) {
+      return "concept_validation";
+    }
+    if (/(문구|copy|카피|표현|메시지)/i.test(requirement)) {
+      return "product_copy";
+    }
+    if (/(재미|유행|밈|한 방|심심|지루|fun)/i.test(requirement)) {
+      return "fun_factor";
+    }
+    if (/(결과.*심심|결과.*지루|결과|result)/i.test(requirement)) {
+      return "result_shareability";
+    }
+    return "engagement_positioning";
+  }
   return undefined;
 }
 
@@ -271,6 +307,7 @@ function extractDomainKeywords(requirement: string): string[] {
     [/(상태|state|유지|바뀌|변경됨)/i, ["state"]],
     [/(결과|result)/i, ["result"]],
     [/(문구|텍스트|단어|표현|copy|wording)/i, ["text", "wording"]],
+    [/(재미|유행|바이럴|공유|차별화|후킹|리텐션|매력|컨셉|포지셔닝|밈)/i, ["product", "engagement", "positioning"]],
     [/(영어|영문|다국어|i18n|locale|translation|언어)/i, ["i18n", "locale"]],
     [/(auth|login|로그인|인증)/i, ["auth"]],
     [/(api|fetch|서버|요청|응답)/i, ["api"]]

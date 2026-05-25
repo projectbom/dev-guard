@@ -553,7 +553,7 @@ function routeCandidateFiles(
     };
   }
 
-  if (taskType.type === "docs" || taskType.type === "infra_config" || taskType.type === "architecture" || taskType.type === "migration") {
+  if (taskType.type === "docs" || taskType.type === "infra_config" || taskType.type === "architecture" || taskType.type === "migration" || taskType.type === "product_strategy") {
     const relatedFileCandidates = inferTaskTypeCandidateFiles(taskType, projectFiles, genericCandidates);
     return {
       relatedFileCandidates,
@@ -627,6 +627,10 @@ function inferTaskTypeCandidateFiles(taskType: TaskTypeResult, projectFiles: str
     return filterCandidateFiles((architectureCandidates.length > 0 ? architectureCandidates : fallback).slice(0, 8));
   }
 
+  if (taskType.type === "product_strategy") {
+    return filterCandidateFiles(fallback.slice(0, 8));
+  }
+
   return filterCandidateFiles(fallback);
 }
 
@@ -638,10 +642,11 @@ function scoreTaskTypeCandidates(taskType: TaskTypeResult, candidates: string[],
     const isDocs = taskType.type === "docs";
     const isInfra = taskType.type === "infra_config";
     const role: TaskAIFileCandidate["role"] =
-      taskType.type === "i18n" ? (isStructure || isLayout ? "edit" : "reference") : index < 5 ? "edit" : "reference";
+      taskType.type === "i18n" ? (isStructure || isLayout ? "edit" : "reference") : taskType.type === "product_strategy" ? "reference" : index < 5 ? "edit" : "reference";
     const reasons = [
       taskType.type === "i18n" && isStructure ? "i18n structure candidate" : "",
       taskType.type === "i18n" && isLayout ? "provider/wiring candidate" : "",
+      taskType.type === "product_strategy" ? "product discovery reference only" : "",
       isDocs ? "docs strategy candidate" : "",
       isInfra ? "infra/config strategy candidate" : "",
       taskType.type === "architecture" || taskType.type === "migration" ? "phased structure candidate" : "",

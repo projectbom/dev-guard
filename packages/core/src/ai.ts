@@ -308,6 +308,11 @@ ${taskTypeStrategyNotes(taskType).map((note) => `- ${note}`).join("\n")}
 - i18n 작업에서는 전체 app/page 파일, admin/dashboard/settings/checklist 같은 전역 화면을 무차별 수정 대상으로 나열하지 마세요.
 - i18n 작업 task.md에는 "1단계 목표", "이번 작업 범위", "이후 단계", "이번 작업에서 제외할 것" 섹션을 포함하세요.
 - architecture/migration처럼 requiresPhasing=true인 작업은 "이번 단계", "이후 단계", "이번 작업에서 제외할 것"을 포함하세요.
+- product_strategy 작업은 바로 코드 수정하지 말고 discovery-first product brief 작업으로 작성하세요.
+- product_strategy 작업에서는 관련 파일을 "참고 대상"으로만 두고, "수정 대상"은 승인 전까지 없음으로 표시하세요.
+- product_strategy 작업에는 "구현 전 정의해야 할 것" 섹션을 포함하고, 왜 써야 하는지/공유 이유/재미 요소/검증 기준/최소 구현 범위를 정의하게 하세요.
+- product_strategy 작업에는 "추천 실험 방향" 섹션을 포함하고, implementation 이전 단계의 lightweight experiment proposal을 3~5개 compact하게 제안하세요.
+- "추천 실험 방향"은 feature spec, UI redesign, 코드 수정 지시가 아닌 user reaction 중심의 실험 단위여야 합니다. "왜 공유하고 싶어지는지", "왜 다시 해보고 싶어지는지" 기준으로 작성하세요.
 
 위 정보를 바탕으로 .devguard/task.md에 바로 저장할 Markdown만 생성하세요.`;
 }
@@ -339,6 +344,7 @@ function taskAISystemPrompt(): string {
     "Do not invent stakeholders such as designer, PM, QA, user research, or brand policy unless explicitly present in the user request or context.",
     "For UI-only tasks, protect logic, state, storage/restore, fetch/auth, result calculation, routing, animation state, cache, providers, and layout shells unless explicitly requested.",
     "Always include pnpm run build in verification commands.",
+    "For product_strategy tasks, do not start code edits. Generate a discovery-first brief with reference files only, no primary edit targets until scope is approved.",
     "Do not invent causes that are not supported by the provided project files or user requirement.",
     "If the relevant file is unclear, write 확인 필요 instead of guessing.",
     "Do not transform social-login requirements into email/password issues unless the user explicitly says email/password.",
@@ -784,6 +790,19 @@ function postProcessTaskMarkdown(markdown: string, context: TaskAIContext, candi
       scopeFilledFromCandidates: changed
     };
   } else {
+    if (taskType.type === "product_strategy") {
+      const productResult = applyProductStrategySections(nextMarkdown, context, candidates);
+      nextMarkdown = productResult.markdown;
+      changed ||= productResult.changed;
+      const compactResult = compactRedundantTaskSections(nextMarkdown);
+      nextMarkdown = compactResult.markdown;
+      changed ||= compactResult.changed;
+      return {
+        markdown: nextMarkdown,
+        scopeFilledFromCandidates: changed
+      };
+    }
+
     const scopeResult = fillScopeFromCandidates(nextMarkdown, candidates, explicitRoutes);
     nextMarkdown = scopeResult.markdown;
     changed ||= scopeResult.scopeFilledFromCandidates;
@@ -1129,6 +1148,9 @@ function applyRequirementInterpretationSection(markdown: string, context: TaskAI
 }
 
 function interpretRequirement(requirement: string, taskType: TaskTypeResult): string {
+  if (taskType.type === "product_strategy") {
+    return "제품 가치, 사용 이유, 재미/공유/리텐션 요소를 코드 수정 전에 정의하는 discovery-first 작업이다.";
+  }
   if (taskType.subtype === "bugfix.navigation_state") {
     return "이전/뒤로 이동 시 원래 보던 항목과 상태가 유지되지 않고 다른 항목으로 바뀌는 navigation/state 버그를 재현하고 수정한다.";
   }
@@ -1142,6 +1164,13 @@ function interpretRequirement(requirement: string, taskType: TaskTypeResult): st
 }
 
 function notThisTaskLines(requirement: string, taskType: TaskTypeResult): string[] {
+  if (taskType.type === "product_strategy") {
+    return [
+      "바로 UI 섹션이나 기능을 추가하는 구현 작업",
+      "결과 페이지 파일을 primary edit target으로 확정하는 작업",
+      "결과 계산, 저장, 인증, routing 로직 변경"
+    ];
+  }
   if (taskType.subtype === "bugfix.navigation_state") {
     return [
       "결과 페이지 문구 수정",
@@ -1182,6 +1211,154 @@ function applyCompletionCriteriaSection(markdown: string, criteria: ReturnType<t
     markdown: replaceMarkdownSection(markdown, "완료 기준", body),
     changed: true
   };
+}
+
+function inferExperimentIdeas(subtype: string | undefined, requirement: string): string[] {
+  if (subtype === "viral_loop") {
+    return [
+      "- 결과 공유 시 '내 점수 vs 친구 점수' 비교 포맷 노출",
+      "- 결과 일부를 blur 처리하고 '공유하면 전체 공개' 유도",
+      "- 공유 버튼 문구를 '결과 공유' 대신 감정 반응 유발 문장으로 교체",
+      "- 결과 카드에 '상위 X%' 수치 추가로 자랑 동기 강화",
+      "- '친구가 본 당신' 형식으로 타인 시선 비교 요소 추가"
+    ];
+  }
+  if (subtype === "retention_hook") {
+    return [
+      "- 진행 중 '상위 3%만 여기까지 왔습니다' 희소성 카피 실험",
+      "- 결과 화면에 '답을 바꾸면 결과가 달라질 수 있어요' 재시도 훅",
+      "- 마지막 문항 진입 시 '거의 다 왔어요' 기대감 카피 강화",
+      "- 결과 저장 + 일정 기간 후 '결과가 바뀌었을까?' 재방문 유도",
+      "- 테스트 완료 직후 '한 번 더 해볼까요?' 재시작 진입점 강화"
+    ];
+  }
+  if (subtype === "fun_factor") {
+    return [
+      "- 결과 제목을 현재 유행 밈 문법으로 재구성",
+      "- 문항 표현에 공감/유머 추가 (딱딱한 질문 → 대화체)",
+      "- 결과 화면에 과장된 감탄사/이모지로 감정 반응 강화",
+      "- TikTok/Threads 스타일 짧고 강한 문장 구조 실험",
+      "- '당신은 X형 인간' 같은 정체성 라벨링으로 공감 자극"
+    ];
+  }
+  if (subtype === "result_shareability") {
+    return [
+      "- 결과 제목을 더 공격적/밈 스타일로 교체",
+      "- 결과 카드를 스크린샷하기 좋은 짧은 문장 구조로 재구성",
+      "- '친구가 본 당신' 형식의 비교 요소 추가",
+      "- 결과 일부를 blur 처리하고 공유 후 전체 공개 유도",
+      "- 결과 공유 시 친구와 점수 비교 유도"
+    ];
+  }
+  // engagement_positioning default — also covers concept_validation, product_copy
+  return [
+    "- 서비스 진입 카피를 '왜 해야 하는지' 동기 유발 한 문장으로 교체",
+    "- 결과 제목을 더 공격적/밈 스타일로 변경",
+    "- 결과 공유 시 친구 비교 유도",
+    "- 테스트 진행 중 기대감 카피 강화",
+    "- TikTok/Threads 스타일 짧은 문장 구조 실험"
+  ];
+}
+
+function applyProductStrategySections(markdown: string, context: TaskAIContext, candidates: string[]): { markdown: string; changed: boolean } {
+  const references = candidates.slice(0, 6).map((candidate) => `- ${candidate}`);
+  let nextMarkdown = markdown;
+
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "목표",
+    "서비스를 꼭 써야 하는 이유와 재미/공유/재방문 동기를 코드 수정 전에 정의한다."
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "현재 문제",
+    "서비스의 핵심 사용 이유, 재미 요소, 유행성/공유성이 아직 명확하지 않아 바로 기능 추가로 해결할 수 있는 상태가 아니다."
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "수정 범위",
+    "- 코드 수정 전 기획 정의 필요\n- 직접 수정 대상 없음"
+  );
+  nextMarkdown = replaceMarkdownSection(nextMarkdown, "수정 대상", "- 없음. product brief 승인 전까지 코드 수정하지 않는다.");
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "참고 대상",
+    references.length > 0 ? references.join("\n") : "- 현재 결과/공유/진입 흐름 관련 파일은 필요 시 reference로만 확인한다."
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "보호 대상",
+    [
+      "- 결과 계산 로직",
+      "- 상태 저장/복원 로직",
+      "- routing/auth/fetch 처리",
+      "- 검증되지 않은 데이터 구조",
+      "- 기존 공유/결과 렌더링 동작"
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "구현 전 정의해야 할 것",
+    [
+      "- 사용자가 이 서비스를 굳이 해야 하는 한 문장 이유",
+      "- 결과를 친구에게 공유하고 싶은 이유",
+      "- 끝까지 진행하게 만드는 긴장감/기대감",
+      "- 결과 페이지에서 기억에 남는 표현 방식",
+      "- 현재 유행 문법과 연결할 수 있는 요소",
+      "- 코드로 구현할 최소 범위와 검증 기준"
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "추천 실험 방향",
+    inferExperimentIdeas(context.taskType?.subtype, context.requirement).join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "반드시 지킬 규칙",
+    [
+      "- 바로 코드 수정하지 말고 product brief 또는 implementation proposal을 먼저 작성한다.",
+      "- 관련 파일은 reference로만 보고 수정 대상으로 확정하지 않는다.",
+      "- 구현이 필요하면 최소 변경 범위와 검증 기준을 먼저 제안한다."
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "건드리면 안 되는 것",
+    [
+      "- 바로 UI 섹션 추가",
+      "- 결과 계산 로직",
+      "- 상태 저장/복원",
+      "- routing/auth/fetch",
+      "- 검증되지 않은 데이터 구조 변경"
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "완료 조건",
+    [
+      "- 서비스의 핵심 hook이 한 문장으로 정의된다.",
+      "- 공유하고 싶은 이유와 다시 써볼 이유가 분리되어 적힌다.",
+      "- 구현 후보가 최소 범위와 검증 기준으로 정리된다.",
+      "- 코드 수정이 필요하면 승인받을 수 있는 implementation proposal이 있다."
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "검증 명령어",
+    "- 코드 수정 전에는 실행 명령 없음\n- 코드 수정 범위가 승인되면 `pnpm run build`"
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "Codex에게 전달할 주의사항",
+    [
+      "- 바로 코드 수정하지 말고 먼저 product brief 또는 implementation proposal을 작성한다.",
+      "- 코드 수정이 필요하면 최소 변경 범위를 제안한 뒤 진행한다.",
+      "- 결과/공유 관련 파일은 reference일 뿐 primary target이 아니다."
+    ].join("\n")
+  );
+
+  return { markdown: nextMarkdown, changed: true };
 }
 
 function applyI18nTaskDecomposition(markdown: string, context: TaskAIContext, taskType: TaskTypeResult): { markdown: string; changed: boolean } {
