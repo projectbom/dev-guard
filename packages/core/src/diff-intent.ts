@@ -6,6 +6,9 @@ const cliOutputPattern = /(console\.(log|error|warn)|format|summary|preview|succ
 const promptPattern = /(prompt|density|token|compact|ultra|context|프롬프트|토큰|압축)/i;
 const relevancePattern = /(relevance|candidate|score|scope|drift|intent|router|routing|selection|후보|관련|범위|의도|분류)/i;
 const workflowPattern = /(done|watch|review|check|report|guardrail|workflow|self|update preview|워크플로우|검증|가드)/i;
+const cliCommandHandlerPattern = /(^|\/)(task-ai|fix-prompt|self-check|done|status|update|watch|review|check|prompt|doctor|report|scan|refresh|telemetry|self|index)\.ts$/i;
+const appSourcePathPattern = /^(app|pages|components|src\/app|src\/pages|src\/components|lib|hooks|utils)\//i;
+const livingDocumentPattern = /(living[-_]?document|thought[-_]?artifact|artifact|artifacts|brain|memo|folder|document[-_]?ui|문서|메모|폴더|생각)/i;
 
 export function inferDiffIntent(input: {
   changedFiles: string[];
@@ -147,6 +150,8 @@ function inferSingleDiffIntent(input: {
   const riskSignals: string[] = [];
   const supportingFiles = new Set<string>();
   const targetCommand = inferTargetCommand(changedFiles, changedText);
+  const cliTooling = isCliToolingContext(changedFiles);
+  const appContext = isAppSourceContext(changedFiles);
 
   if (targetCommand) {
     addScore(scores, "command_target", 40);
@@ -156,13 +161,22 @@ function inferSingleDiffIntent(input: {
     addScore(scores, "command_token", 25);
     evidence.push(`diff mentions command:${targetCommand}`);
   }
-  if (cliOutputPattern.test(changedText) || changedFiles.some((file) => /packages\/cli\/src\/|(^|\/)cli(\/|$)/i.test(file))) {
+  if (cliTooling && (cliOutputPattern.test(changedText) || changedFiles.some((file) => /packages\/cli\/src\/|(^|\/)cli(\/|$)/i.test(file)))) {
     addScore(scores, "cli_output", 20);
     evidence.push("CLI output/format keywords changed");
+  } else if (appContext && cliOutputPattern.test(changedText)) {
+    evidence.push("weak output keyword in app diff");
   }
   if (strings.length > 0) {
     addScore(scores, "user_facing_strings", 15);
     evidence.push(`added strings:${strings.slice(0, 3).join(" | ")}`);
+  }
+  if (isLivingDocumentRefactor(changedFiles, changedText)) {
+    addScore(scores, "living_document_refactor", 70);
+    evidence.push("living document/artifact migration");
+  } else if (isAppSourceContext(changedFiles) && hasAppArchitectureSignal(changedFiles, changedText)) {
+    addScore(scores, "app_architecture_refactor", 45);
+    evidence.push("app API/UI architecture change");
   }
   if (input.codeGraph?.some((entry) => changedFiles.includes(entry.file) && entry.importedBy.length > 0)) {
     addScore(scores, "graph_adjacency", 10);
@@ -242,13 +256,17 @@ export function inferredIntentToTaskType(intent: InferredDiffIntent): TaskTypeRe
 
 export function formatInferredDiffIntent(intent: InferredDiffIntent): string {
   const target = intent.targetCommand ? `(${intent.targetCommand})` : "";
+  const intentName =
+    intent.type === "app_feature_refactor" && intent.subtype
+      ? `${intent.type}(${intent.subtype})`
+      : `${intent.subtype ?? intent.type}${target}`;
   const flags = [
     intent.subtype === "cli_output_polish" ? "preview_clarity✓" : "",
     intent.subtype === "noise_reduction" ? "noise↓" : "",
     intent.subtype === "relevance_fix" ? "relevance✓" : "",
     intent.riskSignals.length > 0 ? "risk!" : ""
   ].filter(Boolean);
-  return `INTENT: ${intent.subtype ?? intent.type}${target}; SCOPE: ${intent.scope.join(", ") || "changed files"}; confidence=${intent.confidence}${flags.length ? `; FLAGS: ${flags.join(" ")}` : ""}`;
+  return `INTENT: ${intentName}; SCOPE: ${intent.scope.join(", ") || "changed files"}; confidence=${intent.confidence}${flags.length ? `; FLAGS: ${flags.join(" ")}` : ""}`;
 }
 
 export function formatInferredDiffIntentClusters(clusters: InferredDiffIntentClusters): string {
@@ -266,13 +284,20 @@ export function filterDiffTextForFiles(diffText: string, files: string[]): strin
 }
 
 function inferTypeSubtype(changedFiles: string[], text: string, symbols: string[], targetCommand?: string): { type: string; subtype: string } {
-  if (promptPattern.test(text) || changedFiles.some((file) => /prompt|task-ai|ai\.ts|task-router|completion|density/i.test(file))) {
+  const cliTooling = isCliToolingContext(changedFiles);
+  if (isLivingDocumentRefactor(changedFiles, text)) {
+    return { type: "app_feature_refactor", subtype: "living_document" };
+  }
+  if (isAppSourceContext(changedFiles) && hasAppArchitectureSignal(changedFiles, text)) {
+    return { type: "app_feature_refactor", subtype: "app_feature_refactor" };
+  }
+  if ((cliTooling && promptPattern.test(text)) || changedFiles.some((file) => /prompt|task-ai|ai\.ts|task-router|completion|density/i.test(file))) {
     return /token|density|compact|ultra|budget/i.test(text) ? { type: "polish", subtype: "token_optimization" } : { type: "bugfix", subtype: "prompt_quality" };
   }
-  if (relevancePattern.test(text) || changedFiles.some((file) => /relevance|command-target|task-router|drift|analyze/i.test(file))) {
+  if ((cliTooling && relevancePattern.test(text)) || changedFiles.some((file) => /relevance|command-target|task-router|drift|analyze/i.test(file))) {
     return { type: "bugfix", subtype: "relevance_fix" };
   }
-  if (workflowPattern.test(text) || targetCommand) {
+  if ((cliTooling && workflowPattern.test(text)) || targetCommand) {
     if (cliOutputPattern.test(text) || targetCommand === "done" || targetCommand === "status") {
       return { type: "polish", subtype: "cli_output_polish" };
     }
@@ -281,10 +306,13 @@ function inferTypeSubtype(changedFiles: string[], text: string, symbols: string[
   if (changedFiles.some((file) => /refactor|types|utils|core/i.test(file)) && symbols.length > 0) {
     return { type: "refactor", subtype: "internal_refactor" };
   }
-  return cliOutputPattern.test(text) ? { type: "polish", subtype: "cli_output_polish" } : { type: "bugfix", subtype: "command_behavior" };
+  return cliTooling && cliOutputPattern.test(text) ? { type: "polish", subtype: "cli_output_polish" } : { type: "bugfix", subtype: "command_behavior" };
 }
 
 function inferTargetCommand(changedFiles: string[], text: string): string | undefined {
+  if (!isCliToolingContext(changedFiles)) {
+    return undefined;
+  }
   const scores = commands.map((command) => {
     let score = 0;
     const commandPattern = new RegExp(`(^|/|-)${escapeRegExp(command)}(\\.|/|-|$)`, "i");
@@ -301,7 +329,7 @@ function inferTargetCommand(changedFiles: string[], text: string): string | unde
     return { command, score };
   });
   const best = scores.sort((a, b) => b.score - a.score || a.command.localeCompare(b.command))[0];
-  return best && best.score >= 25 ? best.command : undefined;
+  return best && best.score >= 40 ? best.command : undefined;
 }
 
 function clusterChangedFiles(changedFiles: string[], diffText: string, codeGraph: CodeGraphEntry[]): Array<{ key: string; files: string[] }> {
@@ -309,8 +337,9 @@ function clusterChangedFiles(changedFiles: string[], diffText: string, codeGraph
   for (const file of changedFiles) {
     const fileDiff = buildClusterDiff(diffText, [file]);
     const category = fileCategory(file);
+    const subtype = inferSubtypeKey([file], fileDiff);
     const command = /^(docs|tests|release|high-impact)$/.test(category) ? undefined : inferTargetCommand([file], fileDiff);
-    const key = command ? `command:${command}` : `${category}:${inferSubtypeKey([file], fileDiff)}`;
+    const key = command ? `command:${command}` : subtype === "living_document" ? `app:${subtype}` : `${category}:${subtype}`;
     const bucket = byKey.get(key) ?? new Set<string>();
     bucket.add(file);
     byKey.set(key, bucket);
@@ -435,16 +464,30 @@ function buildClusterDiff(diffText: string, files: string[]): string {
 
 function inferScope(changedFiles: string[], text: string, targetCommand?: string): string[] {
   const scope = new Set<string>();
+  const cliTooling = isCliToolingContext(changedFiles);
   if (targetCommand) {
     scope.add(`command:${targetCommand}`);
   }
-  if (changedFiles.some((file) => /packages\/cli\/src|(^|\/)cli(\/|$)/i.test(file)) || cliOutputPattern.test(text)) {
+  if (cliTooling && (changedFiles.some((file) => /packages\/cli\/src|(^|\/)cli(\/|$)/i.test(file)) || cliOutputPattern.test(text))) {
     scope.add("cli_output");
   }
-  if (promptPattern.test(text)) {
+  if (isLivingDocumentRefactor(changedFiles, text)) {
+    const paths = changedFiles.join("\n");
+    if (/(^|\/)components\/brain\//i.test(paths) || /\bbrain\b/i.test(text)) {
+      scope.add("brain");
+    }
+    scope.add("living_document");
+    if (changedFiles.some((file) => /(^|\/)app\/api\/artifacts\//i.test(file))) {
+      scope.add("artifact_api");
+    }
+    if (/(^|\/)components\//i.test(paths) || /LivingDocumentView|ThoughtArtifactView/i.test(text)) {
+      scope.add("document_ui");
+    }
+  }
+  if (cliTooling && promptPattern.test(text)) {
     scope.add("prompt");
   }
-  if (relevancePattern.test(text)) {
+  if (cliTooling && relevancePattern.test(text)) {
     scope.add("relevance");
   }
   if (changedFiles.some((file) => /\.(md|mdx)$/i.test(file) || /^docs\//i.test(file))) {
@@ -473,8 +516,8 @@ function baseTaskType(type: TaskTypeResult["type"], intent: InferredDiffIntent):
     subtype: intent.subtype,
     confidence: intent.confidence,
     reasons: intent.evidence,
-    strategy: intent.subtype === "cli_output_polish" ? "minimal-output-polish" : "diff-inferred-scope",
-    riskLevel: intent.riskSignals.length > 0 ? "medium" : "low",
+    strategy: intent.subtype === "cli_output_polish" ? "minimal-output-polish" : intent.subtype === "living_document" ? "scoped-architecture-change" : "diff-inferred-scope",
+    riskLevel: intent.subtype === "living_document" ? "high" : intent.riskSignals.length > 0 ? "medium" : "low",
     requiresPhasing: false,
     domainKeywords: intent.scope
   };
@@ -524,4 +567,34 @@ function normalizeFiles(files: string[]): string[] {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isCliToolingContext(changedFiles: string[]): boolean {
+  return changedFiles.some((file) =>
+    /packages\/cli\/src\//i.test(file) ||
+    (/packages\/core\/src\//i.test(file) && /(diff-intent|prompt|report|review|check|analyze|task-router|completion|ai|types)\.ts$/i.test(file)) ||
+    cliCommandHandlerPattern.test(file)
+  );
+}
+
+function isAppSourceContext(changedFiles: string[]): boolean {
+  return changedFiles.some((file) => appSourcePathPattern.test(file));
+}
+
+function isLivingDocumentRefactor(changedFiles: string[], text: string): boolean {
+  const combined = `${changedFiles.join("\n")}\n${text}`;
+  const hasLivingOrArtifact = livingDocumentPattern.test(combined);
+  const hasMigrationSignal =
+    /LivingDocumentView|living[-_]?document/i.test(combined) &&
+    (/ThoughtArtifactView|thought[-_]?artifact/i.test(combined) || /(^|\/)app\/api\/artifacts\//i.test(changedFiles.join("\n")));
+  return isAppSourceContext(changedFiles) && (hasMigrationSignal || (hasLivingOrArtifact && /(^|\/)(components\/brain|app\/api\/artifacts)\//i.test(changedFiles.join("\n"))));
+}
+
+function hasAppArchitectureSignal(changedFiles: string[], text: string): boolean {
+  const paths = changedFiles.join("\n");
+  return (
+    isAppSourceContext(changedFiles) &&
+    ((/(^|\/)app\/api\//i.test(paths) && /components?\//i.test(paths)) ||
+      /(rename|remove|delete|migrate|migration|refactor|replace|전환|구조|삭제|이동|재해석)/i.test(text))
+  );
 }

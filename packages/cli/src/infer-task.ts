@@ -2,12 +2,13 @@ import {
   formatInferredDiffIntentClusters,
   inferDiffIntentClusters,
   inferredIntentToRequirement,
-  scoreTaskAnchorFreshness,
   type CodeGraphEntry
 } from "@dev-guard/core";
 import { writeAIContext } from "./ai-context.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges } from "./git.js";
+import { loadCurrentProjectIdentity } from "./project-identity.js";
+import { formatEffectiveTaskContext, resolveEffectiveTaskContext } from "./effective-task.js";
 
 interface InferTaskOptions {
   write: boolean;
@@ -15,10 +16,11 @@ interface InferTaskOptions {
 
 export async function runInferTask(root: string, args: string[]): Promise<void> {
   const options = parseInferTaskOptions(args);
-  const [gitChanges, taskMarkdown, codeGraph] = await Promise.all([
+  const [gitChanges, taskMarkdown, codeGraph, currentIdentity] = await Promise.all([
     getGitChanges(root),
     readTextFile(fromRoot(root, ".devguard/task.md")),
-    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), []),
+    loadCurrentProjectIdentity(root).catch(() => undefined)
   ]);
 
   if (gitChanges.changedFiles.length === 0) {
@@ -28,34 +30,23 @@ export async function runInferTask(root: string, args: string[]): Promise<void> 
     return;
   }
 
-  const clusters = inferDiffIntentClusters({
-    changedFiles: gitChanges.changedFiles,
-    changeFiles: gitChanges.changeFiles,
-    diffText: gitChanges.diffText,
-    codeGraph
-  });
-  const intent = clusters.primaryIntent;
-
-  // Task anchor check — handles absent/placeholder/stale/fresh
-  const anchor = scoreTaskAnchorFreshness({
+  const effective = await resolveEffectiveTaskContext({
+    root,
     taskMarkdown,
-    diffText: gitChanges.diffText,
-    changedFiles: gitChanges.changedFiles,
-    changeFiles: gitChanges.changeFiles
+    gitChanges,
+    codeGraph,
+    currentIdentity
   });
+  const clusters = effective.inferredTask;
+  const intent = clusters.primaryIntent;
 
   console.log("dev-guard infer-task");
   console.log("");
-
-  if (anchor.mode === "anchor_absent") {
-    console.log("task anchor: absent");
-  } else if (anchor.mode === "stale") {
-    console.log(`task.md: stale (match score ${anchor.matchScore})`);
-    if (anchor.taskType) console.log(`task.md task: ${anchor.taskType}`);
-  } else if (anchor.mode === "uncertain") {
-    console.log(`task.md: uncertain (match score ${anchor.matchScore})`);
-  } else {
-    console.log(`task.md: fresh (match score ${anchor.matchScore})`);
+  for (const line of formatEffectiveTaskContext("dev-guard infer-task", effective)) {
+    console.log(line);
+  }
+  if (effective.runSelection.warning) {
+    console.log(`dev-guard infer-task: warning: ${effective.runSelection.warning}`);
   }
   console.log("");
 
@@ -92,10 +83,10 @@ export async function runInferTask(root: string, args: string[]): Promise<void> 
     console.log("[written] .devguard/AI_CONTEXT.md updated.");
   } else {
     console.log("");
-    if (anchor.mode === "anchor_absent") {
+    if (effective.anchorStatus === "absent") {
       console.log("task.md absent. Use --write to create from current diff:");
-    } else if (anchor.mode === "stale") {
-      console.log("task.md stale. Use --write to replace with current diff:");
+    } else if (!effective.useTaskMarkdown) {
+      console.log("task.md is not the active anchor. Use --write to replace with current diff:");
     } else {
       console.log("Preview only. Use --write to replace .devguard/task.md:");
     }

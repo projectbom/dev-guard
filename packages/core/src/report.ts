@@ -2,7 +2,10 @@ import type { CompactReport, CompactReportInput, GuardFinding } from "./types.js
 
 export function generateCompactReport(input: CompactReportInput): CompactReport {
   const task = extractSection(input.taskMarkdown, "목표") || firstMeaningfulLine(input.taskMarkdown) || "현재 task 없음";
-  const userRequest = input.runLog?.userRequest || input.runLog?.title || "저장된 userRequest 없음";
+  const isDiffFirst = input.anchorMode === "diff-first";
+  const userRequest = isDiffFirst
+    ? "inferred from current diff"
+    : input.runLog?.userRequest || input.runLog?.title || "저장된 userRequest 없음";
   const changedFiles = input.changedFiles;
   const check = summarizeCheck(input.checkReport.findings);
   const review = summarizeReview(input.runLog?.reviewResult);
@@ -19,7 +22,7 @@ export function generateCompactReport(input: CompactReportInput): CompactReport 
     changedFiles,
     check,
     review,
-    runId: input.runLog?.id ?? "none",
+    runId: isDiffFirst ? "ignored (stale anchor)" : (input.runLog?.id ?? "none"),
     nextAction
   };
 }

@@ -407,6 +407,7 @@ export interface CompactReportInput {
   checkReport: GuardReport;
   runLog?: DevGuardRunLog;
   scanStale?: boolean;
+  anchorMode?: "diff-first" | "task-first";
 }
 
 export interface CompactReport {

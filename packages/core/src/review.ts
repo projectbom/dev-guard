@@ -82,8 +82,8 @@ ${formatMemorySummaries(context.memorySummaries ?? [], context.projectMapMarkdow
 - task type이 i18n이면 hardcoded user-facing strings, locale mix, missing translation keys, aria/title/placeholder/metadata 누락 가능성을 diff에서 확인하세요.
 - i18n에서 기존 컴포넌트의 한국어 문자열이 t("key") 호출로 바뀌고, ko/en locale resource가 함께 추가되며 default locale이 ko로 유지되면 정상 migration으로 보세요. 이 경우 한국어 copy 삭제나 영어 덮어쓰기로 판단하지 마세요.
 - task type이 ui_text_cleanup이면 wording consistency, duplicate phrasing, awkward CTA wording을 확인하세요.
-- 원래 userRequest, generatedTaskMarkdown, generatedCodexPrompt가 run 기록에 있으면 이것을 최우선 기준으로 현재 diff와 비교하세요.
-- run match score가 낮거나 latest run does not match current diff 경고가 있으면, 오래된 run 기준으로 pass를 쉽게 내지 말고 현재 task.md와 실제 diff를 우선하세요.
+- review 기준 선택에서 "run: ignored" 또는 "using diff-inferred task"라고 표시된 경우, run 기록(userRequest/generatedTaskMarkdown/generatedCodexPrompt)은 참고용 reference로만 사용하고 요구사항 판단의 primary basis로 쓰지 마세요. 이 경우 현재 task.md(위에 제공된 목표)를 유일한 primary requirement로 사용하세요.
+- run이 제공된 경우에도 run match score가 낮거나 latest run does not match 경고가 있으면, run 기준으로 pass를 쉽게 내지 말고 현재 task.md와 실제 diff를 우선하세요.
 - 실제 diff에 나온 파일명, 수정된 문자열, 컴포넌트명, 조건문, import/export 변경을 먼저 근거로 쓰세요.
 - 영향도 힌트가 있으면 변경 파일의 reverse dependency를 참고해 필요한 검증 범위를 짚으세요.
 - 가능하면 수정된 문구 자체를 짧게 인용하세요. 단, 긴 코드는 인용하지 말고 요약하세요.

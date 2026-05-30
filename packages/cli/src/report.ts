@@ -3,17 +3,14 @@ import {
   defaultConfig,
   filterDevGuardContextFiles,
   generateCompactReport,
-  scoreTaskAnchorFreshness,
-  formatInferredDiffIntentClusters,
-  inferDiffIntentClusters,
-  inferredIntentToRequirement,
   type DevGuardConfig,
   type CodeGraphEntry
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
 import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
 import { getCommitGitChanges, getGitChanges } from "./git.js";
-import { readLatestRun } from "./runs.js";
+import { loadCurrentProjectIdentity } from "./project-identity.js";
+import { formatEffectiveTaskContext, resolveEffectiveTaskContext } from "./effective-task.js";
 
 interface ReportOptions {
   compact: boolean;
@@ -24,26 +21,27 @@ interface ReportOptions {
 
 export async function runReport(root: string, args: string[]): Promise<void> {
   const options = parseReportOptions(args);
-  const [gitChanges, taskText, rulesText, config, runLog, codeGraph] = await Promise.all([
+  const [gitChanges, taskText, rulesText, config, codeGraph, currentIdentity] = await Promise.all([
     options.since ? getCommitGitChanges(root, options.since) : getGitChanges(root),
     readTextFile(fromRoot(root, ".devguard/task.md")),
     readTextFile(fromRoot(root, ".devguard/rules.md")),
     readJsonFile<DevGuardConfig>(fromRoot(root, ".devguard/config.json"), defaultConfig),
-    readLatestRun(root),
-    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), []),
+    loadCurrentProjectIdentity(root).catch(() => undefined)
   ]);
   const reportChangeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
   const changedFiles = [...new Set(reportChangeFiles.map((file) => file.path))].sort();
-
-  // Task anchor freshness check — scoreTaskAnchorFreshness handles absent/placeholder/stale/fresh
-  const anchor = changedFiles.length > 0
-    ? scoreTaskAnchorFreshness({ taskMarkdown: taskText, diffText: gitChanges.diffText, changedFiles, changeFiles: reportChangeFiles })
-    : null;
-
-  const needsDiffTask = anchor?.mode === "stale" || anchor?.mode === "anchor_absent";
-  const effectiveTaskText = needsDiffTask
-    ? buildInferredTaskSummary(changedFiles, reportChangeFiles, gitChanges.diffText, codeGraph)
-    : taskText;
+  const effective = await resolveEffectiveTaskContext({
+    root,
+    taskMarkdown: taskText,
+    gitChanges: { diffText: gitChanges.diffText, changedFiles, changeFiles: reportChangeFiles },
+    changedFiles,
+    reviewChangeFiles: reportChangeFiles,
+    codeGraph,
+    currentIdentity
+  });
+  const effectiveTaskText = effective.effectiveTaskMarkdown;
+  const anchorMode = effective.useTaskMarkdown ? "task-first" : "diff-first";
 
   const checkReport = analyzeDiff({
     changedFiles: gitChanges.changedFiles,
@@ -58,16 +56,18 @@ export async function runReport(root: string, args: string[]): Promise<void> {
     taskMarkdown: effectiveTaskText,
     changedFiles,
     checkReport,
-    runLog,
-    scanStale: false
+    runLog: effective.effectiveRunLog,
+    scanStale: false,
+    anchorMode
   });
 
-  if (anchor?.mode === "anchor_absent") {
-    console.error("dev-guard report: task anchor: absent; using diff-inferred task");
-  } else if (anchor?.mode === "stale") {
-    console.error(`dev-guard report: task.md stale (match score ${anchor.matchScore}); using diff-inferred task`);
-  } else if (anchor?.mode === "uncertain") {
-    console.error(`dev-guard report: task.md uncertain (match score ${anchor.matchScore})`);
+  if (changedFiles.length > 0) {
+    for (const line of formatEffectiveTaskContext("dev-guard report", effective)) {
+      console.error(line);
+    }
+    if (effective.runSelection.warning) {
+      console.error(`dev-guard report: warning: ${effective.runSelection.warning}`);
+    }
   }
 
   const output = options.json ? `${JSON.stringify(report, null, 2)}\n` : options.compact ? formatCompactReport(report) : formatReport(report);
@@ -128,30 +128,4 @@ function formatReport(report: ReturnType<typeof generateCompactReport>): string 
     `Latest review: ${report.review}`,
     `Suggested next action: ${report.nextAction}`
   ].join("\n");
-}
-
-function buildInferredTaskSummary(
-  changedFiles: string[],
-  changeFiles: ReturnType<typeof filterDevGuardContextFiles>,
-  diffText: string,
-  codeGraph: CodeGraphEntry[]
-): string {
-  const clusters = inferDiffIntentClusters({ changedFiles, changeFiles, diffText, codeGraph });
-  const intent = clusters.primaryIntent;
-  return [
-    "# Inferred Current Task (task.md stale)",
-    "",
-    `- type: ${intent.type}`,
-    intent.subtype ? `- subtype: ${intent.subtype}` : "",
-    `- confidence: ${intent.confidence}`,
-    `- scope: ${intent.scope.join(", ") || changedFiles.slice(0, 3).join(", ")}`,
-    "",
-    `## Goal`,
-    `- ${inferredIntentToRequirement(intent)}`,
-    "",
-    `## Inferred from diff`,
-    `- ${formatInferredDiffIntentClusters(clusters)}`
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
 }

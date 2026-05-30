@@ -3,7 +3,6 @@ import {
   analyzeGeneratedDiffDrift,
   filterDiffTextForFiles,
   formatInferredDiffIntentClusters,
-  inferDiffIntentClusters,
   inferredIntentToRequirement,
   inferredIntentToTaskType,
   scoreWorkflowQuality,
@@ -14,15 +13,14 @@ import {
   isAlwaysIgnoredContextPath,
   NoneAIProvider,
   OpenAIProvider,
-  scoreTaskAnchorFreshness,
-  type DevGuardRunLog,
   type CodeGraphEntry,
+  type DevGuardRunLog,
   type FileSummary,
+  type InferredDiffIntentClusters,
   type ProjectIdentity,
   type ReviewResult,
   type ReviewFileContext,
-  type ReviewMemorySummary,
-  type TaskAnchorFreshnessResult
+  type ReviewMemorySummary
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
 import { loadConfig, readOpenAIApiKey } from "./config.js";
@@ -35,8 +33,14 @@ import {
   sameProjectIdentity
 } from "./project-identity.js";
 import { filterRelevantMarkdown } from "./rule-filter.js";
-import { listRunLogs, readLatestRun, readRunById, updateRunLog } from "./runs.js";
+import { updateRunLog } from "./runs.js";
 import { recordDriftTelemetry } from "./drift-telemetry.js";
+import {
+  formatEffectiveTaskBasis,
+  formatEffectiveRunSummary,
+  formatEffectiveTaskContext,
+  resolveEffectiveTaskContext
+} from "./effective-task.js";
 
 interface ReviewOptions {
   output?: string;
@@ -227,35 +231,48 @@ async function executeReview(
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
   const impactHints = buildImpactHints(reviewChangedFiles, codeGraph);
-
-  // Task anchor freshness check — handles absent/placeholder/stale/fresh
-  const anchor = resolveTaskAnchor({
+  const effective = await resolveEffectiveTaskContext({
+    root,
     taskMarkdown,
-    diffText,
+    gitChanges: { diffText, changedFiles: reviewChangedFiles, changeFiles: reviewChangeFiles },
+    reviewChangeFiles,
     changedFiles: reviewChangedFiles,
-    changeFiles: reviewChangeFiles,
-    forceTask: options.forceTask,
-    fromDiff: options.fromDiff
+    codeGraph,
+    currentIdentity,
+    options: {
+      forceTask: options.forceTask,
+      fromDiff: options.fromDiff,
+      noRun: options.noRun,
+      runId: options.runId
+    }
   });
-  if (!options.fromDiff) {
-    printAnchorStatus(anchor);
+  for (const line of formatEffectiveTaskContext("dev-guard review", effective)) {
+    console.error(line);
   }
-
-  const inferredClusters = inferDiffIntentClusters({ changedFiles: reviewChangedFiles, changeFiles: reviewChangeFiles, diffText, codeGraph, taskText: anchor.useTaskMarkdown ? taskMarkdown : undefined });
+  for (const line of formatEffectiveTaskBasis(effective)) {
+    console.error(`dev-guard review: ${line}`);
+  }
+  if (effective.runSelection.warning) {
+    console.error(`dev-guard review: warning: ${effective.runSelection.warning}`);
+  }
+  const inferredClusters = effective.inferredTask;
   const inferredIntent = inferredClusters.primaryIntent;
-  const effectiveTaskMarkdown = anchor.useTaskMarkdown
-    ? taskMarkdown
-    : `## Diff Intent\n${formatInferredDiffIntentClusters(inferredClusters)}\n\n${inferredIntentToRequirement(inferredIntent)}\n`;
+  const effectiveTaskMarkdown = effective.effectiveTaskMarkdown;
+
+  // Step 6: Filter rules against effective task
   const ruleRelevanceText = [effectiveTaskMarkdown, reviewChangedFiles.join("\n"), projectStateMarkdown, decisionsMarkdown].join("\n");
   const filteredRules = filterRelevantMarkdown(rulesMarkdown, ruleRelevanceText, currentIdentity);
   const filteredMistakes = filterRelevantMarkdown(mistakesMarkdown, ruleRelevanceText, currentIdentity);
-  const runSelection = await selectReviewRun(root, options, reviewChangedFiles, effectiveTaskMarkdown, currentIdentity);
-  printRunSelection(runSelection, anchor.useTaskMarkdown ? "task" : "diff");
+
   const untrackedFileContexts = await collectUntrackedFileContexts(
     root,
     reviewChangeFiles.filter((file) => file.source === "untracked").map((file) => file.path),
     extractReviewKeywords(effectiveTaskMarkdown)
   );
+
+  // Effective run: excluded when diff-first to prevent old requirement contamination
+  const effectiveRunLog = effective.effectiveRunLog;
+  const effectiveRunSummary = formatEffectiveRunSummary(effective);
 
   if (options.heuristic || providerName === "none") {
     console.error("dev-guard review");
@@ -273,32 +290,33 @@ async function executeReview(
       diffText,
       taskMarkdown: effectiveTaskMarkdown,
       inferredClusters,
-      taskAvailable: anchor.useTaskMarkdown,
-      anchorStale: anchor.stale,
-      anchorAbsent: anchor.anchorAbsent,
+      taskAvailable: effective.useTaskMarkdown,
+      anchorStale: !effective.useTaskMarkdown && (effective.anchorStatus === "stale" || effective.mode === "diff-first_uncertain"),
+      anchorAbsent: !effective.useTaskMarkdown && effective.anchorStatus === "absent",
+      anchorMode: effective.mode,
       untrackedFileContexts,
       impactHints,
       providerName
     });
     const drift = analyzeGeneratedDiffDrift({
-      requirementText: anchor.useTaskMarkdown ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
-      taskMarkdown: anchor.useTaskMarkdown ? taskMarkdown : "",
+      requirementText: effective.useTaskMarkdown ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
+      taskMarkdown: effective.useTaskMarkdown ? taskMarkdown : "",
       diffText: filterDiffTextForFiles(diffText, inferredIntent.changedFiles),
       changedFiles: inferredIntent.changedFiles,
       changeFiles: reviewChangeFiles.filter((file) => inferredIntent.changedFiles.includes(file.path)),
-      taskType: anchor.useTaskMarkdown ? undefined : inferredIntentToTaskType(inferredIntent)
+      taskType: effective.useTaskMarkdown ? undefined : inferredIntentToTaskType(inferredIntent)
     });
     await recordDriftTelemetry(root, {
       result: drift,
       source: "review:heuristic",
-      subtype: extractTaskSubtype(anchor.useTaskMarkdown ? taskMarkdown : effectiveTaskMarkdown)
+      subtype: extractTaskSubtype(effective.useTaskMarkdown ? taskMarkdown : effectiveTaskMarkdown)
     }).catch((error) => console.error(`dev-guard review: telemetry warning: ${errorMessage(error)}`));
     return {
       result: heuristicResult,
       taskMarkdown: effectiveTaskMarkdown,
       changedFiles: reviewChangedFiles,
       changeFiles: reviewChangeFiles,
-      runLog: runSelection.run
+      runLog: effectiveRunLog
     };
   }
 
@@ -335,24 +353,24 @@ async function executeReview(
       untrackedFileContexts,
       memorySummaries: memory.summaries,
       projectMapMarkdown: memory.projectMapMarkdown,
-      runLog: runSelection.run,
-      runSelectionSummary: formatRunSelectionSummary(runSelection),
+      runLog: effectiveRunLog,
+      runSelectionSummary: effectiveRunSummary,
       impactHints
     },
     model
   );
   const drift = analyzeGeneratedDiffDrift({
-    requirementText: anchor.useTaskMarkdown ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
-    taskMarkdown: anchor.useTaskMarkdown ? taskMarkdown : "",
+    requirementText: effective.useTaskMarkdown ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
+    taskMarkdown: effective.useTaskMarkdown ? taskMarkdown : "",
     diffText: filterDiffTextForFiles(diffText, inferredIntent.changedFiles),
     changedFiles: inferredIntent.changedFiles,
     changeFiles: reviewChangeFiles.filter((file) => inferredIntent.changedFiles.includes(file.path)),
-    taskType: anchor.useTaskMarkdown ? undefined : inferredIntentToTaskType(inferredIntent)
+    taskType: effective.useTaskMarkdown ? undefined : inferredIntentToTaskType(inferredIntent)
   });
   await recordDriftTelemetry(root, {
     result: drift,
     source: "review:ai",
-    subtype: extractTaskSubtype(anchor.useTaskMarkdown ? taskMarkdown : effectiveTaskMarkdown)
+    subtype: extractTaskSubtype(effective.useTaskMarkdown ? taskMarkdown : effectiveTaskMarkdown)
   }).catch((error) => console.error(`dev-guard review: telemetry warning: ${errorMessage(error)}`));
 
   return {
@@ -360,200 +378,8 @@ async function executeReview(
     taskMarkdown: effectiveTaskMarkdown,
     changedFiles: reviewChangedFiles,
     changeFiles: reviewChangeFiles,
-    runLog: runSelection.run
+    runLog: effectiveRunLog
   };
-}
-
-function hasTaskContext(taskMarkdown: string): boolean {
-  const text = taskMarkdown.trim();
-  return text.length > 0 && !/^#?\s*Current task/i.test(text) && !/Describe the requested change/i.test(text);
-}
-
-interface RunSelection {
-  run?: DevGuardRunLog;
-  score?: number;
-  mode: "none" | "explicit" | "latest" | "matched";
-  warning?: string;
-}
-
-async function selectReviewRun(
-  root: string,
-  options: ReviewTargetOptions,
-  changedFiles: string[],
-  taskMarkdown: string,
-  currentIdentity?: ProjectIdentity
-): Promise<RunSelection> {
-  if (options.noRun) {
-    return { mode: "none" };
-  }
-
-  if (options.runId === "latest") {
-    const latest = await readLatestRun(root);
-    if (!latest) {
-      return { mode: "latest", warning: "latest run not found" };
-    }
-    const identityWarning = runIdentityWarning("latest run", latest, currentIdentity);
-    if (identityWarning) {
-      return { mode: "latest", warning: identityWarning };
-    }
-
-    return {
-      run: latest,
-      score: scoreRunAgainstDiff(latest, changedFiles, taskMarkdown),
-      mode: "latest"
-    };
-  }
-
-  if (options.runId) {
-    const run = await readRunById(root, options.runId);
-    if (!run) {
-      return { mode: "explicit", warning: `run ${options.runId} not found; falling back to task.md` };
-    }
-    const identityWarning = runIdentityWarning(`run ${options.runId}`, run, currentIdentity);
-    if (identityWarning) {
-      return { mode: "explicit", warning: identityWarning };
-    }
-
-    return {
-      run,
-      score: scoreRunAgainstDiff(run, changedFiles, taskMarkdown),
-      mode: "explicit"
-    };
-  }
-
-  const [latest, runs] = await Promise.all([readLatestRun(root), listRunLogs(root)]);
-  const usableRuns = runs.filter((run) => !runIdentityWarning(`run ${run.id}`, run, currentIdentity));
-  const scoredRuns = usableRuns
-    .map((run) => ({ run, score: scoreRunAgainstDiff(run, changedFiles, taskMarkdown) }))
-    .filter((entry) => entry.score > 0)
-    .sort((a, b) => b.score - a.score || Date.parse(b.run.createdAt) - Date.parse(a.run.createdAt));
-  const selected = scoredRuns[0];
-  const latestIdentityWarning = latest ? runIdentityWarning("latest run", latest, currentIdentity) : undefined;
-  const latestScore = latest && !latestIdentityWarning ? scoreRunAgainstDiff(latest, changedFiles, taskMarkdown) : undefined;
-
-  if (selected) {
-    return {
-      run: selected.run,
-      score: selected.score,
-      mode: "matched",
-      warning: latestIdentityWarning ?? (latest && latest.id !== selected.run.id && latestScore === 0 ? "latest run does not match current diff" : undefined)
-    };
-  }
-
-  return {
-    mode: "none",
-    score: latestScore,
-    warning: latestIdentityWarning ?? (latest && latestScore === 0 ? "latest run does not match current diff" : undefined)
-  };
-}
-
-function runIdentityWarning(source: string, run: DevGuardRunLog, currentIdentity?: ProjectIdentity): string | undefined {
-  if (!currentIdentity) {
-    return undefined;
-  }
-
-  if (!run.projectIdentity) {
-    return `${source} has no project identity; ignoring run`;
-  }
-
-  return sameProjectIdentity(currentIdentity, run.projectIdentity) ? undefined : `${source} project identity mismatch; ignoring run`;
-}
-
-function printRunSelection(selection: RunSelection, taskMode: "task" | "diff" = "task"): void {
-  if (selection.warning) {
-    console.error(`dev-guard review: warning: ${selection.warning}`);
-  }
-
-  if (selection.run) {
-    console.error(`dev-guard review: using run ${selection.run.id}`);
-    console.error(`dev-guard review: run match score ${selection.score ?? 0}`);
-  } else if (taskMode === "task") {
-    console.error("dev-guard review: using task.md");
-    if (selection.score !== undefined) {
-      console.error(`dev-guard review: run match score ${selection.score}`);
-    }
-  } else {
-    console.error("dev-guard review: using diff-inferred task");
-    if (selection.score !== undefined) {
-      console.error(`dev-guard review: run match score ${selection.score}`);
-    }
-  }
-}
-
-function formatRunSelectionSummary(selection: RunSelection): string {
-  const lines = [
-    selection.run ? `- using run: ${selection.run.id}` : "- using task.md",
-    `- run match score: ${selection.score ?? "none"}`,
-    `- run selection mode: ${selection.mode}`
-  ];
-  if (selection.warning) {
-    lines.push(`- warning: ${selection.warning}`);
-  }
-  return lines.join("\n");
-}
-
-function scoreRunAgainstDiff(run: DevGuardRunLog, changedFiles: string[], taskMarkdown: string): number {
-  const changed = changedFiles.filter((file) => !isAlwaysIgnoredContextPath(file));
-  if (changed.length === 0) {
-    return 0;
-  }
-
-  const runHints = [
-    ...(run.relatedFiles ?? []),
-    ...(run.changedFilesAtCreation ?? []),
-    ...extractPathHints(run.generatedTaskMarkdown ?? ""),
-    ...extractPathHints(run.generatedCodexPrompt ?? "")
-  ].filter((path) => !isAlwaysIgnoredContextPath(path));
-  let score = 0;
-
-  for (const file of changed) {
-    if (runHints.some((hint) => pathHintMatches(file, hint))) {
-      score += 3;
-    }
-  }
-
-  if (run.userRequest && taskMarkdown.includes(run.userRequest.slice(0, 30))) {
-    score += 1;
-  }
-
-  return score;
-}
-
-function extractPathHints(markdown: string): string[] {
-  const roots = "(?:app|apps|pages|packages|src|lib|components|hooks|utils|supabase|styles|constants|public|docs)";
-  const matches = [...markdown.matchAll(new RegExp(`(?:^|[\\s\`])((?:\\./)?${roots}/[^\\s,)\\]\`]+)`, "g"))].map((match) =>
-    cleanPathHint(match[1] ?? "")
-  );
-  return [...new Set(matches.filter(Boolean))];
-}
-
-function cleanPathHint(path: string): string {
-  return path
-    .trim()
-    .replace(/^`|`$/g, "")
-    .replace(/^\.\//, "")
-    .replace(/\s+-\s+.*$/, "")
-    .replace(/\s+\([^)]*\)$/, "")
-    .replace(/[),.\]]+$/, "");
-}
-
-function pathHintMatches(file: string, hint: string): boolean {
-  const normalizedHint = cleanPathHint(hint);
-  if (!normalizedHint) {
-    return false;
-  }
-
-  if (normalizedHint.endsWith("/**")) {
-    const directory = normalizedHint.slice(0, -3);
-    return file === directory || file.startsWith(`${directory}/`);
-  }
-
-  if (normalizedHint.endsWith("/*")) {
-    const directory = normalizedHint.slice(0, -2);
-    return file.startsWith(`${directory}/`) && !file.slice(directory.length + 1).includes("/");
-  }
-
-  return file === normalizedHint || file.startsWith(`${normalizedHint}/`);
 }
 
 function parseReviewOptions(args: string[]): ReviewOptions {
@@ -628,10 +454,11 @@ function generateHeuristicReview(input: {
   changeFiles: GitChanges["changeFiles"];
   diffText: string;
   taskMarkdown: string;
-  inferredClusters?: ReturnType<typeof inferDiffIntentClusters>;
+  inferredClusters?: InferredDiffIntentClusters;
   taskAvailable?: boolean;
   anchorStale?: boolean;
   anchorAbsent?: boolean;
+  anchorMode?: string;
   untrackedFileContexts: ReviewFileContext[];
   impactHints: ReturnType<typeof buildImpactHints>;
   providerName: string;
@@ -733,6 +560,8 @@ function generateHeuristicReview(input: {
   const taskSourceNote = input.inferredClusters
     ? input.anchorAbsent
       ? `- task anchor absent; diff intent 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+      : input.anchorMode === "diff-first_uncertain"
+        ? `- task.md uncertain; diff intent 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
       : input.anchorStale
         ? `- task.md stale; diff intent 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
         : input.taskAvailable
@@ -999,70 +828,4 @@ function readOption(args: string[], name: string): string | undefined {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-interface TaskAnchorResolution {
-  useTaskMarkdown: boolean;
-  stale: boolean;
-  anchorAbsent: boolean;
-  freshnessResult: TaskAnchorFreshnessResult;
-}
-
-function resolveTaskAnchor(input: {
-  taskMarkdown: string;
-  diffText: string;
-  changedFiles: string[];
-  changeFiles: GitChanges["changeFiles"];
-  forceTask?: boolean;
-  fromDiff?: boolean;
-}): TaskAnchorResolution {
-  // Always run scoreTaskAnchorFreshness — it handles absent/placeholder internally
-  const result = scoreTaskAnchorFreshness({
-    taskMarkdown: input.taskMarkdown,
-    diffText: input.diffText,
-    changedFiles: input.changedFiles,
-    changeFiles: input.changeFiles
-  });
-
-  if (input.fromDiff) {
-    return { useTaskMarkdown: false, stale: false, anchorAbsent: false, freshnessResult: result };
-  }
-  if (result.mode === "anchor_absent") {
-    return { useTaskMarkdown: false, stale: false, anchorAbsent: true, freshnessResult: result };
-  }
-  if (input.forceTask) {
-    return { useTaskMarkdown: true, stale: false, anchorAbsent: false, freshnessResult: result };
-  }
-
-  const useTaskMarkdown = result.mode !== "stale";
-  return { useTaskMarkdown, stale: result.mode === "stale", anchorAbsent: false, freshnessResult: result };
-}
-
-function printAnchorStatus(anchor: TaskAnchorResolution): void {
-  const result = anchor.freshnessResult;
-
-  if (result.mode === "anchor_absent") {
-    console.error("dev-guard review: task anchor: absent");
-    console.error("dev-guard review: mode: diff-first inferred task");
-    return;
-  }
-
-  if (result.mode === "use_task") return; // No noise when fresh
-
-  const score = result.matchScore;
-  if (result.mode === "uncertain") {
-    console.error(`dev-guard review: task.md: uncertain (match score ${score}) — using task.md with caution`);
-    if (result.reasons.length > 0) {
-      console.error(`dev-guard review: anchor signals: ${result.reasons.slice(0, 2).join("; ")}`);
-    }
-  } else {
-    console.error(`dev-guard review: task.md: stale (match score ${score})`);
-    if (result.taskType) {
-      console.error(`dev-guard review: task.md task: ${result.taskType}`);
-    }
-    if (result.reasons.length > 0) {
-      console.error(`dev-guard review: anchor signals: ${result.reasons.slice(0, 2).join("; ")}`);
-    }
-    console.error(`dev-guard review: mode: diff-first inferred review`);
-  }
 }

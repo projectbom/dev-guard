@@ -1,15 +1,11 @@
 import {
   generateUpdateSuggestions,
-  scoreTaskAnchorFreshness,
-  inferDiffIntentClusters,
-  formatInferredDiffIntentClusters,
-  inferredIntentToRequirement,
   type CodeGraphEntry
 } from "@dev-guard/core";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges } from "./git.js";
-import { loadCurrentProjectIdentity, sameProjectIdentity } from "./project-identity.js";
-import { readLatestRun } from "./runs.js";
+import { loadCurrentProjectIdentity } from "./project-identity.js";
+import { formatEffectiveTaskContext, resolveEffectiveTaskContext } from "./effective-task.js";
 
 interface UpdateOptions {
   write: boolean;
@@ -24,19 +20,14 @@ const targetDocs = {
 } as const;
 
 export async function runUpdate(root: string, options: UpdateOptions): Promise<void> {
-  const [gitChanges, taskMarkdown, rulesMarkdown, mistakesMarkdown, runLog, identity, codeGraph] = await Promise.all([
+  const [gitChanges, taskMarkdown, rulesMarkdown, mistakesMarkdown, identity, codeGraph] = await Promise.all([
     getGitChanges(root),
     readTextFile(fromRoot(root, ".devguard/task.md")),
     readTextFile(fromRoot(root, ".devguard/rules.md")),
     readTextFile(fromRoot(root, ".devguard/mistakes.md")),
-    readLatestRun(root),
     loadCurrentProjectIdentity(root).catch(() => undefined),
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
-  const matchedRunLog = runLog && identity && runLog.projectIdentity && sameProjectIdentity(identity, runLog.projectIdentity) ? runLog : undefined;
-  if (runLog && !matchedRunLog) {
-    console.error("dev-guard update: warning: latest run project identity mismatch; ignoring run context.");
-  }
 
   if (gitChanges.changeFiles.length === 0 && !gitChanges.diffText.trim()) {
     console.log("dev-guard update");
@@ -45,33 +36,29 @@ export async function runUpdate(root: string, options: UpdateOptions): Promise<v
     return;
   }
 
-  // Task anchor check — use diff-inferred task when absent or stale
-  const anchor = scoreTaskAnchorFreshness({
+  const effective = await resolveEffectiveTaskContext({
+    root,
     taskMarkdown,
-    diffText: gitChanges.diffText,
-    changedFiles: gitChanges.changedFiles,
-    changeFiles: gitChanges.changeFiles
+    gitChanges,
+    codeGraph,
+    currentIdentity: identity
   });
-  const needsDiffTask = anchor.mode === "anchor_absent" || anchor.mode === "stale";
-  const effectiveTaskMarkdown = needsDiffTask
-    ? buildUpdateInferredTask(gitChanges.changedFiles, gitChanges.changeFiles, gitChanges.diffText, codeGraph)
-    : taskMarkdown;
-
-  if (anchor.mode === "anchor_absent") {
-    console.error("dev-guard update: task anchor: absent; using diff-inferred task for docs update");
-  } else if (anchor.mode === "stale") {
-    console.error(`dev-guard update: task.md stale (match score ${anchor.matchScore}); using diff-inferred task`);
+  for (const line of formatEffectiveTaskContext("dev-guard update", effective)) {
+    console.error(line);
+  }
+  if (effective.runSelection.warning) {
+    console.error(`dev-guard update: warning: ${effective.runSelection.warning}`);
   }
 
   const suggestions = generateUpdateSuggestions({
     changedFiles: gitChanges.changedFiles,
     changeFiles: gitChanges.changeFiles,
     diffText: gitChanges.diffText,
-    taskMarkdown: effectiveTaskMarkdown,
+    taskMarkdown: effective.effectiveTaskMarkdown,
     rulesMarkdown,
     mistakesMarkdown,
     includeContextFiles: options.includeContextFiles,
-    runLog: matchedRunLog
+    runLog: effective.effectiveRunLog
   });
 
   if (options.write) {
@@ -185,23 +172,4 @@ function extractActionItems(markdown: string): string[] {
   }
 
   return [...new Set(items)];
-}
-
-function buildUpdateInferredTask(
-  changedFiles: string[],
-  changeFiles: import("@dev-guard/core").ChangeFile[],
-  diffText: string,
-  codeGraph: CodeGraphEntry[]
-): string {
-  const clusters = inferDiffIntentClusters({ changedFiles, changeFiles, diffText, codeGraph });
-  const intent = clusters.primaryIntent;
-  return [
-    "# Inferred Current Task (anchor absent/stale)",
-    "",
-    `## Goal`,
-    `- ${inferredIntentToRequirement(intent)}`,
-    "",
-    "## Diff clusters",
-    `- ${formatInferredDiffIntentClusters(clusters)}`
-  ].join("\n");
 }

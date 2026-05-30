@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { formatInferredDiffIntentClusters, inferDiffIntentClusters, scoreTaskAnchorFreshness, type CodeGraphEntry } from "@dev-guard/core";
+import { formatInferredDiffIntentClusters, type CodeGraphEntry } from "@dev-guard/core";
 import { runCheck } from "./check.js";
 import { runConfigure } from "./configure.js";
 import { runDoctor } from "./doctor.js";
@@ -17,6 +17,8 @@ import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
 import { getGitChanges } from "./git.js";
+import { loadCurrentProjectIdentity } from "./project-identity.js";
+import { formatEffectiveTaskBlock, resolveEffectiveTaskContext } from "./effective-task.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -222,7 +224,6 @@ async function runDone(root: string): Promise<void> {
   const results: Array<{ name: string; ok: boolean; reason?: string; output: string[] }> = [];
   console.log("dev-guard done");
   console.log("policy: preview only; docs are not modified unless you run dev-guard update --write");
-  await printDoneTaskAnchor(root).catch(() => undefined);
 
   for (const step of [
     { name: "refresh", run: () => runRefresh(root, []) },
@@ -237,6 +238,9 @@ async function runDone(root: string): Promise<void> {
       results.push({ name: step.name, ok: true, output });
       for (const line of summarizeStepOutput(step.name, output)) {
         console.log(`  ${line}`);
+      }
+      if (step.name === "refresh") {
+        await printDoneTaskAnchor(root).catch(() => undefined);
       }
     } catch (error) {
       const reason = errorMessage(error);
@@ -257,52 +261,38 @@ async function runDone(root: string): Promise<void> {
 }
 
 async function printDoneTaskAnchor(root: string): Promise<void> {
-  const [gitChanges, taskMarkdown, codeGraph] = await Promise.all([
+  const [gitChanges, taskMarkdown, codeGraph, currentIdentity] = await Promise.all([
     getGitChanges(root),
     readTextFile(fromRoot(root, ".devguard/task.md")),
-    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), []),
+    loadCurrentProjectIdentity(root).catch(() => undefined)
   ]);
   if (gitChanges.changedFiles.length === 0) {
     return;
   }
-  const clusters = inferDiffIntentClusters({
-    changedFiles: gitChanges.changedFiles,
-    changeFiles: gitChanges.changeFiles,
-    diffText: gitChanges.diffText,
-    codeGraph
+  const effective = await resolveEffectiveTaskContext({
+    root,
+    taskMarkdown,
+    gitChanges,
+    codeGraph,
+    currentIdentity
   });
+  const clusters = effective.inferredTask;
   console.log(`self: inferred from diff`);
   console.log(`  ${formatInferredDiffIntentClusters(clusters)}`);
 
-  // Task anchor freshness check — handles absent/placeholder/stale/fresh
-  const anchor = scoreTaskAnchorFreshness({
-    taskMarkdown,
-    diffText: gitChanges.diffText,
-    changedFiles: gitChanges.changedFiles,
-    changeFiles: gitChanges.changeFiles
-  });
-
-  if (anchor.mode === "anchor_absent") {
-    console.log(`\n[done] task anchor check`);
-    console.log(`  task.md: absent`);
-    console.log(`  using: inferred task from current diff`);
+  console.log("");
+  for (const line of formatEffectiveTaskBlock("[done] task anchor check", effective)) {
+    console.log(line);
+  }
+  if (effective.runSelection.warning) {
+    console.log(`  warning: ${effective.runSelection.warning}`);
+  }
+  if (!effective.useTaskMarkdown) {
     console.log(`  next: run dev-guard infer-task --write if you want to save this as task.md`);
     if (clusters.primaryIntent.confidence === "low") {
       console.log('  hint: run dev-guard "<requirement>" for stronger task context');
     }
-  } else if (anchor.mode === "stale") {
-    console.log(`\n[done] task anchor check`);
-    console.log(`  task.md: stale`);
-    console.log(`  match score: ${anchor.matchScore}`);
-    if (anchor.taskType) console.log(`  task.md task: ${anchor.taskType}`);
-    console.log(`  using: inferred task from current diff`);
-    console.log(`  next: run dev-guard infer-task --write if you want to replace task.md`);
-  } else if (anchor.mode === "uncertain") {
-    console.log(`\n[done] task anchor check`);
-    console.log(`  task.md: uncertain (match score ${anchor.matchScore})`);
-    console.log(`  review output will flag if drift is high`);
-  } else {
-    console.log(`  task.md: fresh (match score ${anchor.matchScore})`);
   }
 }
 
