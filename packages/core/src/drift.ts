@@ -3,6 +3,7 @@ import type { ChangeFile, ContextPriority, DriftResult, TaskTypeResult, Workflow
 const domainPatterns: Record<string, RegExp> = {
   navigation_state: /(이전|뒤로|돌아가|previous|prev|back|navigation|navigate|router|history|질문|문제|question|state|상태|유지|바뀌|변경)/i,
   text_wording: /(문구|텍스트|단어|표현|copy|wording|카피|어색|모호|불분명|cta|제목)/i,
+  ui_interaction: /(클릭|누르면|눌렀을 때|열기|열리|펼치|전체 보기|목록 보기|상세 보기|modal|모달|sheet|바텀시트|expand|더보기|local state|ui state)/i,
   auth: /(login|로그인|auth|인증|session|token|cookie|oauth|callback)/i,
   i18n: /(영어|영문|다국어|i18n|locale|localization|translation|messages|번역|언어)/i,
   api: /(api|fetch|request|response|요청|응답|서버|network|네트워크)/i,
@@ -15,6 +16,7 @@ const domainPatterns: Record<string, RegExp> = {
 const allowedExpansionsByDomain: Record<string, string[]> = {
   navigation_state: ["router", "history", "state", "navigation", "question", "selection", "storage"],
   text_wording: ["copy", "wording", "cta", "title", "label", "placeholder", "aria"],
+  ui_interaction: ["click", "handler", "modal", "sheet", "expand", "local state", "list", "scroll", "responsive"],
   auth: ["session", "token", "cookie", "oauth", "callback", "provider"],
   i18n: ["locale", "messages", "translation", "dictionary", "language", "metadata", "aria"],
   api: ["fetch", "request", "response", "network", "server", "error"],
@@ -36,6 +38,7 @@ const zonePatterns: Record<string, RegExp> = {
   state_logic: /(state|상태|유지|restore|persist|localStorage|sessionStorage|store|reducer|history|sequence|순서)/i,
   routing: /(router|route|routing|navigate|navigation|redirect|pathname|href|뒤로|이전|돌아가|경로)/i,
   ui_copy: /(문구|텍스트|단어|표현|copy|wording|label|placeholder|aria-label|title|cta)/i,
+  ui_interaction: /(onClick|handler|modal|sheet|bottomSheet|drawer|dialog|popover|expand|selected|open|isOpen|펼치|열기|목록|상세)/i,
   styling: /(className|style|css|tailwind|layout|레이아웃|스타일|색상|spacing|margin|padding)/i,
   architecture: /(provider|wrapper|layout|architecture|구조|migration|refactor|dependency|interface)/i,
   config: /(config|환경\s*변수|env|package\.json|tsconfig|vite|next\.config|eslint|설정)/i,
@@ -47,6 +50,7 @@ const pathZonePatterns: Array<[string, RegExp]> = [
   ["routing", /(^|\/)(app|pages|routes?|router|navigation)(\/|$)|middleware\.|route\./i],
   ["state_logic", /(^|\/)(store|state|hooks|reducers?|context)(\/|$)|use[A-Z].*\.(ts|tsx)$/],
   ["ui_copy", /(copy|content|messages|locales?|i18n|translations?|labels?)/i],
+  ["ui_interaction", /(modal|sheet|drawer|dialog|popover|expand|interaction|card|components?)/i],
   ["styling", /\.(css|scss|sass|less)$|(^|\/)(styles?|theme)(\/|$)/i],
   ["architecture", /(^|\/)(providers?|layouts?|wrappers?|core|infra)(\/|$)/i],
   ["config", /(^|\/)(package\.json|tsconfig|vite\.config|next\.config|eslint|prettier|\.env)/i],
@@ -168,6 +172,9 @@ export function inferDomains(text: string, taskType?: TaskTypeResult): string[] 
     domains.add("navigation_state");
   } else if (taskType?.subtype === "bugfix.text_content" || taskType?.type === "ui_text_cleanup") {
     domains.add("text_wording");
+  } else if (taskType?.type === "ui_feature_polish") {
+    domains.add("text_wording");
+    domains.add("ui_interaction");
   } else if (taskType?.type === "i18n") {
     domains.add("i18n");
   } else if (taskType?.subtype === "bugfix.api_error") {
@@ -192,6 +199,9 @@ export function inferSemanticZones(text: string, paths: string[] = [], taskType?
     zones.add("state_logic");
   } else if (taskType?.subtype === "bugfix.text_content" || taskType?.type === "ui_text_cleanup") {
     zones.add("ui_copy");
+  } else if (taskType?.type === "ui_feature_polish") {
+    zones.add("ui_copy");
+    zones.add("ui_interaction");
   } else if (taskType?.type === "i18n") {
     zones.add("ui_copy");
     zones.add("config");

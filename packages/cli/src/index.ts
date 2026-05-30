@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { formatInferredDiffIntentClusters, inferDiffIntentClusters, type CodeGraphEntry } from "@dev-guard/core";
+import { formatInferredDiffIntentClusters, inferDiffIntentClusters, scoreTaskAnchorFreshness, type CodeGraphEntry } from "@dev-guard/core";
 import { runCheck } from "./check.js";
 import { runConfigure } from "./configure.js";
 import { runDoctor } from "./doctor.js";
+import { runInferTask } from "./infer-task.js";
 import { runInit } from "./init.js";
 import { parsePromptOptions, runPrompt } from "./prompt.js";
 import { runRefresh } from "./refresh.js";
@@ -14,7 +15,7 @@ import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
-import { fromRoot, readJsonFile } from "./fs.js";
+import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
 import { getGitChanges } from "./git.js";
 
 async function main(): Promise<void> {
@@ -42,6 +43,11 @@ async function main(): Promise<void> {
 
   if (command === "done") {
     await runDone(root);
+    return;
+  }
+
+  if (command === "infer-task") {
+    await runInferTask(root, process.argv.slice(3));
     return;
   }
 
@@ -179,10 +185,11 @@ Usage:
   dev-guard doctor
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
-  dev-guard review [--heuristic] [--fix-prompt] [--copy] [--output <file>] [--copy-fix] [--include-context-files] [--staged] [--commit <ref>] [--run <id|latest>] [--no-run]
+  dev-guard review [--heuristic] [--fix-prompt] [--copy] [--output <file>] [--copy-fix] [--include-context-files] [--staged] [--commit <ref>] [--run <id|latest>] [--no-run] [--task] [--from-diff]
   dev-guard fix-prompt [--copy] [--output <file>] [--include-context-files] [--staged] [--commit <ref>] [--run <id|latest>] [--no-run]
   dev-guard update [--write] [--include-context-files]
   dev-guard prompt [--compact] [--ultra-compact] [--density <ultra|compact|verbose>] [--max-prompt-tokens <n>] [--copy] [--output <file>] [--include-context-files] [--save-run]
+  dev-guard infer-task [--write]
   dev-guard task-ai "<requirement>" [--write] [--prompt] [--copy] [--save-run] [--context-files <n>] [--no-code-context] [--no-cache|--fresh] [--debug-context]
   dev-guard self "<requirement>" [--copy] [--check]
   dev-guard self-check
@@ -204,6 +211,7 @@ Commands:
   fix-prompt Generate a Codex-ready fix prompt from AI review
   update Generate project docs update candidates from current git diff
   prompt Generate a Codex-ready task prompt from project context
+  infer-task Preview (or write) a task.md inferred from the current git diff
   task-ai Generate .devguard/task.md from natural language with an AI provider
   self   Dogfood dev-guard on this repo and print an ultra-compact Codex prompt
   self-check Run build, local check, heuristic review, and doctor sequentially
@@ -214,7 +222,7 @@ async function runDone(root: string): Promise<void> {
   const results: Array<{ name: string; ok: boolean; reason?: string; output: string[] }> = [];
   console.log("dev-guard done");
   console.log("policy: preview only; docs are not modified unless you run dev-guard update --write");
-  await printDoneInferredIntent(root).catch(() => undefined);
+  await printDoneTaskAnchor(root).catch(() => undefined);
 
   for (const step of [
     { name: "refresh", run: () => runRefresh(root, []) },
@@ -248,9 +256,10 @@ async function runDone(root: string): Promise<void> {
   }
 }
 
-async function printDoneInferredIntent(root: string): Promise<void> {
-  const [gitChanges, codeGraph] = await Promise.all([
+async function printDoneTaskAnchor(root: string): Promise<void> {
+  const [gitChanges, taskMarkdown, codeGraph] = await Promise.all([
     getGitChanges(root),
+    readTextFile(fromRoot(root, ".devguard/task.md")),
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
   if (gitChanges.changedFiles.length === 0) {
@@ -264,8 +273,34 @@ async function printDoneInferredIntent(root: string): Promise<void> {
   });
   console.log(`self: inferred from diff`);
   console.log(`  ${formatInferredDiffIntentClusters(clusters)}`);
-  if (clusters.primaryIntent.confidence === "low") {
-    console.log('  hint: run dev-guard "<requirement>" before the next edit for stronger context');
+
+  // Task anchor freshness check
+  const hasTask = taskMarkdown.trim().length > 0 && !/^#?\s*Current task/i.test(taskMarkdown.trim());
+  if (hasTask) {
+    const anchor = scoreTaskAnchorFreshness({
+      taskMarkdown,
+      diffText: gitChanges.diffText,
+      changedFiles: gitChanges.changedFiles,
+      changeFiles: gitChanges.changeFiles
+    });
+    if (anchor.mode === "stale") {
+      console.log(`\n[done] task anchor check`);
+      console.log(`  task.md: stale`);
+      console.log(`  match score: ${anchor.matchScore}`);
+      if (anchor.taskType) console.log(`  task.md task: ${anchor.taskType}`);
+      console.log(`  using: inferred task from current diff`);
+      console.log(`  next: run dev-guard infer-task --write if you want to replace task.md`);
+    } else if (anchor.mode === "uncertain") {
+      console.log(`\n[done] task anchor check`);
+      console.log(`  task.md: uncertain (match score ${anchor.matchScore})`);
+      console.log(`  review output will flag if drift is high`);
+    } else {
+      console.log(`  task.md: fresh (match score ${anchor.matchScore})`);
+    }
+  } else {
+    if (clusters.primaryIntent.confidence === "low") {
+      console.log('  hint: run dev-guard "<requirement>" before the next edit for stronger context');
+    }
   }
 }
 

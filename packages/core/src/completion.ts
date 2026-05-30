@@ -70,6 +70,17 @@ const criteriaByType: Record<TaskType, TaskCompletionCriteria> = {
     reviewHints: ["변경된 UI surface와 기존 흐름의 연결만 확인한다."],
     blockingFailures: ["기존 기능 동작 훼손", "요청과 무관한 UI 구조 추가"]
   },
+  ui_feature_polish: {
+    requiredChecks: [
+      "실제 렌더 경로를 확인한 뒤 사용 중인 UI 컴포넌트만 수정한다.",
+      "요청된 문구 정리와 scoped UI interaction이 모두 동작한다.",
+      "PC/mobile에서 추가 view가 기존 흐름을 깨지 않고 열린다.",
+      "기존 데이터 저장/조회/인증/API 흐름은 유지된다."
+    ],
+    forbiddenPatterns: ["copy-only로 필요한 UI interaction 금지", "전체 화면 재설계", "데이터 모델/API/storage 변경", "사용 여부 확인 없는 old component 수정"],
+    reviewHints: ["local UI state, click handler, modal/sheet/inline expand는 허용된 변경으로 본다.", "데이터 구조, persistence, API, auth 변경은 별도 위험으로 본다."],
+    blockingFailures: ["문구만 바꾸고 필요한 전체 보기 interaction 누락", "old/unused 파일만 수정", "데이터 저장 구조 또는 API 변경"]
+  },
   bugfix: {
     requiredChecks: ["재현 조건이 설명된다.", "원인 후보와 수정 근거가 연결된다.", "회귀 검증 방법이 포함된다."],
     forbiddenPatterns: ["원인 불명 상태의 광범위 수정", "정상 동작하던 경로 훼손"],

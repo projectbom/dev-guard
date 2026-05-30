@@ -14,13 +14,16 @@ import {
   isAlwaysIgnoredContextPath,
   NoneAIProvider,
   OpenAIProvider,
+  scoreTaskAnchorFreshness,
+  formatTaskAnchorStatus,
   type DevGuardRunLog,
   type CodeGraphEntry,
   type FileSummary,
   type ProjectIdentity,
   type ReviewResult,
   type ReviewFileContext,
-  type ReviewMemorySummary
+  type ReviewMemorySummary,
+  type TaskAnchorFreshnessResult
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
 import { loadConfig, readOpenAIApiKey } from "./config.js";
@@ -47,6 +50,8 @@ interface ReviewOptions {
   runId?: string;
   noRun: boolean;
   heuristic: boolean;
+  forceTask: boolean;
+  fromDiff: boolean;
 }
 
 interface FixPromptOptions {
@@ -66,6 +71,8 @@ interface ReviewTargetOptions {
   runId?: string;
   noRun?: boolean;
   heuristic?: boolean;
+  forceTask?: boolean;
+  fromDiff?: boolean;
 }
 
 const untrackedFileLimit = 5;
@@ -74,7 +81,7 @@ const totalUntrackedCharacterLimit = 12000;
 
 export async function runReview(root: string, args: string[]): Promise<void> {
   const options = parseReviewOptions(args);
-  const review = await executeReview(root, options);
+  const review = await executeReview(root, { ...options });
 
   if (!review) {
     return;
@@ -222,14 +229,29 @@ async function executeReview(
   ]);
   const impactHints = buildImpactHints(reviewChangedFiles, codeGraph);
   const taskAvailable = hasTaskContext(taskMarkdown);
-  const inferredClusters = inferDiffIntentClusters({ changedFiles: reviewChangedFiles, changeFiles: reviewChangeFiles, diffText, codeGraph, taskText: taskAvailable ? taskMarkdown : undefined });
+
+  // Task anchor freshness check
+  const anchor = resolveTaskAnchor({
+    taskMarkdown,
+    taskAvailable,
+    diffText,
+    changedFiles: reviewChangedFiles,
+    changeFiles: reviewChangeFiles,
+    forceTask: options.forceTask,
+    fromDiff: options.fromDiff
+  });
+  printAnchorStatus(anchor);
+
+  const inferredClusters = inferDiffIntentClusters({ changedFiles: reviewChangedFiles, changeFiles: reviewChangeFiles, diffText, codeGraph, taskText: anchor.useTaskMarkdown ? taskMarkdown : undefined });
   const inferredIntent = inferredClusters.primaryIntent;
-  const effectiveTaskMarkdown = taskAvailable ? taskMarkdown : `## Diff Intent\n${formatInferredDiffIntentClusters(inferredClusters)}\n\n${inferredIntentToRequirement(inferredIntent)}\n`;
-  const ruleRelevanceText = [taskMarkdown, reviewChangedFiles.join("\n"), projectStateMarkdown, decisionsMarkdown].join("\n");
+  const effectiveTaskMarkdown = anchor.useTaskMarkdown
+    ? taskMarkdown
+    : `## Diff Intent\n${formatInferredDiffIntentClusters(inferredClusters)}\n\n${inferredIntentToRequirement(inferredIntent)}\n`;
+  const ruleRelevanceText = [effectiveTaskMarkdown, reviewChangedFiles.join("\n"), projectStateMarkdown, decisionsMarkdown].join("\n");
   const filteredRules = filterRelevantMarkdown(rulesMarkdown, ruleRelevanceText, currentIdentity);
   const filteredMistakes = filterRelevantMarkdown(mistakesMarkdown, ruleRelevanceText, currentIdentity);
-  const runSelection = await selectReviewRun(root, options, reviewChangedFiles, taskMarkdown, currentIdentity);
-  printRunSelection(runSelection);
+  const runSelection = await selectReviewRun(root, options, reviewChangedFiles, effectiveTaskMarkdown, currentIdentity);
+  printRunSelection(runSelection, anchor.useTaskMarkdown ? "task" : "diff");
   const untrackedFileContexts = await collectUntrackedFileContexts(
     root,
     reviewChangeFiles.filter((file) => file.source === "untracked").map((file) => file.path),
@@ -252,27 +274,28 @@ async function executeReview(
       diffText,
       taskMarkdown: effectiveTaskMarkdown,
       inferredClusters,
-      taskAvailable,
+      taskAvailable: anchor.useTaskMarkdown,
+      anchorStale: anchor.stale,
       untrackedFileContexts,
       impactHints,
       providerName
     });
     const drift = analyzeGeneratedDiffDrift({
-      requirementText: taskAvailable ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
-      taskMarkdown: taskAvailable ? taskMarkdown : "",
+      requirementText: anchor.useTaskMarkdown ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
+      taskMarkdown: anchor.useTaskMarkdown ? taskMarkdown : "",
       diffText: filterDiffTextForFiles(diffText, inferredIntent.changedFiles),
       changedFiles: inferredIntent.changedFiles,
       changeFiles: reviewChangeFiles.filter((file) => inferredIntent.changedFiles.includes(file.path)),
-      taskType: taskAvailable ? undefined : inferredIntentToTaskType(inferredIntent)
+      taskType: anchor.useTaskMarkdown ? undefined : inferredIntentToTaskType(inferredIntent)
     });
     await recordDriftTelemetry(root, {
       result: drift,
       source: "review:heuristic",
-      subtype: extractTaskSubtype(taskMarkdown)
+      subtype: extractTaskSubtype(anchor.useTaskMarkdown ? taskMarkdown : effectiveTaskMarkdown)
     }).catch((error) => console.error(`dev-guard review: telemetry warning: ${errorMessage(error)}`));
     return {
       result: heuristicResult,
-      taskMarkdown,
+      taskMarkdown: effectiveTaskMarkdown,
       changedFiles: reviewChangedFiles,
       changeFiles: reviewChangeFiles,
       runLog: runSelection.run
@@ -301,7 +324,7 @@ async function executeReview(
   const result = await generateReviewResult(
     provider,
     {
-      taskMarkdown,
+      taskMarkdown: effectiveTaskMarkdown,
       rulesMarkdown: filteredRules.filteredMarkdown,
       mistakesMarkdown: filteredMistakes.filteredMarkdown,
       projectStateMarkdown,
@@ -319,22 +342,22 @@ async function executeReview(
     model
   );
   const drift = analyzeGeneratedDiffDrift({
-    requirementText: taskAvailable ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
-    taskMarkdown: taskAvailable ? taskMarkdown : "",
+    requirementText: anchor.useTaskMarkdown ? taskMarkdown : inferredIntentToRequirement(inferredIntent),
+    taskMarkdown: anchor.useTaskMarkdown ? taskMarkdown : "",
     diffText: filterDiffTextForFiles(diffText, inferredIntent.changedFiles),
     changedFiles: inferredIntent.changedFiles,
     changeFiles: reviewChangeFiles.filter((file) => inferredIntent.changedFiles.includes(file.path)),
-    taskType: taskAvailable ? undefined : inferredIntentToTaskType(inferredIntent)
+    taskType: anchor.useTaskMarkdown ? undefined : inferredIntentToTaskType(inferredIntent)
   });
   await recordDriftTelemetry(root, {
     result: drift,
     source: "review:ai",
-    subtype: extractTaskSubtype(taskMarkdown)
+    subtype: extractTaskSubtype(anchor.useTaskMarkdown ? taskMarkdown : effectiveTaskMarkdown)
   }).catch((error) => console.error(`dev-guard review: telemetry warning: ${errorMessage(error)}`));
 
   return {
     result,
-    taskMarkdown,
+    taskMarkdown: effectiveTaskMarkdown,
     changedFiles: reviewChangedFiles,
     changeFiles: reviewChangeFiles,
     runLog: runSelection.run
@@ -436,7 +459,7 @@ function runIdentityWarning(source: string, run: DevGuardRunLog, currentIdentity
   return sameProjectIdentity(currentIdentity, run.projectIdentity) ? undefined : `${source} project identity mismatch; ignoring run`;
 }
 
-function printRunSelection(selection: RunSelection): void {
+function printRunSelection(selection: RunSelection, taskMode: "task" | "diff" = "task"): void {
   if (selection.warning) {
     console.error(`dev-guard review: warning: ${selection.warning}`);
   }
@@ -444,8 +467,13 @@ function printRunSelection(selection: RunSelection): void {
   if (selection.run) {
     console.error(`dev-guard review: using run ${selection.run.id}`);
     console.error(`dev-guard review: run match score ${selection.score ?? 0}`);
-  } else {
+  } else if (taskMode === "task") {
     console.error("dev-guard review: using task.md");
+    if (selection.score !== undefined) {
+      console.error(`dev-guard review: run match score ${selection.score}`);
+    }
+  } else {
+    console.error("dev-guard review: using diff-inferred task (task.md stale)");
     if (selection.score !== undefined) {
       console.error(`dev-guard review: run match score ${selection.score}`);
     }
@@ -539,12 +567,17 @@ function parseReviewOptions(args: string[]): ReviewOptions {
   const runId = readOption(args, "--run");
   const noRun = args.includes("--no-run");
   const heuristic = args.includes("--heuristic");
+  const forceTask = args.includes("--task");
+  const fromDiff = args.includes("--from-diff");
 
   if (staged && commit) {
     throw new Error("--staged와 --commit은 함께 사용할 수 없습니다.");
   }
   if (noRun && runId) {
     throw new Error("--no-run과 --run은 함께 사용할 수 없습니다.");
+  }
+  if (forceTask && fromDiff) {
+    throw new Error("--task와 --from-diff는 함께 사용할 수 없습니다.");
   }
 
   return {
@@ -557,7 +590,9 @@ function parseReviewOptions(args: string[]): ReviewOptions {
     commit,
     runId,
     noRun,
-    heuristic
+    heuristic,
+    forceTask,
+    fromDiff
   };
 }
 
@@ -595,6 +630,7 @@ function generateHeuristicReview(input: {
   taskMarkdown: string;
   inferredClusters?: ReturnType<typeof inferDiffIntentClusters>;
   taskAvailable?: boolean;
+  anchorStale?: boolean;
   untrackedFileContexts: ReviewFileContext[];
   impactHints: ReturnType<typeof buildImpactHints>;
   providerName: string;
@@ -693,6 +729,14 @@ function generateHeuristicReview(input: {
           "blocking/warning 항목을 먼저 해결한 뒤 pnpm run build를 실행하세요."
         ].join("\n");
 
+  const taskSourceNote = input.inferredClusters
+    ? input.anchorStale
+      ? `- task.md stale; diff intent 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+      : input.taskAvailable
+        ? `- task.md 기준으로 검토했습니다. diff clusters: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+        : `- 원본 task prompt 없이 diff intent를 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+    : "- task.md 기준으로 검토했습니다.";
+
   return {
     status,
     fixPrompt,
@@ -704,7 +748,7 @@ ${status === "pass" ? "로컬 휴리스틱 기준으로 커밋을 막을 명확�
 ## 요구사항 충족 여부
 - AI semantic review는 실행하지 않았습니다.
 - 현재 결과는 diff/static heuristic 기준입니다.
-${input.inferredClusters ? (input.taskAvailable ? `- task.md 기준으로 검토했습니다. diff clusters: ${formatInferredDiffIntentClusters(input.inferredClusters)}` : `- 원본 task prompt 없이 diff intent를 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`) : "- task.md 기준으로 검토했습니다."}
+${taskSourceNote}
 
 ## 범위 초과 수정
 ${largeChange ? "- broad diff입니다. task scope와 변경 파일을 다시 비교하세요." : "- 뚜렷한 broad scope 신호는 없습니다."}
@@ -952,4 +996,67 @@ function readOption(args: string[], name: string): string | undefined {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+interface TaskAnchorResolution {
+  useTaskMarkdown: boolean;
+  stale: boolean;
+  freshnessResult?: TaskAnchorFreshnessResult;
+}
+
+function resolveTaskAnchor(input: {
+  taskMarkdown: string;
+  taskAvailable: boolean;
+  diffText: string;
+  changedFiles: string[];
+  changeFiles: GitChanges["changeFiles"];
+  forceTask?: boolean;
+  fromDiff?: boolean;
+}): TaskAnchorResolution {
+  if (input.fromDiff) {
+    return { useTaskMarkdown: false, stale: false };
+  }
+  if (!input.taskAvailable) {
+    return { useTaskMarkdown: false, stale: false };
+  }
+  if (input.forceTask) {
+    return { useTaskMarkdown: true, stale: false };
+  }
+
+  const result = scoreTaskAnchorFreshness({
+    taskMarkdown: input.taskMarkdown,
+    diffText: input.diffText,
+    changedFiles: input.changedFiles,
+    changeFiles: input.changeFiles
+  });
+
+  const useTaskMarkdown = result.mode !== "stale";
+  return { useTaskMarkdown, stale: result.mode === "stale", freshnessResult: result };
+}
+
+function printAnchorStatus(anchor: TaskAnchorResolution): void {
+  const result = anchor.freshnessResult;
+  if (!result) return;
+
+  if (result.mode === "use_task") {
+    // No noise when task.md is fresh
+    return;
+  }
+
+  const score = result.matchScore;
+  if (result.mode === "uncertain") {
+    console.error(`dev-guard review: task.md: uncertain (match score ${score}) — using task.md with caution`);
+    if (result.reasons.length > 0) {
+      console.error(`dev-guard review: anchor signals: ${result.reasons.slice(0, 2).join("; ")}`);
+    }
+  } else {
+    console.error(`dev-guard review: task.md: stale (match score ${score})`);
+    if (result.taskType) {
+      console.error(`dev-guard review: task.md task: ${result.taskType}`);
+    }
+    if (result.reasons.length > 0) {
+      console.error(`dev-guard review: anchor signals: ${result.reasons.slice(0, 2).join("; ")}`);
+    }
+    console.error(`dev-guard review: mode: diff-first inferred review`);
+  }
 }

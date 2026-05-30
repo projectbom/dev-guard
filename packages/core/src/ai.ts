@@ -272,6 +272,9 @@ ${taskTypeStrategyNotes(taskType).map((note) => `- ${note}`).join("\n")}
 - userRequest/task/rules/run context에 없는 이해관계자를 만들지 마세요. 예: "디자이너의 요구", "PM 요구사항", "QA 피드백", "사용자 조사 결과", "브랜드 정책" 같은 표현은 사용자가 말한 경우에만 쓰세요.
 - UI-only 요청은 기능 추가가 아니라 배치/문구/시각적 위계/기존 흐름 통합으로 해석하세요.
 - UI-only 요청에서는 로직, 상태 관리, 저장/복원, fetch/auth, 결과 계산, routing 변경을 기본적으로 보호 대상으로 분리하세요.
+- copy cleanup과 "전체 보기/누르면/열기/펼치기/모달/바텀시트" 같은 작은 UI interaction이 함께 있으면 copy-only가 아니라 scoped UI change로 작성하세요.
+- scoped UI change에서는 클릭 이벤트, 선택 상태, local UI state, modal/right sheet/bottom sheet/inline expand를 허용하되 데이터 구조/API/auth/Supabase/OpenAI 연동은 보호하세요.
+- scoped UI change에서는 실제 렌더 경로를 먼저 확인하고, 사용되지 않는 old component를 단일 수정 대상으로 고정하지 마세요.
 - "현재 문제"는 사용자 원문 요구사항에 근거해서만 작성하세요.
 - 코드에 근거 없는 원인 추측을 하지 마세요.
 - 파일을 확인하지 못했거나 후보가 불충분하면 "현재 코드 확인 필요" 또는 "관련 파일 확인 필요"라고 적으세요.
@@ -343,6 +346,7 @@ function taskAISystemPrompt(): string {
     "For UI refinement requests about already-added behavior, frame the goal as natural integration or polish, not adding the feature again.",
     "Do not invent stakeholders such as designer, PM, QA, user research, or brand policy unless explicitly present in the user request or context.",
     "For UI-only tasks, protect logic, state, storage/restore, fetch/auth, result calculation, routing, animation state, cache, providers, and layout shells unless explicitly requested.",
+    "For ui_feature_polish tasks, allow scoped UI interactions such as click handlers, local component state, modal/sheet/inline expand, but protect data model, persistence, API, auth, and server integrations.",
     "Always include pnpm run build in verification commands.",
     "For product_strategy tasks, do not start code edits. Generate a discovery-first brief with reference files only, no primary edit targets until scope is approved.",
     "Do not invent causes that are not supported by the provided project files or user requirement.",
@@ -790,6 +794,19 @@ function postProcessTaskMarkdown(markdown: string, context: TaskAIContext, candi
       scopeFilledFromCandidates: changed
     };
   } else {
+    if (taskType.type === "ui_feature_polish") {
+      const featurePolishResult = applyUiFeaturePolishSections(nextMarkdown, context, candidates);
+      nextMarkdown = featurePolishResult.markdown;
+      changed ||= featurePolishResult.changed;
+      const compactResult = compactRedundantTaskSections(nextMarkdown);
+      nextMarkdown = compactResult.markdown;
+      changed ||= compactResult.changed;
+      return {
+        markdown: nextMarkdown,
+        scopeFilledFromCandidates: changed
+      };
+    }
+
     if (taskType.type === "product_strategy") {
       const productResult = applyProductStrategySections(nextMarkdown, context, candidates);
       nextMarkdown = productResult.markdown;
@@ -1164,6 +1181,14 @@ function interpretRequirement(requirement: string, taskType: TaskTypeResult): st
 }
 
 function notThisTaskLines(requirement: string, taskType: TaskTypeResult): string[] {
+  if (taskType.type === "ui_feature_polish") {
+    return [
+      "copy-only 문구 수정으로 잠그는 작업",
+      "전체 화면 UX 재설계",
+      "데이터 모델/API/auth/storage 변경",
+      "사용 여부 확인 없는 old component 수정"
+    ];
+  }
   if (taskType.type === "product_strategy") {
     return [
       "바로 UI 섹션이나 기능을 추가하는 구현 작업",
@@ -1258,6 +1283,116 @@ function inferExperimentIdeas(subtype: string | undefined, requirement: string):
     "- 테스트 진행 중 기대감 카피 강화",
     "- TikTok/Threads 스타일 짧은 문장 구조 실험"
   ];
+}
+
+function applyUiFeaturePolishSections(markdown: string, context: TaskAIContext, candidates: string[]): { markdown: string; changed: boolean } {
+  const references = candidates.slice(0, 8).map((candidate) => `- ${candidate} (후보)`);
+  const memoRequest = /(메모|memo|생각들|thought)/i.test(context.requirement);
+  let nextMarkdown = markdown;
+
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "목표",
+    memoRequest
+      ? "어색한 표현을 제거하고, 카드의 메모 개수 표시에서 해당 메모 전체를 볼 수 있는 scoped UI 기능을 추가한다."
+      : "요청된 문구 정리와 작은 UI interaction을 실제 렌더 경로 안에서 최소 범위로 반영한다."
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "현재 문제",
+    memoRequest
+      ? "특정 표현이 어색하게 노출되고 있고, 카드의 개수 표시가 어떤 메모를 의미하는지 전체 목록으로 확인할 수 없다."
+      : "문구 정리와 함께 사용자가 직접 확인하거나 열어볼 수 있는 작은 UI interaction이 필요하다."
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "수정 범위",
+    [
+      "- 현재 실제 화면 렌더 경로를 먼저 확인한다.",
+      "- 사용 중인 카드/목록/피드 컴포넌트를 기준으로 최소 수정한다.",
+      "- 필요 시 modal, right sheet, bottom sheet, inline expand 중 현재 UI에 맞는 방식으로 scoped view를 추가한다."
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "수정 대상",
+    references.length > 0 ? references.join("\n") : "- 실제 렌더 경로 확인 후 사용 중인 UI 컴포넌트만 후보로 확정한다."
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "참고 대상",
+    "- 렌더 경로 확인에 필요한 주변 page/shell/store 파일만 참고한다."
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "보호 대상",
+    [
+      "- 데이터 모델",
+      "- store/localStorage 저장 및 복원 로직",
+      "- API/auth/OpenAI/Supabase 연동",
+      "- 기존 입력/저장/표시 흐름",
+      "- unrelated UI"
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "반드시 지킬 규칙",
+    [
+      "- 실제 렌더 경로를 확인하기 전까지 특정 파일을 primary target으로 확정하지 않는다.",
+      "- 사용되지 않는 old component를 수정하지 않는다.",
+      "- copy-only 작업으로 처리하지 않는다.",
+      "- scoped UI state는 허용한다.",
+      "- 데이터 저장 구조/API/auth/OpenAI/Supabase 연동은 변경하지 않는다.",
+      "- 전체 화면 UX를 재설계하지 않는다."
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "허용되는 변경",
+    [
+      "- 요청된 표현 제거/문구 정리",
+      "- 카드의 개수/더보기 UI 클릭 이벤트",
+      "- 선택된 item/topic/group에 대한 local component state",
+      "- full list modal/right sheet/bottom sheet/inline expand",
+      "- 목록 scroll 처리",
+      "- PC/mobile 대응"
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "건드리면 안 되는 것",
+    [
+      "- 전체 화면 재설계",
+      "- 데이터 구조 대규모 변경",
+      "- 기존 store/localStorage 파괴",
+      "- unrelated file 수정",
+      "- 실제 사용 여부 확인 없는 old file 수정",
+      "- 인증/결제/분석/서버 로직 수정"
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "완료 조건",
+    [
+      "- 요청된 어색한 표현이 사용자 화면에서 제거된다.",
+      "- 카드의 개수 또는 더보기 UI를 통해 해당 항목 전체를 확인할 수 있다.",
+      "- PC와 모바일에서 목록 확인이 가능하다.",
+      "- 기존 입력/저장/표시 흐름이 유지된다.",
+      "- `pnpm run build`가 성공한다."
+    ].join("\n")
+  );
+  nextMarkdown = replaceMarkdownSection(nextMarkdown, "검증 명령어", "- `pnpm run build`");
+  nextMarkdown = replaceMarkdownSection(
+    nextMarkdown,
+    "Codex에게 전달할 주의사항",
+    [
+      "- 먼저 실제 렌더 경로와 사용 중인 컴포넌트를 확인한다.",
+      "- copy cleanup과 scoped interaction을 같은 작업 안에서 최소 범위로 처리한다.",
+      "- local UI state는 허용하지만 데이터 저장/API/auth/server 연동은 수정하지 않는다."
+    ].join("\n")
+  );
+
+  return { markdown: nextMarkdown, changed: true };
 }
 
 function applyProductStrategySections(markdown: string, context: TaskAIContext, candidates: string[]): { markdown: string; changed: boolean } {

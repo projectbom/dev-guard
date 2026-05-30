@@ -1,4 +1,15 @@
-import { analyzeDiff, defaultConfig, filterDevGuardContextFiles, generateCompactReport, type DevGuardConfig } from "@dev-guard/core";
+import {
+  analyzeDiff,
+  defaultConfig,
+  filterDevGuardContextFiles,
+  generateCompactReport,
+  scoreTaskAnchorFreshness,
+  formatInferredDiffIntentClusters,
+  inferDiffIntentClusters,
+  inferredIntentToRequirement,
+  type DevGuardConfig,
+  type CodeGraphEntry
+} from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
 import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
 import { getCommitGitChanges, getGitChanges } from "./git.js";
@@ -13,31 +24,50 @@ interface ReportOptions {
 
 export async function runReport(root: string, args: string[]): Promise<void> {
   const options = parseReportOptions(args);
-  const [gitChanges, taskText, rulesText, config, runLog] = await Promise.all([
+  const [gitChanges, taskText, rulesText, config, runLog, codeGraph] = await Promise.all([
     options.since ? getCommitGitChanges(root, options.since) : getGitChanges(root),
     readTextFile(fromRoot(root, ".devguard/task.md")),
     readTextFile(fromRoot(root, ".devguard/rules.md")),
     readJsonFile<DevGuardConfig>(fromRoot(root, ".devguard/config.json"), defaultConfig),
-    readLatestRun(root)
+    readLatestRun(root),
+    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
   const reportChangeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
   const changedFiles = [...new Set(reportChangeFiles.map((file) => file.path))].sort();
+
+  // Task anchor freshness check for report
+  const hasTask = taskText.trim().length > 0 && !/^#?\s*Current task/i.test(taskText.trim());
+  const anchor = hasTask && changedFiles.length > 0
+    ? scoreTaskAnchorFreshness({ taskMarkdown: taskText, diffText: gitChanges.diffText, changedFiles, changeFiles: reportChangeFiles })
+    : null;
+
+  const effectiveTaskText = anchor?.mode === "stale"
+    ? buildInferredTaskSummary(changedFiles, reportChangeFiles, gitChanges.diffText, codeGraph)
+    : taskText;
+
   const checkReport = analyzeDiff({
     changedFiles: gitChanges.changedFiles,
     changeFiles: gitChanges.changeFiles,
     diffText: gitChanges.diffText,
-    taskText,
+    taskText: effectiveTaskText,
     rulesText,
     config,
     includeContextFiles: false
   });
   const report = generateCompactReport({
-    taskMarkdown: taskText,
+    taskMarkdown: effectiveTaskText,
     changedFiles,
     checkReport,
     runLog,
     scanStale: false
   });
+
+  if (anchor?.mode === "stale") {
+    console.error(`dev-guard report: task.md stale (match score ${anchor.matchScore}); using diff-inferred task`);
+  } else if (anchor?.mode === "uncertain") {
+    console.error(`dev-guard report: task.md uncertain (match score ${anchor.matchScore})`);
+  }
+
   const output = options.json ? `${JSON.stringify(report, null, 2)}\n` : options.compact ? formatCompactReport(report) : formatReport(report);
 
   if (options.copy) {
@@ -96,4 +126,30 @@ function formatReport(report: ReturnType<typeof generateCompactReport>): string 
     `Latest review: ${report.review}`,
     `Suggested next action: ${report.nextAction}`
   ].join("\n");
+}
+
+function buildInferredTaskSummary(
+  changedFiles: string[],
+  changeFiles: ReturnType<typeof filterDevGuardContextFiles>,
+  diffText: string,
+  codeGraph: CodeGraphEntry[]
+): string {
+  const clusters = inferDiffIntentClusters({ changedFiles, changeFiles, diffText, codeGraph });
+  const intent = clusters.primaryIntent;
+  return [
+    "# Inferred Current Task (task.md stale)",
+    "",
+    `- type: ${intent.type}`,
+    intent.subtype ? `- subtype: ${intent.subtype}` : "",
+    `- confidence: ${intent.confidence}`,
+    `- scope: ${intent.scope.join(", ") || changedFiles.slice(0, 3).join(", ")}`,
+    "",
+    `## Goal`,
+    `- ${inferredIntentToRequirement(intent)}`,
+    "",
+    `## Inferred from diff`,
+    `- ${formatInferredDiffIntentClusters(clusters)}`
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
 }

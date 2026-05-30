@@ -66,6 +66,16 @@ const rules: TypeRule[] = [
     patterns: [/refactor|리팩터|리팩토|정리|중복\s*제거|구조\s*개선|cleanup|clean\s*up/i]
   },
   {
+    type: "ui_feature_polish",
+    strategy: "scoped-ui-change",
+    riskLevel: "medium",
+    requiresPhasing: false,
+    patterns: [
+      /(문구|텍스트|단어|표현|copy|wording|카피|어색).*(기능도\s*있어야|볼\s*수\s*있|전체\s*보기|전체를\s*볼|누르면|눌렀을\s*때|열기|열리|펼치기|목록\s*보기|상세\s*보기|모달|바텀시트|bottom\s*sheet|sheet|expand|더보기)/i,
+      /(기능도\s*있어야|볼\s*수\s*있|전체\s*보기|전체를\s*볼|누르면|눌렀을\s*때|클릭|열기|열리|펼치기|목록\s*보기|상세\s*보기|모달|바텀시트|bottom\s*sheet|sheet|expand|더보기)/i
+    ]
+  },
+  {
     type: "ui_text_cleanup",
     strategy: "copy-only",
     riskLevel: "low",
@@ -138,7 +148,7 @@ export function classifyTaskType(requirement: string): TaskTypeResult {
   return {
     type: selected.rule.type,
     subtype,
-    confidence: selected.rule.type === "i18n" || selected.rule.type === "product_strategy" ? "high" : confidenceFromScore(selected.score),
+    confidence: selected.rule.type === "i18n" || selected.rule.type === "product_strategy" || selected.rule.type === "ui_feature_polish" ? "high" : confidenceFromScore(selected.score),
     reasons: [...selected.reasons.slice(0, 4), ...(subtype ? [`subtype ${subtype}`] : [])],
     strategy: selected.rule.strategy,
     riskLevel: selected.rule.riskLevel,
@@ -158,6 +168,11 @@ export function taskTypeStrategyNotes(result: TaskTypeResult): string[] {
       "기존 UI 흐름 안에서 최소 수정한다.",
       "새 섹션, 새 카드, 새 기능 추가를 피한다.",
       "상태/동작 로직은 보호한다."
+    ],
+    ui_feature_polish: [
+      "copy-only로 잠그지 않고 scoped UI interaction으로 제한한다.",
+      "실제 렌더 경로를 먼저 확인한 뒤 사용 중인 컴포넌트만 최소 수정한다.",
+      "클릭 이벤트, local UI state, modal/sheet/inline expand는 허용하되 데이터/API/storage는 보호한다."
     ],
     product_strategy: [
       "바로 코드 수정하지 않고 product brief를 먼저 정의한다.",
@@ -235,6 +250,7 @@ function rulePriority(type: TaskType): number {
     "performance",
     "bugfix",
     "docs",
+    "ui_feature_polish",
     "ui_text_cleanup",
     "ui_polish",
     "product_strategy",
@@ -269,6 +285,25 @@ function inferSubtype(type: TaskType, requirement: string): string | undefined {
 
   if (type === "ui_text_cleanup") {
     return "ui_text_cleanup.wording";
+  }
+  if (type === "ui_feature_polish") {
+    const subtypes = new Set<string>();
+    if (/(문구|텍스트|단어|표현|copy|wording|카피|어색|걷어내|제거)/i.test(requirement)) {
+      subtypes.add("wording_cleanup");
+    }
+    if (/(메모|memo).*(전체|목록|보기|볼 수)|생각들|thought/i.test(requirement)) {
+      subtypes.add("memo_list_view");
+    }
+    if (/(카드|card).*(누르면|클릭|우측|상단|숫자|개)/i.test(requirement)) {
+      subtypes.add("card_interaction");
+    }
+    if (/(상세|detail)/i.test(requirement)) {
+      subtypes.add("detail_view");
+    }
+    if (/(펼치|expand|더보기|열리|열기|모달|바텀시트|sheet)/i.test(requirement)) {
+      subtypes.add("expand_view");
+    }
+    return subtypes.size > 0 ? [...subtypes].join("+") : "card_interaction";
   }
   if (type === "ui_polish") {
     if (/(명령|command|출력|output|요약|summary|help|status|done|preview|watch|review|check|task-ai|prompt|doctor|update)/i.test(requirement)) {
@@ -307,7 +342,9 @@ function extractDomainKeywords(requirement: string): string[] {
     [/(상태|state|유지|바뀌|변경됨)/i, ["state"]],
     [/(결과|result)/i, ["result"]],
     [/(문구|텍스트|단어|표현|copy|wording)/i, ["text", "wording"]],
-    [/(재미|유행|바이럴|공유|차별화|후킹|리텐션|매력|컨셉|포지셔닝|밈)/i, ["product", "engagement", "positioning"]],
+    [/(brain|생각|메모|memo|thought)/i, ["brain-ui", "ui-interaction"]],
+    [/(카드|card|누르면|클릭|전체 보기|목록|상세|모달|바텀시트|펼치|열리|열기)/i, ["ui-interaction"]],
+    [/(재미|유행|바이럴|공유하고\s*싶|다시\s*하고\s*싶|차별화|후킹|리텐션|매력|컨셉|포지셔닝|밈)/i, ["product", "engagement", "positioning"]],
     [/(영어|영문|다국어|i18n|locale|translation|언어)/i, ["i18n", "locale"]],
     [/(auth|login|로그인|인증)/i, ["auth"]],
     [/(api|fetch|서버|요청|응답)/i, ["api"]]

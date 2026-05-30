@@ -165,6 +165,7 @@ export interface TaskAIFileCandidate {
 export type TaskType =
   | "ui_text_cleanup"
   | "ui_polish"
+  | "ui_feature_polish"
   | "bugfix"
   | "feature_add"
   | "product_strategy"
@@ -416,4 +417,15 @@ export interface CompactReport {
   review: string;
   runId: string;
   nextAction: string;
+}
+
+export type TaskAnchorMode = "use_task" | "uncertain" | "stale";
+
+export interface TaskAnchorFreshnessResult {
+  matchScore: number;
+  mode: TaskAnchorMode;
+  taskType?: string;
+  diffType?: string;
+  reasons: string[];
+  drift: DriftResult;
 }

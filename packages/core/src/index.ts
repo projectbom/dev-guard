@@ -19,6 +19,7 @@ export {
   inferSemanticZones,
   scoreWorkflowQuality
 } from "./drift.js";
+export { scoreTaskAnchorFreshness, formatTaskAnchorStatus } from "./task-anchor.js";
 export {
   formatInferredDiffIntent,
   formatInferredDiffIntentClusters,
@@ -70,7 +71,9 @@ export type {
   ImpactHint,
   InferredDiffIntent,
   InferredDiffIntentClusters,
-  Severity
+  Severity,
+  TaskAnchorFreshnessResult,
+  TaskAnchorMode
 } from "./types.js";
 export type { UpdateSuggestionInput, UpdateSuggestions } from "./types.js";
 export type {

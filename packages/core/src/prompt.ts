@@ -200,6 +200,9 @@ function resolveDensity(input: CodexPromptInput, changeFiles: ChangeFile[]): Pro
   if (task.type === "architecture" || task.type === "migration") {
     return "verbose";
   }
+  if (task.type === "ui_feature_polish") {
+    return "compact";
+  }
   if (task.type === "bugfix") {
     return complex >= 3 ? "compact+" : "compact";
   }
@@ -371,6 +374,12 @@ function formatUltraSuccess(taskSections: TaskSections): string {
 
   if (/cli_output_polish|명령|command|출력|output|요약|summary|preview|done|status|help/.test(source)) {
     flags.add("cli_output_clear=true");
+  }
+  if (/ui_feature_polish|scoped-ui-change|memo_list_view|card_interaction|modal|bottom sheet|바텀시트|전체 보기|클릭/.test(source)) {
+    flags.add("wording_removed=true");
+    flags.add("memo_list_view=true");
+    flags.add("mobile_pc_ok=true");
+    flags.add("build=true");
   }
   if (/done/.test(source)) {
     flags.add("done_output_clear=true");
@@ -580,6 +589,11 @@ function formatSymbolicProtection(taskSections: TaskSections, rulesMarkdown: str
     ]) {
       flags.add(flag);
     }
+  }
+  if (task.type === "ui_feature_polish" || /scoped-ui-change|memo_list_view|card_interaction|modal|bottom sheet|바텀시트|inline expand/.test(text)) {
+    flags.add("allow_click_handler=true");
+    flags.add("allow_local_ui_state=true");
+    flags.add("allow_modal_or_sheet=true");
   }
   if (/ui|화면|layout|레이아웃|redesign|리디자인/.test(text)) {
     flags.add("avoid_ui_redesign=true");
