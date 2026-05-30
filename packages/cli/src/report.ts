@@ -35,13 +35,13 @@ export async function runReport(root: string, args: string[]): Promise<void> {
   const reportChangeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
   const changedFiles = [...new Set(reportChangeFiles.map((file) => file.path))].sort();
 
-  // Task anchor freshness check for report
-  const hasTask = taskText.trim().length > 0 && !/^#?\s*Current task/i.test(taskText.trim());
-  const anchor = hasTask && changedFiles.length > 0
+  // Task anchor freshness check — scoreTaskAnchorFreshness handles absent/placeholder/stale/fresh
+  const anchor = changedFiles.length > 0
     ? scoreTaskAnchorFreshness({ taskMarkdown: taskText, diffText: gitChanges.diffText, changedFiles, changeFiles: reportChangeFiles })
     : null;
 
-  const effectiveTaskText = anchor?.mode === "stale"
+  const needsDiffTask = anchor?.mode === "stale" || anchor?.mode === "anchor_absent";
+  const effectiveTaskText = needsDiffTask
     ? buildInferredTaskSummary(changedFiles, reportChangeFiles, gitChanges.diffText, codeGraph)
     : taskText;
 
@@ -62,7 +62,9 @@ export async function runReport(root: string, args: string[]): Promise<void> {
     scanStale: false
   });
 
-  if (anchor?.mode === "stale") {
+  if (anchor?.mode === "anchor_absent") {
+    console.error("dev-guard report: task anchor: absent; using diff-inferred task");
+  } else if (anchor?.mode === "stale") {
     console.error(`dev-guard report: task.md stale (match score ${anchor.matchScore}); using diff-inferred task`);
   } else if (anchor?.mode === "uncertain") {
     console.error(`dev-guard report: task.md uncertain (match score ${anchor.matchScore})`);

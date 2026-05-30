@@ -19,7 +19,7 @@ export {
   inferSemanticZones,
   scoreWorkflowQuality
 } from "./drift.js";
-export { scoreTaskAnchorFreshness, formatTaskAnchorStatus } from "./task-anchor.js";
+export { scoreTaskAnchorFreshness, formatTaskAnchorStatus, isTaskAnchorAbsent } from "./task-anchor.js";
 export {
   formatInferredDiffIntent,
   formatInferredDiffIntentClusters,

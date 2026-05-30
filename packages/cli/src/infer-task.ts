@@ -23,7 +23,7 @@ export async function runInferTask(root: string, args: string[]): Promise<void> 
   if (gitChanges.changedFiles.length === 0) {
     console.log("dev-guard infer-task");
     console.log("");
-    console.log("변경 사항 없음: infer할 diff가 없습니다.");
+    console.log("no diff to infer task from: 변경 사항이 없습니다.");
     return;
   }
 
@@ -35,32 +35,28 @@ export async function runInferTask(root: string, args: string[]): Promise<void> 
   });
   const intent = clusters.primaryIntent;
 
-  // Check if existing task.md is stale
-  const hasTask = taskMarkdown.trim().length > 0 && !/^#?\s*Current task/i.test(taskMarkdown.trim());
-  const anchor = hasTask
-    ? scoreTaskAnchorFreshness({
-        taskMarkdown,
-        diffText: gitChanges.diffText,
-        changedFiles: gitChanges.changedFiles,
-        changeFiles: gitChanges.changeFiles
-      })
-    : null;
+  // Task anchor check — handles absent/placeholder/stale/fresh
+  const anchor = scoreTaskAnchorFreshness({
+    taskMarkdown,
+    diffText: gitChanges.diffText,
+    changedFiles: gitChanges.changedFiles,
+    changeFiles: gitChanges.changeFiles
+  });
 
   console.log("dev-guard infer-task");
   console.log("");
 
-  if (anchor) {
-    const scoreLabel = `match score ${anchor.matchScore}`;
-    if (anchor.mode === "stale") {
-      console.log(`task.md: stale (${scoreLabel})`);
-      if (anchor.taskType) console.log(`task.md task: ${anchor.taskType}`);
-    } else if (anchor.mode === "uncertain") {
-      console.log(`task.md: uncertain (${scoreLabel})`);
-    } else {
-      console.log(`task.md: fresh (${scoreLabel})`);
-    }
-    console.log("");
+  if (anchor.mode === "anchor_absent") {
+    console.log("task anchor: absent");
+  } else if (anchor.mode === "stale") {
+    console.log(`task.md: stale (match score ${anchor.matchScore})`);
+    if (anchor.taskType) console.log(`task.md task: ${anchor.taskType}`);
+  } else if (anchor.mode === "uncertain") {
+    console.log(`task.md: uncertain (match score ${anchor.matchScore})`);
+  } else {
+    console.log(`task.md: fresh (match score ${anchor.matchScore})`);
   }
+  console.log("");
 
   const inferredMarkdown = buildInferredTaskMarkdown(intent, clusters, gitChanges.changedFiles);
 
@@ -93,11 +89,14 @@ export async function runInferTask(root: string, args: string[]): Promise<void> 
     console.log("[written] .devguard/task.md updated with inferred task.");
   } else {
     console.log("");
-    console.log("Preview only. Use --write to replace .devguard/task.md:");
-    console.log("  dev-guard infer-task --write");
-    if (anchor?.mode === "stale") {
-      console.log("  (recommended: task.md is stale)");
+    if (anchor.mode === "anchor_absent") {
+      console.log("task.md absent. Use --write to create from current diff:");
+    } else if (anchor.mode === "stale") {
+      console.log("task.md stale. Use --write to replace with current diff:");
+    } else {
+      console.log("Preview only. Use --write to replace .devguard/task.md:");
     }
+    console.log("  dev-guard infer-task --write");
   }
 }
 

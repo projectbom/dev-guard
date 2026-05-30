@@ -419,7 +419,7 @@ export interface CompactReport {
   nextAction: string;
 }
 
-export type TaskAnchorMode = "use_task" | "uncertain" | "stale";
+export type TaskAnchorMode = "use_task" | "uncertain" | "stale" | "anchor_absent";
 
 export interface TaskAnchorFreshnessResult {
   matchScore: number;

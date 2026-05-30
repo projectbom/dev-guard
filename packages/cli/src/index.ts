@@ -274,33 +274,35 @@ async function printDoneTaskAnchor(root: string): Promise<void> {
   console.log(`self: inferred from diff`);
   console.log(`  ${formatInferredDiffIntentClusters(clusters)}`);
 
-  // Task anchor freshness check
-  const hasTask = taskMarkdown.trim().length > 0 && !/^#?\s*Current task/i.test(taskMarkdown.trim());
-  if (hasTask) {
-    const anchor = scoreTaskAnchorFreshness({
-      taskMarkdown,
-      diffText: gitChanges.diffText,
-      changedFiles: gitChanges.changedFiles,
-      changeFiles: gitChanges.changeFiles
-    });
-    if (anchor.mode === "stale") {
-      console.log(`\n[done] task anchor check`);
-      console.log(`  task.md: stale`);
-      console.log(`  match score: ${anchor.matchScore}`);
-      if (anchor.taskType) console.log(`  task.md task: ${anchor.taskType}`);
-      console.log(`  using: inferred task from current diff`);
-      console.log(`  next: run dev-guard infer-task --write if you want to replace task.md`);
-    } else if (anchor.mode === "uncertain") {
-      console.log(`\n[done] task anchor check`);
-      console.log(`  task.md: uncertain (match score ${anchor.matchScore})`);
-      console.log(`  review output will flag if drift is high`);
-    } else {
-      console.log(`  task.md: fresh (match score ${anchor.matchScore})`);
-    }
-  } else {
+  // Task anchor freshness check — handles absent/placeholder/stale/fresh
+  const anchor = scoreTaskAnchorFreshness({
+    taskMarkdown,
+    diffText: gitChanges.diffText,
+    changedFiles: gitChanges.changedFiles,
+    changeFiles: gitChanges.changeFiles
+  });
+
+  if (anchor.mode === "anchor_absent") {
+    console.log(`\n[done] task anchor check`);
+    console.log(`  task.md: absent`);
+    console.log(`  using: inferred task from current diff`);
+    console.log(`  next: run dev-guard infer-task --write if you want to save this as task.md`);
     if (clusters.primaryIntent.confidence === "low") {
-      console.log('  hint: run dev-guard "<requirement>" before the next edit for stronger context');
+      console.log('  hint: run dev-guard "<requirement>" for stronger task context');
     }
+  } else if (anchor.mode === "stale") {
+    console.log(`\n[done] task anchor check`);
+    console.log(`  task.md: stale`);
+    console.log(`  match score: ${anchor.matchScore}`);
+    if (anchor.taskType) console.log(`  task.md task: ${anchor.taskType}`);
+    console.log(`  using: inferred task from current diff`);
+    console.log(`  next: run dev-guard infer-task --write if you want to replace task.md`);
+  } else if (anchor.mode === "uncertain") {
+    console.log(`\n[done] task anchor check`);
+    console.log(`  task.md: uncertain (match score ${anchor.matchScore})`);
+    console.log(`  review output will flag if drift is high`);
+  } else {
+    console.log(`  task.md: fresh (match score ${anchor.matchScore})`);
   }
 }
 

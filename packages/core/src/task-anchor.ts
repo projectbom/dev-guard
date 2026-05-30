@@ -2,8 +2,43 @@ import type { ChangeFile, DriftResult, TaskAnchorFreshnessResult } from "./types
 import { analyzeGeneratedDiffDrift } from "./drift.js";
 
 /**
+ * Returns true when task.md is missing, empty, or contains only template placeholder content.
+ * Used to distinguish "no active task" (anchor_absent) from "stale task" (stale).
+ */
+export function isTaskAnchorAbsent(markdown: string): boolean {
+  const text = markdown.trim();
+  if (!text) return true;
+
+  // Default template placeholder text
+  if (/Describe the (exact request scope|requested change)/i.test(text)) return true;
+
+  // Only a title line and nothing else
+  if (/^#?\s*Current Task\s*$/im.test(text) && text.length < 100) return true;
+
+  // Count substantive lines: not headings, not empty bullets, not blank
+  const substantiveLines = text
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0 && !l.startsWith("#") && !/^-\s*$/.test(l));
+
+  // Fewer than 3 substantive lines → effectively no task
+  if (substantiveLines.length < 3) return true;
+
+  // Total meaningful characters (strip structural markup)
+  const meaningful = substantiveLines
+    .join(" ")
+    .replace(/[-*_`|>#]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (meaningful.length < 40) return true;
+
+  return false;
+}
+
+/**
  * Scores how well the current task.md matches the current git diff.
  * Returns a matchScore 0-100 (higher = better match) and a mode:
+ *   - "anchor_absent": task.md is missing, empty, or placeholder-only
  *   - "use_task" (score >= 60): task.md is fresh, use it normally
  *   - "uncertain" (30-59): task.md may be stale, use with caution
  *   - "stale" (< 30): task.md is stale, switch to diff-first review
@@ -16,11 +51,11 @@ export function scoreTaskAnchorFreshness(input: {
 }): TaskAnchorFreshnessResult {
   const taskMarkdown = input.taskMarkdown.trim();
 
-  if (!taskMarkdown) {
+  if (isTaskAnchorAbsent(taskMarkdown)) {
     return {
       matchScore: 0,
-      mode: "stale",
-      reasons: ["task.md is empty"],
+      mode: "anchor_absent",
+      reasons: ["task.md is absent or placeholder"],
       drift: emptyDrift()
     };
   }
@@ -54,6 +89,9 @@ export function scoreTaskAnchorFreshness(input: {
 }
 
 export function formatTaskAnchorStatus(result: TaskAnchorFreshnessResult, taskLabel?: string, diffLabel?: string): string {
+  if (result.mode === "anchor_absent") {
+    return "task anchor: absent";
+  }
   const score = `match score ${result.matchScore}`;
   if (result.mode === "use_task") {
     return `task.md: fresh (${score})`;
@@ -69,7 +107,9 @@ export function formatTaskAnchorStatus(result: TaskAnchorFreshnessResult, taskLa
     taskPart,
     diffPart,
     "mode: diff-first inferred review"
-  ].filter(Boolean).join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function computeFileHintBonus(taskMarkdown: string, changedFiles: string[]): number {

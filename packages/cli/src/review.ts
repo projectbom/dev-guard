@@ -15,7 +15,6 @@ import {
   NoneAIProvider,
   OpenAIProvider,
   scoreTaskAnchorFreshness,
-  formatTaskAnchorStatus,
   type DevGuardRunLog,
   type CodeGraphEntry,
   type FileSummary,
@@ -228,19 +227,19 @@ async function executeReview(
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
   const impactHints = buildImpactHints(reviewChangedFiles, codeGraph);
-  const taskAvailable = hasTaskContext(taskMarkdown);
 
-  // Task anchor freshness check
+  // Task anchor freshness check — handles absent/placeholder/stale/fresh
   const anchor = resolveTaskAnchor({
     taskMarkdown,
-    taskAvailable,
     diffText,
     changedFiles: reviewChangedFiles,
     changeFiles: reviewChangeFiles,
     forceTask: options.forceTask,
     fromDiff: options.fromDiff
   });
-  printAnchorStatus(anchor);
+  if (!options.fromDiff) {
+    printAnchorStatus(anchor);
+  }
 
   const inferredClusters = inferDiffIntentClusters({ changedFiles: reviewChangedFiles, changeFiles: reviewChangeFiles, diffText, codeGraph, taskText: anchor.useTaskMarkdown ? taskMarkdown : undefined });
   const inferredIntent = inferredClusters.primaryIntent;
@@ -255,7 +254,7 @@ async function executeReview(
   const untrackedFileContexts = await collectUntrackedFileContexts(
     root,
     reviewChangeFiles.filter((file) => file.source === "untracked").map((file) => file.path),
-    extractReviewKeywords(taskMarkdown)
+    extractReviewKeywords(effectiveTaskMarkdown)
   );
 
   if (options.heuristic || providerName === "none") {
@@ -276,6 +275,7 @@ async function executeReview(
       inferredClusters,
       taskAvailable: anchor.useTaskMarkdown,
       anchorStale: anchor.stale,
+      anchorAbsent: anchor.anchorAbsent,
       untrackedFileContexts,
       impactHints,
       providerName
@@ -473,7 +473,7 @@ function printRunSelection(selection: RunSelection, taskMode: "task" | "diff" = 
       console.error(`dev-guard review: run match score ${selection.score}`);
     }
   } else {
-    console.error("dev-guard review: using diff-inferred task (task.md stale)");
+    console.error("dev-guard review: using diff-inferred task");
     if (selection.score !== undefined) {
       console.error(`dev-guard review: run match score ${selection.score}`);
     }
@@ -631,6 +631,7 @@ function generateHeuristicReview(input: {
   inferredClusters?: ReturnType<typeof inferDiffIntentClusters>;
   taskAvailable?: boolean;
   anchorStale?: boolean;
+  anchorAbsent?: boolean;
   untrackedFileContexts: ReviewFileContext[];
   impactHints: ReturnType<typeof buildImpactHints>;
   providerName: string;
@@ -730,11 +731,13 @@ function generateHeuristicReview(input: {
         ].join("\n");
 
   const taskSourceNote = input.inferredClusters
-    ? input.anchorStale
-      ? `- task.md stale; diff intent 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
-      : input.taskAvailable
-        ? `- task.md 기준으로 검토했습니다. diff clusters: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
-        : `- 원본 task prompt 없이 diff intent를 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+    ? input.anchorAbsent
+      ? `- task anchor absent; diff intent 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+      : input.anchorStale
+        ? `- task.md stale; diff intent 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+        : input.taskAvailable
+          ? `- task.md 기준으로 검토했습니다. diff clusters: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
+          : `- 원본 task prompt 없이 diff intent를 기준으로 검토했습니다: ${formatInferredDiffIntentClusters(input.inferredClusters)}`
     : "- task.md 기준으로 검토했습니다.";
 
   return {
@@ -1001,28 +1004,19 @@ function errorMessage(error: unknown): string {
 interface TaskAnchorResolution {
   useTaskMarkdown: boolean;
   stale: boolean;
-  freshnessResult?: TaskAnchorFreshnessResult;
+  anchorAbsent: boolean;
+  freshnessResult: TaskAnchorFreshnessResult;
 }
 
 function resolveTaskAnchor(input: {
   taskMarkdown: string;
-  taskAvailable: boolean;
   diffText: string;
   changedFiles: string[];
   changeFiles: GitChanges["changeFiles"];
   forceTask?: boolean;
   fromDiff?: boolean;
 }): TaskAnchorResolution {
-  if (input.fromDiff) {
-    return { useTaskMarkdown: false, stale: false };
-  }
-  if (!input.taskAvailable) {
-    return { useTaskMarkdown: false, stale: false };
-  }
-  if (input.forceTask) {
-    return { useTaskMarkdown: true, stale: false };
-  }
-
+  // Always run scoreTaskAnchorFreshness — it handles absent/placeholder internally
   const result = scoreTaskAnchorFreshness({
     taskMarkdown: input.taskMarkdown,
     diffText: input.diffText,
@@ -1030,18 +1024,30 @@ function resolveTaskAnchor(input: {
     changeFiles: input.changeFiles
   });
 
+  if (input.fromDiff) {
+    return { useTaskMarkdown: false, stale: false, anchorAbsent: false, freshnessResult: result };
+  }
+  if (result.mode === "anchor_absent") {
+    return { useTaskMarkdown: false, stale: false, anchorAbsent: true, freshnessResult: result };
+  }
+  if (input.forceTask) {
+    return { useTaskMarkdown: true, stale: false, anchorAbsent: false, freshnessResult: result };
+  }
+
   const useTaskMarkdown = result.mode !== "stale";
-  return { useTaskMarkdown, stale: result.mode === "stale", freshnessResult: result };
+  return { useTaskMarkdown, stale: result.mode === "stale", anchorAbsent: false, freshnessResult: result };
 }
 
 function printAnchorStatus(anchor: TaskAnchorResolution): void {
   const result = anchor.freshnessResult;
-  if (!result) return;
 
-  if (result.mode === "use_task") {
-    // No noise when task.md is fresh
+  if (result.mode === "anchor_absent") {
+    console.error("dev-guard review: task anchor: absent");
+    console.error("dev-guard review: mode: diff-first inferred task");
     return;
   }
+
+  if (result.mode === "use_task") return; // No noise when fresh
 
   const score = result.matchScore;
   if (result.mode === "uncertain") {
