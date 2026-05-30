@@ -6,6 +6,7 @@ import {
   type FileSummary,
   type ProjectIndexEntry
 } from "@dev-guard/core";
+import { writeAIContext } from "./ai-context.js";
 import { loadConfig } from "./config.js";
 import { fileMetadata, fromRoot, readJsonFile, writeTextFile } from "./fs.js";
 import { getGitChanges, getProjectFiles } from "./git.js";
@@ -119,6 +120,7 @@ export async function refreshProjectMemory(root: string, options: RefreshOptions
   });
 
   await writeMemoryFiles(root, refreshed.index, refreshed.summaries, refreshed.projectMapMarkdown, refreshed.codeGraph);
+  await writeAIContext(root).catch(() => undefined);
   return result;
 }
 
@@ -149,6 +151,7 @@ async function runFullRefresh(root: string, options: RefreshOptions, config: Dev
   }
 
   await writeMemoryFiles(root, scan.index, scan.summaries, scan.projectMapMarkdown, scan.codeGraph);
+  await writeAIContext(root).catch(() => undefined);
   return result;
 }
 
@@ -184,7 +187,7 @@ function printRefreshPlan(plan: {
   console.log(`- updated summaries: ${plan.updatedPaths.length}`);
   console.log(`- removed summaries: ${plan.removedPaths.length}`);
   console.log(`- unchanged files skipped: ${plan.unchangedCount}`);
-  console.log("- writes: .devguard/project-index.json, .devguard/file-summaries.json, .devguard/code-graph.json, .devguard/project-map.md, .devguard/project-identity.json");
+  console.log("- writes: .devguard/project-index.json, .devguard/file-summaries.json, .devguard/code-graph.json, .devguard/project-map.md, .devguard/project-identity.json, .devguard/AI_CONTEXT.md");
   console.log("- reason: keep project memory current for task-ai/review/report");
 
   if (plan.updatedPaths.length > 0) {

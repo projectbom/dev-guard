@@ -25,6 +25,7 @@ import {
   type TaskAIFileCandidate,
   type TaskTypeResult
 } from "@dev-guard/core";
+import { buildAIContextPreamble, writeAIContext } from "./ai-context.js";
 import { copyTextToClipboard } from "./clipboard.js";
 import { filterCommandTargetCandidates, inferCommandTargetFiles, mergeCommandTargetCandidates } from "./command-targets.js";
 import { loadConfig, readOpenAIApiKey } from "./config.js";
@@ -197,13 +198,15 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
 
   if (options.write) {
     await writeTextFile(fromRoot(root, ".devguard/task.md"), taskMarkdown);
+    await writeAIContext(root).catch(() => undefined);
     console.error("dev-guard task-ai: .devguard/task.md updated");
+    console.error("dev-guard task-ai: .devguard/AI_CONTEXT.md updated");
   } else {
     console.error("dev-guard task-ai: preview only. 저장하려면 --write를 사용하세요.");
     console.error("dev-guard task-ai: Codex 프롬프트도 보려면 --prompt, 클립보드 복사는 --copy를 사용하세요.");
   }
 
-  const codexPrompt =
+  const rawCodexPrompt =
     options.prompt || options.copy || options.saveRun
       ? generateCodexPrompt({
           taskMarkdown,
@@ -220,6 +223,9 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
           impactHints
         }).promptText
       : undefined;
+
+  // Prepend AI_CONTEXT.md reference so Codex/Claude reads it first
+  const codexPrompt = rawCodexPrompt ? buildAIContextPreamble() + rawCodexPrompt : undefined;
 
   if (options.copy && codexPrompt) {
     const result = await copyTextToClipboard(codexPrompt);
@@ -242,7 +248,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
       command: "task-ai",
       userRequest: options.requirement,
       generatedTaskMarkdown: taskMarkdown,
-      generatedCodexPrompt: codexPrompt,
+      generatedCodexPrompt: rawCodexPrompt,
       relatedFiles: relatedFileCandidates,
       model,
       provider: providerName,

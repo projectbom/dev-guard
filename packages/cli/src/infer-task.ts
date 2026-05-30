@@ -5,6 +5,7 @@ import {
   scoreTaskAnchorFreshness,
   type CodeGraphEntry
 } from "@dev-guard/core";
+import { writeAIContext } from "./ai-context.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges } from "./git.js";
 
@@ -85,8 +86,10 @@ export async function runInferTask(root: string, args: string[]): Promise<void> 
   if (options.write) {
     const taskPath = fromRoot(root, ".devguard/task.md");
     await writeTextFile(taskPath, inferredMarkdown);
+    await writeAIContext(root).catch(() => undefined);
     console.log("");
     console.log("[written] .devguard/task.md updated with inferred task.");
+    console.log("[written] .devguard/AI_CONTEXT.md updated.");
   } else {
     console.log("");
     if (anchor.mode === "anchor_absent") {
