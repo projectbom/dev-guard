@@ -25,6 +25,7 @@
     "cli": "node dist/index.js"
   },
   "dependencies": {
-    "@dev-guard/core": "0.1.0"
+    "@dev-guard/core": "workspace:*",
+    "chokidar": "^4.0.3"
   }
 }

@@ -1,219 +1,161 @@
+import { existsSync, watch as fsWatch } from "node:fs";
+import { join } from "node:path";
 import {
-  formatInferredDiffIntentClusters,
-  inferDiffIntentClusters,
-  type CodeGraphEntry,
-  type InferredDiffIntentClusters
-} from "@dev-guard/core";
-import { createHash } from "node:crypto";
-import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
-import { getGitChanges } from "./git.js";
-import { runCheck } from "./check.js";
-import { runReview } from "./review.js";
+  hashRuntimeFiles,
+  isIgnoredWatchPath,
+  markRuntimeStable,
+  readRuntimeState,
+  recordRuntimeChange
+} from "./runtime-state.js";
 
-type WatchStatus = "idle" | "active" | "stable" | "ready_for_done" | "mixed_warning";
+type WatchStatus = "idle" | "active" | "ready_for_done";
 
 interface WatchOptions {
-  check: boolean;
-  review: boolean;
-  once: boolean;
-  intervalMs: number;
   stableAfterMs: number;
-  density: "compact" | "ultra";
+  compact: boolean;
 }
 
-interface WatchRenderState {
-  status: WatchStatus;
-  lastDiffHash: string;
-  stableDurationMs: number;
-  primaryIntent?: InferredDiffIntentClusters["primaryIntent"];
-  secondaryIntents?: InferredDiffIntentClusters["secondaryIntents"];
-}
-
-const defaultIntervalMs = 1000;
-const defaultStableAfterMs = 30_000;
+const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", "devguard"];
+const excludedSummary = "node_modules, .git, dist, build, .next, coverage, devguard/runtime.json, devguard/reports/*";
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   const options = parseWatchOptions(args);
-  console.log("watching changes...");
-  console.log(`interval=${options.intervalMs}ms; stable_after=${Math.round(options.stableAfterMs / 1000)}s; density=${options.density}`);
-  console.log("policy: suggestion only; done/update/write/commit are never run automatically");
+  console.log("dev-guard watch");
+  console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
+  console.log(`excluded: ${excludedSummary}`);
+  console.log("mode: event-driven; no periodic refresh; no auto write");
   console.log("stop: Ctrl+C");
 
-  let lastSignature = "";
-  let lastRenderKey = "";
-  let lastOptionalKey = "";
-  let lastHashChangeAt = Date.now();
-  let running = false;
+  let status: WatchStatus = "idle";
+  let stableTimer: NodeJS.Timeout | undefined;
+  let lastPrintedKey = "";
 
-  const tick = async () => {
-    if (running) {
+  const printState = async (nextStatus: WatchStatus) => {
+    const runtime = await readRuntimeState(root);
+    const key = `${nextStatus}:${runtime.pendingChangedFiles.join("|")}`;
+    if (key === lastPrintedKey) {
       return;
     }
-    running = true;
-    try {
-      const next = await buildWatchState(root, options, lastSignature, lastHashChangeAt);
-      if (next.diffHash !== lastSignature) {
-        lastSignature = next.diffHash;
-        lastHashChangeAt = Date.now();
-      }
-      const stableDurationMs = next.diffHash ? Date.now() - lastHashChangeAt : 0;
-      const state = toRenderState(next.clusters, next.diffHash, stableDurationMs, options);
-      if (lastRenderKey !== next.renderKey) {
-        printWatchState(state, next.clusters, options);
-        lastRenderKey = next.renderKey;
-      }
-
-      const optionalKey = `${next.diffHash}:${state.status}`;
-      if ((state.status === "stable" || state.status === "ready_for_done" || state.status === "mixed_warning") && lastOptionalKey !== optionalKey) {
-        await runOptionalChecks(root, options, state);
-        lastOptionalKey = optionalKey;
-      }
-    } catch (error) {
-      console.error(`watch warning: ${errorMessage(error)}`);
-    } finally {
-      running = false;
+    lastPrintedKey = key;
+    status = nextStatus;
+    console.log("");
+    console.log(`STATUS: ${status}`);
+    if (runtime.pendingChangedFiles.length > 0) {
+      console.log(`changed: ${runtime.pendingChangedFiles.slice(0, 8).join(", ")}${runtime.pendingChangedFiles.length > 8 ? `, +${runtime.pendingChangedFiles.length - 8}` : ""}`);
+    }
+    if (status === "ready_for_done") {
+      console.log("NEXT: dev-guard done");
+    } else {
+      console.log("NEXT: keep editing; run dev-guard done when the AI task is finished");
     }
   };
 
-  await tick();
-  if (options.once) {
-    return;
-  }
+  const handleChange = async (path: string) => {
+    if (!path || isIgnoredWatchPath(path)) {
+      return;
+    }
+    try {
+      clearTimeout(stableTimer);
+      const runtime = await recordRuntimeChange(root, path);
+      await printState("active");
+      stableTimer = setTimeout(async () => {
+        const latest = await readRuntimeState(root);
+        await markRuntimeStable(root, hashRuntimeFiles(latest.pendingChangedFiles));
+        await printState(latest.pendingChangedFiles.length > 0 ? "ready_for_done" : "idle");
+      }, options.stableAfterMs);
+      if (!options.compact) {
+        console.log(`event: ${path}; pending=${runtime.pendingChangedFiles.length}`);
+      }
+    } catch (error) {
+      console.error(`watch warning: ${errorMessage(error)}`);
+      console.error("recovery: fix the file issue or run dev-guard reset");
+    }
+  };
 
-  const interval = setInterval(tick, options.intervalMs);
-  process.on("SIGINT", () => {
-    clearInterval(interval);
+  const watcher = await createWatcher(root, handleChange);
+  await printState(status);
+
+  process.on("SIGINT", async () => {
+    await closeWatcher(watcher);
+    clearTimeout(stableTimer);
     console.log("\ndev-guard watch stopped");
     process.exit(0);
   });
+
   await new Promise<void>(() => {
     // Keep process alive until SIGINT.
   });
 }
 
-async function buildWatchState(root: string, options: WatchOptions, previousHash: string, lastHashChangeAt: number): Promise<{
-  diffHash: string;
-  clusters: InferredDiffIntentClusters;
-  renderKey: string;
-}> {
-  const [gitChanges, taskMarkdown, codeGraph] = await Promise.all([
-    getGitChanges(root),
-    readTextFile(fromRoot(root, ".devguard/task.md")),
-    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
-  ]);
-  const diffHash = hashDiff([gitChanges.changedFiles.join("\n"), gitChanges.diffText].join("\n"));
-  const clusters = inferDiffIntentClusters({
-    changedFiles: gitChanges.changedFiles,
-    changeFiles: gitChanges.changeFiles,
-    diffText: gitChanges.diffText,
-    codeGraph,
-    taskText: hasTaskContext(taskMarkdown) ? taskMarkdown : undefined
-  });
-  const stableDurationMs = diffHash === previousHash ? Date.now() - lastHashChangeAt : 0;
-  const status = toWatchStatus(clusters, diffHash, stableDurationMs, options);
-  const renderKey = [diffHash, status, formatInferredDiffIntentClusters(clusters)].join("|");
-  return { diffHash, clusters, renderKey };
-}
-
-function toRenderState(
-  clusters: InferredDiffIntentClusters,
-  diffHash: string,
-  stableDurationMs: number,
-  options: WatchOptions
-): WatchRenderState {
-  return {
-    status: toWatchStatus(clusters, diffHash, stableDurationMs, options),
-    lastDiffHash: diffHash,
-    stableDurationMs,
-    primaryIntent: clusters.primaryIntent,
-    secondaryIntents: clusters.secondaryIntents
-  };
-}
-
-function toWatchStatus(clusters: InferredDiffIntentClusters, diffHash: string, stableDurationMs: number, options: WatchOptions): WatchStatus {
-  if (!diffHash || clusters.primaryIntent.changedFiles.length === 0) {
-    return "idle";
-  }
-  if (stableDurationMs < options.stableAfterMs) {
-    return "active";
-  }
-  if (clusters.mixedRisk !== "low") {
-    return "mixed_warning";
-  }
-  if (clusters.primaryIntent.confidence === "high") {
-    return "ready_for_done";
-  }
-  return "stable";
-}
-
-function printWatchState(state: WatchRenderState, clusters: InferredDiffIntentClusters, options: WatchOptions): void {
-  if (state.status === "idle") {
-    console.log("STATUS: idle");
-    console.log("NEXT: edit files or run dev-guard \"requirement\"");
-    return;
-  }
-
-  const primary = clusters.primaryIntent;
-  console.log("");
-  console.log(`INTENT: ${primary.subtype ?? primary.type}${primary.targetCommand ? `(${primary.targetCommand})` : ""}`);
-  console.log(`SCOPE: ${primary.scope.join(", ") || "changed files"}`);
-  if (clusters.secondaryDetails.length > 0) {
-    const mixed = clusters.secondaryDetails
-      .slice(0, 2)
-      .map((detail) => {
-        const target = detail.intent.targetCommand ? `(${detail.intent.targetCommand})` : "";
-        return `${detail.intent.subtype ?? detail.intent.type}${target}(${detail.intent.changedFiles.length}) ${shortSeverity(detail.severity)}`;
-      })
-      .join(", ");
-    const remaining = clusters.secondaryDetails.length - Math.min(2, clusters.secondaryDetails.length);
-    console.log(`MIXED: ${mixed}${remaining > 0 ? `, +${remaining} clusters` : ""}`);
-  }
-  console.log(`DRIFT: ${clusters.mixedRisk}`);
-  console.log(`STATUS: ${state.status}`);
-  if (state.status === "stable" || state.status === "ready_for_done" || state.status === "mixed_warning") {
-    console.log(`stable for ${Math.round(state.stableDurationMs / 1000)}s`);
-  }
-  if (state.status === "ready_for_done") {
-    console.log("NEXT: dev-guard done");
-  } else if (state.status === "mixed_warning") {
-    console.log("NEXT: inspect mixed files, then run dev-guard done");
-  } else if (primary.confidence === "low") {
-    console.log('NEXT: dev-guard "<requirement>" for stronger context');
-  }
-  if (options.density === "compact" && primary.evidence.length > 0) {
-    console.log(`EVIDENCE: ${primary.evidence.slice(0, 2).join("; ")}`);
-  }
-}
-
-async function runOptionalChecks(root: string, options: WatchOptions, state: WatchRenderState): Promise<void> {
-  if (state.status === "active" || state.status === "idle") {
-    return;
-  }
-  if (options.check) {
-    console.log("running: dev-guard check --local");
-    await runCheck(root, { includeContextFiles: false, local: true });
-  }
-  if (options.review) {
-    console.log("running: dev-guard review --heuristic");
-    await runReview(root, ["--heuristic"]);
-  }
-}
-
 function parseWatchOptions(args: string[]): WatchOptions {
-  const intervalMs = readNumberOption(args, "--interval", defaultIntervalMs);
-  const debounceMs = readNumberOption(args, "--debounce", intervalMs);
-  const stableAfterSec = readNumberOption(args, "--stable-after", defaultStableAfterMs / 1000);
-  if (intervalMs <= 0 || debounceMs <= 0 || stableAfterSec <= 0) {
-    throw new Error("dev-guard watch interval/debounce/stable-after options must be positive numbers.");
+  const stableAfterSec = readNumberOption(args, "--stable-after", 20);
+  if (stableAfterSec <= 0) {
+    throw new Error("dev-guard watch --stable-after must be positive.");
   }
   return {
-    check: args.includes("--check"),
-    review: args.includes("--review"),
-    once: args.includes("--once"),
-    intervalMs: debounceMs,
     stableAfterMs: stableAfterSec * 1000,
-    density: args.includes("--ultra") ? "ultra" : "compact"
+    compact: args.includes("--compact") || args.includes("--ultra")
   };
+}
+
+async function createWatcher(root: string, onChange: (path: string) => Promise<void>): Promise<unknown> {
+  const existingRoots = watchRoots.map((path) => join(root, path)).filter((path) => existsSync(path));
+  const paths = existingRoots.length > 0 ? existingRoots : [root];
+  const chokidar = await loadChokidar();
+  if (chokidar?.watch) {
+    const watcher = chokidar.watch(paths, {
+      ignoreInitial: true,
+      ignored: (path: string) => isIgnoredWatchPath(path.replace(`${root}/`, "")),
+      awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 }
+    });
+    watcher.on("all", (_event: string, path: string) => {
+      void onChange(path.replace(`${root}/`, ""));
+    });
+    watcher.on("error", (error: Error) => {
+      console.error(`watch warning: ${error.message}`);
+      console.error("watch backend unavailable in this shell; run dev-guard done manually or reduce watched paths");
+      void watcher.close?.();
+    });
+    return watcher;
+  }
+
+  console.log("watch backend: node fs.watch fallback (top-level only; install dependencies for chokidar recursive watching)");
+  const watcher = fsWatch(root, { recursive: false }, (_event, filename) => {
+    if (filename) {
+      void onChange(filename.toString());
+    }
+  });
+  let fallbackErrored = false;
+  watcher.on("error", (error) => {
+    if (fallbackErrored) {
+      return;
+    }
+    fallbackErrored = true;
+    console.error(`watch warning: ${error.message}`);
+    console.error("watch backend unavailable in this shell; install dependencies for chokidar support or run dev-guard done manually");
+    watcher.close();
+  });
+  return [watcher];
+}
+
+async function closeWatcher(watcher: unknown): Promise<void> {
+  if (Array.isArray(watcher)) {
+    for (const item of watcher) {
+      item.close();
+    }
+    return;
+  }
+  const maybe = watcher as { close?: () => Promise<void> | void };
+  await maybe.close?.();
+}
+
+async function loadChokidar(): Promise<{ watch?: (...args: unknown[]) => { on: (...args: unknown[]) => unknown; close?: () => Promise<void> | void } } | undefined> {
+  try {
+    const dynamicImport = new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<unknown>;
+    return (await dynamicImport("chokidar")) as { watch?: (...args: unknown[]) => { on: (...args: unknown[]) => unknown; close?: () => Promise<void> | void } };
+  } catch {
+    return undefined;
+  }
 }
 
 function readNumberOption(args: string[], name: string, fallback: number): number {
@@ -226,26 +168,6 @@ function readNumberOption(args: string[], name: string, fallback: number): numbe
     throw new Error(`${name} requires a number.`);
   }
   return value;
-}
-
-function hashDiff(text: string): string {
-  const normalized = text.trim();
-  if (!normalized) {
-    return "";
-  }
-  return createHash("sha1").update(normalized).digest("hex").slice(0, 12);
-}
-
-function shortSeverity(severity: InferredDiffIntentClusters["secondaryDetails"][number]["severity"]): string {
-  if (severity === "info") return "i";
-  if (severity === "caution") return "!";
-  if (severity === "warning") return "warning";
-  return "high";
-}
-
-function hasTaskContext(taskMarkdown: string): boolean {
-  const text = taskMarkdown.trim();
-  return text.length > 0 && !/^#?\s*Current task/i.test(text) && !/Describe the requested change/i.test(text);
 }
 
 function errorMessage(error: unknown): string {

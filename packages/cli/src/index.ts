@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { formatInferredDiffIntentClusters, type CodeGraphEntry } from "@dev-guard/core";
 import { runCheck } from "./check.js";
 import { runConfigure } from "./configure.js";
 import { runDoctor } from "./doctor.js";
@@ -15,10 +14,7 @@ import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
-import { fromRoot, readJsonFile, readTextFile } from "./fs.js";
-import { getGitChanges } from "./git.js";
-import { loadCurrentProjectIdentity } from "./project-identity.js";
-import { formatEffectiveTaskBlock, resolveEffectiveTaskContext } from "./effective-task.js";
+import { processDoneEvent, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -55,6 +51,11 @@ async function main(): Promise<void> {
 
   if (command === "status") {
     await runStatus(root);
+    return;
+  }
+
+  if (command === "reset") {
+    await runReset(root);
     return;
   }
 
@@ -156,6 +157,7 @@ Quick commands:
   dev-guard "fix the login redirect bug"
   dev-guard done
   dev-guard status
+  dev-guard reset
   dev-guard watch
 
 Common flow:
@@ -177,13 +179,14 @@ Usage:
   dev-guard "requirement"
   dev-guard done
   dev-guard status
+  dev-guard reset
   dev-guard check [--local] [--include-context-files]
   dev-guard configure ai --provider openai --model gpt-4o-mini
   dev-guard config set <provider|model|temperature|maxTokens|reasoningEffort|baseURL> <value>
   dev-guard config show
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
-  dev-guard watch [--interval <ms>] [--stable-after <sec>] [--compact|--ultra] [--check] [--review] [--once]
+  dev-guard watch [--stable-after <sec>] [--compact|--ultra]
   dev-guard doctor
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
@@ -199,13 +202,14 @@ Usage:
 Commands:
   init   Create .devguard and docs guard files
   "requirement" Generate task.md and a compact Codex prompt
-  done   Refresh, run local checks/review, print report, and preview docs updates
-  status Show project/provider/git/task status
+  done   Treat pending changes as task complete and generate report/next prompt
+  status Show pending watch state and last processed task
+  reset  Clear watch runtime state without deleting project state
   check  Analyze current git diff with rule-based checks
   configure Configure dev-guard settings
   scan   Cache project structure and file summaries into .devguard
   refresh Incrementally update project memory cache
-  watch  Monitor git diff intent and suggest when to run done
+  watch  Monitor file changes and wait for a task completion event
   doctor Print config, provider, git, memory, and telemetry diagnostics
   telemetry Print privacy-safe drift telemetry summary
   report Print a compact current-work summary for ChatGPT/Codex handoff
@@ -221,88 +225,66 @@ Commands:
 }
 
 async function runDone(root: string): Promise<void> {
-  const results: Array<{ name: string; ok: boolean; reason?: string; output: string[] }> = [];
-  console.log("dev-guard done");
-  console.log("policy: preview only; docs are not modified unless you run dev-guard update --write");
-
-  for (const step of [
-    { name: "refresh", run: () => runRefresh(root, []) },
-    { name: "check --local", run: () => runCheck(root, { includeContextFiles: false, local: true }) },
-    { name: "review --heuristic", run: () => runReview(root, ["--heuristic"]) },
-    { name: "report --compact", run: () => runReport(root, ["--compact"]) },
-    { name: "update preview", run: () => runUpdate(root, { write: false, includeContextFiles: false }) }
-  ]) {
-    console.log(`\n[done] running ${step.name}`);
-    try {
-      const output = await captureConsole(step.run);
-      results.push({ name: step.name, ok: true, output });
-      for (const line of summarizeStepOutput(step.name, output)) {
-        console.log(`  ${line}`);
-      }
-      if (step.name === "refresh") {
-        await printDoneTaskAnchor(root).catch(() => undefined);
-      }
-    } catch (error) {
-      const reason = errorMessage(error);
-      console.error(`[done] ${step.name} failed: ${reason}`);
-      results.push({ name: step.name, ok: false, reason, output: [] });
+  try {
+    const result = await processDoneEvent(root);
+    console.log("작업 완료 처리됨");
+    console.log("");
+    console.log("변경 파일:");
+    for (const file of result.changedFiles.slice(0, 20)) {
+      console.log(`- ${file}`);
     }
-  }
-
-  console.log("\ndev-guard done summary");
-  for (const result of results) {
-    console.log(`- ${result.ok ? "pass" : "fail"}: ${result.name}${result.reason ? ` (${result.reason})` : ""}`);
-  }
-  const failed = results.filter((result) => !result.ok);
-  console.log(`Next: ${failed.length > 0 ? "fix failed checks, then rerun dev-guard done" : "review warnings, then commit or run dev-guard update --write if docs should be updated"}`);
-  if (failed.length > 0) {
+    if (result.changedFiles.length > 20) {
+      console.log(`- ... +${result.changedFiles.length - 20} files`);
+    }
+    console.log("");
+    console.log("감지된 영역:");
+    for (const area of result.areas) {
+      console.log(`- ${area}`);
+    }
+    console.log("");
+    console.log("판단:");
+    for (const judgment of result.judgments) {
+      console.log(`- ${judgment}`);
+    }
+    console.log("");
+    console.log("생성됨:");
+    console.log(`- ${result.reportPath}`);
+    console.log(`- ${result.promptPath}`);
+    console.log("");
+    console.log("다음 작업:");
+    console.log(`${result.promptPath} 확인 후 필요한 수정 진행`);
+  } catch (error) {
+    console.error(`dev-guard done failed: ${errorMessage(error)}`);
+    console.error("recovery: run dev-guard status, then dev-guard reset if the pending buffer is wrong");
     process.exitCode = 1;
-  }
-}
-
-async function printDoneTaskAnchor(root: string): Promise<void> {
-  const [gitChanges, taskMarkdown, codeGraph, currentIdentity] = await Promise.all([
-    getGitChanges(root),
-    readTextFile(fromRoot(root, ".devguard/task.md")),
-    readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), []),
-    loadCurrentProjectIdentity(root).catch(() => undefined)
-  ]);
-  if (gitChanges.changedFiles.length === 0) {
-    return;
-  }
-  const effective = await resolveEffectiveTaskContext({
-    root,
-    taskMarkdown,
-    gitChanges,
-    codeGraph,
-    currentIdentity
-  });
-  const clusters = effective.inferredTask;
-  console.log(`self: inferred from diff`);
-  console.log(`  ${formatInferredDiffIntentClusters(clusters)}`);
-
-  console.log("");
-  for (const line of formatEffectiveTaskBlock("[done] task anchor check", effective)) {
-    console.log(line);
-  }
-  if (effective.runSelection.warning) {
-    console.log(`  warning: ${effective.runSelection.warning}`);
-  }
-  if (!effective.useTaskMarkdown) {
-    console.log(`  next: run dev-guard infer-task --write if you want to save this as task.md`);
-    if (clusters.primaryIntent.confidence === "low") {
-      console.log('  hint: run dev-guard "<requirement>" for stronger task context');
-    }
   }
 }
 
 async function runStatus(root: string): Promise<void> {
   console.log("dev-guard status");
-  const doctorOutput = await captureConsole(() => runDoctor(root));
-  const reportOutput = await captureConsole(() => runReport(root, ["--compact"]));
-  for (const line of summarizeStatusOutput(doctorOutput, reportOutput)) {
-    console.log(line);
+  const [runtime, state] = await Promise.all([readRuntimeState(root), readProjectState(root)]);
+  console.log(`Pending files: ${runtime.pendingChangedFiles.length}`);
+  for (const file of runtime.pendingChangedFiles.slice(0, 12)) {
+    console.log(`- ${file}`);
   }
+  if (runtime.pendingChangedFiles.length > 12) {
+    console.log(`- ... +${runtime.pendingChangedFiles.length - 12} files`);
+  }
+  console.log(`Runtime status: ${runtime.lastStatus ?? "idle"}`);
+  console.log(`Last changed: ${runtime.lastChangedAt ?? "none"}`);
+  console.log(`Last processed: ${state.lastProcessedAt ?? "none"}`);
+  console.log(`Last summary: ${state.lastSummary ?? "none"}`);
+  console.log(`Drift: ${state.lastDrift ?? "unknown"}`);
+  console.log("");
+  console.log("Next:");
+  console.log(runtime.pendingChangedFiles.length > 0 ? "  dev-guard done" : "  dev-guard watch");
+}
+
+async function runReset(root: string): Promise<void> {
+  await resetRuntimeState(root);
+  console.log("dev-guard reset");
+  console.log("- runtime pending changes cleared");
+  console.log("- devguard/state.json preserved");
 }
 
 function errorMessage(error: unknown): string {
