@@ -2,6 +2,19 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
+## Local Runtime Files
+
+The current event-based workflow writes runtime artifacts under `devguard/`:
+
+- `runtime.json`
+- `state.json`
+- `history.jsonl`
+- `reports/`
+- `prompts/`
+- optional project notes such as `project.md`, `architecture.md`, `decisions.md`, and `tasks.md`
+
+These are local by default. They are generated to help `watch`, `done`, `status`, and handoff prompts.
+
 ## Local `.devguard` Files
 
 The `.devguard/` directory is local project state by default. Generated files are ignored:

@@ -1,54 +1,100 @@
-# Architecture Notes
+# Architecture
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-dev-guard is a pnpm TypeScript monorepo.
+dev-guard is a pnpm TypeScript monorepo with a local-first CLI workflow.
 
 ```text
 packages/
-  core/  Rule-based analysis, task routing, prompt generation, review helpers
-  cli/   Node.js CLI, filesystem/git/config/provider integration
+  core/  reusable heuristics, diff intent, task routing, review helpers
+  cli/   Node CLI, git/filesystem/config/provider/runtime integration
 ```
 
-## Design Goals
+## Current Workflow
 
-- Keep reusable analysis in `packages/core`.
-- Keep filesystem, git, clipboard, and terminal behavior in `packages/cli`.
-- Make provider integration optional.
-- Keep default behavior preview-first and local-first.
-- Avoid project-specific hardcoding.
-
-## Project Memory
-
-`dev-guard scan` and `dev-guard refresh` write project-local memory under `.devguard/`:
-
-- `project-index.json`
-- `file-summaries.json`
-- `code-graph.json`
-- `project-map.md`
-- `project-identity.json`
-
-Project identity includes the project root, package name, git remote, framework/runtime hints, and fingerprint. This is used to reduce cross-project context contamination.
-
-`code-graph.json` is a lightweight, heuristic graph for TypeScript/Node-style projects. It stores resolved relative imports, export hints, reverse dependencies, and compact impact candidates. It is not a full AST or compiler-backed graph.
-
-## Context Selection
-
-Task generation prioritizes current user requirements over older context:
+The public MVP workflow is event based:
 
 ```text
-requirement > current code context > task subtype context > previous runs/docs
+watch
+  -> accumulate changed files in devguard/runtime.json
+  -> stable state suggests done
+
+done
+  -> collect git diff and pending runtime files
+  -> classify changed areas
+  -> infer diff intent and drift candidates
+  -> append history.jsonl
+  -> write last-run report
+  -> write history summary
+  -> write decision candidates
+  -> write quality report
+  -> write next Codex/Claude handoff prompt
+  -> clear pending runtime state
+
+status
+  -> show pending files, last run, quality verdict, recent history, next action
+
+reset
+  -> clear runtime pending state only
 ```
 
-Older runs and stale docs are treated as hints, not as the source of truth.
+`watch` does not run `done` automatically. `done` is the explicit task-completion event.
 
-## Prompt Density
+## Runtime Files
 
-Prompts can be compacted by task type and budget. Guardrail-critical sections such as `TASK`, `TYPE`, `PROTECT`, `SUCCESS`, and `VERIFY` should remain present even in ultra-compact prompts.
+The event workflow uses `devguard/`:
+
+```text
+devguard/
+  project.md
+  architecture.md
+  decisions.md
+  tasks.md
+  state.json
+  runtime.json
+  history.jsonl
+  prompts/next-codex-prompt.md
+  reports/last-run.md
+  reports/history-summary.md
+  reports/decision-candidates.md
+  reports/quality-report.md
+```
+
+These files are generated or project-local. Existing markdown files are not overwritten when the workspace is initialized.
+
+## Legacy And Advanced Memory
+
+The older `.devguard/` path still exists for advanced features:
+
+- `.devguard/config.json`
+- `.devguard/task.md`
+- `.devguard/runs/`
+- `.devguard/project-index.json`
+- `.devguard/file-summaries.json`
+- `.devguard/code-graph.json`
+- `.devguard/project-map.md`
+
+`scan` and `refresh` maintain project memory cache here. The event workflow can reuse this context when available, but the main user flow no longer requires manual scan/refresh.
+
+## Analysis Layers
+
+`done` is rule-based. It does not call an LLM.
+
+Current local layers:
+
+- git diff and untracked file collection
+- changed-file area classification
+- diff intent inference and clustering
+- drift candidate extraction
+- documentation update candidate summary
+- package.json-based verification command discovery
+- completion quality verdict
+- handoff prompt rendering
 
 ## Safety Boundaries
 
-- `update` previews only.
-- `update --write` writes managed blocks only.
-- `watch` refreshes memory only by default.
-- API keys are never stored in config or markdown files.
+- No source files are modified by `watch`, `done`, `status`, or `reset`.
+- `done` writes only `devguard/` runtime artifacts.
+- `decisions.md` is never auto-edited; candidates go to `reports/decision-candidates.md`.
+- `update` remains preview-first and only `update --write` writes managed doc blocks.
+- Provider integration is optional and separate from the default event workflow.

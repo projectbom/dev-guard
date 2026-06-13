@@ -2,53 +2,72 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-This page lists commands that are intentionally kept out of the main README.
-
-## Main Flow
+## Main Commands
 
 ```bash
 dev-guard init
-dev-guard status
-dev-guard "Describe the change"
+dev-guard watch
 dev-guard done
+dev-guard status
+dev-guard reset
 ```
 
-## Common Commands
+- `init`: create initial `.devguard` guard files. Existing files are not overwritten.
+- `watch`: watch source/config/doc changes and accumulate pending paths in `devguard/runtime.json`.
+- `done`: treat the current work as complete and generate history, reports, quality verdict, and handoff prompt.
+- `status`: show pending changes, last processed task, recent history, quality verdict, and next action.
+- `reset`: clear pending runtime state only. It preserves `devguard/state.json` and history.
 
-- `dev-guard init`: create `.devguard` and docs guard files without overwriting existing content.
-- `dev-guard status`: combine diagnostics and compact report.
-- `dev-guard "<requirement>"`: generate `.devguard/task.md` and a compact Codex prompt.
-- `dev-guard done`: run refresh, local check, heuristic review, compact report, and docs update preview.
-- `dev-guard update`: preview docs update candidates.
-- `dev-guard update --write`: update only dev-guard managed blocks.
-- `dev-guard watch`: keep project memory current while editing.
+## Watch Options
 
-## Advanced Commands
+```bash
+dev-guard watch --stable-after 20
+dev-guard watch --depth 8
+dev-guard watch --poll
+dev-guard watch --include-lockfiles
+dev-guard watch --compact
+```
 
-- `dev-guard task-ai "<requirement>"`: AI-backed task generation with options such as `--write`, `--prompt`, `--copy`, `--debug-context`, `--context-files`, and `--fresh`.
-- `dev-guard prompt`: generate a Codex prompt from current context. Supports `--compact`, `--ultra-compact`, `--density`, `--copy`, and `--output`.
-- `dev-guard check --local`: run rule-based scope checks against working tree, staged, and untracked changes.
-- `dev-guard review --heuristic`: run local static review without an AI provider.
-- `dev-guard review`: use configured AI provider when available.
-- `dev-guard fix-prompt`: generate a Codex-ready correction prompt from review output.
-- `dev-guard report --compact`: print a short handoff summary.
-- `dev-guard scan`: build project memory cache.
-- `dev-guard refresh`: incrementally update project memory.
-- `dev-guard doctor`: inspect provider, config, git baseline, detected runtime, telemetry, and memory.
-- `dev-guard telemetry`: show privacy-safe drift telemetry summary.
+`watch` is event-driven. It does not run periodic refresh jobs and does not run `done` automatically.
+
+## Completion Output
+
+`dev-guard done` writes:
+
+- `devguard/reports/last-run.md`
+- `devguard/history.jsonl`
+- `devguard/reports/history-summary.md`
+- `devguard/reports/decision-candidates.md`
+- `devguard/reports/quality-report.md`
+- `devguard/prompts/next-codex-prompt.md`
+
+## Advanced / Legacy Commands
+
+These commands remain available but are no longer the main onboarding path:
+
+- `dev-guard "<requirement>"`: generate a task and compact prompt through the older task flow.
+- `dev-guard task-ai "<requirement>"`: AI-backed task generation.
+- `dev-guard prompt`: generate a prompt from current project context.
+- `dev-guard check --local`: run local scope checks directly.
+- `dev-guard review --heuristic`: run local heuristic review directly.
+- `dev-guard review`: provider-backed review when configured.
+- `dev-guard fix-prompt`: generate a fix prompt from review output.
+- `dev-guard report --compact`: print a compact handoff summary.
+- `dev-guard scan`: build `.devguard` project memory cache.
+- `dev-guard refresh`: incrementally update project memory cache.
+- `dev-guard update`: preview managed docs update candidates.
+- `dev-guard update --write`: write managed docs blocks only.
+- `dev-guard doctor`: print config/provider/git/runtime diagnostics.
+- `dev-guard telemetry`: print privacy-safe drift telemetry summary.
 - `dev-guard configure ai`: configure provider/model.
-- `dev-guard config set`: change provider/model/temperature/max token settings.
+- `dev-guard config set`: update config values.
 
-## Local Files
+## Development Helpers
 
-Generated `.devguard/` files are local-only by default. `task.md`, `runs/`, memory cache, `code-graph.json`, and telemetry are ignored. Keep examples in docs instead of committing local `.devguard` runtime files.
+These are mostly for developing dev-guard itself:
 
-## Development Workflow
-
-These commands are mainly for developing dev-guard itself:
-
-- `dev-guard self "<requirement>"`: wrapper around task/prompt generation for this repo.
-- `dev-guard self-check`: run build, local check, heuristic review, and doctor in sequence.
+- `dev-guard self "<requirement>"`
+- `dev-guard self-check`
 
 ## Help
 

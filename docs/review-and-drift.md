@@ -2,7 +2,16 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-dev-guard has two review modes:
+Direct review commands are advanced tools. The default workflow is:
+
+```bash
+dev-guard watch
+dev-guard done
+```
+
+`done` records drift candidates in `last-run.md`, `quality-report.md`, and `next-codex-prompt.md`.
+
+dev-guard also has two direct review modes:
 
 - local heuristic review, available without an API key
 - provider-backed review, when configured

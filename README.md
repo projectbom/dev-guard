@@ -2,39 +2,52 @@
 
 [English](./README.md) | [한국어](./README.ko.md)
 
-dev-guard is an Alpha CLI guardrail for AI-assisted coding workflows. It helps you turn a natural-language task into a compact Codex prompt, then checks whether the resulting git changes stayed inside the requested scope.
+dev-guard is an Alpha CLI guardrail for AI-assisted coding workflows. It watches project changes, turns finished work into a compact handoff report, and generates the next Codex/Claude prompt with local quality checks.
 
-It is designed for teams that want a lightweight loop:
+The current MVP is centered on this loop:
 
 ```bash
 dev-guard init
-dev-guard status
-dev-guard "Fix loading flicker"
+dev-guard watch
+# let Claude/Codex edit files
 dev-guard done
+dev-guard status
 ```
 
-dev-guard supports Korean and English natural-language requirements. The public CLI/docs are English-first, and a Korean guide is available in [README.ko.md](./README.ko.md).
+dev-guard supports Korean and English project notes and prompts. The public docs are English-first; the Korean guide is in [README.ko.md](./README.ko.md).
 
-## What It Does
+## Problem
 
-- Creates project-local guard files under `.devguard/`.
-- Detects project type, package manager, runtime, git baseline, and pending changes.
-- Builds lightweight project memory, including import/reverse-dependency impact hints.
-- Generates compact Codex-ready prompts from your current requirement.
-- Runs local heuristic checks and review without requiring an API provider.
-- Optionally uses an AI provider for richer task generation and review.
-- Keeps docs updates safe: `update` previews, and only `update --write` modifies managed blocks.
+AI coding agents often finish a task without preserving enough context for the next step. Teams then paste long chat logs into the next Codex/Claude session, miss drift risks, or forget why a file changed.
 
-## Install
+dev-guard keeps this workflow local and explicit:
 
-For local development:
+- watch file changes while an AI agent works
+- process completion only when you run `done`
+- keep append-only history
+- produce quality verdicts and handoff prompts
+- avoid automatic source edits or document writes
+
+## Quick Start
+
+Install and build:
 
 ```bash
 pnpm install
 pnpm run build
 ```
 
-Link the CLI locally:
+Run from this monorepo:
+
+```bash
+pnpm cli init
+pnpm cli watch
+# edit files with Claude/Codex
+pnpm cli done
+pnpm cli status
+```
+
+After linking globally:
 
 ```bash
 cd packages/cli
@@ -43,142 +56,172 @@ pnpm link --global
 dev-guard --help
 ```
 
-## Quick Start
-
-The basic loop should be understandable in under a minute:
+Use it in another project:
 
 ```bash
 dev-guard init
-dev-guard status
-dev-guard "Fix loading flicker"
-# paste the generated prompt into Codex, then let Codex edit files
+dev-guard watch
+# let Claude/Codex work
 dev-guard done
-```
-
-If you are running inside this monorepo before linking:
-
-```bash
-pnpm cli init
-pnpm cli status
-pnpm cli "Fix loading flicker"
-pnpm cli done
+dev-guard status
 ```
 
 ## Recommended Workflow
 
-1. Initialize the project
-   - command:
-     ```bash
-     dev-guard init
-     ```
-   - purpose:
-     Create `.devguard` and docs guard files without overwriting existing content.
+1. Initialize local guard files
+   ```bash
+   dev-guard init
+   ```
+   Creates the initial `.devguard` guard files. The event-based workflow also creates `devguard/` runtime docs when needed.
 
-2. Check current status
-   - command:
-     ```bash
-     dev-guard status
-     ```
-   - purpose:
-     Confirm provider/model, API key state, git baseline, project detection, pending changes, and the next recommended action.
+2. Start the watcher
+   ```bash
+   dev-guard watch
+   ```
+   Watches project files and accumulates changed paths. It does not run `done`, write docs, commit, or call an AI provider.
 
-3. Generate a task prompt
-   - command:
-     ```bash
-     dev-guard "Describe the change you want"
-     ```
-   - purpose:
-     Analyze the requirement, write `.devguard/task.md`, and print a compact Codex prompt.
+3. Let Claude/Codex edit files
+   Work normally in your editor or agent session.
 
-4. Give the prompt to Codex
-   - purpose:
-     Codex edits the code using the generated `TASK`, `TYPE`, `FILES`, `PROTECT`, `SUCCESS`, and `VERIFY` sections.
+4. Mark the work as complete
+   ```bash
+   dev-guard done
+   ```
+   Reads git diff and pending watch state, classifies changed files, appends history, writes reports, creates a quality verdict, and generates the next handoff prompt.
 
-5. Check the finished work
-   - command:
-     ```bash
-     dev-guard done
-     ```
-   - purpose:
-     Refresh project memory, run local scope checks, run heuristic review, print a compact report, and preview docs updates.
+5. Check status
+   ```bash
+   dev-guard status
+   ```
+   Shows pending changes, last run summary, quality verdict, recent history, and the next recommended action.
 
-6. Preview docs updates when needed
-   - command:
-     ```bash
-     dev-guard update
-     ```
-   - purpose:
-     Preview candidate updates for project state, current task, decisions, and do-not-repeat notes.
+6. Reset only runtime state when needed
+   ```bash
+   dev-guard reset
+   ```
+   Clears the pending watch buffer. It does not delete history or project state.
 
-7. Write docs updates explicitly
-   - command:
-     ```bash
-     dev-guard update --write
-     ```
-   - purpose:
-     Update only dev-guard managed blocks. User-written sections are preserved.
-
-8. Repeat with the next task
-   - command:
-     ```bash
-     dev-guard "Next change"
-     ```
-   - purpose:
-     Generate the next compact Codex prompt.
-
-## Common Commands
+## Core Commands
 
 ```bash
 dev-guard init
-dev-guard status
-dev-guard "Fix the bug described here"
+dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard done
-dev-guard update
-dev-guard update --write
-dev-guard watch
-dev-guard help advanced
+dev-guard status
+dev-guard reset
 ```
 
-`watch` is optional. It refreshes project memory while you edit, but does not auto-fix code or write docs by default.
+Advanced and legacy commands still exist, but they are no longer the main workflow:
 
-## Examples
+- `scan`, `refresh`: project memory/cache maintenance
+- `check`, `review`, `report`: direct inspection commands
+- `prompt`, `task-ai`, natural-language command: prompt/task generation
+- `update`, `update --write`: managed docs update preview/write
+- `doctor`, `telemetry`, `self`, `self-check`: diagnostics and development helpers
 
-- [Bugfix workflow](./examples/bugfix.md)
-- [i18n workflow](./examples/i18n.md)
-- [Architecture workflow](./examples/architecture.md)
+See [docs/commands.md](./docs/commands.md) for details.
+
+## Generated File Structure
+
+dev-guard keeps runtime artifacts under `devguard/`:
+
+```text
+devguard/
+  project.md
+  architecture.md
+  decisions.md
+  tasks.md
+  state.json
+  runtime.json
+  history.jsonl
+  prompts/
+    next-codex-prompt.md
+  reports/
+    last-run.md
+    history-summary.md
+    decision-candidates.md
+    quality-report.md
+```
+
+The `.devguard/` directory is still used for older guard config, task files, runs, memory cache, and code graph data.
+
+Generated runtime/cache files are local-only by default and should not be committed unless a project intentionally changes its tracking policy. See [docs/configuration.md](./docs/configuration.md).
+
+## Handoff Flow
+
+`dev-guard done` creates:
+
+- `devguard/reports/last-run.md`: current completed-work report
+- `devguard/history.jsonl`: append-only run history
+- `devguard/reports/history-summary.md`: recent 5-run summary
+- `devguard/reports/decision-candidates.md`: decisions worth manually recording
+- `devguard/reports/quality-report.md`: PASS / NEEDS_REVIEW / BLOCKED quality verdict
+- `devguard/prompts/next-codex-prompt.md`: ready-to-paste Codex/Claude handoff prompt
+
+Example:
+
+```txt
+Quality: NEEDS_REVIEW
+Generated:
+- devguard/reports/last-run.md
+- devguard/prompts/next-codex-prompt.md
+- devguard/reports/history-summary.md
+- devguard/reports/decision-candidates.md
+- devguard/reports/quality-report.md
+```
+
+Read more in [docs/handoff.md](./docs/handoff.md).
+
+## Quality Flow
+
+`done` does not run build/test automatically. It checks what should be verified.
+
+Quality verdicts:
+
+- `PASS`: small scope, no blocking/high-risk signal, verification command exists, next task is clear
+- `NEEDS_REVIEW`: drift, broad change, risky area, CLI router/watch/runtime/prompt logic, or package manifest changed
+- `BLOCKED`: generated runtime files are in git changes, package/lockfile state looks inconsistent, or build script exists but no build verification can be suggested
+
+Example:
+
+```txt
+Quality: NEEDS_REVIEW
+Next recommended action: run pnpm run build, then review devguard/reports/quality-report.md
+```
+
+Read more in [docs/quality.md](./docs/quality.md).
+
+## Safety Model
+
+- No source edits are applied by `watch`, `done`, `status`, or `reset`.
+- `watch` is event-driven and does not run periodic refresh loops.
+- `done` writes only `devguard/` runtime reports/prompts/history/state.
+- `decisions.md` is not modified automatically; decision candidates are written to a report.
+- `update` is preview-only; `update --write` is the only docs-write command and only touches managed blocks.
+- API providers are optional. Local heuristic mode works without an API key.
+- API keys must stay in environment variables, not config or markdown files.
+
+## Watch Notes
+
+If your environment hits file descriptor limits:
+
+```bash
+dev-guard watch --poll
+dev-guard watch --depth 4
+```
+
+Watch excludes common heavy/generated paths such as `node_modules`, `.git`, `.next`, `dist`, `build`, `coverage`, and dev-guard runtime report/prompt files.
 
 ## AI Provider Setup
 
-dev-guard works without an API key by using local heuristics. AI features are optional.
-
-Configure OpenAI when you want AI-backed task generation or review:
+The event-based workflow works without an AI provider. Configure one only for advanced task/review flows:
 
 ```bash
 dev-guard configure ai --provider openai --model gpt-4o-mini
 export OPENAI_API_KEY="your_api_key"
 ```
 
-Do not store API keys in project files. Prefer environment variables such as `OPENAI_API_KEY`.
-
-You can change settings later:
-
-```bash
-dev-guard config set provider openai
-dev-guard config set model gpt-5
-dev-guard config set temperature 0.2
-dev-guard config show
-```
-
-## Safety Model
-
-- Default mode is local and preview-first.
-- `dev-guard done` does not modify docs.
-- `dev-guard update` does not modify files.
-- `dev-guard update --write` only updates managed blocks.
-- Context/cache files are excluded from normal changed-file summaries.
-- `.devguard/` runtime files are local-only by default; see [configuration docs](./docs/configuration.md) for examples.
-- Provider/API configuration is optional.
-- Watch mode auto-refreshes memory only; it does not apply source edits.
+Do not store API keys in project files.
 
 ## Alpha Status
 
@@ -197,18 +240,18 @@ Alpha limitations:
 - Optimized for TypeScript/Node projects.
 - Heuristic-heavy by design; not a full AST semantic engine.
 - Drift detection is probabilistic and should support, not replace, review.
-- AI review quality depends on provider configuration.
 - Local heuristic review is useful but not a full semantic code review.
-- Initial repositories without a git baseline can produce noisy untracked-file warnings.
-- Watch mode is intentionally conservative.
+- Watch mode is conservative and may need `--poll` or lower `--depth` in large repos.
 
 ## Advanced Docs
 
 - [Command reference](./docs/commands.md)
-- [Configuration and tracking policy](./docs/configuration.md)
-- [Release checklist](./docs/release-checklist.md)
-- [Architecture notes](./docs/architecture.md)
-- [Task AI and prompt generation](./docs/task-ai.md)
-- [Review, drift, and local heuristics](./docs/review-and-drift.md)
+- [Architecture](./docs/architecture.md)
+- [Handoff prompt](./docs/handoff.md)
+- [Quality verdicts](./docs/quality.md)
 - [Watch mode](./docs/watch.md)
+- [Configuration and tracking policy](./docs/configuration.md)
 - [Docs update safety](./docs/update.md)
+- [Review, drift, and local heuristics](./docs/review-and-drift.md)
+- [Task AI and prompt generation](./docs/task-ai.md)
+- [Release checklist](./docs/release-checklist.md)

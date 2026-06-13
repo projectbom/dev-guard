@@ -2,7 +2,19 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-`dev-guard "<requirement>"` is the default task prompt flow. Advanced users can call `dev-guard task-ai "<requirement>"` directly.
+Task AI and prompt generation are advanced/legacy flows. The current default workflow is event based:
+
+```bash
+dev-guard watch
+dev-guard done
+```
+
+Use task generation when you want dev-guard to create an initial task prompt before coding:
+
+```bash
+dev-guard "<requirement>"
+dev-guard task-ai "<requirement>"
+```
 
 ## Requirement Anchoring
 

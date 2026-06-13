@@ -2,39 +2,78 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-Watch mode monitors the current git diff while you edit and prints a compact intent summary.
+`dev-guard watch` is the default way to keep dev-guard aware of AI-agent work.
 
 ```bash
 dev-guard watch
 ```
 
-It polls git/worktree state instead of running as a background daemon.
+It watches file changes, accumulates pending paths, and waits for the user to run `dev-guard done`.
 
 ## Behavior
 
-- Runs diff intent inference and clustering.
-- Prints only when the diff hash, inferred intent, or watch status changes.
-- Uses a stable-after timer so formatter/prettier save bursts do not spam the terminal.
-- Does not auto-apply source edits.
-- Does not write docs by default.
-- Does not run `done`, `update --write`, git commit, or any autonomous action.
+- Uses chokidar when available.
+- Accumulates changed files in `devguard/runtime.json`.
+- Prints a stable state after changes settle.
+- Does not run `done` automatically.
+- Does not run `update --write`.
+- Does not edit source files.
+- Does not commit.
+- Does not call an AI provider.
 
-Status flow:
+Typical output:
 
 ```txt
-idle -> active -> stable -> ready_for_done
-                       -> mixed_warning
+dev-guard watch
+watching: packages, docs, devguard
+excluded: node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**
+depth: 8; poll: off; lockfiles: excluded
+mode: event-driven; no periodic refresh; no auto write
+stop: Ctrl+C
+
+STATUS: idle
+NEXT: keep editing; run dev-guard done when the AI task is finished
 ```
 
 ## Options
 
 ```bash
-dev-guard watch --check
-dev-guard watch --review
-dev-guard watch --interval 1000
-dev-guard watch --stable-after 30
-dev-guard watch --ultra
-dev-guard watch --once
+dev-guard watch --stable-after 10
+dev-guard watch --depth 4
+dev-guard watch --poll
+dev-guard watch --include-lockfiles
+dev-guard watch --compact
 ```
 
-`--check` and `--review` run only after the diff reaches a stable state. `--review` uses heuristic review here and does not auto-fix code.
+- `--stable-after <sec>`: wait time before reporting ready state.
+- `--depth <n>`: limit watcher depth. Default is `8`.
+- `--poll`: use polling, useful when native file watching hits `EMFILE`.
+- `--include-lockfiles`: include lockfile changes in watch events.
+- `--compact` / `--ultra`: keep output short.
+
+## Excluded Paths
+
+Watch excludes heavy/generated paths:
+
+- `node_modules/**`
+- `.git/**`
+- `.next/**`
+- `dist/**`
+- `build/**`
+- `coverage/**`
+- `devguard/runtime.json`
+- `devguard/reports/**`
+- `devguard/prompts/**`
+
+Lockfiles are excluded by default from watch events, but git diff analysis in `done` can still see them.
+
+## EMFILE Recovery
+
+If you see `EMFILE: too many open files`, try:
+
+```bash
+dev-guard watch --poll
+dev-guard watch --depth 4
+```
+
+You can also run from a narrower project path or increase the OS file descriptor limit.
