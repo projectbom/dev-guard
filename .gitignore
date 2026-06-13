@@ -6,6 +6,7 @@ dist
 # Keep project-local task/runs/cache out of GitHub.
 .devguard/*
 devguard/*.md
+devguard/history.jsonl
 devguard/runtime.json
 devguard/state.json
 devguard/reports/

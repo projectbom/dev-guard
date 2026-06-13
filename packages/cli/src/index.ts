@@ -14,7 +14,7 @@ import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
-import { processDoneEvent, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
+import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -250,6 +250,8 @@ async function runDone(root: string): Promise<void> {
     console.log("생성됨:");
     console.log(`- ${result.reportPath}`);
     console.log(`- ${result.promptPath}`);
+    console.log(`- ${result.historySummaryPath}`);
+    console.log(`- ${result.decisionCandidatesPath}`);
     console.log("");
     console.log("다음 작업:");
     console.log(`${result.promptPath} 확인 후 필요한 수정 진행`);
@@ -262,7 +264,7 @@ async function runDone(root: string): Promise<void> {
 
 async function runStatus(root: string): Promise<void> {
   console.log("dev-guard status");
-  const [runtime, state] = await Promise.all([readRuntimeState(root), readProjectState(root)]);
+  const [runtime, state, history] = await Promise.all([readRuntimeState(root), readProjectState(root), readHistoryRecords(root, 3)]);
   console.log(`Pending files: ${runtime.pendingChangedFiles.length}`);
   for (const file of runtime.pendingChangedFiles.slice(0, 12)) {
     console.log(`- ${file}`);
@@ -271,10 +273,23 @@ async function runStatus(root: string): Promise<void> {
     console.log(`- ... +${runtime.pendingChangedFiles.length - 12} files`);
   }
   console.log(`Runtime status: ${runtime.lastStatus ?? "idle"}`);
+  if (runtime.pendingChangedFiles.length === 0) {
+    console.log("State: 대기 중");
+  }
   console.log(`Last changed: ${runtime.lastChangedAt ?? "none"}`);
   console.log(`Last processed: ${state.lastProcessedAt ?? "none"}`);
   console.log(`Last summary: ${state.lastSummary ?? "none"}`);
   console.log(`Drift: ${state.lastDrift ?? "unknown"}`);
+  if (history.length > 0) {
+    console.log("");
+    console.log("Recent history:");
+    for (const record of history.slice().reverse()) {
+      console.log(`- ${record.timestamp}: ${record.inferredSummary}`);
+      if (record.driftCandidates.length > 0) {
+        console.log(`  drift: ${record.driftCandidates.slice(0, 2).join("; ")}`);
+      }
+    }
+  }
   console.log("");
   console.log("Next:");
   console.log(runtime.pendingChangedFiles.length > 0 ? "  dev-guard done" : "  dev-guard watch");
