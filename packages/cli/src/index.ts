@@ -291,6 +291,7 @@ async function runStatus(root: string): Promise<void> {
     }
   }
   console.log("");
+  console.log(`Next recommended action: ${nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift)}`);
   console.log("Next:");
   console.log(runtime.pendingChangedFiles.length > 0 ? "  dev-guard done" : "  dev-guard watch");
 }
@@ -304,6 +305,16 @@ async function runReset(root: string): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | "high"): string {
+  if (pendingCount > 0) {
+    return "run dev-guard done";
+  }
+  if (drift && drift !== "low") {
+    return "review devguard/prompts/next-codex-prompt.md";
+  }
+  return "대기 중";
 }
 
 async function captureConsole(run: () => Promise<unknown>): Promise<string[]> {

@@ -63,6 +63,37 @@ export interface HistoryRecord {
   reportPath: string;
 }
 
+interface PackageJson {
+  packageManager?: string;
+  scripts?: Record<string, string>;
+}
+
+interface ProjectContextSummary {
+  projectPurpose: string;
+  currentGoal: string;
+  notDoing: string;
+  techStack: string;
+  structure: string;
+  decisions: string[];
+}
+
+interface RiskDetail {
+  content: string;
+  relatedFiles: string[];
+  reason: string;
+  checkMethod: string;
+  decisionRule: string;
+}
+
+interface NextTaskPlan {
+  title: string;
+  goal: string;
+  scope: string[];
+  likelyFiles: string[];
+  doNotEdit: string[];
+  success: string[];
+}
+
 const runtimePath = "devguard/runtime.json";
 const statePath = "devguard/state.json";
 const historyPath = "devguard/history.jsonl";
@@ -212,7 +243,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const summary = formatInferredDiffIntentClusters(clusters);
   const timestamp = new Date().toISOString();
   const majorChanges = inferMajorChanges({ summary, changedFiles, areas, diffText });
-  const testCandidates = inferTestCandidates({ areas, changedFiles });
+  const testCandidates = await inferTestCandidates(root, { areas, changedFiles });
+  const projectContext = summarizeProjectContext({ projectMarkdown, architectureMarkdown, decisionsMarkdown });
   const docUpdateCandidates = [updateSuggestions.summary];
   const historyRecord: HistoryRecord = {
     id: `run_${timestamp.replace(/[-:.]/g, "").slice(0, 15)}_${hashRuntimeFiles(changedFiles).slice(0, 6)}`,
@@ -230,6 +262,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const previousHistory = await readHistoryRecords(root, 20);
   const nextHistory = [...previousHistory, historyRecord];
   const decisionCandidates = inferDecisionCandidates({ areas, changedFiles, judgments, summary });
+  const riskDetails = buildRiskDetails({ judgments, changedFiles, areas });
+  const nextTask = chooseNextTask({ drift, judgments, areas, changedFiles, testCandidates });
   const reportMarkdown = renderLastRunReport({
     timestamp,
     changedFiles,
@@ -250,14 +284,17 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     changedFiles
   });
   const promptMarkdown = renderNextPrompt({
+    projectContext,
     summary,
     changedFiles,
     areas,
     judgments,
     drift,
-    testCommands: inferTestCommands({ areas, changedFiles }),
+    testCommands: testCandidates,
     recentHistory: nextHistory.slice(-5),
-    decisionCandidates
+    decisionCandidates,
+    riskDetails,
+    nextTask
   });
   await Promise.all([
     appendTextFile(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`),
@@ -298,6 +335,8 @@ export function classifyAreas(files: string[]): string[] {
     if (/(^|\/)(config|package\.json|tsconfig|next\.config|vite\.config|middleware\.ts)/i.test(file)) areas.add("config");
     if (/\.(md|mdx)$/i.test(file) || /^docs\//i.test(file)) areas.add("docs");
     if (/(\.test|\.spec)\.[tj]sx?$|(^|\/)(tests?|__tests__)\//i.test(file)) areas.add("tests");
+    if (/^packages\/cli\//i.test(file)) areas.add("cli");
+    if (/^packages\/core\//i.test(file)) areas.add("core");
     if (/^(app|pages|components|src\/app|src\/components|styles|public)\//i.test(file)) areas.add("ui");
   }
   return areas.size > 0 ? [...areas].sort() : ["unknown"];
@@ -407,6 +446,7 @@ function renderLastRunReport(input: {
 }
 
 function renderNextPrompt(input: {
+  projectContext: ProjectContextSummary;
   summary: string;
   changedFiles: string[];
   areas: string[];
@@ -415,6 +455,8 @@ function renderNextPrompt(input: {
   testCommands: string[];
   recentHistory: HistoryRecord[];
   decisionCandidates: string[];
+  riskDetails: RiskDetail[];
+  nextTask: NextTaskPlan;
 }): string {
   const focusFiles = input.changedFiles.slice(0, 12);
   const recentLines = input.recentHistory
@@ -422,48 +464,69 @@ function renderNextPrompt(input: {
     .reverse()
     .map((record) => `- ${record.timestamp}: ${record.inferredSummary}`);
   return [
-    "# Next Codex Prompt",
+    "# Codex Handoff Prompt",
     "",
-    "아래 프로젝트 인수인계를 바탕으로 필요한 최소 수정만 진행해줘.",
+    "아래 인수인계를 기준으로 이어서 작업해줘. 추측보다 파일/명령/검증 결과를 우선하고, 관련 없는 수정은 하지 마.",
     "",
-    "## 최근 작업 요약",
+    "## Current Project Context",
+    `- project purpose: ${input.projectContext.projectPurpose}`,
+    `- current goal: ${input.projectContext.currentGoal}`,
+    `- not doing: ${input.projectContext.notDoing}`,
+    `- tech stack: ${input.projectContext.techStack}`,
+    `- structure: ${input.projectContext.structure}`,
+    "- decided:",
+    ...formatBullets(input.projectContext.decisions),
+    "",
+    "## Recent Work Summary",
+    "- current done:",
+    `  - ${input.summary}`,
+    `  - areas: ${input.areas.join(", ")}`,
+    `  - drift: ${input.drift}`,
+    "- recent history:",
     ...formatBullets(recentLines.map((line) => line.replace(/^- /, ""))),
+    "- repeatedly touched areas:",
+    ...formatBullets(formatCounts(countItems(input.recentHistory.flatMap((record) => record.areas))).slice(0, 5)),
     "",
-    "## 현재 변경 요약",
-    `- ${input.summary}`,
-    `- areas: ${input.areas.join(", ")}`,
-    `- drift: ${input.drift}`,
-    "",
-    "## 확인해야 할 파일",
-    ...formatBullets(focusFiles),
+    "## Changed Files",
+    ...formatBullets(focusFiles.map((file) => `${file} - ${inferFileRole(file)}; area=${classifyAreas([file]).join(",")}`)),
     ...(input.changedFiles.length > focusFiles.length ? [`- ... +${input.changedFiles.length - focusFiles.length} files`] : []),
     "",
-    "## 수정 목표",
-    "- 위 변경사항이 현재 의도한 작업 범위와 맞는지 확인한다.",
-    "- 누락된 마무리 수정이 있으면 관련 파일 안에서만 최소 변경한다.",
-    "- 문서 업데이트가 필요하면 직접 덮어쓰지 말고 update 후보로 남긴다.",
+    "## Risk / Drift Candidates",
+    ...formatRiskDetails(input.riskDetails),
     "",
-    "## 수정 금지 범위",
-    "- unrelated feature 추가 금지",
-    "- auth/database/api/config 변경은 현재 변경 의도와 직접 관련 있을 때만 수정",
+    "## Do Not Change",
+    "- 이번 작업과 관련 없는 영역",
     "- devguard/reports, devguard/prompts, devguard/runtime.json 직접 수정 금지",
-    "- 이미 결정된 사항은 임의로 뒤집지 말고 decision-candidates를 확인한 뒤 제안으로 남길 것",
-    "- 대규모 리팩터링 금지",
+    "- 사용자가 명시하지 않은 대규모 리팩터링 금지",
+    "- 기존 공개 명령어 UX 유지: watch/done/status/reset",
+    "- 기존 문서 원본 직접 수정 금지. 필요한 내용은 후보 파일 또는 보고로 남길 것",
+    "- auth/database/api/config 변경은 현재 작업과 직접 관련 있을 때만 수정",
     "",
-    "## 이미 결정된 사항 후보",
+    "## Already Decided / Decision Candidates",
     ...formatBullets(input.decisionCandidates.length > 0 ? input.decisionCandidates : ["새 결정 후보 없음"]),
     "",
-    "## 현재 확인 포인트",
-    ...formatBullets(input.judgments.length > 0 ? input.judgments : ["No blocking local judgment inferred."]),
+    "## Next Task",
+    `- priority: ${input.nextTask.title}`,
+    `- goal: ${input.nextTask.goal}`,
+    "- scope:",
+    ...formatBullets(input.nextTask.scope),
+    "- likely files:",
+    ...formatBullets(input.nextTask.likelyFiles),
+    "- do not edit:",
+    ...formatBullets(input.nextTask.doNotEdit),
+    "- success:",
+    ...formatBullets(input.nextTask.success),
     "",
-    "## 테스트 명령어",
+    "## Verification Commands",
     ...formatBullets(input.testCommands),
     "",
-    "## 완료 후 보고 형식",
+    "## Completion Report Format",
     "1. 수정한 파일",
-    "2. 수정 이유",
-    "3. 테스트 결과",
-    "4. 남은 위험 또는 확인 필요 사항"
+    "2. 수행한 작업",
+    "3. 수정하지 않은 범위",
+    "4. 검증 결과",
+    "5. 남은 리스크",
+    "6. 다음 권장 작업"
   ].join("\n") + "\n";
 }
 
@@ -514,18 +577,28 @@ function inferMajorChanges(input: { summary: string; changedFiles: string[]; are
   return [...changes].slice(0, 8);
 }
 
-function inferTestCandidates(input: { areas: string[]; changedFiles: string[] }): string[] {
+async function inferTestCandidates(root: string, input: { areas: string[]; changedFiles: string[] }): Promise<string[]> {
+  const [rootPackage, cliPackage] = await Promise.all([
+    readJsonFile<PackageJson>(fromRoot(root, "package.json"), {}),
+    readJsonFile<PackageJson>(fromRoot(root, "packages/cli/package.json"), {})
+  ]);
+  const rootScripts = rootPackage.scripts ?? {};
+  const cliScripts = cliPackage.scripts ?? {};
+  const usesPnpm = (rootPackage.packageManager ?? "").startsWith("pnpm") || Object.keys(rootScripts).some((script) => script === "cli");
   const tests = new Set<string>();
-  tests.add("pnpm run build");
-  if (input.changedFiles.some((file) => file.includes("watch"))) tests.add("pnpm cli watch --stable-after 1 --compact");
-  if (input.changedFiles.some((file) => file.includes("runtime") || file.includes("index.ts"))) tests.add("pnpm cli done");
-  if (input.areas.includes("config")) tests.add("pnpm cli status");
-  if (input.areas.includes("docs")) tests.add("pnpm cli update");
+  const runner = usesPnpm ? "pnpm" : "npm";
+  if (rootScripts.build) tests.add(`${runner} run build`);
+  if (rootScripts.test) tests.add(`${runner} test`);
+  if (rootScripts.cli) {
+    if (input.changedFiles.some((file) => file.includes("watch"))) tests.add(`${runner} cli watch --stable-after 1 --compact`);
+    if (input.changedFiles.some((file) => file.includes("runtime") || file.includes("index.ts"))) tests.add(`${runner} cli done`);
+    tests.add(`${runner} cli status`);
+    if (input.areas.includes("docs")) tests.add(`${runner} cli update`);
+  } else if (cliScripts.cli && usesPnpm) {
+    tests.add("pnpm --filter @dev-guard/cli cli status");
+  }
+  if (tests.size === 0) tests.add("확인 필요: package.json scripts에서 검증 명령을 찾지 못함");
   return [...tests];
-}
-
-function inferTestCommands(input: { areas: string[]; changedFiles: string[] }): string[] {
-  return inferTestCandidates(input);
 }
 
 function inferDecisionCandidates(input: { areas: string[]; changedFiles: string[]; judgments: string[]; summary: string }): string[] {
@@ -590,6 +663,147 @@ function renderDecisionCandidates(input: { timestamp: string; summary: string; c
     "## 근거 파일",
     ...formatBullets(input.changedFiles.slice(0, 12))
   ].join("\n") + "\n";
+}
+
+function summarizeProjectContext(input: { projectMarkdown: string; architectureMarkdown: string; decisionsMarkdown: string }): ProjectContextSummary {
+  return {
+    projectPurpose: firstSectionBullet(input.projectMarkdown, "프로젝트 목적") ?? "확인 필요",
+    currentGoal: firstSectionBullet(input.projectMarkdown, "현재 목표") ?? "확인 필요",
+    notDoing: firstSectionBullet(input.projectMarkdown, "하지 않을 것") ?? "확인 필요",
+    techStack: firstSectionBullet(input.architectureMarkdown, "기술 스택") ?? "확인 필요",
+    structure: firstSectionBullet(input.architectureMarkdown, "주요 디렉토리") ?? "확인 필요",
+    decisions: extractDecisionLines(input.decisionsMarkdown)
+  };
+}
+
+function firstSectionBullet(markdown: string, heading: string): string | undefined {
+  const lines = sectionLines(markdown, heading);
+  const bullet = lines.map((line) => line.trim()).find((line) => /^[-*]\s+/.test(line) && !/TODO|확인 필요/i.test(line));
+  return bullet?.replace(/^[-*]\s+/, "").trim();
+}
+
+function sectionLines(markdown: string, heading: string): string[] {
+  const lines = markdown.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.replace(/^#+\s*/, "").trim() === heading);
+  if (start < 0) return [];
+  const result: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^#{1,3}\s+/.test(line)) break;
+    result.push(line);
+  }
+  return result;
+}
+
+function extractDecisionLines(markdown: string): string[] {
+  const lines = markdown
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^#|^\| --- |TODO/.test(line) && !/^\|\s*날짜\s*\|/.test(line));
+  const meaningful = lines.filter((line) => /\|/.test(line) || /^[-*]\s+/.test(line)).slice(0, 5);
+  return meaningful.length > 0 ? meaningful.map((line) => line.replace(/^[-*]\s+/, "")) : ["확인 필요"];
+}
+
+function inferFileRole(file: string): string {
+  if (file.endsWith("package.json")) return "script/dependency config";
+  if (file.endsWith("pnpm-lock.yaml") || file.endsWith("package-lock.json") || file.endsWith("yarn.lock")) return "lockfile/dependency snapshot";
+  if (file === ".gitignore") return "generated artifacts exclusion";
+  if (/src\/index\.tsx?$/.test(file) || /src\/index\.jsx?$/.test(file)) return "CLI command router / entrypoint";
+  if (/watch\.[tj]sx?$/.test(file)) return "watch command / file watcher";
+  if (/runtime-state\.[tj]sx?$/.test(file)) return "runtime state / history persistence";
+  if (/review\.[tj]sx?$/.test(file)) return "review command / drift analysis";
+  if (/update\.[tj]sx?$/.test(file)) return "docs update preview/write logic";
+  if (/\.mdx?$/.test(file)) return "documentation";
+  if (/(\.test|\.spec)\.[tj]sx?$/.test(file)) return "test file";
+  if (/app\/api|pages\/api|route\.[tj]s$/.test(file)) return "API/server route";
+  if (/components|app|pages/.test(file)) return "UI/component surface";
+  if (/config|tsconfig|vite|next\.config/.test(file)) return "build/runtime config";
+  return "source file";
+}
+
+function buildRiskDetails(input: { judgments: string[]; changedFiles: string[]; areas: string[] }): RiskDetail[] {
+  const relatedFiles = input.changedFiles.slice(0, 6);
+  const risks = input.judgments.slice(0, 5).map((judgment) => ({
+    content: judgment,
+    relatedFiles,
+    reason: riskReason(judgment, input.areas),
+    checkMethod: riskCheckMethod(judgment, input.areas),
+    decisionRule: riskDecisionRule(judgment)
+  }));
+  return risks.length > 0
+    ? risks
+    : [
+        {
+          content: "명시적 drift 후보 없음",
+          relatedFiles,
+          reason: "local heuristic에서 blocking 후보를 찾지 못함",
+          checkMethod: "변경 파일을 직접 확인하고 검증 명령 실행",
+          decisionRule: "검증 통과 시 추가 수정 없이 종료"
+        }
+      ];
+}
+
+function riskReason(judgment: string, areas: string[]): string {
+  if (/mixed|drift/i.test(judgment)) return "여러 변경 의도가 섞였거나 현재 task와 다른 방향일 수 있음";
+  if (/auth|database|API|config/.test(judgment)) return `${areas.join(", ")} 영역은 런타임 동작 영향이 클 수 있음`;
+  if (/docs|문서/i.test(judgment)) return "코드 변경과 문서 상태가 어긋날 수 있음";
+  return "rule-based check에서 확인 후보로 분류됨";
+}
+
+function riskCheckMethod(judgment: string, areas: string[]): string {
+  if (/mixed|drift/i.test(judgment)) return "변경 파일이 하나의 작업 목표로 설명되는지 확인";
+  if (areas.includes("config")) return "빌드와 CLI status를 실행해 설정 영향 확인";
+  if (areas.includes("api")) return "API route 변경 diff와 호출 파일 확인";
+  return "관련 파일 diff를 읽고 package scripts 기반 검증 명령 실행";
+}
+
+function riskDecisionRule(judgment: string): string {
+  if (/high|drift/i.test(judgment)) return "현재 작업 목표와 직접 관련 없으면 수정/분리 후보";
+  if (/docs|문서/i.test(judgment)) return "코드 동작 변경이면 update 후보 생성, 직접 원본 문서 수정 금지";
+  return "검증 명령 통과와 관련 파일 일치 여부로 판단";
+}
+
+function formatRiskDetails(details: RiskDetail[]): string[] {
+  return details.flatMap((detail, index) => [
+    `- candidate ${index + 1}: ${detail.content}`,
+    `  - related files: ${detail.relatedFiles.length > 0 ? detail.relatedFiles.join(", ") : "none"}`,
+    `  - why check: ${detail.reason}`,
+    `  - how to check: ${detail.checkMethod}`,
+    `  - decision rule: ${detail.decisionRule}`
+  ]);
+}
+
+function chooseNextTask(input: {
+  drift: "low" | "medium" | "high";
+  judgments: string[];
+  areas: string[];
+  changedFiles: string[];
+  testCandidates: string[];
+}): NextTaskPlan {
+  if (input.changedFiles.some((file) => file.includes("watch")) && input.judgments.some((item) => /EMFILE|watch|mixed/i.test(item))) {
+    return nextTask("watch stability verification", "watch가 안정적으로 변경을 감지하고 EMFILE fallback 안내를 유지하는지 확인한다.", input);
+  }
+  if (input.changedFiles.some((file) => file.includes("runtime-state") || file.includes("prompt")) || input.judgments.some((item) => /prompt|history/i.test(item))) {
+    return nextTask("handoff prompt quality", "next-codex-prompt.md가 다음 에이전트가 바로 작업할 수 있는 인수인계 문서인지 확인한다.", input);
+  }
+  if (input.testCandidates.length > 0 && input.drift !== "low") {
+    return nextTask("verification before commit", "현재 변경을 추가 수정하기 전에 검증 명령을 실행하고 drift 후보를 정리한다.", input);
+  }
+  if (input.judgments.some((item) => /docs|문서/i.test(item))) {
+    return nextTask("docs update candidate review", "문서 원본을 직접 수정하지 않고 update 후보가 필요한지 확인한다.", input);
+  }
+  return nextTask("final review", "변경 파일을 확인하고 빌드/status 결과 기준으로 커밋 가능 여부를 판단한다.", input);
+}
+
+function nextTask(title: string, goal: string, input: { changedFiles: string[]; areas: string[]; testCandidates: string[] }): NextTaskPlan {
+  const likelyFiles = input.changedFiles.slice(0, 8);
+  return {
+    title,
+    goal,
+    scope: [`areas: ${input.areas.join(", ")}`, "현재 changed files 안에서만 최소 수정"],
+    likelyFiles: likelyFiles.length > 0 ? likelyFiles : ["확인 필요"],
+    doNotEdit: ["devguard/reports/*", "devguard/prompts/*", "devguard/runtime.json", "관련 없는 product/source files"],
+    success: ["검증 명령 통과", "drift 후보가 설명되거나 해소됨", "next-codex-prompt가 현재 변경과 일치"]
+  };
 }
 
 function countItems(items: string[]): Map<string, number> {
