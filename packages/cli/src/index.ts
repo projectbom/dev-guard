@@ -3,6 +3,7 @@ import { runCheck } from "./check.js";
 import { runConfigure } from "./configure.js";
 import { runDoctor } from "./doctor.js";
 import { runInferTask } from "./infer-task.js";
+import { getHookStatus, runInstallHooks, writeHookStatusReport } from "./hooks.js";
 import { runInit } from "./init.js";
 import { parsePromptOptions, runPrompt } from "./prompt.js";
 import { runRefresh } from "./refresh.js";
@@ -41,6 +42,11 @@ async function main(): Promise<void> {
 
   if (command === "done") {
     await runDone(root);
+    return;
+  }
+
+  if (command === "install-hooks") {
+    await runInstallHooks(root, process.argv.slice(3));
     return;
   }
 
@@ -159,6 +165,7 @@ Quick commands:
   dev-guard status
   dev-guard reset
   dev-guard watch
+  dev-guard install-hooks
 
 Common flow:
   1. dev-guard init
@@ -178,6 +185,7 @@ Usage:
   dev-guard init
   dev-guard "requirement"
   dev-guard done
+  dev-guard install-hooks [--force]
   dev-guard status
   dev-guard reset
   dev-guard check [--local] [--include-context-files]
@@ -203,6 +211,7 @@ Commands:
   init   Create .devguard and docs guard files
   "requirement" Generate task.md and a compact Codex prompt
   done   Treat pending changes as task complete and generate report/next prompt
+  install-hooks Install Claude Code and Codex stop hooks for automatic done/status
   status Show pending watch state and last processed task
   reset  Clear watch runtime state without deleting project state
   check  Analyze current git diff with rule-based checks
@@ -267,7 +276,13 @@ async function runDone(root: string): Promise<void> {
 
 async function runStatus(root: string): Promise<void> {
   console.log("dev-guard status");
-  const [runtime, state, history] = await Promise.all([readRuntimeState(root), readProjectState(root), readHistoryRecords(root, 3)]);
+  const [runtime, state, history, hookStatus] = await Promise.all([
+    readRuntimeState(root),
+    readProjectState(root),
+    readHistoryRecords(root, 3),
+    getHookStatus(root)
+  ]);
+  await writeHookStatusReport(root);
   console.log(`Pending files: ${runtime.pendingChangedFiles.length}`);
   for (const file of runtime.pendingChangedFiles.slice(0, 12)) {
     console.log(`- ${file}`);
@@ -284,6 +299,12 @@ async function runStatus(root: string): Promise<void> {
   console.log(`Last summary: ${state.lastSummary ?? "none"}`);
   console.log(`Drift: ${state.lastDrift ?? "unknown"}`);
   console.log(`Quality: ${state.lastQualityVerdict ?? "unknown"}`);
+  console.log("");
+  console.log("Hooks");
+  console.log(`Claude Code: ${hookStatus.claudeInstalled && hookStatus.claudeHookFile ? "INSTALLED" : "NOT_INSTALLED"}`);
+  console.log(`Codex CLI: ${hookStatus.codexInstalled && hookStatus.codexHookFile ? "INSTALLED" : "NOT_INSTALLED"}`);
+  console.log(`Last Hook Trigger: ${hookStatus.lastTrigger ?? "none"}`);
+  console.log(`Last Hook Success: ${hookStatus.lastSuccess === undefined ? "unknown" : hookStatus.lastSuccess ? "yes" : "no"}`);
   if (history.length > 0) {
     console.log("");
     console.log("Recent history:");

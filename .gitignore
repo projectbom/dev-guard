@@ -7,7 +7,9 @@ dist
 .devguard/*
 devguard/*.md
 devguard/history.jsonl
+devguard/logs/*
 devguard/runtime.json
 devguard/state.json
+devguard/reports/hook-status.md
 devguard/reports/
 devguard/prompts/
