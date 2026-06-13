@@ -8,6 +8,7 @@ import {
   readRuntimeState,
   recordRuntimeChange
 } from "./runtime-state.js";
+import { getHookStatus } from "./hooks.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done";
 
@@ -17,6 +18,7 @@ interface WatchOptions {
   depth: number;
   poll: boolean;
   includeLockfiles: boolean;
+  manual: boolean;
 }
 
 const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", "devguard"];
@@ -25,11 +27,30 @@ const excludedSummary = "node_modules/**, .git/**, dist/**, build/**, .next/**, 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   await ensureDevguardWorkspace(root);
   const options = parseWatchOptions(args);
+  const hookStatus = await getHookStatus(root);
+  const claudeHookInstalled = hookStatus.claudeInstalled && hookStatus.claudeHookFile;
+  const codexHookInstalled = hookStatus.codexInstalled && hookStatus.codexHookFile;
+  const autoMode = !options.manual && (claudeHookInstalled || codexHookInstalled);
   console.log("dev-guard watch");
+  console.log(`Mode: ${autoMode ? "Auto Mode" : "Manual Mode"}`);
+  console.log(`Claude Code Hook: ${claudeHookInstalled ? "INSTALLED" : "NOT_INSTALLED"}`);
+  console.log(`Codex Hook: ${codexHookInstalled ? "INSTALLED" : "NOT_INSTALLED"}`);
+  console.log(`Done trigger: ${autoMode ? "Agent Stop Hook" : "manual dev-guard done"}`);
+  if (autoMode) {
+    console.log("");
+    console.log("Watching for file changes...");
+    console.log("When Claude/Codex finishes, dev-guard done will run automatically.");
+  } else {
+    console.log("");
+    console.log("Watching for file changes...");
+    console.log("Tip:");
+    console.log(options.manual ? "Manual Mode enabled; run dev-guard done when the AI task is finished." : "Run dev-guard install-hooks to enable Auto Mode.");
+  }
+  console.log("");
   console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
   console.log(`excluded: ${excludedSummary}`);
-  console.log(`depth: ${options.depth}; poll: ${options.poll ? "on" : "off"}; lockfiles: ${options.includeLockfiles ? "included" : "excluded"}`);
-  console.log("mode: event-driven; no periodic refresh; no auto write");
+  console.log(`depth: ${options.depth}; poll: ${options.poll ? "on" : "off"}; lockfiles: ${options.includeLockfiles ? "included" : "excluded"}; manual: ${options.manual ? "on" : "off"}`);
+  console.log("mode: event-driven; no periodic refresh; no idle-time completion");
   console.log("stop: Ctrl+C");
 
   let status: WatchStatus = "idle";
@@ -50,9 +71,9 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       console.log(`changed: ${runtime.pendingChangedFiles.slice(0, 8).join(", ")}${runtime.pendingChangedFiles.length > 8 ? `, +${runtime.pendingChangedFiles.length - 8}` : ""}`);
     }
     if (status === "ready_for_done") {
-      console.log("NEXT: dev-guard done");
+      console.log(autoMode ? "NEXT: wait for Claude/Codex Stop Hook; fallback: dev-guard done" : "NEXT: dev-guard done");
     } else {
-      console.log("NEXT: keep editing; run dev-guard done when the AI task is finished");
+      console.log(autoMode ? "NEXT: keep editing; Stop Hook will run done when the AI task finishes" : "NEXT: keep editing; run dev-guard done when the AI task is finished");
     }
   };
 
@@ -107,7 +128,8 @@ function parseWatchOptions(args: string[]): WatchOptions {
     compact: args.includes("--compact") || args.includes("--ultra"),
     depth,
     poll: args.includes("--poll"),
-    includeLockfiles: args.includes("--include-lockfiles")
+    includeLockfiles: args.includes("--include-lockfiles"),
+    manual: args.includes("--manual") || args.includes("--no-auto")
   };
 }
 

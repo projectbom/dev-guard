@@ -25,6 +25,11 @@ process.stdin.on("end", () => {
     if (type !== "turn.completed" && type !== "turn.failed") continue;
     appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=start\n");
     if (type === "turn.completed") {
+      if (spawnSync("pnpm", ["--version"], { cwd: root, encoding: "utf8" }).status !== 0) {
+        appendFileSync(logPath, "dev-guard codex JSONL listener failed: pnpm was not found. Install pnpm or run dev-guard done/status manually.\n");
+        appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=failed done=127 status_cmd=127\n");
+        continue;
+      }
       const done = spawnSync("pnpm", ["cli", "done"], { cwd: root, encoding: "utf8" });
       const status = spawnSync("pnpm", ["cli", "status"], { cwd: root, encoding: "utf8" });
       appendFileSync(logPath, done.stdout + done.stderr + status.stdout + status.stderr);

@@ -15,7 +15,7 @@ import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
-import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
+import { generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -42,6 +42,11 @@ async function main(): Promise<void> {
 
   if (command === "done") {
     await runDone(root);
+    return;
+  }
+
+  if (command === "handoff") {
+    await runHandoff(root);
     return;
   }
 
@@ -160,18 +165,23 @@ function printHelp(): void {
 
 Quick commands:
   dev-guard init
-  dev-guard "fix the login redirect bug"
+  dev-guard install-hooks
+  dev-guard watch
   dev-guard done
+  dev-guard handoff
   dev-guard status
   dev-guard reset
-  dev-guard watch
-  dev-guard install-hooks
 
-Common flow:
+Recommended Auto Mode:
   1. dev-guard init
-  2. dev-guard "describe the change"
-  3. Run Codex / edit files
-  4. dev-guard done
+  2. dev-guard install-hooks
+  3. dev-guard watch
+  4. Run Claude/Codex; Stop Hook runs done automatically
+  5. dev-guard status
+
+Manual fallback:
+  dev-guard watch --manual
+  dev-guard done
 
 More:
   dev-guard help advanced
@@ -185,6 +195,7 @@ Usage:
   dev-guard init
   dev-guard "requirement"
   dev-guard done
+  dev-guard handoff
   dev-guard install-hooks [--force]
   dev-guard status
   dev-guard reset
@@ -194,7 +205,7 @@ Usage:
   dev-guard config show
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
-  dev-guard watch [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
+  dev-guard watch [--manual|--no-auto] [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
   dev-guard doctor
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
@@ -210,15 +221,16 @@ Usage:
 Commands:
   init   Create .devguard and docs guard files
   "requirement" Generate task.md and a compact Codex prompt
-  done   Treat pending changes as task complete and generate report/next prompt
-  install-hooks Install Claude Code and Codex stop hooks for automatic done/status
-  status Show pending watch state and last processed task
+  done   Manually process pending changes and generate report/next prompt/handoff
+  handoff Regenerate project-handoff.md from current devguard artifacts
+  install-hooks Enable Auto Mode with Claude Code and Codex Stop Hooks
+  status Show pending watch state, recommended mode, and last processed task
   reset  Clear watch runtime state without deleting project state
   check  Analyze current git diff with rule-based checks
   configure Configure dev-guard settings
   scan   Cache project structure and file summaries into .devguard
   refresh Incrementally update project memory cache
-  watch  Monitor file changes and wait for a task completion event
+  watch  Recommended Auto Mode watcher; waits for Stop Hook based done, or manual done fallback
   doctor Print config, provider, git, memory, and telemetry diagnostics
   telemetry Print privacy-safe drift telemetry summary
   report Print a compact current-work summary for ChatGPT/Codex handoff
@@ -262,6 +274,7 @@ async function runDone(root: string): Promise<void> {
     console.log(`- ${result.historySummaryPath}`);
     console.log(`- ${result.decisionCandidatesPath}`);
     console.log(`- ${result.qualityReportPath}`);
+    console.log(`- ${result.projectHandoffPath}`);
     console.log("");
     console.log(`Quality: ${result.qualityVerdict}`);
     console.log("");
@@ -270,6 +283,20 @@ async function runDone(root: string): Promise<void> {
   } catch (error) {
     console.error(`dev-guard done failed: ${errorMessage(error)}`);
     console.error("recovery: run dev-guard status, then dev-guard reset if the pending buffer is wrong");
+    process.exitCode = 1;
+  }
+}
+
+async function runHandoff(root: string): Promise<void> {
+  try {
+    const path = await generateProjectHandoff(root);
+    console.log("dev-guard handoff");
+    console.log(`generated: ${path}`);
+    console.log("");
+    console.log("Resume:");
+    console.log("Start a new Claude/Codex thread and attach/read project-handoff.md");
+  } catch (error) {
+    console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
     process.exitCode = 1;
   }
 }
@@ -300,11 +327,23 @@ async function runStatus(root: string): Promise<void> {
   console.log(`Drift: ${state.lastDrift ?? "unknown"}`);
   console.log(`Quality: ${state.lastQualityVerdict ?? "unknown"}`);
   console.log("");
+  const claudeHook = hookStatus.claudeInstalled && hookStatus.claudeHookFile ? "INSTALLED" : "NOT_INSTALLED";
+  const codexHook = hookStatus.codexInstalled && hookStatus.codexHookFile ? "INSTALLED" : "NOT_INSTALLED";
+  const autoModeReady = claudeHook === "INSTALLED" || codexHook === "INSTALLED";
+  console.log(`Mode: ${autoModeReady ? "Auto Mode recommended" : "Manual Mode fallback"}`);
+  console.log(`Hooks: Claude ${claudeHook} / Codex ${codexHook}`);
+  console.log("");
   console.log("Hooks");
-  console.log(`Claude Code: ${hookStatus.claudeInstalled && hookStatus.claudeHookFile ? "INSTALLED" : "NOT_INSTALLED"}`);
-  console.log(`Codex CLI: ${hookStatus.codexInstalled && hookStatus.codexHookFile ? "INSTALLED" : "NOT_INSTALLED"}`);
+  console.log(`Claude Code: ${claudeHook}`);
+  console.log(`Codex CLI: ${codexHook}`);
   console.log(`Last Hook Trigger: ${hookStatus.lastTrigger ?? "none"}`);
   console.log(`Last Hook Success: ${hookStatus.lastSuccess === undefined ? "unknown" : hookStatus.lastSuccess ? "yes" : "no"}`);
+  console.log("");
+  console.log("Handoff:");
+  console.log("devguard/reports/project-handoff.md");
+  console.log("");
+  console.log("Resume:");
+  console.log("Start a new Claude/Codex thread and attach/read project-handoff.md");
   if (history.length > 0) {
     console.log("");
     console.log("Recent history:");

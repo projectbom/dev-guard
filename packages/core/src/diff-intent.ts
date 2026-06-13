@@ -1,12 +1,12 @@
 import type { ChangeFile, CodeGraphEntry, InferredDiffIntent, InferredDiffIntentClusters, TaskTypeResult } from "./types.js";
 
-const commands = ["task-ai", "fix-prompt", "self-check", "done", "status", "update", "watch", "review", "check", "prompt", "doctor", "report", "scan", "refresh", "telemetry", "self"];
+const commands = ["task-ai", "fix-prompt", "self-check", "done", "handoff", "status", "update", "watch", "review", "check", "prompt", "doctor", "report", "scan", "refresh", "telemetry", "self"];
 
 const cliOutputPattern = /(console\.(log|error|warn)|format|summary|preview|success|error|warning|output|print|stdout|stderr|출력|요약|미리보기|성공|실패|경고|안내)/i;
 const promptPattern = /(prompt|density|token|compact|ultra|context|프롬프트|토큰|압축)/i;
 const relevancePattern = /(relevance|candidate|score|scope|drift|intent|router|routing|selection|후보|관련|범위|의도|분류)/i;
-const workflowPattern = /(done|watch|review|check|report|guardrail|workflow|self|update preview|워크플로우|검증|가드)/i;
-const cliCommandHandlerPattern = /(^|\/)(task-ai|fix-prompt|self-check|done|status|update|watch|review|check|prompt|doctor|report|scan|refresh|telemetry|self|index)\.ts$/i;
+const workflowPattern = /(done|handoff|watch|review|check|report|guardrail|workflow|self|update preview|워크플로우|검증|가드)/i;
+const cliCommandHandlerPattern = /(^|\/)(task-ai|fix-prompt|self-check|done|handoff|status|update|watch|review|check|prompt|doctor|report|scan|refresh|telemetry|self|index)\.ts$/i;
 const appSourcePathPattern = /^(app|pages|components|src\/app|src\/pages|src\/components|lib|hooks|utils)\//i;
 const livingDocumentPattern = /(living[-_]?document|thought[-_]?artifact|artifact|artifacts|brain|memo|folder|document[-_]?ui|문서|메모|폴더|생각)/i;
 

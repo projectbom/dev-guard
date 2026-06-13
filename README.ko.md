@@ -4,14 +4,16 @@
 
 dev-guard는 AI/Codex/Claude 작업 흐름을 위한 Alpha 단계 CLI guardrail입니다. 파일 변경을 감시하고, 작업이 끝났을 때 변경 내역/품질/다음 프롬프트를 로컬에서 정리합니다.
 
-현재 MVP의 기본 흐름은 아래입니다.
+기본 권장 흐름은 Hook 기반 Auto Mode입니다.
 
 ```bash
 dev-guard init
+dev-guard install-hooks
 dev-guard watch
 # Claude/Codex가 파일 수정
-dev-guard done
 dev-guard status
+# context window 초과 시 새 스레드에서 이어가기
+dev-guard handoff
 ```
 
 ## 문제 정의
@@ -21,7 +23,8 @@ AI 에이전트 작업은 끝난 뒤 맥락이 쉽게 끊깁니다. 다음 작�
 dev-guard는 이 흐름을 로컬에서 정리합니다.
 
 - 작업 중 파일 변경 감시
-- 사용자가 `done`을 실행했을 때만 완료 처리
+- 신뢰된 Claude/Codex Stop Hook으로 완료 처리
+- Hook을 쓸 수 없을 때는 수동 `done` fallback 유지
 - 작업 이력 누적
 - 품질 verdict 생성
 - 다음 Claude/Codex용 handoff prompt 생성
@@ -40,9 +43,9 @@ pnpm run build
 
 ```bash
 pnpm cli init
+pnpm cli install-hooks
 pnpm cli watch
 # 파일 수정
-pnpm cli done
 pnpm cli status
 ```
 
@@ -59,8 +62,9 @@ dev-guard --help
 
 ```bash
 dev-guard init
+dev-guard install-hooks
 dev-guard watch
-dev-guard done
+# Hook이 없거나 실패하면 dev-guard watch --manual 후 dev-guard done
 dev-guard status
 ```
 
@@ -68,15 +72,20 @@ dev-guard status
 
 ```bash
 dev-guard init
+dev-guard install-hooks [--force]
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
+dev-guard watch --manual
 dev-guard done
+dev-guard handoff
 dev-guard status
 dev-guard reset
 ```
 
 - `init`: 초기 guard 파일 생성
 - `watch`: 변경 파일 감시 및 pending buffer 누적
+- `install-hooks`: Claude Code / Codex Stop Hook 설치
 - `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
+- `handoff`: 현재 devguard 산출물만 읽어서 `project-handoff.md` 재생성
 - `status`: pending 상태, 최근 작업, quality verdict, 다음 권장 작업 출력
 - `reset`: runtime pending buffer만 초기화
 
@@ -112,10 +121,56 @@ devguard/
 - `devguard/reports/decision-candidates.md`
 - `devguard/reports/quality-report.md`
 - `devguard/prompts/next-codex-prompt.md`
+- `devguard/reports/project-handoff.md`
 
 `next-codex-prompt.md`는 다음 Claude/Codex에 바로 전달할 수 있는 인수인계 문서입니다.
+`project-handoff.md`는 context window 초과 후 새 Claude/Codex 스레드에서 바로 이어가기 위한 압축 인수인계 문서입니다.
 
 자세한 내용은 [docs/handoff.md](./docs/handoff.md)를 참고하세요.
+
+## Hook 연동
+
+`dev-guard install-hooks`는 repo-local Stop Hook 파일을 생성합니다.
+
+- Claude Code: `.claude/settings.json`의 `hooks.Stop[].hooks[]`
+- Codex CLI: `.codex/hooks.json`의 `hooks.Stop[].hooks[]`
+- Hook script: `devguard/hooks/claude-stop.sh`, `devguard/hooks/codex-stop.sh`
+- 보조 JSONL listener: `devguard/hooks/codex-event-listener.ts`
+
+Codex의 `turn.completed`는 Hook 이벤트가 아니라 `codex exec --json` JSONL 출력 이벤트입니다. JSONL listener는 이 스트림을 감시하는 보조 기능이며 `.codex/hooks.json`에 섞지 않습니다.
+
+## 사용 모드
+
+### Auto Mode 권장
+
+```bash
+dev-guard install-hooks
+dev-guard watch
+```
+
+Auto Mode가 기본 권장 사용법입니다. Claude Code / Codex Stop Hook이 에이전트 작업 종료를 감지하고 `dev-guard done`을 자동 실행합니다. `done`은 `quality-report.md`, `next-codex-prompt.md`, `project-handoff.md`를 생성합니다.
+
+Auto Mode는 idle timeout, polling 기반 완료 추정, 자동 build/test, 자동 git commit을 사용하지 않습니다.
+
+### Manual Mode fallback
+
+```bash
+dev-guard watch --manual
+dev-guard done
+```
+
+Hook을 사용할 수 없거나 신뢰되지 않았거나 실패했을 때 사용합니다. `watch`는 변경만 누적하고, 사용자가 직접 `done`을 실행합니다.
+
+## Context Overflow 복구
+
+Claude/Codex 세션이 context window 초과로 끊기면 긴 history를 붙여넣지 말고 다음 파일을 사용합니다.
+
+```bash
+dev-guard handoff
+cat devguard/reports/project-handoff.md
+```
+
+새 Claude/Codex 스레드에서는 `devguard/reports/project-handoff.md`를 읽게 하고, Current State / Quality Status / Next Best Task 기준으로 이어서 작업하게 합니다.
 
 ## Quality Flow
 

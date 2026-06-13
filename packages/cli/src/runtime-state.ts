@@ -37,6 +37,7 @@ export interface ProjectState {
   lastChangedFiles?: string[];
   lastReportPath?: string;
   lastPromptPath?: string;
+  lastHandoffPath?: string;
 }
 
 export interface DoneProcessingResult {
@@ -48,6 +49,7 @@ export interface DoneProcessingResult {
   historySummaryPath: string;
   decisionCandidatesPath: string;
   qualityReportPath: string;
+  projectHandoffPath: string;
   qualityVerdict: QualityVerdict;
   summary: string;
   drift: "low" | "medium" | "high";
@@ -124,6 +126,8 @@ const promptPath = "devguard/prompts/next-codex-prompt.md";
 const historySummaryPath = "devguard/reports/history-summary.md";
 const decisionCandidatesPath = "devguard/reports/decision-candidates.md";
 const qualityReportPath = "devguard/reports/quality-report.md";
+const projectHandoffPath = "devguard/reports/project-handoff.md";
+const hookStatusPath = "devguard/reports/hook-status.md";
 
 const defaultRuntime: RuntimeState = {
   pendingChangedFiles: [],
@@ -346,10 +350,12 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
       lastQualityNextAction: qualityReport.nextRecommendedAction,
       lastChangedFiles: changedFiles,
       lastReportPath: reportPath,
-      lastPromptPath: promptPath
+      lastPromptPath: promptPath,
+      lastHandoffPath: projectHandoffPath
     }),
     resetRuntimeState(root)
   ]);
+  await generateProjectHandoff(root);
   return {
     changedFiles,
     areas,
@@ -359,10 +365,46 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     historySummaryPath,
     decisionCandidatesPath,
     qualityReportPath,
+    projectHandoffPath,
     qualityVerdict: qualityReport.verdict,
     summary,
     drift
   };
+}
+
+export async function generateProjectHandoff(root: string): Promise<string> {
+  await ensureDevguardWorkspace(root);
+  const [project, architecture, decisions, tasks, history, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state] = await Promise.all([
+    readRequiredText(root, "devguard/project.md"),
+    readRequiredText(root, "devguard/architecture.md"),
+    readRequiredText(root, "devguard/decisions.md"),
+    readRequiredText(root, "devguard/tasks.md"),
+    readRequiredText(root, historyPath),
+    readRequiredText(root, historySummaryPath),
+    readRequiredText(root, decisionCandidatesPath),
+    readRequiredText(root, qualityReportPath),
+    readRequiredText(root, promptPath),
+    readRequiredText(root, hookStatusPath),
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {})
+      .then((value) => JSON.stringify(value, null, 2))
+      .catch(() => "확인 필요")
+  ]);
+  const records = parseHistoryRecords(history.content).slice(-5);
+  const handoff = renderProjectHandoff({
+    project,
+    architecture,
+    decisions,
+    tasks,
+    records,
+    historySummary,
+    decisionCandidates,
+    qualityReport,
+    nextPrompt,
+    hookStatus,
+    state
+  });
+  await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
+  return projectHandoffPath;
 }
 
 export function classifyAreas(files: string[]): string[] {
@@ -808,6 +850,226 @@ function renderQualityReport(report: QualityReport): string {
     "## Next Recommended Action",
     `- ${report.nextRecommendedAction}`
   ].join("\n") + "\n";
+}
+
+interface RequiredText {
+  path: string;
+  content: string;
+  missing: boolean;
+}
+
+function renderProjectHandoff(input: {
+  project: RequiredText;
+  architecture: RequiredText;
+  decisions: RequiredText;
+  tasks: RequiredText;
+  records: HistoryRecord[];
+  historySummary: RequiredText;
+  decisionCandidates: RequiredText;
+  qualityReport: RequiredText;
+  nextPrompt: RequiredText;
+  hookStatus: RequiredText;
+  state: string;
+}): string {
+  const quality = parseQuality(input.qualityReport.content);
+  const nextTask = extractNextTask(input.nextPrompt.content, input.tasks.content, input.state);
+  const decisions = importantDecisions(input.decisions.content, input.decisionCandidates.content);
+  return [
+    "# Project Handoff",
+    "",
+    "## Current State",
+    ...formatBullets(currentStateSummary(input)),
+    ...missingInputs([input.project, input.architecture, input.tasks]),
+    "",
+    "## Active Workflow",
+    "- `dev-guard watch` keeps the pending file buffer current.",
+    "- Claude/Codex edits files in the normal agent session.",
+    "- Trusted Claude Code / Codex Stop Hooks run `dev-guard done` automatically.",
+    "- `dev-guard done` writes history, quality-report, next-codex-prompt, and project-handoff.",
+    "- Manual fallback: run `dev-guard done`, then `dev-guard handoff` if only the resume file must be refreshed.",
+    "- `dev-guard status` shows hook state, quality state, and the handoff path.",
+    "",
+    "## Recent Changes",
+    ...formatBullets(
+      input.records.length > 0
+        ? input.records
+            .slice(-5)
+            .reverse()
+            .map((record) => `${record.timestamp}: ${record.inferredSummary}`)
+        : extractBullets(input.historySummary.content, 5)
+    ),
+    ...missingInputs([input.historySummary]),
+    "",
+    "## Important Decisions",
+    ...formatBullets(decisions),
+    ...missingInputs([input.decisions, input.decisionCandidates]),
+    "",
+    "## Quality Status",
+    `- verdict: ${quality.verdict}`,
+    "- reason:",
+    ...formatBullets(quality.why),
+    "- required verification:",
+    ...formatBullets(quality.requiredVerification),
+    ...missingInputs([input.qualityReport]),
+    "",
+    "## Open Risks",
+    ...formatBullets(openRisks(input)),
+    "",
+    "## Next Best Task",
+    `- ${nextTask}`,
+    "",
+    "## Do Not Change",
+    "- Do not add idle-timeout based completion detection.",
+    "- Do not add polling-based completion guessing.",
+    "- Do not call LLM APIs automatically.",
+    "- Do not run git commit automatically.",
+    "- Do not change the existing watch/done/status/reset UX.",
+    "- Do not change the verified Claude/Codex hook structure unless official docs require it.",
+    "",
+    "## Resume Prompt",
+    "devguard/reports/project-handoff.md를 읽고 Current State, Quality Status, Next Best Task를 기준으로 이어서 작업해라. 구현되지 않은 기능을 추측하지 말고 현재 파일 기준으로 확인한 뒤 진행해라."
+  ].join("\n") + "\n";
+}
+
+async function readRequiredText(root: string, path: string): Promise<RequiredText> {
+  const content = await readTextFile(fromRoot(root, path));
+  const missing = !content.trim();
+  return {
+    path,
+    content: missing ? "확인 필요" : content,
+    missing
+  };
+}
+
+function parseHistoryRecords(text: string): HistoryRecord[] {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line) as HistoryRecord;
+      } catch {
+        return undefined;
+      }
+    })
+    .filter((record): record is HistoryRecord => Boolean(record));
+}
+
+function parseQuality(markdown: string): { verdict: string; why: string[]; requiredVerification: string[] } {
+  return {
+    verdict: firstSectionBullet(markdown, "Verdict") ?? "확인 필요",
+    why: extractSectionBullets(markdown, "Why", 4),
+    requiredVerification: extractSectionBullets(markdown, "Required Verification", 5)
+  };
+}
+
+function extractNextTask(nextPrompt: string, tasks: string, state: string): string {
+  const priority = firstSectionBullet(nextPrompt, "Next Task")?.replace(/^priority:\s*/i, "");
+  if (priority && priority !== "none") return priority;
+  const fromTasks = firstSectionBullet(tasks, "다음 작업") ?? firstSectionBullet(tasks, "진행 중");
+  if (fromTasks && !/TODO|확인 필요/i.test(fromTasks)) return fromTasks;
+  return summarizeFromState(state, "lastQualityNextAction") ?? "확인 필요";
+}
+
+function importantDecisions(decisions: string, candidates: string): string[] {
+  const merged = [...extractDecisionLines(decisions), ...extractSectionBullets(candidates, "기록 후보", 5)];
+  return [...new Set(merged.filter(isUsefulText))].slice(0, 6);
+}
+
+function openRisks(input: {
+  qualityReport: RequiredText;
+  hookStatus: RequiredText;
+  state: string;
+  project: RequiredText;
+  architecture: RequiredText;
+  decisions: RequiredText;
+  tasks: RequiredText;
+  historySummary: RequiredText;
+  decisionCandidates: RequiredText;
+  nextPrompt: RequiredText;
+}): string[] {
+  const risks = new Set<string>();
+  for (const item of [...extractSectionBullets(input.qualityReport.content, "Blocked Items", 5), ...extractSectionBullets(input.qualityReport.content, "Warnings", 5)]) {
+    if (item !== "none" && item !== "확인 필요") risks.add(item);
+  }
+  if (/NOT_INSTALLED|unknown|no/i.test(input.hookStatus.content)) risks.add("Hook status needs verification in the actual Claude/Codex environment.");
+  if (/Codex CLI: INSTALLED/.test(input.hookStatus.content)) risks.add("Codex Stop Hook format is configured; actual Codex runtime trust/execution still needs environment verification.");
+  if (/lastQualityVerdict":\s*"NEEDS_REVIEW"|lastQualityVerdict":\s*"BLOCKED"/.test(input.state)) {
+    risks.add(`Quality state is ${summarizeFromState(input.state, "lastQualityVerdict")}; review quality-report before commit.`);
+  }
+  for (const doc of [input.project, input.architecture, input.decisions, input.tasks, input.historySummary, input.decisionCandidates, input.nextPrompt]) {
+    if (doc.missing) risks.add(`${doc.path} missing or empty; 확인 필요`);
+  }
+  return risks.size > 0 ? [...risks].slice(0, 8) : ["확인 필요: no open risk was identified from current devguard artifacts."];
+}
+
+function currentStateSummary(input: {
+  project: RequiredText;
+  architecture: RequiredText;
+  tasks: RequiredText;
+  qualityReport: RequiredText;
+  hookStatus: RequiredText;
+  state: string;
+}): string[] {
+  const summary = new Set<string>();
+  summary.add("watch / done / status / reset workflow is implemented.");
+  summary.add("done writes history, quality-report, next-codex-prompt, and project-handoff.");
+  summary.add("install-hooks writes Claude Code and Codex Stop Hook integration files.");
+  summary.add("Claude Code Stop Hook uses .claude/settings.json.");
+  summary.add("Codex Stop Hook uses .codex/hooks.json; turn.completed is treated as codex exec --json JSONL, not as a hook.");
+  if (/Claude Code: INSTALLED/.test(input.hookStatus.content)) summary.add("Claude Code hook status is currently INSTALLED.");
+  if (/Codex CLI: INSTALLED/.test(input.hookStatus.content)) summary.add("Codex CLI hook status is currently INSTALLED.");
+  const quality = parseQuality(input.qualityReport.content);
+  if (quality.verdict !== "확인 필요") summary.add(`latest quality verdict is ${quality.verdict}.`);
+  const stateSummary = summarizeFromState(input.state, "lastSummary");
+  if (stateSummary) summary.add(`latest done summary: ${stateSummary}`);
+  for (const item of [summarizeSection(input.project.content, "현재 목표"), summarizeSection(input.architecture.content, "기술 스택"), summarizeSection(input.tasks.content, "진행 중")]) {
+    if (isUsefulText(item)) summary.add(item);
+  }
+  return [...summary].slice(0, 10);
+}
+
+function summarizeSection(markdown: string, heading: string): string | undefined {
+  const bullet = firstSectionBullet(markdown, heading);
+  return bullet && !/TODO/i.test(bullet) ? bullet : undefined;
+}
+
+function summarizeFromState(stateJson: string, key: keyof ProjectState): string | undefined {
+  try {
+    const state = JSON.parse(stateJson) as ProjectState;
+    const value = state[key];
+    return typeof value === "string" && value.trim() ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function extractSectionBullets(markdown: string, heading: string, limit: number): string[] {
+  const bullets = sectionLines(markdown, heading)
+    .map((line) => line.trim())
+    .filter((line) => /^[-*]\s+/.test(line))
+    .map((line) => line.replace(/^[-*]\s+/, "").trim())
+    .filter(isUsefulText);
+  return bullets.length > 0 ? bullets.slice(0, limit) : ["확인 필요"];
+}
+
+function extractBullets(markdown: string, limit: number): string[] {
+  const bullets = markdown
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^[-*]\s+/.test(line))
+    .map((line) => line.replace(/^[-*]\s+/, "").trim())
+    .filter(isUsefulText);
+  return bullets.length > 0 ? bullets.slice(0, limit) : ["확인 필요"];
+}
+
+function missingInputs(inputs: RequiredText[]): string[] {
+  return inputs.filter((input) => input.missing).map((input) => `- ${input.path}: 확인 필요`);
+}
+
+function isUsefulText(value: string | undefined): value is string {
+  return Boolean(value && value.trim() && value.trim() !== "none");
 }
 
 function isGeneratedRuntimePath(file: string): boolean {

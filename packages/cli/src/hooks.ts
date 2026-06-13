@@ -26,6 +26,8 @@ const codexHooksPath = ".codex/hooks.json";
 const hookStatusPath = "devguard/reports/hook-status.md";
 const claudeLogPath = "devguard/logs/claude-hook.log";
 const codexLogPath = "devguard/logs/codex-hook.log";
+const claudeHookCommand = '${CLAUDE_PROJECT_DIR}/devguard/hooks/claude-stop.sh';
+const codexHookCommand = '"$(git rev-parse --show-toplevel)/devguard/hooks/codex-stop.sh"';
 
 export async function runInstallHooks(root: string, args: string[]): Promise<void> {
   const force = args.includes("--force");
@@ -48,9 +50,7 @@ export async function installHooks(root: string, options: { force?: boolean } = 
   const files: Array<{ path: string; content: string; executable?: boolean }> = [
     { path: claudeHookPath, content: shellHook("claude", claudeLogPath), executable: true },
     { path: codexHookPath, content: shellHook("codex", codexLogPath), executable: true },
-    { path: codexListenerPath, content: codexEventListener() },
-    { path: claudeSettingsPath, content: claudeSettings() },
-    { path: codexHooksPath, content: codexHooks() }
+    { path: codexListenerPath, content: codexEventListener(), executable: true }
   ];
 
   for (const file of files) {
@@ -69,6 +69,8 @@ export async function installHooks(root: string, options: { force?: boolean } = 
       skipped.push(`${file.path} (${errorMessage(error)})`);
     }
   }
+  await installJsonHookConfig(root, claudeSettingsPath, createClaudeHookConfig, { ...options, mergeExisting: true }, created, skipped);
+  await installJsonHookConfig(root, codexHooksPath, createCodexHookConfig, { ...options, mergeExisting: false }, created, skipped);
   await writeHookStatusReport(root);
   return { created, skipped, reportPath: hookStatusPath };
 }
@@ -122,25 +124,46 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LOG="$ROOT/${logPath}"
 mkdir -p "$(dirname "$LOG")" "$ROOT/devguard/reports"
 
+hook_input="$(cat)"
 timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 {
   echo "timestamp=$timestamp hook=${kind}.stop status=start"
+  if [ -n "$hook_input" ]; then
+    echo "timestamp=$timestamp hook=${kind}.stop stdin_json_begin"
+    printf '%s\\n' "$hook_input"
+    echo "timestamp=$timestamp hook=${kind}.stop stdin_json_end"
+  fi
   cd "$ROOT" || exit 1
   if [ -f package.json ] && grep -q '"cli"' package.json; then
-    pnpm cli done
-    done_status=$?
-    pnpm cli status
-    status_status=$?
+    if command -v pnpm >/dev/null 2>&1; then
+      pnpm cli done
+      done_status=$?
+      pnpm cli status
+      status_status=$?
+    else
+      echo "dev-guard hook failed: pnpm was not found. Install pnpm or run dev-guard done/status manually."
+      done_status=127
+      status_status=127
+    fi
   else
-    dev-guard done
-    done_status=$?
-    dev-guard status
-    status_status=$?
+    if command -v dev-guard >/dev/null 2>&1; then
+      dev-guard done
+      done_status=$?
+      dev-guard status
+      status_status=$?
+    else
+      echo "dev-guard hook failed: dev-guard was not found on PATH. Install/link dev-guard or run the local CLI manually."
+      done_status=127
+      status_status=127
+    fi
   fi
   if [ "$done_status" -eq 0 ] && [ "$status_status" -eq 0 ]; then
     echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop status=success done=$done_status status_cmd=$status_status"
   else
     echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop status=failed done=$done_status status_cmd=$status_status"
+    if [ "$done_status" -ne 0 ]; then
+      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop handoff=not_generated reason=done_failed"
+    fi
   fi
 } >> "$LOG" 2>&1
 
@@ -162,42 +185,12 @@ cat > "$ROOT/devguard/reports/hook-status.md" <<EOF
 - success: $([ "$done_status" -eq 0 ] && [ "$status_status" -eq 0 ] && echo yes || echo no)
 EOF
 
+if [ "${kind}" = "codex" ]; then
+  printf '{}\\n'
+fi
+
 exit 0
 `;
-}
-
-function claudeSettings(): string {
-  return `${JSON.stringify(
-    {
-      hooks: {
-        Stop: [
-          {
-            matcher: "",
-            hooks: [{ type: "command", command: "devguard/hooks/claude-stop.sh" }]
-          }
-        ]
-      }
-    },
-    null,
-    2
-  )}\n`;
-}
-
-function codexHooks(): string {
-  return `${JSON.stringify(
-    {
-      hooks: [
-        { event: "Stop", command: "devguard/hooks/codex-stop.sh" },
-        { event: "turn.completed", command: "devguard/hooks/codex-stop.sh" }
-      ],
-      jsonl: {
-        events: ["turn.completed", "turn.failed"],
-        listener: "devguard/hooks/codex-event-listener.ts"
-      }
-    },
-    null,
-    2
-  )}\n`;
 }
 
 function codexEventListener(): string {
@@ -228,6 +221,11 @@ process.stdin.on("end", () => {
     if (type !== "turn.completed" && type !== "turn.failed") continue;
     appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=start\\n");
     if (type === "turn.completed") {
+      if (spawnSync("pnpm", ["--version"], { cwd: root, encoding: "utf8" }).status !== 0) {
+        appendFileSync(logPath, "dev-guard codex JSONL listener failed: pnpm was not found. Install pnpm or run dev-guard done/status manually.\\n");
+        appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=failed done=127 status_cmd=127\\n");
+        continue;
+      }
       const done = spawnSync("pnpm", ["cli", "done"], { cwd: root, encoding: "utf8" });
       const status = spawnSync("pnpm", ["cli", "status"], { cwd: root, encoding: "utf8" });
       appendFileSync(logPath, done.stdout + done.stderr + status.stdout + status.stderr);
@@ -238,6 +236,117 @@ process.stdin.on("end", () => {
   }
 });
 `;
+}
+
+async function installJsonHookConfig(
+  root: string,
+  path: string,
+  createConfig: (current: JsonObject) => JsonObject,
+  options: { force?: boolean; mergeExisting?: boolean },
+  created: string[],
+  skipped: string[]
+): Promise<void> {
+  const absolute = fromRoot(root, path);
+  const existed = existsSync(absolute);
+  let current: JsonObject = {};
+
+  if (existed) {
+    if (!options.force && !options.mergeExisting) {
+      skipped.push(`${path} (exists; use --force to update)`);
+      return;
+    }
+    const text = await readTextFile(absolute);
+    try {
+      current = parseJsonObject(text, path);
+    } catch (error) {
+      if (!options.force) {
+        skipped.push(`${path} (${errorMessage(error)}; use --force to overwrite)`);
+        return;
+      }
+      current = {};
+    }
+  }
+
+  const next = createConfig(current);
+  const changed = JSON.stringify(current) !== JSON.stringify(next);
+  if (!changed && existed) {
+    skipped.push(`${path} (dev-guard hook already installed)`);
+    return;
+  }
+
+  await writeTextFile(absolute, `${JSON.stringify(next, null, 2)}\n`);
+  created.push(existed ? `${path} (updated)` : path);
+}
+
+function createClaudeHookConfig(current: JsonObject): JsonObject {
+  return addCommandHook(current, "Stop", {
+    type: "command",
+    command: claudeHookCommand,
+    statusMessage: "Running dev-guard done/status"
+  });
+}
+
+function createCodexHookConfig(current: JsonObject): JsonObject {
+  return addCommandHook(current, "Stop", {
+    type: "command",
+    command: codexHookCommand,
+    timeout: 600,
+    statusMessage: "Running dev-guard done/status"
+  });
+}
+
+function addCommandHook(current: JsonObject, event: string, handler: JsonObject): JsonObject {
+  const next = cloneJsonObject(current);
+  const hooks = isJsonObject(next.hooks) ? next.hooks : {};
+  const hookPath = typeof handler.command === "string" ? handler.command.replace(/^\$\{CLAUDE_PROJECT_DIR\}\//, "").replace(/^"?\$\(git rev-parse --show-toplevel\)\//, "").replace(/"$/, "") : "";
+  const groups = (Array.isArray(hooks[event]) ? hooks[event] : [])
+    .filter(isJsonObject)
+    .map((item) => {
+      const handlers = Array.isArray(item.hooks)
+        ? item.hooks.filter((candidate) => {
+            if (!isJsonObject(candidate)) return true;
+            return typeof candidate.command !== "string" || !candidate.command.includes(hookPath) || candidate.command === handler.command;
+          })
+        : [];
+      return { ...item, hooks: handlers };
+    })
+    .filter((item) => Array.isArray(item.hooks) && item.hooks.length > 0);
+  const group = (groups.find((item) => !("matcher" in item) && Array.isArray(item.hooks)) ?? groups.find((item) => isJsonObject(item) && Array.isArray(item.hooks))) as JsonObject | undefined;
+
+  if (group) {
+    if (event === "Stop" && group.matcher === "") {
+      delete group.matcher;
+    }
+    const handlers = Array.isArray(group.hooks) ? [...group.hooks] : [];
+    if (!handlers.some((item) => isJsonObject(item) && item.command === handler.command)) {
+      group.hooks = [...handlers, handler];
+    }
+  } else {
+    groups.push({ hooks: [handler] });
+  }
+
+  hooks[event] = groups;
+  next.hooks = hooks;
+  return next;
+}
+
+function parseJsonObject(text: string, path: string): JsonObject {
+  const parsed = text.trim() ? JSON.parse(text) : {};
+  if (!isJsonObject(parsed)) {
+    throw new Error(`${path} is not a JSON object`);
+  }
+  return parsed;
+}
+
+function cloneJsonObject(value: JsonObject): JsonObject {
+  return JSON.parse(JSON.stringify(value)) as JsonObject;
+}
+
+type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
+type JsonObject = { [key: string]: JsonValue };
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function extractLogValue(line: string, key: string): string | undefined {

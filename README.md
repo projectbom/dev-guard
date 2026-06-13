@@ -4,14 +4,16 @@
 
 dev-guard is an Alpha CLI guardrail for AI-assisted coding workflows. It watches project changes, turns finished work into a compact handoff report, and generates the next Codex/Claude prompt with local quality checks.
 
-The current MVP is centered on this loop:
+The default workflow is Hook-based Auto Mode:
 
 ```bash
 dev-guard init
+dev-guard install-hooks
 dev-guard watch
-# let Claude/Codex edit files
-dev-guard done
+# let Claude/Codex edit files; Stop Hooks run done automatically
 dev-guard status
+# if a session overflows, start a new thread with:
+dev-guard handoff
 ```
 
 dev-guard supports Korean and English project notes and prompts. The public docs are English-first; the Korean guide is in [README.ko.md](./README.ko.md).
@@ -23,7 +25,8 @@ AI coding agents often finish a task without preserving enough context for the n
 dev-guard keeps this workflow local and explicit:
 
 - watch file changes while an AI agent works
-- process completion only when you run `done`
+- process completion when a trusted Claude/Codex Stop Hook runs
+- keep `done` available as the manual fallback
 - keep append-only history
 - produce quality verdicts and handoff prompts
 - avoid automatic source edits or document writes
@@ -41,9 +44,9 @@ Run from this monorepo:
 
 ```bash
 pnpm cli init
+pnpm cli install-hooks
 pnpm cli watch
-# edit files with Claude/Codex
-pnpm cli done
+# edit files with Claude/Codex; Stop Hook runs done
 pnpm cli status
 ```
 
@@ -60,9 +63,9 @@ Use it in another project:
 
 ```bash
 dev-guard init
+dev-guard install-hooks
 dev-guard watch
-# let Claude/Codex work
-dev-guard done
+# let Claude/Codex work; Stop Hook runs done
 dev-guard status
 ```
 
@@ -74,28 +77,38 @@ dev-guard status
    ```
    Creates the initial `.devguard` guard files. The event-based workflow also creates `devguard/` runtime docs when needed.
 
-2. Start the watcher
+2. Enable Auto Mode once
+   ```bash
+   dev-guard install-hooks
+   ```
+   Installs repo-local Claude Code and Codex Stop Hooks. Auto Mode is Stop Hook based, not time/idle based.
+
+3. Start the watcher
    ```bash
    dev-guard watch
    ```
-   Watches project files and accumulates changed paths. It does not run `done`, write docs, commit, or call an AI provider.
+   Watches project files, accumulates changed paths, and waits for the Stop Hook completion event. When Claude/Codex finishes, the hook runs `dev-guard done`, which writes quality-report, next-codex-prompt, and project-handoff.
 
-3. Let Claude/Codex edit files
-   Work normally in your editor or agent session.
-
-4. Mark the work as complete
+4. Manual fallback when hooks are unavailable
    ```bash
+   dev-guard watch --manual
    dev-guard done
    ```
-   Reads git diff and pending watch state, classifies changed files, appends history, writes reports, creates a quality verdict, and generates the next handoff prompt.
+   Manual Mode only accumulates pending changes until you explicitly run `done`.
 
 5. Check status
    ```bash
    dev-guard status
    ```
-   Shows pending changes, last run summary, quality verdict, recent history, and the next recommended action.
+   Shows pending changes, last run summary, quality verdict, recent history, hook state, the handoff path, and the next recommended action.
 
-6. Reset only runtime state when needed
+6. Resume after context overflow
+   ```bash
+   dev-guard handoff
+   ```
+   Regenerates `devguard/reports/project-handoff.md` from current devguard artifacts only. Start a new Claude/Codex thread and ask it to read that file.
+
+7. Reset only runtime state when needed
    ```bash
    dev-guard reset
    ```
@@ -105,8 +118,11 @@ dev-guard status
 
 ```bash
 dev-guard init
+dev-guard install-hooks [--force]
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
+dev-guard watch --manual
 dev-guard done
+dev-guard handoff
 dev-guard status
 dev-guard reset
 ```
@@ -157,6 +173,7 @@ Generated runtime/cache files are local-only by default and should not be commit
 - `devguard/reports/decision-candidates.md`: decisions worth manually recording
 - `devguard/reports/quality-report.md`: PASS / NEEDS_REVIEW / BLOCKED quality verdict
 - `devguard/prompts/next-codex-prompt.md`: ready-to-paste Codex/Claude handoff prompt
+- `devguard/reports/project-handoff.md`: compressed project resume file for a new Claude/Codex thread
 
 Example:
 
@@ -171,6 +188,60 @@ Generated:
 ```
 
 Read more in [docs/handoff.md](./docs/handoff.md).
+
+## Hook Integration
+
+`dev-guard install-hooks` writes repo-local Stop hook integration files:
+
+- Claude Code: `.claude/settings.json` with `hooks.Stop[].hooks[]`
+- Codex CLI: `.codex/hooks.json` with `hooks.Stop[].hooks[]`
+- Hook scripts: `devguard/hooks/claude-stop.sh` and `devguard/hooks/codex-stop.sh`
+- Optional JSONL helper: `devguard/hooks/codex-event-listener.ts`
+
+The Codex JSONL helper is not a Codex hook config. It is only for consuming `codex exec --json` event streams such as `turn.completed` and `turn.failed`.
+
+## Usage Modes
+
+### Auto Mode Recommended
+
+```bash
+dev-guard install-hooks
+dev-guard watch
+```
+
+Auto Mode is the default recommendation. Claude Code / Codex Stop Hooks detect agent turn completion and run `dev-guard done` automatically. `done` then writes `quality-report.md`, `next-codex-prompt.md`, and `project-handoff.md`.
+
+Auto Mode does not use idle timeout, polling-based completion guessing, automatic build/test, or automatic git commit.
+
+### Manual Mode Fallback
+
+```bash
+dev-guard watch --manual
+dev-guard done
+```
+
+Use Manual Mode when hooks are unavailable, untrusted, or failed. `watch` only accumulates pending changes; you decide when to run `done`.
+
+Useful commands:
+
+```bash
+dev-guard install-hooks
+dev-guard install-hooks --force
+dev-guard status
+dev-guard done
+dev-guard handoff
+```
+
+## Context Overflow Recovery
+
+When a Claude/Codex session hits the context window, do not paste long history into a new thread. Use the generated handoff:
+
+```bash
+dev-guard handoff
+cat devguard/reports/project-handoff.md
+```
+
+In the new thread, attach or ask the agent to read `devguard/reports/project-handoff.md`. It summarizes current state, active workflow, recent changes, important decisions, quality status, open risks, the next best task, and a short resume prompt.
 
 ## Quality Flow
 

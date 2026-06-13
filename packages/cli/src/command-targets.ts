@@ -6,7 +6,7 @@ interface CommandTarget {
   reference: string[];
 }
 
-const knownCommands = ["task-ai", "fix-prompt", "self-check", "done", "status", "update", "watch", "review", "check", "prompt", "doctor", "report", "scan", "refresh", "telemetry", "self"];
+const knownCommands = ["task-ai", "fix-prompt", "self-check", "done", "handoff", "status", "update", "watch", "review", "check", "prompt", "doctor", "report", "scan", "refresh", "telemetry", "self"];
 
 export function inferCommandTargetFiles(requirement: string, projectFiles: string[]): CommandTarget | undefined {
   const command = detectCommand(requirement);
@@ -21,7 +21,7 @@ export function inferCommandTargetFiles(requirement: string, projectFiles: strin
   const references: string[] = [];
   const edits: string[] = [];
 
-  if (command === "done" || command === "status") {
+  if (command === "done" || command === "handoff" || command === "status") {
     if (indexFile) {
       edits.push(indexFile);
     }
@@ -81,7 +81,7 @@ export function filterCommandTargetCandidates(
       return true;
     }
 
-    if ((target.command === "done" || target.command === "status") && /(^|\/)update\.ts$/i.test(candidate.path)) {
+    if ((target.command === "done" || target.command === "handoff" || target.command === "status") && /(^|\/)update\.ts$/i.test(candidate.path)) {
       return false;
     }
 
@@ -124,6 +124,7 @@ function commandFileFor(command: string, fileSet: Set<string>): string | undefin
   const candidates = [
     `packages/cli/src/${command}.ts`,
     `packages/cli/src/${normalized}.ts`,
+    command === "handoff" ? "packages/cli/src/runtime-state.ts" : "",
     command === "task-ai" ? "packages/cli/src/task-ai.ts" : "",
     command === "fix-prompt" ? "packages/cli/src/review.ts" : "",
     command === "review" ? "packages/cli/src/review.ts" : "",
