@@ -252,6 +252,9 @@ async function runDone(root: string): Promise<void> {
     console.log(`- ${result.promptPath}`);
     console.log(`- ${result.historySummaryPath}`);
     console.log(`- ${result.decisionCandidatesPath}`);
+    console.log(`- ${result.qualityReportPath}`);
+    console.log("");
+    console.log(`Quality: ${result.qualityVerdict}`);
     console.log("");
     console.log("다음 작업:");
     console.log(`${result.promptPath} 확인 후 필요한 수정 진행`);
@@ -280,6 +283,7 @@ async function runStatus(root: string): Promise<void> {
   console.log(`Last processed: ${state.lastProcessedAt ?? "none"}`);
   console.log(`Last summary: ${state.lastSummary ?? "none"}`);
   console.log(`Drift: ${state.lastDrift ?? "unknown"}`);
+  console.log(`Quality: ${state.lastQualityVerdict ?? "unknown"}`);
   if (history.length > 0) {
     console.log("");
     console.log("Recent history:");
@@ -291,7 +295,7 @@ async function runStatus(root: string): Promise<void> {
     }
   }
   console.log("");
-  console.log(`Next recommended action: ${nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift)}`);
+  console.log(`Next recommended action: ${nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction)}`);
   console.log("Next:");
   console.log(runtime.pendingChangedFiles.length > 0 ? "  dev-guard done" : "  dev-guard watch");
 }
@@ -307,9 +311,12 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | "high"): string {
+function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | "high", quality?: string, qualityAction?: string): string {
   if (pendingCount > 0) {
     return "run dev-guard done";
+  }
+  if (quality && quality !== "PASS" && qualityAction) {
+    return qualityAction;
   }
   if (drift && drift !== "low") {
     return "review devguard/prompts/next-codex-prompt.md";

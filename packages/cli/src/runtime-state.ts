@@ -32,6 +32,8 @@ export interface ProjectState {
   lastProcessedAt?: string;
   lastSummary?: string;
   lastDrift?: "low" | "medium" | "high";
+  lastQualityVerdict?: QualityVerdict;
+  lastQualityNextAction?: string;
   lastChangedFiles?: string[];
   lastReportPath?: string;
   lastPromptPath?: string;
@@ -45,8 +47,27 @@ export interface DoneProcessingResult {
   promptPath: string;
   historySummaryPath: string;
   decisionCandidatesPath: string;
+  qualityReportPath: string;
+  qualityVerdict: QualityVerdict;
   summary: string;
   drift: "low" | "medium" | "high";
+}
+
+type QualityVerdict = "PASS" | "NEEDS_REVIEW" | "BLOCKED";
+
+interface QualityCheckItem {
+  label: string;
+  status: "PASS" | "WARN" | "BLOCKED";
+  detail: string;
+}
+
+interface QualityReport {
+  verdict: QualityVerdict;
+  why: string[];
+  requiredVerification: string[];
+  checklist: QualityCheckItem[];
+  beforeCommit: string[];
+  nextRecommendedAction: string;
 }
 
 export interface HistoryRecord {
@@ -101,6 +122,7 @@ const reportPath = "devguard/reports/last-run.md";
 const promptPath = "devguard/prompts/next-codex-prompt.md";
 const historySummaryPath = "devguard/reports/history-summary.md";
 const decisionCandidatesPath = "devguard/reports/decision-candidates.md";
+const qualityReportPath = "devguard/reports/quality-report.md";
 
 const defaultRuntime: RuntimeState = {
   pendingChangedFiles: [],
@@ -201,6 +223,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const runtime = await readRuntimeState(root);
   const gitChanges = await loadChangesWithFallback(root, runtime);
   const changeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
+  const rawChangedFiles = [...new Set(gitChanges.changeFiles.map((file) => file.path))].sort();
   const changedFiles = [
     ...new Set(
       (changeFiles.length > 0 ? changeFiles.map((file) => file.path) : runtime.pendingChangedFiles).filter(
@@ -264,6 +287,14 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const decisionCandidates = inferDecisionCandidates({ areas, changedFiles, judgments, summary });
   const riskDetails = buildRiskDetails({ judgments, changedFiles, areas });
   const nextTask = chooseNextTask({ drift, judgments, areas, changedFiles, testCandidates });
+  const qualityReport = await assessCompletionQuality(root, {
+    changedFiles,
+    rawChangedFiles,
+    areas,
+    judgments,
+    testCandidates,
+    nextTaskTitle: nextTask.title
+  });
   const reportMarkdown = renderLastRunReport({
     timestamp,
     changedFiles,
@@ -283,6 +314,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     candidates: decisionCandidates,
     changedFiles
   });
+  const qualityReportMarkdown = renderQualityReport(qualityReport);
   const promptMarkdown = renderNextPrompt({
     projectContext,
     summary,
@@ -294,19 +326,23 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     recentHistory: nextHistory.slice(-5),
     decisionCandidates,
     riskDetails,
-    nextTask
+    nextTask,
+    qualityReport
   });
   await Promise.all([
     appendTextFile(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`),
     writeTextFile(fromRoot(root, reportPath), reportMarkdown),
     writeTextFile(fromRoot(root, historySummaryPath), historySummaryMarkdown),
     writeTextFile(fromRoot(root, decisionCandidatesPath), decisionCandidatesMarkdown),
+    writeTextFile(fromRoot(root, qualityReportPath), qualityReportMarkdown),
     writeTextFile(fromRoot(root, promptPath), promptMarkdown),
     writeProjectState(root, {
       ...(await readProjectState(root)),
       lastProcessedAt: new Date().toISOString(),
       lastSummary: summary,
       lastDrift: drift,
+      lastQualityVerdict: qualityReport.verdict,
+      lastQualityNextAction: qualityReport.nextRecommendedAction,
       lastChangedFiles: changedFiles,
       lastReportPath: reportPath,
       lastPromptPath: promptPath
@@ -321,6 +357,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     promptPath,
     historySummaryPath,
     decisionCandidatesPath,
+    qualityReportPath,
+    qualityVerdict: qualityReport.verdict,
     summary,
     drift
   };
@@ -457,6 +495,7 @@ function renderNextPrompt(input: {
   decisionCandidates: string[];
   riskDetails: RiskDetail[];
   nextTask: NextTaskPlan;
+  qualityReport: QualityReport;
 }): string {
   const focusFiles = input.changedFiles.slice(0, 12);
   const recentLines = input.recentHistory
@@ -493,6 +532,19 @@ function renderNextPrompt(input: {
     "",
     "## Risk / Drift Candidates",
     ...formatRiskDetails(input.riskDetails),
+    "",
+    "## Quality Gate",
+    `- verdict: ${input.qualityReport.verdict}`,
+    "- required verification:",
+    ...formatBullets(input.qualityReport.requiredVerification),
+    "- before commit:",
+    ...formatBullets(input.qualityReport.beforeCommit),
+    "- blocked/warn items:",
+    ...formatBullets(
+      input.qualityReport.checklist
+        .filter((item) => item.status !== "PASS")
+        .map((item) => `${item.status}: ${item.label} - ${item.detail}`)
+    ),
     "",
     "## Do Not Change",
     "- 이번 작업과 관련 없는 영역",
@@ -599,6 +651,161 @@ async function inferTestCandidates(root: string, input: { areas: string[]; chang
   }
   if (tests.size === 0) tests.add("확인 필요: package.json scripts에서 검증 명령을 찾지 못함");
   return [...tests];
+}
+
+async function assessCompletionQuality(
+  root: string,
+  input: {
+    changedFiles: string[];
+    rawChangedFiles: string[];
+    areas: string[];
+    judgments: string[];
+    testCandidates: string[];
+    nextTaskTitle: string;
+  }
+): Promise<QualityReport> {
+  const [rootPackage, cliPackage] = await Promise.all([
+    readJsonFile<PackageJson>(fromRoot(root, "package.json"), {}),
+    readJsonFile<PackageJson>(fromRoot(root, "packages/cli/package.json"), {})
+  ]);
+  const rootScripts = rootPackage.scripts ?? {};
+  const checklist: QualityCheckItem[] = [];
+  const rawGeneratedFiles = input.rawChangedFiles.filter(isGeneratedRuntimePath);
+  checklist.push({
+    label: "generated/runtime files",
+    status: rawGeneratedFiles.length > 0 ? "BLOCKED" : "PASS",
+    detail: rawGeneratedFiles.length > 0 ? `generated files in git changes: ${rawGeneratedFiles.join(", ")}` : "no generated runtime files in git changes"
+  });
+
+  const packageChanged = input.changedFiles.some((file) => /(^|\/)package\.json$/.test(file));
+  const lockChanged = input.rawChangedFiles.some((file) => /(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?)$/.test(file));
+  checklist.push({
+    label: "package lock consistency",
+    status: packageChanged && !lockChanged ? "BLOCKED" : "PASS",
+    detail: packageChanged && !lockChanged ? "package.json changed but no lockfile change detected" : "package/lockfile state does not look inconsistent"
+  });
+
+  const hasBuildScript = Boolean(rootScripts.build);
+  const hasBuildVerification = input.testCandidates.some((command) => /\bbuild\b/.test(command));
+  checklist.push({
+    label: "build verification candidate",
+    status: hasBuildScript && !hasBuildVerification ? "BLOCKED" : "PASS",
+    detail: hasBuildScript ? (hasBuildVerification ? "build verification candidate found" : "build script exists but no build command was suggested") : "no build script found"
+  });
+
+  checklist.push({
+    label: "change breadth",
+    status: input.changedFiles.length >= 10 ? "WARN" : "PASS",
+    detail: `${input.changedFiles.length} changed file(s)`
+  });
+
+  const riskyAreas = input.areas.filter((area) => ["auth", "database", "api", "config"].includes(area));
+  checklist.push({
+    label: "risky areas",
+    status: riskyAreas.length > 0 ? "WARN" : "PASS",
+    detail: riskyAreas.length > 0 ? `risky area(s): ${riskyAreas.join(", ")}` : "no auth/database/api/config area detected"
+  });
+
+  const commandRouterChanged = input.changedFiles.some((file) => /packages\/cli\/src\/index\.tsx?$/.test(file));
+  checklist.push({
+    label: "CLI router/help verification",
+    status: commandRouterChanged ? "WARN" : "PASS",
+    detail: commandRouterChanged ? "CLI command router changed; verify help/status output" : "CLI router not changed"
+  });
+
+  const watchChanged = input.changedFiles.some((file) => /watch\.[tj]sx?$/.test(file));
+  checklist.push({
+    label: "watch verification",
+    status: watchChanged ? "WARN" : "PASS",
+    detail: watchChanged ? "watch changed; verify --poll and --depth behavior" : "watch implementation not changed"
+  });
+
+  const stateHistoryChanged = input.changedFiles.some((file) => /(runtime-state|history|state|prompt)\.[tj]sx?$/.test(file));
+  checklist.push({
+    label: "state/history verification",
+    status: stateHistoryChanged ? "WARN" : "PASS",
+    detail: stateHistoryChanged ? "state/history/prompt generation changed; verify done/status output" : "state/history generation not changed"
+  });
+
+  const codeChanged = input.changedFiles.some((file) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file));
+  const docsChanged = input.changedFiles.some((file) => /\.(md|mdx)$/.test(file) || file.startsWith("docs/"));
+  checklist.push({
+    label: "docs update candidate",
+    status: codeChanged && !docsChanged ? "WARN" : "PASS",
+    detail: codeChanged && !docsChanged ? "source changed without docs changes; review update candidates" : "docs/source balance does not require warning"
+  });
+
+  const hasDrift = input.judgments.some((item) => /drift|Generated diff/i.test(item));
+  checklist.push({
+    label: "drift clarity",
+    status: hasDrift && !input.nextTaskTitle ? "WARN" : "PASS",
+    detail: hasDrift ? `drift candidate present; next task=${input.nextTaskTitle || "missing"}` : "no drift candidate"
+  });
+
+  const blocked = checklist.filter((item) => item.status === "BLOCKED");
+  const warns = checklist.filter((item) => item.status === "WARN");
+  const verdict: QualityVerdict = blocked.length > 0 ? "BLOCKED" : warns.length > 0 ? "NEEDS_REVIEW" : "PASS";
+  const requiredVerification = input.testCandidates.length > 0 ? input.testCandidates : ["확인 필요: package.json scripts에서 검증 명령을 찾지 못함"];
+  const beforeCommit = [
+    ...requiredVerification.map((command) => `run ${command}`),
+    "review devguard/reports/quality-report.md",
+    "review devguard/prompts/next-codex-prompt.md"
+  ];
+  const nextRecommendedAction =
+    verdict === "BLOCKED"
+      ? "fix BLOCKED items before commit"
+      : verdict === "NEEDS_REVIEW"
+        ? `run ${requiredVerification[0]}, then review devguard/reports/quality-report.md`
+        : "ready for final review or commit";
+  return {
+    verdict,
+    why:
+      verdict === "PASS"
+        ? ["change scope is small, verification exists, and no blocking local quality rule fired"]
+        : [...blocked, ...warns].map((item) => `${item.status}: ${item.label} - ${item.detail}`),
+    requiredVerification,
+    checklist,
+    beforeCommit,
+    nextRecommendedAction
+  };
+}
+
+function renderQualityReport(report: QualityReport): string {
+  return [
+    "# Completion Quality Report",
+    "",
+    "## Verdict",
+    `- ${report.verdict}`,
+    "",
+    "## Why",
+    ...formatBullets(report.why),
+    "",
+    "## Required Verification",
+    ...formatBullets(report.requiredVerification),
+    "",
+    "## Risk Checklist",
+    ...report.checklist.map((item) => `- ${item.status}: ${item.label} - ${item.detail}`),
+    "",
+    "## Before Commit",
+    ...formatBullets(report.beforeCommit),
+    "",
+    "## Next Recommended Action",
+    `- ${report.nextRecommendedAction}`
+  ].join("\n") + "\n";
+}
+
+function isGeneratedRuntimePath(file: string): boolean {
+  return (
+    file === "devguard/runtime.json" ||
+    file === "devguard/state.json" ||
+    file === "devguard/history.jsonl" ||
+    file.startsWith("devguard/reports/") ||
+    file.startsWith("devguard/prompts/") ||
+    file.startsWith(".devguard/runs/") ||
+    file === ".devguard/project-index.json" ||
+    file === ".devguard/file-summaries.json" ||
+    file === ".devguard/code-graph.json"
+  );
 }
 
 function inferDecisionCandidates(input: { areas: string[]; changedFiles: string[]; judgments: string[]; summary: string }): string[] {
