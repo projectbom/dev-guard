@@ -315,8 +315,14 @@ function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | 
   if (pendingCount > 0) {
     return "run dev-guard done";
   }
-  if (quality && quality !== "PASS" && qualityAction) {
-    return qualityAction;
+  if (quality === "BLOCKED") {
+    return "fix blocked quality items before commit";
+  }
+  if (quality === "NEEDS_REVIEW") {
+    return qualityAction ?? "run verification, then review devguard/reports/quality-report.md";
+  }
+  if (quality === "PASS") {
+    return "ready for final review or commit";
   }
   if (drift && drift !== "low") {
     return "review devguard/prompts/next-codex-prompt.md";

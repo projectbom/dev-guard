@@ -59,6 +59,7 @@ interface QualityCheckItem {
   label: string;
   status: "PASS" | "WARN" | "BLOCKED";
   detail: string;
+  affectsVerdict?: boolean;
 }
 
 interface QualityReport {
@@ -684,6 +685,11 @@ async function assessCompletionQuality(
     status: packageChanged && !lockChanged ? "BLOCKED" : "PASS",
     detail: packageChanged && !lockChanged ? "package.json changed but no lockfile change detected" : "package/lockfile state does not look inconsistent"
   });
+  checklist.push({
+    label: "package manifest changed",
+    status: packageChanged ? "WARN" : "PASS",
+    detail: packageChanged ? "package.json changed; verify scripts/dependencies and publish impact" : "package.json not changed"
+  });
 
   const hasBuildScript = Boolean(rootScripts.build);
   const hasBuildVerification = input.testCandidates.some((command) => /\bbuild\b/.test(command));
@@ -731,19 +737,21 @@ async function assessCompletionQuality(
   const docsChanged = input.changedFiles.some((file) => /\.(md|mdx)$/.test(file) || file.startsWith("docs/"));
   checklist.push({
     label: "docs update candidate",
-    status: codeChanged && !docsChanged ? "WARN" : "PASS",
-    detail: codeChanged && !docsChanged ? "source changed without docs changes; review update candidates" : "docs/source balance does not require warning"
+    status: "PASS",
+    detail: codeChanged && !docsChanged ? "source changed without docs changes; recorded as doc update candidate only" : "docs/source balance does not require warning",
+    affectsVerdict: false
   });
 
   const hasDrift = input.judgments.some((item) => /drift|Generated diff/i.test(item));
   checklist.push({
     label: "drift clarity",
-    status: hasDrift && !input.nextTaskTitle ? "WARN" : "PASS",
+    status: hasDrift ? "WARN" : "PASS",
     detail: hasDrift ? `drift candidate present; next task=${input.nextTaskTitle || "missing"}` : "no drift candidate"
   });
 
-  const blocked = checklist.filter((item) => item.status === "BLOCKED");
-  const warns = checklist.filter((item) => item.status === "WARN");
+  const verdictItems = checklist.filter((item) => item.affectsVerdict !== false);
+  const blocked = verdictItems.filter((item) => item.status === "BLOCKED");
+  const warns = verdictItems.filter((item) => item.status === "WARN");
   const verdict: QualityVerdict = blocked.length > 0 ? "BLOCKED" : warns.length > 0 ? "NEEDS_REVIEW" : "PASS";
   const requiredVerification = input.testCandidates.length > 0 ? input.testCandidates : ["확인 필요: package.json scripts에서 검증 명령을 찾지 못함"];
   const beforeCommit = [
@@ -771,6 +779,8 @@ async function assessCompletionQuality(
 }
 
 function renderQualityReport(report: QualityReport): string {
+  const blocked = report.checklist.filter((item) => item.status === "BLOCKED");
+  const warnings = report.checklist.filter((item) => item.status === "WARN");
   return [
     "# Completion Quality Report",
     "",
@@ -782,6 +792,12 @@ function renderQualityReport(report: QualityReport): string {
     "",
     "## Required Verification",
     ...formatBullets(report.requiredVerification),
+    "",
+    "## Blocked Items",
+    ...formatBullets(blocked.map((item) => `${item.label} - ${item.detail}`)),
+    "",
+    "## Warnings",
+    ...formatBullets(warnings.map((item) => `${item.label} - ${item.detail}`)),
     "",
     "## Risk Checklist",
     ...report.checklist.map((item) => `- ${item.status}: ${item.label} - ${item.detail}`),
