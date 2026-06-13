@@ -1,6 +1,7 @@
 import { existsSync, watch as fsWatch } from "node:fs";
 import { join } from "node:path";
 import {
+  ensureDevguardWorkspace,
   hashRuntimeFiles,
   isIgnoredWatchPath,
   markRuntimeStable,
@@ -13,16 +14,21 @@ type WatchStatus = "idle" | "active" | "ready_for_done";
 interface WatchOptions {
   stableAfterMs: number;
   compact: boolean;
+  depth: number;
+  poll: boolean;
+  includeLockfiles: boolean;
 }
 
 const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", "devguard"];
-const excludedSummary = "node_modules, .git, dist, build, .next, coverage, devguard/runtime.json, devguard/reports/*";
+const excludedSummary = "node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, devguard/runtime.json, devguard/reports/**, devguard/prompts/**";
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
+  await ensureDevguardWorkspace(root);
   const options = parseWatchOptions(args);
   console.log("dev-guard watch");
   console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
   console.log(`excluded: ${excludedSummary}`);
+  console.log(`depth: ${options.depth}; poll: ${options.poll ? "on" : "off"}; lockfiles: ${options.includeLockfiles ? "included" : "excluded"}`);
   console.log("mode: event-driven; no periodic refresh; no auto write");
   console.log("stop: Ctrl+C");
 
@@ -51,7 +57,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   };
 
   const handleChange = async (path: string) => {
-    if (!path || isIgnoredWatchPath(path)) {
+    if (!path || isIgnoredWatchPath(path) || isLockfilePath(path, options)) {
       return;
     }
     try {
@@ -72,7 +78,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   };
 
-  const watcher = await createWatcher(root, handleChange);
+  const watcher = await createWatcher(root, handleChange, options);
   await printState(status);
 
   process.on("SIGINT", async () => {
@@ -89,31 +95,50 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 
 function parseWatchOptions(args: string[]): WatchOptions {
   const stableAfterSec = readNumberOption(args, "--stable-after", 20);
+  const depth = readNumberOption(args, "--depth", 8);
   if (stableAfterSec <= 0) {
     throw new Error("dev-guard watch --stable-after must be positive.");
   }
+  if (depth < 1) {
+    throw new Error("dev-guard watch --depth must be 1 or greater.");
+  }
   return {
     stableAfterMs: stableAfterSec * 1000,
-    compact: args.includes("--compact") || args.includes("--ultra")
+    compact: args.includes("--compact") || args.includes("--ultra"),
+    depth,
+    poll: args.includes("--poll"),
+    includeLockfiles: args.includes("--include-lockfiles")
   };
 }
 
-async function createWatcher(root: string, onChange: (path: string) => Promise<void>): Promise<unknown> {
+async function createWatcher(root: string, onChange: (path: string) => Promise<void>, options: WatchOptions): Promise<unknown> {
   const existingRoots = watchRoots.map((path) => join(root, path)).filter((path) => existsSync(path));
   const paths = existingRoots.length > 0 ? existingRoots : [root];
   const chokidar = await loadChokidar();
   if (chokidar?.watch) {
     const watcher = chokidar.watch(paths, {
       ignoreInitial: true,
-      ignored: (path: string) => isIgnoredWatchPath(path.replace(`${root}/`, "")),
-      awaitWriteFinish: { stabilityThreshold: 500, pollInterval: 100 }
+      ignored: (path: string) => {
+        const normalized = path.replace(`${root}/`, "");
+        return isIgnoredWatchPath(normalized) || isLockfilePath(normalized, options);
+      },
+      depth: options.depth,
+      usePolling: options.poll,
+      interval: options.poll ? 500 : undefined,
+      binaryInterval: options.poll ? 1000 : undefined,
+      awaitWriteFinish: { stabilityThreshold: 800, pollInterval: 100 }
     });
     watcher.on("all", (_event: string, path: string) => {
       void onChange(path.replace(`${root}/`, ""));
     });
     watcher.on("error", (error: Error) => {
       console.error(`watch warning: ${error.message}`);
-      console.error("watch backend unavailable in this shell; run dev-guard done manually or reduce watched paths");
+      console.error("recovery:");
+      console.error("- run from a narrower project path");
+      console.error("- retry with dev-guard watch --poll");
+      console.error("- lower watched depth with dev-guard watch --depth 4");
+      console.error("- increase the OS file descriptor limit");
+      console.error("- run dev-guard done manually when the task is finished");
       void watcher.close?.();
     });
     return watcher;
@@ -132,7 +157,7 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
     }
     fallbackErrored = true;
     console.error(`watch warning: ${error.message}`);
-    console.error("watch backend unavailable in this shell; install dependencies for chokidar support or run dev-guard done manually");
+    console.error("recovery: retry with --poll, reduce --depth, increase OS file limit, or run dev-guard done manually");
     watcher.close();
   });
   return [watcher];
@@ -168,6 +193,14 @@ function readNumberOption(args: string[], name: string, fallback: number): numbe
     throw new Error(`${name} requires a number.`);
   }
   return value;
+}
+
+function isLockfilePath(path: string, options: WatchOptions): boolean {
+  if (options.includeLockfiles) {
+    return false;
+  }
+  const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
+  return /(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?)$/.test(normalized);
 }
 
 function errorMessage(error: unknown): string {

@@ -186,7 +186,7 @@ Usage:
   dev-guard config show
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
-  dev-guard watch [--stable-after <sec>] [--compact|--ultra]
+  dev-guard watch [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
   dev-guard doctor
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
