@@ -5,6 +5,8 @@ import { runDoctor } from "./doctor.js";
 import { runInferTask } from "./infer-task.js";
 import { getHookStatus, runInstallHooks, writeHookStatusReport } from "./hooks.js";
 import { runInit } from "./init.js";
+import { legacyDevguardWarning } from "./migration.js";
+import { devguardPaths } from "./paths.js";
 import { parsePromptOptions, runPrompt } from "./prompt.js";
 import { runRefresh } from "./refresh.js";
 import { runReport } from "./report.js";
@@ -294,7 +296,7 @@ async function runHandoff(root: string): Promise<void> {
     console.log(`generated: ${path}`);
     console.log("");
     console.log("Resume:");
-    console.log("Start a new Claude/Codex thread and attach/read project-handoff.md");
+    console.log(`Start a new Claude/Codex thread and attach/read ${devguardPaths.projectHandoff}`);
   } catch (error) {
     console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
     process.exitCode = 1;
@@ -340,10 +342,16 @@ async function runStatus(root: string): Promise<void> {
   console.log(`Last Hook Success: ${hookStatus.lastSuccess === undefined ? "unknown" : hookStatus.lastSuccess ? "yes" : "no"}`);
   console.log("");
   console.log("Handoff:");
-  console.log("devguard/reports/project-handoff.md");
+  console.log(devguardPaths.projectHandoff);
   console.log("");
   console.log("Resume:");
-  console.log("Start a new Claude/Codex thread and attach/read project-handoff.md");
+  console.log(`Start a new Claude/Codex thread and attach/read ${devguardPaths.projectHandoff}`);
+  const legacyWarning = legacyDevguardWarning(root);
+  if (legacyWarning) {
+    console.log("");
+    console.log("Warning:");
+    console.log(legacyWarning);
+  }
   if (history.length > 0) {
     console.log("");
     console.log("Recent history:");
@@ -364,7 +372,7 @@ async function runReset(root: string): Promise<void> {
   await resetRuntimeState(root);
   console.log("dev-guard reset");
   console.log("- runtime pending changes cleared");
-  console.log("- devguard/state.json preserved");
+  console.log(`- ${devguardPaths.state} preserved`);
 }
 
 function errorMessage(error: unknown): string {
@@ -379,13 +387,13 @@ function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | 
     return "fix blocked quality items before commit";
   }
   if (quality === "NEEDS_REVIEW") {
-    return qualityAction ?? "run verification, then review devguard/reports/quality-report.md";
+    return qualityAction ?? `run verification, then review ${devguardPaths.qualityReport}`;
   }
   if (quality === "PASS") {
     return "ready for final review or commit";
   }
   if (drift && drift !== "low") {
-    return "review devguard/prompts/next-codex-prompt.md";
+    return `review ${devguardPaths.nextCodexPrompt}`;
   }
   return "대기 중";
 }

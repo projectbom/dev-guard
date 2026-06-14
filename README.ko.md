@@ -92,7 +92,7 @@ dev-guard reset
 ## 생성되는 파일 구조
 
 ```text
-devguard/
+.devguard/
   project.md
   architecture.md
   decisions.md
@@ -109,19 +109,19 @@ devguard/
     quality-report.md
 ```
 
-`devguard/` runtime 산출물은 기본적으로 git ignore 대상입니다.
+`.devguard/` runtime 산출물은 기본적으로 git ignore 대상입니다.
 
 ## Handoff Flow
 
 `dev-guard done`은 다음 파일을 생성합니다.
 
-- `devguard/reports/last-run.md`
-- `devguard/history.jsonl`
-- `devguard/reports/history-summary.md`
-- `devguard/reports/decision-candidates.md`
-- `devguard/reports/quality-report.md`
-- `devguard/prompts/next-codex-prompt.md`
-- `devguard/reports/project-handoff.md`
+- `.devguard/reports/last-run.md`
+- `.devguard/history.jsonl`
+- `.devguard/reports/history-summary.md`
+- `.devguard/reports/decision-candidates.md`
+- `.devguard/reports/quality-report.md`
+- `.devguard/prompts/next-codex-prompt.md`
+- `.devguard/reports/project-handoff.md`
 
 `next-codex-prompt.md`는 다음 Claude/Codex에 바로 전달할 수 있는 인수인계 문서입니다.
 `project-handoff.md`는 context window 초과 후 새 Claude/Codex 스레드에서 바로 이어가기 위한 압축 인수인계 문서입니다.
@@ -134,8 +134,8 @@ devguard/
 
 - Claude Code: `.claude/settings.json`의 `hooks.Stop[].hooks[]`
 - Codex CLI: `.codex/hooks.json`의 `hooks.Stop[].hooks[]`
-- Hook script: `devguard/hooks/claude-stop.sh`, `devguard/hooks/codex-stop.sh`
-- 보조 JSONL listener: `devguard/hooks/codex-event-listener.ts`
+- Hook script: `.devguard/hooks/claude-stop.sh`, `.devguard/hooks/codex-stop.sh`
+- 보조 JSONL listener: `.devguard/hooks/codex-event-listener.ts`
 
 Codex의 `turn.completed`는 Hook 이벤트가 아니라 `codex exec --json` JSONL 출력 이벤트입니다. JSONL listener는 이 스트림을 감시하는 보조 기능이며 `.codex/hooks.json`에 섞지 않습니다.
 
@@ -167,10 +167,10 @@ Claude/Codex 세션이 context window 초과로 끊기면 긴 history를 붙여�
 
 ```bash
 dev-guard handoff
-cat devguard/reports/project-handoff.md
+cat .devguard/reports/project-handoff.md
 ```
 
-새 Claude/Codex 스레드에서는 `devguard/reports/project-handoff.md`를 읽게 하고, Current State / Quality Status / Next Best Task 기준으로 이어서 작업하게 합니다.
+새 Claude/Codex 스레드에서는 `.devguard/reports/project-handoff.md`를 읽게 하고, Current State / Quality Status / Next Best Task 기준으로 이어서 작업하게 합니다.
 
 ## Quality Flow
 
@@ -188,7 +188,7 @@ Verdict:
 
 - `watch`, `done`, `status`, `reset`은 소스 파일을 수정하지 않습니다.
 - `watch`는 주기 실행이 아니라 이벤트 기반입니다.
-- `done`은 `devguard/` runtime 산출물만 씁니다.
+- `done`은 `.devguard/` runtime 산출물만 씁니다.
 - `decisions.md`는 자동 수정하지 않고 후보만 생성합니다.
 - `update`는 preview이며, `update --write`에서만 managed block을 수정합니다.
 - API provider는 선택 사항입니다.

@@ -2,6 +2,8 @@ import { chmod, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
 import { fromRoot, readTextFile, writeTextFile } from "./fs.js";
+import { migrateLegacyDevguardDir } from "./migration.js";
+import { devguardPaths } from "./paths.js";
 
 interface InstallHooksResult {
   created: string[];
@@ -18,16 +20,16 @@ interface HookStatus {
   lastSuccess?: boolean;
 }
 
-const claudeHookPath = "devguard/hooks/claude-stop.sh";
-const codexHookPath = "devguard/hooks/codex-stop.sh";
-const codexListenerPath = "devguard/hooks/codex-event-listener.ts";
+const claudeHookPath = devguardPaths.claudeHook;
+const codexHookPath = devguardPaths.codexHook;
+const codexListenerPath = devguardPaths.codexEventListener;
 const claudeSettingsPath = ".claude/settings.json";
 const codexHooksPath = ".codex/hooks.json";
-const hookStatusPath = "devguard/reports/hook-status.md";
-const claudeLogPath = "devguard/logs/claude-hook.log";
-const codexLogPath = "devguard/logs/codex-hook.log";
-const claudeHookCommand = '${CLAUDE_PROJECT_DIR}/devguard/hooks/claude-stop.sh';
-const codexHookCommand = '"$(git rev-parse --show-toplevel)/devguard/hooks/codex-stop.sh"';
+const hookStatusPath = devguardPaths.hookStatus;
+const claudeLogPath = devguardPaths.claudeLog;
+const codexLogPath = devguardPaths.codexLog;
+const claudeHookCommand = '${CLAUDE_PROJECT_DIR}/.devguard/hooks/claude-stop.sh';
+const codexHookCommand = '"$(git rev-parse --show-toplevel)/.devguard/hooks/codex-stop.sh"';
 
 export async function runInstallHooks(root: string, args: string[]): Promise<void> {
   const force = args.includes("--force");
@@ -45,8 +47,9 @@ export async function runInstallHooks(root: string, args: string[]): Promise<voi
 }
 
 export async function installHooks(root: string, options: { force?: boolean } = {}): Promise<InstallHooksResult> {
+  const migration = await migrateLegacyDevguardDir(root, { force: options.force });
   const created: string[] = [];
-  const skipped: string[] = [];
+  const skipped: string[] = migration.message ? [migration.message] : [];
   const files: Array<{ path: string; content: string; executable?: boolean }> = [
     { path: claudeHookPath, content: shellHook("claude", claudeLogPath), executable: true },
     { path: codexHookPath, content: shellHook("codex", codexLogPath), executable: true },
@@ -122,7 +125,7 @@ set +e
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LOG="$ROOT/${logPath}"
-mkdir -p "$(dirname "$LOG")" "$ROOT/devguard/reports"
+mkdir -p "$(dirname "$LOG")" "$ROOT/${devguardPaths.reportsDir}"
 
 hook_input="$(cat)"
 timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -167,7 +170,7 @@ timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   fi
 } >> "$LOG" 2>&1
 
-cat > "$ROOT/devguard/reports/hook-status.md" <<EOF
+cat > "$ROOT/${devguardPaths.hookStatus}" <<EOF
 # Hook Status
 
 ## Installed
@@ -200,7 +203,7 @@ const { appendFileSync, mkdirSync } = require("node:fs");
 const { dirname, resolve } = require("node:path");
 
 const root = resolve(__dirname, "../..");
-const logPath = resolve(root, "devguard/logs/codex-hook.log");
+const logPath = resolve(root, "${devguardPaths.codexLog}");
 mkdirSync(dirname(logPath), { recursive: true });
 
 let input = "";
@@ -299,13 +302,14 @@ function addCommandHook(current: JsonObject, event: string, handler: JsonObject)
   const next = cloneJsonObject(current);
   const hooks = isJsonObject(next.hooks) ? next.hooks : {};
   const hookPath = typeof handler.command === "string" ? handler.command.replace(/^\$\{CLAUDE_PROJECT_DIR\}\//, "").replace(/^"?\$\(git rev-parse --show-toplevel\)\//, "").replace(/"$/, "") : "";
+  const legacyHookPath = hookPath.replace(/^\.devguard\//, "devguard/");
   const groups = (Array.isArray(hooks[event]) ? hooks[event] : [])
     .filter(isJsonObject)
     .map((item) => {
       const handlers = Array.isArray(item.hooks)
         ? item.hooks.filter((candidate) => {
             if (!isJsonObject(candidate)) return true;
-            return typeof candidate.command !== "string" || !candidate.command.includes(hookPath) || candidate.command === handler.command;
+            return typeof candidate.command !== "string" || (!candidate.command.includes(hookPath) && !candidate.command.includes(legacyHookPath)) || candidate.command === handler.command;
           })
         : [];
       return { ...item, hooks: handlers };

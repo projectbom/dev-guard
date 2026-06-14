@@ -2,7 +2,7 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-`dev-guard update` is an advanced docs-maintenance command. The main event-based workflow uses `dev-guard done`, which writes docs update candidates into `devguard/reports/*` but does not modify source docs.
+`dev-guard update` is an advanced docs-maintenance command. The main event-based workflow uses `dev-guard done`, which writes docs update candidates into `.devguard/reports/*` but does not modify source docs.
 
 Use `update` when you explicitly want to preview or write managed documentation blocks.
 

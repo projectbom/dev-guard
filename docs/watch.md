@@ -21,7 +21,7 @@ dev-guard done
 ## Behavior
 
 - Uses chokidar when available.
-- Accumulates changed files in `devguard/runtime.json`.
+- Accumulates changed files in `.devguard/runtime.json`.
 - Prints a stable state after changes settle.
 - Auto Mode waits for Stop Hook based `dev-guard done`.
 - Manual Mode only accumulates changes until the user runs `dev-guard done`.
@@ -84,9 +84,9 @@ dev-guard status
 
 `done` also writes:
 
-- `devguard/reports/quality-report.md`
-- `devguard/prompts/next-codex-prompt.md`
-- `devguard/reports/project-handoff.md`
+- `.devguard/reports/quality-report.md`
+- `.devguard/prompts/next-codex-prompt.md`
+- `.devguard/reports/project-handoff.md`
 
 Manual fallback:
 
@@ -100,7 +100,7 @@ If only the overflow resume file needs to be refreshed:
 dev-guard handoff
 ```
 
-Codex JSONL note: `devguard/hooks/codex-event-listener.ts` is not a hook. It is a helper for piping `codex exec --json` JSONL events such as `turn.completed` and `turn.failed`.
+Codex JSONL note: `.devguard/hooks/codex-event-listener.ts` is not a hook. It is a helper for piping `codex exec --json` JSONL events such as `turn.completed` and `turn.failed`.
 
 ## Context Overflow Recovery
 
@@ -113,7 +113,7 @@ dev-guard handoff
 Start a new Claude/Codex thread and attach or ask it to read:
 
 ```txt
-devguard/reports/project-handoff.md
+.devguard/reports/project-handoff.md
 ```
 
 The resume file is intentionally compressed. It is meant to get the next agent oriented in 1-2 minutes, not to preserve the full history.
@@ -147,9 +147,9 @@ Watch excludes heavy/generated paths:
 - `dist/**`
 - `build/**`
 - `coverage/**`
-- `devguard/runtime.json`
-- `devguard/reports/**`
-- `devguard/prompts/**`
+- `.devguard/runtime.json`
+- `.devguard/reports/**`
+- `.devguard/prompts/**`
 
 Lockfiles are excluded by default from watch events, but git diff analysis in `done` can still see them.
 

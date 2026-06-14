@@ -16,6 +16,8 @@ import {
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
 import { getDiffForChangeFiles, getGitChanges, type GitChanges } from "./git.js";
+import { migrateLegacyDevguardDir } from "./migration.js";
+import { devguardPaths } from "./paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -118,16 +120,16 @@ interface NextTaskPlan {
   success: string[];
 }
 
-const runtimePath = "devguard/runtime.json";
-const statePath = "devguard/state.json";
-const historyPath = "devguard/history.jsonl";
-const reportPath = "devguard/reports/last-run.md";
-const promptPath = "devguard/prompts/next-codex-prompt.md";
-const historySummaryPath = "devguard/reports/history-summary.md";
-const decisionCandidatesPath = "devguard/reports/decision-candidates.md";
-const qualityReportPath = "devguard/reports/quality-report.md";
-const projectHandoffPath = "devguard/reports/project-handoff.md";
-const hookStatusPath = "devguard/reports/hook-status.md";
+const runtimePath = devguardPaths.runtime;
+const statePath = devguardPaths.state;
+const historyPath = devguardPaths.history;
+const reportPath = devguardPaths.lastRunReport;
+const promptPath = devguardPaths.nextCodexPrompt;
+const historySummaryPath = devguardPaths.historySummary;
+const decisionCandidatesPath = devguardPaths.decisionCandidates;
+const qualityReportPath = devguardPaths.qualityReport;
+const projectHandoffPath = devguardPaths.projectHandoff;
+const hookStatusPath = devguardPaths.hookStatus;
 
 const defaultRuntime: RuntimeState = {
   pendingChangedFiles: [],
@@ -217,8 +219,8 @@ export function isIgnoredWatchPath(path: string): boolean {
     normalized.startsWith(".git/") ||
     normalized.startsWith("coverage/") ||
     normalized === runtimePath ||
-    normalized.startsWith("devguard/reports/") ||
-    normalized.startsWith("devguard/prompts/") ||
+    normalized.startsWith(`${devguardPaths.reportsDir}/`) ||
+    normalized.startsWith(`${devguardPaths.promptsDir}/`) ||
     /\.(png|jpe?g|gif|webp|avif|ico|svg|ttf|otf|woff2?|mp4|mov|mp3|wav|pdf|zip|gz)$/i.test(normalized)
   );
 }
@@ -239,10 +241,10 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const diffText = changeFiles.length > 0 ? await getDiffForChangeFiles(root, changeFiles).catch(() => gitChanges.diffText) : gitChanges.diffText;
   const diffStat = await getGitDiffStat(root).catch(() => "git diff stat unavailable");
   const [projectMarkdown, architectureMarkdown, decisionsMarkdown, tasksMarkdown, config, codeGraph] = await Promise.all([
-    readTextFile(fromRoot(root, "devguard/project.md")),
-    readTextFile(fromRoot(root, "devguard/architecture.md")),
-    readTextFile(fromRoot(root, "devguard/decisions.md")),
-    readTextFile(fromRoot(root, "devguard/tasks.md")),
+    readTextFile(fromRoot(root, devguardPaths.project)),
+    readTextFile(fromRoot(root, devguardPaths.architecture)),
+    readTextFile(fromRoot(root, devguardPaths.decisions)),
+    readTextFile(fromRoot(root, devguardPaths.tasks)),
     readJsonFile<DevGuardConfig>(fromRoot(root, ".devguard/config.json"), defaultConfig),
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
@@ -375,10 +377,10 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
 export async function generateProjectHandoff(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const [project, architecture, decisions, tasks, history, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state] = await Promise.all([
-    readRequiredText(root, "devguard/project.md"),
-    readRequiredText(root, "devguard/architecture.md"),
-    readRequiredText(root, "devguard/decisions.md"),
-    readRequiredText(root, "devguard/tasks.md"),
+    readRequiredText(root, devguardPaths.project),
+    readRequiredText(root, devguardPaths.architecture),
+    readRequiredText(root, devguardPaths.decisions),
+    readRequiredText(root, devguardPaths.tasks),
     readRequiredText(root, historyPath),
     readRequiredText(root, historySummaryPath),
     readRequiredText(root, decisionCandidatesPath),
@@ -591,7 +593,7 @@ function renderNextPrompt(input: {
     "",
     "## Do Not Change",
     "- 이번 작업과 관련 없는 영역",
-    "- devguard/reports, devguard/prompts, devguard/runtime.json 직접 수정 금지",
+    `- ${devguardPaths.reportsDir}, ${devguardPaths.promptsDir}, ${devguardPaths.runtime} 직접 수정 금지`,
     "- 사용자가 명시하지 않은 대규모 리팩터링 금지",
     "- 기존 공개 명령어 UX 유지: watch/done/status/reset",
     "- 기존 문서 원본 직접 수정 금지. 필요한 내용은 후보 파일 또는 보고로 남길 것",
@@ -630,6 +632,7 @@ function formatBullets(items: string[]): string[] {
 }
 
 export async function ensureDevguardDirs(root: string): Promise<void> {
+  await migrateLegacyDevguardDir(root);
   await Promise.all([
     mkdir(dirname(fromRoot(root, reportPath)), { recursive: true }),
     mkdir(dirname(fromRoot(root, promptPath)), { recursive: true }),
@@ -641,10 +644,10 @@ export async function ensureDevguardDirs(root: string): Promise<void> {
 export async function ensureDevguardWorkspace(root: string): Promise<void> {
   await ensureDevguardDirs(root);
   await Promise.all([
-    writeFileIfMissing(fromRoot(root, "devguard/project.md"), projectTemplate()),
-    writeFileIfMissing(fromRoot(root, "devguard/architecture.md"), architectureTemplate()),
-    writeFileIfMissing(fromRoot(root, "devguard/decisions.md"), decisionsTemplate()),
-    writeFileIfMissing(fromRoot(root, "devguard/tasks.md"), tasksTemplate()),
+    writeFileIfMissing(fromRoot(root, devguardPaths.project), projectTemplate()),
+    writeFileIfMissing(fromRoot(root, devguardPaths.architecture), architectureTemplate()),
+    writeFileIfMissing(fromRoot(root, devguardPaths.decisions), decisionsTemplate()),
+    writeFileIfMissing(fromRoot(root, devguardPaths.tasks), tasksTemplate()),
     writeFileIfMissing(fromRoot(root, statePath), "{}\n"),
     writeFileIfMissing(fromRoot(root, historyPath), ""),
     writeFileIfMissing(fromRoot(root, runtimePath), `${JSON.stringify(defaultRuntime, null, 2)}\n`)
@@ -798,14 +801,14 @@ async function assessCompletionQuality(
   const requiredVerification = input.testCandidates.length > 0 ? input.testCandidates : ["확인 필요: package.json scripts에서 검증 명령을 찾지 못함"];
   const beforeCommit = [
     ...requiredVerification.map((command) => `run ${command}`),
-    "review devguard/reports/quality-report.md",
-    "review devguard/prompts/next-codex-prompt.md"
+    `review ${devguardPaths.qualityReport}`,
+    `review ${devguardPaths.nextCodexPrompt}`
   ];
   const nextRecommendedAction =
     verdict === "BLOCKED"
       ? "fix BLOCKED items before commit"
       : verdict === "NEEDS_REVIEW"
-        ? `run ${requiredVerification[0]}, then review devguard/reports/quality-report.md`
+        ? `run ${requiredVerification[0]}, then review ${devguardPaths.qualityReport}`
         : "ready for final review or commit";
   return {
     verdict,
@@ -927,7 +930,7 @@ function renderProjectHandoff(input: {
     "- Do not change the verified Claude/Codex hook structure unless official docs require it.",
     "",
     "## Resume Prompt",
-    "devguard/reports/project-handoff.md를 읽고 Current State, Quality Status, Next Best Task를 기준으로 이어서 작업해라. 구현되지 않은 기능을 추측하지 말고 현재 파일 기준으로 확인한 뒤 진행해라."
+    ".devguard/reports/project-handoff.md를 읽고 Current State, Quality Status, Next Best Task를 기준으로 이어서 작업해라. 구현되지 않은 기능을 추측하지 말고 현재 파일 기준으로 확인한 뒤 진행해라."
   ].join("\n") + "\n";
 }
 
@@ -1074,11 +1077,11 @@ function isUsefulText(value: string | undefined): value is string {
 
 function isGeneratedRuntimePath(file: string): boolean {
   return (
-    file === "devguard/runtime.json" ||
-    file === "devguard/state.json" ||
-    file === "devguard/history.jsonl" ||
-    file.startsWith("devguard/reports/") ||
-    file.startsWith("devguard/prompts/") ||
+    file === devguardPaths.runtime ||
+    file === devguardPaths.state ||
+    file === devguardPaths.history ||
+    file.startsWith(`${devguardPaths.reportsDir}/`) ||
+    file.startsWith(`${devguardPaths.promptsDir}/`) ||
     file.startsWith(".devguard/runs/") ||
     file === ".devguard/project-index.json" ||
     file === ".devguard/file-summaries.json" ||
@@ -1286,7 +1289,7 @@ function nextTask(title: string, goal: string, input: { changedFiles: string[]; 
     goal,
     scope: [`areas: ${input.areas.join(", ")}`, "현재 changed files 안에서만 최소 수정"],
     likelyFiles: likelyFiles.length > 0 ? likelyFiles : ["확인 필요"],
-    doNotEdit: ["devguard/reports/*", "devguard/prompts/*", "devguard/runtime.json", "관련 없는 product/source files"],
+    doNotEdit: [`${devguardPaths.reportsDir}/*`, `${devguardPaths.promptsDir}/*`, devguardPaths.runtime, "관련 없는 product/source files"],
     success: ["검증 명령 통과", "drift 후보가 설명되거나 해소됨", "next-codex-prompt가 현재 변경과 일치"]
   };
 }
@@ -1317,7 +1320,7 @@ function inferNextHistoryChecks(records: HistoryRecord[]): string[] {
   if (recent.some((record) => record.testCandidates.length > 0)) {
     checks.add("최근 작업의 테스트 후보 명령 실행 여부 확인");
   }
-  checks.add("다음 Codex 작업 전 devguard/prompts/next-codex-prompt.md 확인");
+  checks.add(`다음 Codex 작업 전 ${devguardPaths.nextCodexPrompt} 확인`);
   return [...checks];
 }
 

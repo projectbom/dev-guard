@@ -5,7 +5,7 @@
 `dev-guard done` writes a ready-to-paste handoff prompt:
 
 ```text
-devguard/prompts/next-codex-prompt.md
+.devguard/prompts/next-codex-prompt.md
 ```
 
 The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
@@ -14,7 +14,7 @@ The goal is to let the next Claude/Codex session continue safely without pasting
 
 `next-codex-prompt.md` includes:
 
-- `Current Project Context`: summary from `devguard/project.md`, `architecture.md`, and `decisions.md`
+- `Current Project Context`: summary from `.devguard/project.md`, `architecture.md`, and `decisions.md`
 - `Recent Work Summary`: current done result and recent history
 - `Changed Files`: changed paths, inferred roles, and areas
 - `Risk / Drift Candidates`: what needs attention and how to check it
@@ -29,11 +29,11 @@ The goal is to let the next Claude/Codex session continue safely without pasting
 
 The handoff prompt is rule-based and local. It uses:
 
-- `devguard/project.md`
-- `devguard/architecture.md`
-- `devguard/decisions.md`
-- `devguard/tasks.md`
-- `devguard/history.jsonl`
+- `.devguard/project.md`
+- `.devguard/architecture.md`
+- `.devguard/decisions.md`
+- `.devguard/tasks.md`
+- `.devguard/history.jsonl`
 - current git diff and untracked files
 - package.json scripts
 
@@ -51,7 +51,7 @@ If a project doc is empty or still contains TODO-only content, the prompt says `
 
 ```bash
 dev-guard done
-cat devguard/prompts/next-codex-prompt.md
+cat .devguard/prompts/next-codex-prompt.md
 ```
 
 Paste the content into Claude/Codex for the next focused task.

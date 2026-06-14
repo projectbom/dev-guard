@@ -5,7 +5,7 @@
 `dev-guard done` creates:
 
 ```text
-devguard/reports/quality-report.md
+.devguard/reports/quality-report.md
 ```
 
 This report answers: is the completed AI-agent work ready for commit, or does it need review first?
@@ -73,5 +73,5 @@ This keeps quality checks useful without making every small code change noisy.
 
 ```txt
 Quality: NEEDS_REVIEW
-Next recommended action: run pnpm run build, then review devguard/reports/quality-report.md
+Next recommended action: run pnpm run build, then review .devguard/reports/quality-report.md
 ```

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/devguard/hooks/codex-stop.sh\"",
+            "command": "\"$(git rev-parse --show-toplevel)/.devguard/hooks/codex-stop.sh\"",
             "timeout": 600,
             "statusMessage": "Running dev-guard done/status"
           }

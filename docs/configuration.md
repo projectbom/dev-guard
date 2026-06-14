@@ -4,7 +4,7 @@
 
 ## Local Runtime Files
 
-The current event-based workflow writes runtime artifacts under `devguard/`:
+The current event-based workflow writes runtime artifacts under `.devguard/`:
 
 - `runtime.json`
 - `state.json`
@@ -15,6 +15,14 @@ The current event-based workflow writes runtime artifacts under `devguard/`:
 
 These are local by default. They are generated to help `watch`, `done`, `status`, and handoff prompts.
 
+## Legacy `devguard/` Migration
+
+`.devguard/` is the official internal directory.
+
+If a project only has the legacy `devguard/` directory, dev-guard migrates it to `.devguard/`.
+
+If both `.devguard/` and `devguard/` exist, dev-guard does not merge or delete user data automatically. `status` warns about the legacy directory. With forceful hook installation, legacy data is moved to a timestamped backup directory such as `devguard.backup-YYYYMMDD-HHmmss/`.
+
 ## Local `.devguard` Files
 
 The `.devguard/` directory is local project state by default. Generated files are ignored:
@@ -24,6 +32,7 @@ The `.devguard/` directory is local project state by default. Generated files ar
 - project memory cache JSON
 - `code-graph.json`
 - telemetry files
+- runtime state, reports, logs, hooks, and prompts
 
 Use documentation examples instead of committing local runtime files.
 

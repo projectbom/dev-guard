@@ -16,7 +16,7 @@ The public MVP workflow is event based:
 
 ```text
 watch
-  -> accumulate changed files in devguard/runtime.json
+  -> accumulate changed files in .devguard/runtime.json
   -> stable state suggests done
 
 done
@@ -42,10 +42,10 @@ reset
 
 ## Runtime Files
 
-The event workflow uses `devguard/`:
+The event workflow uses `.devguard/`:
 
 ```text
-devguard/
+.devguard/
   project.md
   architecture.md
   decisions.md
@@ -62,9 +62,9 @@ devguard/
 
 These files are generated or project-local. Existing markdown files are not overwritten when the workspace is initialized.
 
-## Legacy And Advanced Memory
+## Advanced Memory And Config
 
-The older `.devguard/` path still exists for advanced features:
+The same `.devguard/` path also stores advanced features:
 
 - `.devguard/config.json`
 - `.devguard/task.md`
@@ -94,7 +94,7 @@ Current local layers:
 ## Safety Boundaries
 
 - No source files are modified by `watch`, `done`, `status`, or `reset`.
-- `done` writes only `devguard/` runtime artifacts.
+- `done` writes only `.devguard/` runtime artifacts.
 - `decisions.md` is never auto-edited; candidates go to `reports/decision-candidates.md`.
 - `update` remains preview-first and only `update --write` writes managed doc blocks.
 - Provider integration is optional and separate from the default event workflow.

@@ -75,7 +75,7 @@ dev-guard status
    ```bash
    dev-guard init
    ```
-   Creates the initial `.devguard` guard files. The event-based workflow also creates `devguard/` runtime docs when needed.
+   Creates the initial `.devguard` guard files. The event-based workflow also creates `.devguard/` runtime docs when needed.
 
 2. Enable Auto Mode once
    ```bash
@@ -106,7 +106,7 @@ dev-guard status
    ```bash
    dev-guard handoff
    ```
-   Regenerates `devguard/reports/project-handoff.md` from current devguard artifacts only. Start a new Claude/Codex thread and ask it to read that file.
+   Regenerates `.devguard/reports/project-handoff.md` from current devguard artifacts only. Start a new Claude/Codex thread and ask it to read that file.
 
 7. Reset only runtime state when needed
    ```bash
@@ -139,10 +139,10 @@ See [docs/commands.md](./docs/commands.md) for details.
 
 ## Generated File Structure
 
-dev-guard keeps runtime artifacts under `devguard/`:
+dev-guard keeps runtime artifacts under `.devguard/`:
 
 ```text
-devguard/
+.devguard/
   project.md
   architecture.md
   decisions.md
@@ -159,7 +159,7 @@ devguard/
     quality-report.md
 ```
 
-The `.devguard/` directory is still used for older guard config, task files, runs, memory cache, and code graph data.
+The same `.devguard/` directory also stores guard config, task files, runs, memory cache, and code graph data.
 
 Generated runtime/cache files are local-only by default and should not be committed unless a project intentionally changes its tracking policy. See [docs/configuration.md](./docs/configuration.md).
 
@@ -167,24 +167,24 @@ Generated runtime/cache files are local-only by default and should not be commit
 
 `dev-guard done` creates:
 
-- `devguard/reports/last-run.md`: current completed-work report
-- `devguard/history.jsonl`: append-only run history
-- `devguard/reports/history-summary.md`: recent 5-run summary
-- `devguard/reports/decision-candidates.md`: decisions worth manually recording
-- `devguard/reports/quality-report.md`: PASS / NEEDS_REVIEW / BLOCKED quality verdict
-- `devguard/prompts/next-codex-prompt.md`: ready-to-paste Codex/Claude handoff prompt
-- `devguard/reports/project-handoff.md`: compressed project resume file for a new Claude/Codex thread
+- `.devguard/reports/last-run.md`: current completed-work report
+- `.devguard/history.jsonl`: append-only run history
+- `.devguard/reports/history-summary.md`: recent 5-run summary
+- `.devguard/reports/decision-candidates.md`: decisions worth manually recording
+- `.devguard/reports/quality-report.md`: PASS / NEEDS_REVIEW / BLOCKED quality verdict
+- `.devguard/prompts/next-codex-prompt.md`: ready-to-paste Codex/Claude handoff prompt
+- `.devguard/reports/project-handoff.md`: compressed project resume file for a new Claude/Codex thread
 
 Example:
 
 ```txt
 Quality: NEEDS_REVIEW
 Generated:
-- devguard/reports/last-run.md
-- devguard/prompts/next-codex-prompt.md
-- devguard/reports/history-summary.md
-- devguard/reports/decision-candidates.md
-- devguard/reports/quality-report.md
+- .devguard/reports/last-run.md
+- .devguard/prompts/next-codex-prompt.md
+- .devguard/reports/history-summary.md
+- .devguard/reports/decision-candidates.md
+- .devguard/reports/quality-report.md
 ```
 
 Read more in [docs/handoff.md](./docs/handoff.md).
@@ -195,8 +195,8 @@ Read more in [docs/handoff.md](./docs/handoff.md).
 
 - Claude Code: `.claude/settings.json` with `hooks.Stop[].hooks[]`
 - Codex CLI: `.codex/hooks.json` with `hooks.Stop[].hooks[]`
-- Hook scripts: `devguard/hooks/claude-stop.sh` and `devguard/hooks/codex-stop.sh`
-- Optional JSONL helper: `devguard/hooks/codex-event-listener.ts`
+- Hook scripts: `.devguard/hooks/claude-stop.sh` and `.devguard/hooks/codex-stop.sh`
+- Optional JSONL helper: `.devguard/hooks/codex-event-listener.ts`
 
 The Codex JSONL helper is not a Codex hook config. It is only for consuming `codex exec --json` event streams such as `turn.completed` and `turn.failed`.
 
@@ -238,10 +238,10 @@ When a Claude/Codex session hits the context window, do not paste long history i
 
 ```bash
 dev-guard handoff
-cat devguard/reports/project-handoff.md
+cat .devguard/reports/project-handoff.md
 ```
 
-In the new thread, attach or ask the agent to read `devguard/reports/project-handoff.md`. It summarizes current state, active workflow, recent changes, important decisions, quality status, open risks, the next best task, and a short resume prompt.
+In the new thread, attach or ask the agent to read `.devguard/reports/project-handoff.md`. It summarizes current state, active workflow, recent changes, important decisions, quality status, open risks, the next best task, and a short resume prompt.
 
 ## Quality Flow
 
@@ -257,7 +257,7 @@ Example:
 
 ```txt
 Quality: NEEDS_REVIEW
-Next recommended action: run pnpm run build, then review devguard/reports/quality-report.md
+Next recommended action: run pnpm run build, then review .devguard/reports/quality-report.md
 ```
 
 Read more in [docs/quality.md](./docs/quality.md).
@@ -266,7 +266,7 @@ Read more in [docs/quality.md](./docs/quality.md).
 
 - No source edits are applied by `watch`, `done`, `status`, or `reset`.
 - `watch` is event-driven and does not run periodic refresh loops.
-- `done` writes only `devguard/` runtime reports/prompts/history/state.
+- `done` writes only `.devguard/` runtime reports/prompts/history/state.
 - `decisions.md` is not modified automatically; decision candidates are written to a report.
 - `update` is preview-only; `update --write` is the only docs-write command and only touches managed blocks.
 - API providers are optional. Local heuristic mode works without an API key.

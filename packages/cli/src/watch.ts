@@ -9,6 +9,7 @@ import {
   recordRuntimeChange
 } from "./runtime-state.js";
 import { getHookStatus } from "./hooks.js";
+import { devguardPaths } from "./paths.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done";
 
@@ -22,7 +23,7 @@ interface WatchOptions {
 }
 
 const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", "devguard"];
-const excludedSummary = "node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, devguard/runtime.json, devguard/reports/**, devguard/prompts/**";
+const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, ${devguardPaths.runtime}, ${devguardPaths.reportsDir}/**, ${devguardPaths.promptsDir}/**`;
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   await ensureDevguardWorkspace(root);
