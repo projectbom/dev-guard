@@ -10,7 +10,7 @@ dev-guard는 AI/Codex/Claude 작업 흐름을 위한 Alpha 단계 CLI guardrail�
 dev-guard init
 dev-guard install-hooks
 dev-guard watch
-# Claude/Codex가 파일 수정
+# Claude/Codex가 파일 수정; Stop Hook이 done 실행
 dev-guard status
 # context window 초과 시 새 스레드에서 이어가기
 dev-guard handoff
@@ -45,7 +45,7 @@ pnpm run build
 pnpm cli init
 pnpm cli install-hooks
 pnpm cli watch
-# 파일 수정
+# Claude/Codex가 파일 수정; Stop Hook이 done 실행
 pnpm cli status
 ```
 
@@ -82,10 +82,10 @@ dev-guard reset
 ```
 
 - `init`: 초기 guard 파일 생성
-- `watch`: 변경 파일 감시 및 pending buffer 누적
+- `watch`: 권장 Auto Mode watcher, 변경 파일 감시 및 Stop Hook 기반 done 대기
 - `install-hooks`: Claude Code / Codex Stop Hook 설치
 - `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
-- `handoff`: 현재 devguard 산출물만 읽어서 `project-handoff.md` 재생성
+- `handoff`: 현재 `.devguard/` 산출물만 읽어서 `project-handoff.md` 재생성
 - `status`: pending 상태, 최근 작업, quality verdict, 다음 권장 작업 출력
 - `reset`: runtime pending buffer만 초기화
 
@@ -107,6 +107,7 @@ dev-guard reset
     history-summary.md
     decision-candidates.md
     quality-report.md
+    project-handoff.md
 ```
 
 `.devguard/` runtime 산출물은 기본적으로 git ignore 대상입니다.

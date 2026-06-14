@@ -18,7 +18,7 @@ dev-guard reset
 - `watch`: recommended Auto Mode watcher; watches changes and waits for Stop Hook based completion.
 - `install-hooks`: enable Auto Mode with repo-local Claude Code and Codex Stop hooks.
 - `done`: manually process pending changes and generate history, reports, quality verdict, and handoff prompt.
-- `handoff`: regenerate only `.devguard/reports/project-handoff.md` from current devguard artifacts.
+- `handoff`: regenerate only `.devguard/reports/project-handoff.md` from current `.devguard/` artifacts.
 - `status`: show pending changes, last processed task, recent history, quality verdict, and next action.
 - `reset`: clear pending runtime state only. It preserves `.devguard/state.json` and history.
 
@@ -101,7 +101,7 @@ Without `--force`, existing Claude settings are merged safely and existing Codex
 dev-guard handoff
 ```
 
-`handoff` does not analyze git changes, update history, call an LLM, run tests, or modify source files. It reads the current devguard artifacts and rewrites only:
+`handoff` does not analyze git changes, update history, call an LLM, run tests, or modify source files. It reads the current `.devguard/` artifacts and rewrites only:
 
 - `.devguard/reports/project-handoff.md`
 

@@ -106,7 +106,7 @@ dev-guard status
    ```bash
    dev-guard handoff
    ```
-   Regenerates `.devguard/reports/project-handoff.md` from current devguard artifacts only. Start a new Claude/Codex thread and ask it to read that file.
+   Regenerates `.devguard/reports/project-handoff.md` from current `.devguard/` artifacts only. Start a new Claude/Codex thread and ask it to read that file.
 
 7. Reset only runtime state when needed
    ```bash
@@ -185,6 +185,7 @@ Generated:
 - .devguard/reports/history-summary.md
 - .devguard/reports/decision-candidates.md
 - .devguard/reports/quality-report.md
+- .devguard/reports/project-handoff.md
 ```
 
 Read more in [docs/handoff.md](./docs/handoff.md).

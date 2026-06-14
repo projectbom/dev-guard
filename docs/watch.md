@@ -44,8 +44,8 @@ Done trigger: Agent Stop Hook
 Watching for file changes...
 When Claude/Codex finishes, dev-guard done will run automatically.
 
-watching: packages, docs, devguard
-excluded: node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**
+watching: packages, docs, .devguard
+excluded: node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, .devguard/runtime.json, .devguard/state.json, .devguard/history.jsonl, .devguard/reports/**, .devguard/prompts/**, .devguard/logs/**, .devguard/hooks/**
 depth: 8; poll: off; lockfiles: excluded; manual: off
 mode: event-driven; no periodic refresh; no idle-time completion
 stop: Ctrl+C
@@ -148,8 +148,12 @@ Watch excludes heavy/generated paths:
 - `build/**`
 - `coverage/**`
 - `.devguard/runtime.json`
+- `.devguard/state.json`
+- `.devguard/history.jsonl`
 - `.devguard/reports/**`
 - `.devguard/prompts/**`
+- `.devguard/logs/**`
+- `.devguard/hooks/**`
 
 Lockfiles are excluded by default from watch events, but git diff analysis in `done` can still see them.
 

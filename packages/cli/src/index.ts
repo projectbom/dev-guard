@@ -224,7 +224,7 @@ Commands:
   init   Create .devguard and docs guard files
   "requirement" Generate task.md and a compact Codex prompt
   done   Manually process pending changes and generate report/next prompt/handoff
-  handoff Regenerate project-handoff.md from current devguard artifacts
+  handoff Regenerate project-handoff.md from current .devguard/ artifacts
   install-hooks Enable Auto Mode with Claude Code and Codex Stop Hooks
   status Show pending watch state, recommended mode, and last processed task
   reset  Clear watch runtime state without deleting project state

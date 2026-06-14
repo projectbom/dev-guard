@@ -1,14 +1,15 @@
-# Handoff Prompt
+# Handoff Files
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-`dev-guard done` writes a ready-to-paste handoff prompt:
+`dev-guard done` writes two handoff files:
 
 ```text
 .devguard/prompts/next-codex-prompt.md
+.devguard/reports/project-handoff.md
 ```
 
-The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
+`next-codex-prompt.md` is a ready-to-paste task prompt. `project-handoff.md` is the compressed context-overflow recovery file for a fresh Claude/Codex thread. The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
 
 ## Prompt Sections
 
@@ -55,3 +56,14 @@ cat .devguard/prompts/next-codex-prompt.md
 ```
 
 Paste the content into Claude/Codex for the next focused task.
+
+## Context Overflow Recovery
+
+If the Claude/Codex context window is full, regenerate only the compact project handoff:
+
+```bash
+dev-guard handoff
+cat .devguard/reports/project-handoff.md
+```
+
+Start a new Claude/Codex thread and ask it to read `.devguard/reports/project-handoff.md`. The file includes current state, active workflow, recent changes, important decisions, quality status, open risks, one next best task, do-not-change constraints, and a short resume prompt.

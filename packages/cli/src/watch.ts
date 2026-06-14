@@ -9,7 +9,7 @@ import {
   recordRuntimeChange
 } from "./runtime-state.js";
 import { getHookStatus } from "./hooks.js";
-import { devguardPaths } from "./paths.js";
+import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done";
 
@@ -22,8 +22,8 @@ interface WatchOptions {
   manual: boolean;
 }
 
-const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", "devguard"];
-const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, ${devguardPaths.runtime}, ${devguardPaths.reportsDir}/**, ${devguardPaths.promptsDir}/**`;
+const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", DEVGUARD_DIR];
+const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, ${devguardPaths.runtime}, ${devguardPaths.state}, ${devguardPaths.history}, ${devguardPaths.reportsDir}/**, ${devguardPaths.promptsDir}/**, ${devguardPaths.logsDir}/**, ${devguardPaths.hooksDir}/**`;
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   await ensureDevguardWorkspace(root);

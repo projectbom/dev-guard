@@ -219,8 +219,12 @@ export function isIgnoredWatchPath(path: string): boolean {
     normalized.startsWith(".git/") ||
     normalized.startsWith("coverage/") ||
     normalized === runtimePath ||
+    normalized === devguardPaths.state ||
+    normalized === devguardPaths.history ||
     normalized.startsWith(`${devguardPaths.reportsDir}/`) ||
     normalized.startsWith(`${devguardPaths.promptsDir}/`) ||
+    normalized.startsWith(`${devguardPaths.logsDir}/`) ||
+    normalized.startsWith(`${devguardPaths.hooksDir}/`) ||
     /\.(png|jpe?g|gif|webp|avif|ico|svg|ttf|otf|woff2?|mp4|mov|mp3|wav|pdf|zip|gz)$/i.test(normalized)
   );
 }
@@ -1004,7 +1008,7 @@ function openRisks(input: {
   for (const doc of [input.project, input.architecture, input.decisions, input.tasks, input.historySummary, input.decisionCandidates, input.nextPrompt]) {
     if (doc.missing) risks.add(`${doc.path} missing or empty; 확인 필요`);
   }
-  return risks.size > 0 ? [...risks].slice(0, 8) : ["확인 필요: no open risk was identified from current devguard artifacts."];
+  return risks.size > 0 ? [...risks].slice(0, 8) : ["확인 필요: no open risk was identified from current .devguard/ artifacts."];
 }
 
 function currentStateSummary(input: {
@@ -1082,6 +1086,8 @@ function isGeneratedRuntimePath(file: string): boolean {
     file === devguardPaths.history ||
     file.startsWith(`${devguardPaths.reportsDir}/`) ||
     file.startsWith(`${devguardPaths.promptsDir}/`) ||
+    file.startsWith(`${devguardPaths.logsDir}/`) ||
+    file.startsWith(`${devguardPaths.hooksDir}/`) ||
     file.startsWith(".devguard/runs/") ||
     file === ".devguard/project-index.json" ||
     file === ".devguard/file-summaries.json" ||
@@ -1092,11 +1098,11 @@ function isGeneratedRuntimePath(file: string): boolean {
 function inferDecisionCandidates(input: { areas: string[]; changedFiles: string[]; judgments: string[]; summary: string }): string[] {
   const candidates = new Set<string>();
   if (input.changedFiles.some((file) => file.includes("watch"))) {
-    candidates.add("watch는 작업 완료 이벤트를 기다리며 자동 done/update/write를 실행하지 않는다.");
+    candidates.add("watch 자체는 time/idle 기반 완료 추정을 하지 않으며 Auto Mode 완료 처리는 Stop Hook이 담당한다.");
     candidates.add("watch는 polling fallback과 depth 제한을 지원한다.");
   }
   if (input.changedFiles.some((file) => file.includes("runtime-state"))) {
-    candidates.add("devguard 런타임 문서는 자동 생성하되 기존 파일은 덮어쓰지 않는다.");
+    candidates.add(".devguard/ runtime 문서는 자동 생성하되 기존 파일은 덮어쓰지 않는다.");
     candidates.add("done은 last-run뿐 아니라 history/report/prompt 산출물을 함께 생성한다.");
   }
   if (input.summary.includes("MIXED:")) {

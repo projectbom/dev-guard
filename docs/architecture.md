@@ -17,7 +17,8 @@ The public MVP workflow is event based:
 ```text
 watch
   -> accumulate changed files in .devguard/runtime.json
-  -> stable state suggests done
+  -> stable state suggests completion is ready to process
+  -> Auto Mode waits for a Claude/Codex Stop Hook
 
 done
   -> collect git diff and pending runtime files
@@ -29,6 +30,7 @@ done
   -> write decision candidates
   -> write quality report
   -> write next Codex/Claude handoff prompt
+  -> write project handoff for context overflow recovery
   -> clear pending runtime state
 
 status
@@ -38,7 +40,7 @@ reset
   -> clear runtime pending state only
 ```
 
-`watch` does not run `done` automatically. `done` is the explicit task-completion event.
+In Auto Mode, `watch` itself does not guess completion from time or idle state. A trusted Claude/Codex Stop Hook runs `dev-guard done` when the agent turn ends. In Manual Mode, the user runs `dev-guard done` explicitly.
 
 ## Runtime Files
 
