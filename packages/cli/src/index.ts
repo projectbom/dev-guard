@@ -18,6 +18,7 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
+import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -101,7 +102,7 @@ async function main(): Promise<void> {
   }
 
   if (command === "doctor") {
-    await runDoctor(root);
+    await runDoctor(root, process.argv.slice(3));
     return;
   }
 
@@ -167,7 +168,7 @@ function printHelp(): void {
 
 Quick commands:
   dev-guard init
-  dev-guard install-hooks
+  dev-guard install-hooks [--agent <claude|codex|codex-notify|all>]
   dev-guard watch
   dev-guard done
   dev-guard handoff
@@ -178,7 +179,7 @@ Recommended Auto Mode:
   1. dev-guard init
   2. dev-guard install-hooks
   3. dev-guard watch
-  4. Run Claude/Codex; Stop Hook runs done automatically
+  4. Run Claude/Codex; verified completion strategy runs done automatically
   5. dev-guard status
 
 Manual fallback:
@@ -198,7 +199,7 @@ Usage:
   dev-guard "requirement"
   dev-guard done
   dev-guard handoff
-  dev-guard install-hooks [--force]
+  dev-guard install-hooks [--force] [--agent <claude|codex|codex-notify|all>]
   dev-guard status
   dev-guard reset
   dev-guard check [--local] [--include-context-files]
@@ -208,7 +209,7 @@ Usage:
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
   dev-guard watch [--manual|--no-auto] [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
-  dev-guard doctor
+  dev-guard doctor [--hooks] [--agents] [--dry-run]
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
   dev-guard review [--heuristic] [--fix-prompt] [--copy] [--output <file>] [--copy-fix] [--include-context-files] [--staged] [--commit <ref>] [--run <id|latest>] [--no-run] [--task] [--from-diff]
@@ -225,15 +226,15 @@ Commands:
   "requirement" Generate task.md and a compact Codex prompt
   done   Manually process pending changes and generate report/next prompt/handoff
   handoff Regenerate project-handoff.md from current .devguard/ artifacts
-  install-hooks Enable Auto Mode with Claude Code and Codex Stop Hooks
+  install-hooks Install agent completion strategy scripts/config
   status Show pending watch state, recommended mode, and last processed task
   reset  Clear watch runtime state without deleting project state
   check  Analyze current git diff with rule-based checks
   configure Configure dev-guard settings
   scan   Cache project structure and file summaries into .devguard
   refresh Incrementally update project memory cache
-  watch  Recommended Auto Mode watcher; waits for Stop Hook based done, or manual done fallback
-  doctor Print config, provider, git, memory, and telemetry diagnostics
+  watch  Recommended watcher; waits for a runtime-verified completion strategy, or manual done fallback
+  doctor Print config/provider/git diagnostics, hook diagnostics with --hooks, and agent strategy diagnostics with --agents
   telemetry Print privacy-safe drift telemetry summary
   report Print a compact current-work summary for ChatGPT/Codex handoff
   review AI-review current changes against task/rules/mistakes
@@ -311,6 +312,7 @@ async function runStatus(root: string): Promise<void> {
     readHistoryRecords(root, 3),
     getHookStatus(root)
   ]);
+  const strategyReport = await getAgentStrategyReport(root);
   await writeHookStatusReport(root);
   console.log(`Pending files: ${runtime.pendingChangedFiles.length}`);
   for (const file of runtime.pendingChangedFiles.slice(0, 12)) {
@@ -331,15 +333,48 @@ async function runStatus(root: string): Promise<void> {
   console.log("");
   const claudeHook = hookStatus.claudeInstalled && hookStatus.claudeHookFile ? "INSTALLED" : "NOT_INSTALLED";
   const codexHook = hookStatus.codexInstalled && hookStatus.codexHookFile ? "INSTALLED" : "NOT_INSTALLED";
-  const autoModeReady = claudeHook === "INSTALLED" || codexHook === "INSTALLED";
-  console.log(`Mode: ${autoModeReady ? "Auto Mode recommended" : "Manual Mode fallback"}`);
-  console.log(`Hooks: Claude ${claudeHook} / Codex ${codexHook}`);
+  const claudeVerified = claudeHook === "INSTALLED" && hookStatus.claudeLastSuccess === true;
+  const codexVerified = codexHook === "INSTALLED" && hookStatus.codexLastSuccess === true;
+  const hooksInstalled = claudeHook === "INSTALLED" || codexHook === "INSTALLED";
+  const hooksVerified = claudeVerified || codexVerified;
+  const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
+  console.log(`Mode: ${runtimeVerified ? "Auto completion runtime verified" : hooksInstalled ? "Auto completion installed, runtime not verified" : "Manual Mode fallback"}`);
+  console.log(`Hooks: Claude ${claudeHook} / ${claudeVerified ? "SCRIPT_VERIFIED" : "NOT_SCRIPT_VERIFIED"}; Codex ${codexHook} / ${codexVerified ? "SCRIPT_VERIFIED" : "NOT_SCRIPT_VERIFIED"}`);
+  console.log("");
+  console.log("Agent Strategies");
+  console.log("Claude Code");
+  console.log(`- strategy: ${strategyReport.claude.name}`);
+  console.log(`- installed: ${formatStrategyFlag(strategyReport.claude.installed)}`);
+  console.log(`- script verified: ${formatStrategyFlag(strategyReport.claude.scriptVerified)}`);
+  console.log(`- runtime verified: ${formatStrategyFlag(strategyReport.claude.runtimeVerified)}`);
+  console.log(`- next: ${strategyReport.claude.next}`);
+  console.log("");
+  console.log("Codex");
+  console.log(`- recommended strategy: ${strategyReport.codexNotify.name}`);
+  console.log(`- notify installed: ${formatStrategyFlag(strategyReport.codexNotify.installed)}`);
+  console.log(`- notify runtime verified: ${formatStrategyFlag(strategyReport.codexNotify.runtimeVerified)}`);
+  console.log(`- stop hook installed: ${formatStrategyFlag(strategyReport.codexStopHook.installed)}`);
+  console.log(`- stop hook requires trust: ${formatStrategyFlag(strategyReport.codexStopHook.requiresUserTrust)}`);
+  console.log(`- stop hook runtime verified: ${formatStrategyFlag(strategyReport.codexStopHook.runtimeVerified)}`);
+  console.log(`- jsonl listener installed: ${formatStrategyFlag(strategyReport.codexJsonlListener.installed)}`);
+  console.log(`- next: ${strategyReport.codexNotify.runtimeVerified ? "Codex notify runtime verified." : strategyReport.codexNotify.next}`);
   console.log("");
   console.log("Hooks");
-  console.log(`Claude Code: ${claudeHook}`);
-  console.log(`Codex CLI: ${codexHook}`);
+  console.log(`Claude Code: ${claudeHook} / ${claudeVerified ? "SCRIPT_VERIFIED" : "NOT_SCRIPT_VERIFIED"}`);
+  console.log(`Codex CLI: ${codexHook} / ${codexVerified ? "SCRIPT_VERIFIED" : "NOT_SCRIPT_VERIFIED"}`);
   console.log(`Last Hook Trigger: ${hookStatus.lastTrigger ?? "none"}`);
   console.log(`Last Hook Success: ${hookStatus.lastSuccess === undefined ? "unknown" : hookStatus.lastSuccess ? "yes" : "no"}`);
+  console.log("");
+  console.log("Auto Mode:");
+  console.log(hooksInstalled ? (runtimeVerified ? "Installed and runtime verified" : "Installed but runtime not verified") : "Not installed");
+  if (hooksInstalled && !runtimeVerified) {
+    console.log("");
+    console.log("Next:");
+    console.log("Run dev-guard doctor --agents");
+    console.log("If Codex is used, open Codex TUI and run /hooks to trust the dev-guard Stop hook.");
+    console.log("Fallback:");
+    console.log("dev-guard done");
+  }
   console.log("");
   console.log("Handoff:");
   console.log(devguardPaths.projectHandoff);

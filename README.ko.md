@@ -4,13 +4,13 @@
 
 dev-guard는 AI/Codex/Claude 작업 흐름을 위한 Alpha 단계 CLI guardrail입니다. 파일 변경을 감시하고, 작업이 끝났을 때 변경 내역/품질/다음 프롬프트를 로컬에서 정리합니다.
 
-기본 권장 흐름은 Hook 기반 Auto Mode입니다.
+기본 권장 흐름은 에이전트별 완료 전략 기반 Auto Mode입니다.
 
 ```bash
 dev-guard init
 dev-guard install-hooks
 dev-guard watch
-# Claude/Codex가 파일 수정; Stop Hook이 done 실행
+# Claude/Codex가 파일 수정; 검증된 완료 전략이 done 실행
 dev-guard status
 # context window 초과 시 새 스레드에서 이어가기
 dev-guard handoff
@@ -23,7 +23,7 @@ AI 에이전트 작업은 끝난 뒤 맥락이 쉽게 끊깁니다. 다음 작�
 dev-guard는 이 흐름을 로컬에서 정리합니다.
 
 - 작업 중 파일 변경 감시
-- 신뢰된 Claude/Codex Stop Hook으로 완료 처리
+- 검증된 에이전트별 완료 전략으로 완료 처리
 - Hook을 쓸 수 없을 때는 수동 `done` fallback 유지
 - 작업 이력 누적
 - 품질 verdict 생성
@@ -45,7 +45,7 @@ pnpm run build
 pnpm cli init
 pnpm cli install-hooks
 pnpm cli watch
-# Claude/Codex가 파일 수정; Stop Hook이 done 실행
+# Claude/Codex가 파일 수정; 검증된 완료 전략이 done 실행
 pnpm cli status
 ```
 
@@ -73,6 +73,10 @@ dev-guard status
 ```bash
 dev-guard init
 dev-guard install-hooks [--force]
+dev-guard install-hooks --agent claude
+dev-guard install-hooks --agent codex
+dev-guard install-hooks --agent codex-notify
+dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --manual
 dev-guard done
@@ -82,8 +86,8 @@ dev-guard reset
 ```
 
 - `init`: 초기 guard 파일 생성
-- `watch`: 권장 Auto Mode watcher, 변경 파일 감시 및 Stop Hook 기반 done 대기
-- `install-hooks`: Claude Code / Codex Stop Hook 설치
+- `watch`: 권장 watcher, 변경 파일 감시 및 검증된 완료 전략 기반 done 대기
+- `install-hooks`: Claude Code / Codex 완료 전략 스크립트와 설정 설치
 - `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
 - `handoff`: 현재 `.devguard/` 산출물만 읽어서 `project-handoff.md` 재생성
 - `status`: pending 상태, 최근 작업, quality verdict, 다음 권장 작업 출력
@@ -129,14 +133,20 @@ dev-guard reset
 
 자세한 내용은 [docs/handoff.md](./docs/handoff.md)를 참고하세요.
 
-## Hook 연동
+## 에이전트별 완료 전략
 
-`dev-guard install-hooks`는 repo-local Stop Hook 파일을 생성합니다.
+dev-guard는 Claude Code와 Codex를 같은 방식으로 취급하지 않습니다.
 
-- Claude Code: `.claude/settings.json`의 `hooks.Stop[].hooks[]`
-- Codex CLI: `.codex/hooks.json`의 `hooks.Stop[].hooks[]`
-- Hook script: `.devguard/hooks/claude-stop.sh`, `.devguard/hooks/codex-stop.sh`
+- Claude Code: `.claude/settings.json`과 `.devguard/hooks/claude-stop.sh`를 사용하는 Stop Hook
+- Codex 권장: user-level `~/.codex/config.toml`의 `notify`가 `.devguard/hooks/codex-notify.sh` 호출
+- Codex 고급 옵션: `.codex/hooks.json`과 `.devguard/hooks/codex-stop.sh`를 사용하는 Stop Hook. `/hooks` trust 필요
 - 보조 JSONL listener: `.devguard/hooks/codex-event-listener.ts`
+
+Codex `notify`는 user-level 설정입니다. 공식 Codex 설정 문서는 project-local `.codex/config.toml`의 `notify`를 무시한다고 설명하므로, `dev-guard install-hooks`는 notify script를 만들지만 project-local notify 설치가 성공했다고 표시하지 않습니다.
+
+전략이 설치된 것과 실제 runtime에서 검증된 것은 다릅니다. `dev-guard doctor --agents`는 Claude/Codex 전략 상태를 보여줍니다. `dev-guard doctor --hooks --dry-run`은 hook 파일/권한/설정 command 경로만 검사하고, `dev-guard doctor --hooks`는 hook script를 직접 실행합니다. 직접 실행 검사는 `dev-guard done`과 `dev-guard status`를 실행할 수 있습니다.
+
+Codex는 project trust와 hook definition trust가 별도일 수 있습니다. Codex Stop Hook을 쓴다면 Codex TUI에서 `/hooks`를 열어 dev-guard Stop Hook을 review/trust해야 합니다. Claude Code Hook은 Claude Code가 설치되어 있고 해당 프로젝트에서 `.claude/settings.json`을 읽는 환경에서만 동작합니다. 실제 실행 여부는 `.devguard/logs/claude-hook.log`, `.devguard/logs/codex-hook.log`, `.devguard/logs/codex-notify.log`, `dev-guard status`로 확인합니다.
 
 Codex의 `turn.completed`는 Hook 이벤트가 아니라 `codex exec --json` JSONL 출력 이벤트입니다. JSONL listener는 이 스트림을 감시하는 보조 기능이며 `.codex/hooks.json`에 섞지 않습니다.
 
@@ -149,7 +159,7 @@ dev-guard install-hooks
 dev-guard watch
 ```
 
-Auto Mode가 기본 권장 사용법입니다. Claude Code / Codex Stop Hook이 에이전트 작업 종료를 감지하고 `dev-guard done`을 자동 실행합니다. `done`은 `quality-report.md`, `next-codex-prompt.md`, `project-handoff.md`를 생성합니다.
+Auto Mode는 전략이 설치되고 runtime에서 검증된 뒤에만 성공으로 봅니다. Claude Code는 Stop Hook을 사용합니다. Codex는 user-level notify를 우선 검토하고, Stop Hook은 `/hooks` trust가 필요한 고급 옵션입니다. 완료 전략이 실행되면 `dev-guard done`이 `quality-report.md`, `next-codex-prompt.md`, `project-handoff.md`를 생성합니다.
 
 Auto Mode는 idle timeout, polling 기반 완료 추정, 자동 build/test, 자동 git commit을 사용하지 않습니다.
 

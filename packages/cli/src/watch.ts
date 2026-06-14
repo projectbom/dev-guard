@@ -10,6 +10,7 @@ import {
 } from "./runtime-state.js";
 import { getHookStatus } from "./hooks.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
+import { getAgentStrategyReport } from "./agent-strategies.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done";
 
@@ -29,18 +30,24 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   await ensureDevguardWorkspace(root);
   const options = parseWatchOptions(args);
   const hookStatus = await getHookStatus(root);
+  const strategyReport = await getAgentStrategyReport(root);
   const claudeHookInstalled = hookStatus.claudeInstalled && hookStatus.claudeHookFile;
   const codexHookInstalled = hookStatus.codexInstalled && hookStatus.codexHookFile;
-  const autoMode = !options.manual && (claudeHookInstalled || codexHookInstalled);
+  const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
+  const autoStrategyInstalled = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
+  const autoMode = !options.manual && autoStrategyInstalled;
   console.log("dev-guard watch");
   console.log(`Mode: ${autoMode ? "Auto Mode" : "Manual Mode"}`);
-  console.log(`Claude Code Hook: ${claudeHookInstalled ? "INSTALLED" : "NOT_INSTALLED"}`);
-  console.log(`Codex Hook: ${codexHookInstalled ? "INSTALLED" : "NOT_INSTALLED"}`);
-  console.log(`Done trigger: ${autoMode ? "Agent Stop Hook" : "manual dev-guard done"}`);
+  console.log("Auto completion strategy:");
+  console.log(`Claude: Stop Hook ${strategyReport.claude.installed ? "installed" : "not installed"}; runtime verified: ${strategyReport.claude.runtimeVerified ? "yes" : "no"}`);
+  console.log(`Codex: Notify recommended (${strategyReport.codexNotify.installed ? "installed" : "not installed"}); Stop Hook ${codexHookInstalled ? "installed" : "not installed"}${strategyReport.codexStopHook.requiresUserTrust ? " but requires /hooks trust" : ""}`);
+  console.log(`Runtime verified: ${runtimeVerified ? "yes" : "no"}`);
+  console.log(`Fallback: dev-guard done`);
+  console.log(`Done trigger: ${autoMode ? "verified agent strategy when runtime calls it" : "manual dev-guard done"}`);
   if (autoMode) {
     console.log("");
     console.log("Watching for file changes...");
-    console.log("When Claude/Codex finishes, dev-guard done will run automatically.");
+    console.log(runtimeVerified ? "When the verified agent completion strategy fires, dev-guard done will run automatically." : "Automatic completion is installed but runtime verification is still required.");
   } else {
     console.log("");
     console.log("Watching for file changes...");
@@ -72,9 +79,15 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       console.log(`changed: ${runtime.pendingChangedFiles.slice(0, 8).join(", ")}${runtime.pendingChangedFiles.length > 8 ? `, +${runtime.pendingChangedFiles.length - 8}` : ""}`);
     }
     if (status === "ready_for_done") {
-      console.log(autoMode ? "NEXT: wait for Claude/Codex Stop Hook; fallback: dev-guard done" : "NEXT: dev-guard done");
+      if (autoMode && runtimeVerified) {
+        console.log("NEXT: wait for verified agent completion strategy; fallback: dev-guard done");
+      } else if (autoMode) {
+        console.log("NEXT: automatic completion is not runtime verified yet. Run dev-guard doctor --agents or fallback: dev-guard done");
+      } else {
+        console.log("NEXT: dev-guard done");
+      }
     } else {
-      console.log(autoMode ? "NEXT: keep editing; Stop Hook will run done when the AI task finishes" : "NEXT: keep editing; run dev-guard done when the AI task is finished");
+      console.log(autoMode ? (runtimeVerified ? "NEXT: keep editing; verified agent strategy will run done when the AI task finishes" : "NEXT: keep editing; verify agent strategy with dev-guard doctor --agents or use dev-guard done") : "NEXT: keep editing; run dev-guard done when the AI task is finished");
     }
   };
 

@@ -221,12 +221,16 @@ export function isIgnoredWatchPath(path: string): boolean {
     normalized === runtimePath ||
     normalized === devguardPaths.state ||
     normalized === devguardPaths.history ||
-    normalized.startsWith(`${devguardPaths.reportsDir}/`) ||
-    normalized.startsWith(`${devguardPaths.promptsDir}/`) ||
-    normalized.startsWith(`${devguardPaths.logsDir}/`) ||
-    normalized.startsWith(`${devguardPaths.hooksDir}/`) ||
+    isPathOrChild(normalized, devguardPaths.reportsDir) ||
+    isPathOrChild(normalized, devguardPaths.promptsDir) ||
+    isPathOrChild(normalized, devguardPaths.logsDir) ||
+    isPathOrChild(normalized, devguardPaths.hooksDir) ||
     /\.(png|jpe?g|gif|webp|avif|ico|svg|ttf|otf|woff2?|mp4|mov|mp3|wav|pdf|zip|gz)$/i.test(normalized)
   );
+}
+
+function isPathOrChild(path: string, parent: string): boolean {
+  return path === parent || path.startsWith(`${parent}/`);
 }
 
 export async function processDoneEvent(root: string): Promise<DoneProcessingResult> {

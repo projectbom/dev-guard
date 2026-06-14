@@ -18,7 +18,7 @@ The public MVP workflow is event based:
 watch
   -> accumulate changed files in .devguard/runtime.json
   -> stable state suggests completion is ready to process
-  -> Auto Mode waits for a Claude/Codex Stop Hook
+  -> Auto Mode waits for a runtime-verified agent completion strategy
 
 done
   -> collect git diff and pending runtime files
@@ -40,7 +40,7 @@ reset
   -> clear runtime pending state only
 ```
 
-In Auto Mode, `watch` itself does not guess completion from time or idle state. A trusted Claude/Codex Stop Hook runs `dev-guard done` when the agent turn ends. In Manual Mode, the user runs `dev-guard done` explicitly.
+In Auto Mode, `watch` itself does not guess completion from time or idle state. Claude Code uses Stop Hook. Codex prefers user-level notify when available; Codex Stop Hook is an advanced option that requires `/hooks` trust. In Manual Mode, the user runs `dev-guard done` explicitly.
 
 ## Runtime Files
 

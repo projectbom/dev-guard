@@ -4,7 +4,7 @@
 
 dev-guard is an Alpha CLI guardrail for AI-assisted coding workflows. It watches project changes, turns finished work into a compact handoff report, and generates the next Codex/Claude prompt with local quality checks.
 
-The default workflow is Hook-based Auto Mode:
+The default workflow is agent-strategy Auto Mode:
 
 ```bash
 dev-guard init
@@ -25,7 +25,7 @@ AI coding agents often finish a task without preserving enough context for the n
 dev-guard keeps this workflow local and explicit:
 
 - watch file changes while an AI agent works
-- process completion when a trusted Claude/Codex Stop Hook runs
+- process completion when a verified agent completion strategy runs
 - keep `done` available as the manual fallback
 - keep append-only history
 - produce quality verdicts and handoff prompts
@@ -46,7 +46,7 @@ Run from this monorepo:
 pnpm cli init
 pnpm cli install-hooks
 pnpm cli watch
-# edit files with Claude/Codex; Stop Hook runs done
+# edit files with Claude/Codex; verified strategy runs done
 pnpm cli status
 ```
 
@@ -65,7 +65,7 @@ Use it in another project:
 dev-guard init
 dev-guard install-hooks
 dev-guard watch
-# let Claude/Codex work; Stop Hook runs done
+# let Claude/Codex work; verified strategy runs done
 dev-guard status
 ```
 
@@ -81,13 +81,13 @@ dev-guard status
    ```bash
    dev-guard install-hooks
    ```
-   Installs repo-local Claude Code and Codex Stop Hooks. Auto Mode is Stop Hook based, not time/idle based.
+   Installs available agent completion strategy files. Claude Code uses a Stop Hook. Codex notify is the recommended Codex path when configured at user level; Codex Stop Hook remains available but requires `/hooks` trust.
 
 3. Start the watcher
    ```bash
    dev-guard watch
    ```
-   Watches project files, accumulates changed paths, and waits for the Stop Hook completion event. When Claude/Codex finishes, the hook runs `dev-guard done`, which writes quality-report, next-codex-prompt, and project-handoff.
+   Watches project files, accumulates changed paths, and waits for a verified agent completion strategy. When the strategy fires, it runs `dev-guard done`, which writes quality-report, next-codex-prompt, and project-handoff.
 
 4. Manual fallback when hooks are unavailable
    ```bash
@@ -119,6 +119,10 @@ dev-guard status
 ```bash
 dev-guard init
 dev-guard install-hooks [--force]
+dev-guard install-hooks --agent claude
+dev-guard install-hooks --agent codex
+dev-guard install-hooks --agent codex-notify
+dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --manual
 dev-guard done
@@ -190,14 +194,20 @@ Generated:
 
 Read more in [docs/handoff.md](./docs/handoff.md).
 
-## Hook Integration
+## Agent Completion Strategies
 
-`dev-guard install-hooks` writes repo-local Stop hook integration files:
+dev-guard does not treat Claude Code and Codex as the same runtime.
 
-- Claude Code: `.claude/settings.json` with `hooks.Stop[].hooks[]`
-- Codex CLI: `.codex/hooks.json` with `hooks.Stop[].hooks[]`
-- Hook scripts: `.devguard/hooks/claude-stop.sh` and `.devguard/hooks/codex-stop.sh`
+- Claude Code: Stop Hook through `.claude/settings.json` and `.devguard/hooks/claude-stop.sh`
+- Codex recommended: `notify` in user-level `~/.codex/config.toml` calling `.devguard/hooks/codex-notify.sh`
+- Codex advanced: Stop Hook through `.codex/hooks.json` and `.devguard/hooks/codex-stop.sh`; requires `/hooks` trust
 - Optional JSONL helper: `.devguard/hooks/codex-event-listener.ts`
+
+Codex notify is user-level configuration. Official Codex config ignores `notify` in project-local `.codex/config.toml`, so `dev-guard install-hooks` creates the notify script but does not silently edit or claim project-local notify installation.
+
+Installed strategies are not the same as runtime-verified strategies. Use `dev-guard doctor --agents` to see Claude/Codex strategy state, `dev-guard doctor --hooks --dry-run` to check hook files and command paths, or `dev-guard doctor --hooks` to execute hook scripts directly. The active hook check can run `dev-guard done` and `dev-guard status`.
+
+Codex can require separate trust for the project and for each hook definition. If the Codex Stop Hook path is used, open Codex TUI in the repo and run `/hooks` to review/trust the dev-guard Stop Hook. Runtime verification is based on `.devguard/logs/claude-hook.log`, `.devguard/logs/codex-hook.log`, `.devguard/logs/codex-notify.log`, and `dev-guard status`.
 
 The Codex JSONL helper is not a Codex hook config. It is only for consuming `codex exec --json` event streams such as `turn.completed` and `turn.failed`.
 
@@ -210,7 +220,7 @@ dev-guard install-hooks
 dev-guard watch
 ```
 
-Auto Mode is the default recommendation. Claude Code / Codex Stop Hooks detect agent turn completion and run `dev-guard done` automatically. `done` then writes `quality-report.md`, `next-codex-prompt.md`, and `project-handoff.md`.
+Auto Mode is the default recommendation only after a strategy is installed and runtime verified. Claude Code uses Stop Hook. Codex should prefer notify when the user-level Codex config is available; Codex Stop Hook is an advanced option requiring `/hooks` trust. `done` then writes `quality-report.md`, `next-codex-prompt.md`, and `project-handoff.md`.
 
 Auto Mode does not use idle timeout, polling-based completion guessing, automatic build/test, or automatic git commit.
 
@@ -228,6 +238,8 @@ Useful commands:
 ```bash
 dev-guard install-hooks
 dev-guard install-hooks --force
+dev-guard doctor --hooks --dry-run
+dev-guard doctor --hooks
 dev-guard status
 dev-guard done
 dev-guard handoff

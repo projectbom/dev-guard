@@ -2,14 +2,14 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-`dev-guard watch` is the default Auto Mode watcher for AI-agent work.
+`dev-guard watch` is the default watcher for AI-agent work. Automatic completion is agent-specific and must be runtime verified.
 
 ```bash
 dev-guard install-hooks
 dev-guard watch
 ```
 
-It watches file changes, accumulates pending paths, and waits for trusted Claude Code / Codex Stop Hooks to run `dev-guard done` when the agent turn ends.
+It watches file changes, accumulates pending paths, and waits for a verified completion strategy to run `dev-guard done` when the agent turn ends.
 
 Manual fallback:
 
@@ -23,7 +23,7 @@ dev-guard done
 - Uses chokidar when available.
 - Accumulates changed files in `.devguard/runtime.json`.
 - Prints a stable state after changes settle.
-- Auto Mode waits for Stop Hook based `dev-guard done`.
+- Auto Mode waits for an agent-specific completion strategy.
 - Manual Mode only accumulates changes until the user runs `dev-guard done`.
 - Does not use idle timeout or polling-based completion guessing.
 - Does not run `update --write`.
@@ -37,12 +37,15 @@ Typical output:
 ```txt
 dev-guard watch
 Mode: Auto Mode
-Claude Code Hook: INSTALLED
-Codex Hook: INSTALLED
-Done trigger: Agent Stop Hook
+Auto completion strategy:
+Claude: Stop Hook installed; runtime verified: no
+Codex: Notify recommended (not installed); Stop Hook installed but requires /hooks trust
+Runtime verified: no
+Fallback: dev-guard done
+Done trigger: verified agent strategy when runtime calls it
 
 Watching for file changes...
-When Claude/Codex finishes, dev-guard done will run automatically.
+Automatic completion is installed but runtime verification is still required.
 
 watching: packages, docs, .devguard
 excluded: node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, .devguard/runtime.json, .devguard/state.json, .devguard/history.jsonl, .devguard/reports/**, .devguard/prompts/**, .devguard/logs/**, .devguard/hooks/**
@@ -51,15 +54,25 @@ mode: event-driven; no periodic refresh; no idle-time completion
 stop: Ctrl+C
 
 STATUS: idle
-NEXT: keep editing; Stop Hook will run done when the AI task finishes
+NEXT: keep editing; verify agent strategy with dev-guard doctor --agents or use dev-guard done
+```
+
+If hooks are installed but not yet verified, `ready_for_done` shows:
+
+```txt
+STATUS: ready_for_done
+NEXT: automatic completion is not runtime verified yet. Run dev-guard doctor --agents or fallback: dev-guard done
 ```
 
 Without hooks:
 
 ```txt
 Mode: Manual Mode
-Claude Code Hook: NOT_INSTALLED
-Codex Hook: NOT_INSTALLED
+Auto completion strategy:
+Claude: Stop Hook not installed; runtime verified: no
+Codex: Notify recommended (not installed); Stop Hook not installed but requires /hooks trust
+Runtime verified: no
+Fallback: dev-guard done
 Done trigger: manual dev-guard done
 
 Tip:
@@ -75,7 +88,7 @@ dev-guard install-hooks
 dev-guard status
 ```
 
-When Claude Code or Codex fires a `Stop` hook, dev-guard runs:
+When a verified strategy fires, dev-guard runs:
 
 ```bash
 dev-guard done
@@ -100,7 +113,34 @@ If only the overflow resume file needs to be refreshed:
 dev-guard handoff
 ```
 
-Codex JSONL note: `.devguard/hooks/codex-event-listener.ts` is not a hook. It is a helper for piping `codex exec --json` JSONL events such as `turn.completed` and `turn.failed`.
+Codex strategy notes:
+
+- Codex notify is preferred when you can configure user-level `~/.codex/config.toml`.
+- Codex Stop Hook is available but requires `/hooks` trust.
+- Codex JSONL listener is not a hook. It is a helper for piping `codex exec --json` JSONL events such as `turn.completed` and `turn.failed`.
+
+## Hook Verification
+
+Installed hooks do not prove that the agent runtime has called them. Verify hook activation with:
+
+```bash
+dev-guard doctor --hooks --dry-run
+dev-guard doctor --hooks
+dev-guard doctor --agents
+dev-guard status
+```
+
+`doctor --agents` shows Claude Stop Hook, Codex notify, Codex Stop Hook, Codex JSONL listener, and manual fallback status. `doctor --hooks --dry-run` checks files, permissions, config commands, command targets, and existing logs without running hooks. `doctor --hooks` directly executes the hook scripts and can run `dev-guard done` and `dev-guard status`.
+
+Codex can require separate project trust and hook definition trust. If Auto Mode does not complete after `STATUS: ready_for_done`, open Codex TUI and run `/hooks` to review/trust the dev-guard Stop hook.
+
+Claude Code hooks require Claude Code to be installed and the project `.claude/settings.json` to be loaded. Confirm actual execution through `.devguard/logs/claude-hook.log` and `dev-guard status`.
+
+If hook runtime execution is not verified yet, use the manual fallback:
+
+```bash
+dev-guard done
+```
 
 ## Context Overflow Recovery
 
