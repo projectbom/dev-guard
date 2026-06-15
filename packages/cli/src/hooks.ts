@@ -37,6 +37,7 @@ const codexHooksPath = ".codex/hooks.json";
 const hookStatusPath = devguardPaths.hookStatus;
 const claudeLogPath = devguardPaths.claudeLog;
 const codexLogPath = devguardPaths.codexLog;
+const codexNotifyLogPath = devguardPaths.codexNotifyLog;
 export const claudeHookCommand = '${CLAUDE_PROJECT_DIR}/.devguard/hooks/claude-stop.sh';
 export const codexHookCommand = '"$(git rev-parse --show-toplevel)/.devguard/hooks/codex-stop.sh"';
 export const hookConfigPaths = {
@@ -46,7 +47,8 @@ export const hookConfigPaths = {
   codexHookPath,
   codexNotifyHookPath,
   claudeLogPath,
-  codexLogPath
+  codexLogPath,
+  codexNotifyLogPath
 } as const;
 
 export async function runInstallHooks(root: string, args: string[]): Promise<void> {
@@ -133,14 +135,15 @@ export async function installHooks(root: string, options: { force?: boolean; age
 }
 
 export async function getHookStatus(root: string): Promise<HookStatus> {
-  const [claudeLog, codexLog] = await Promise.all([
+  const [claudeLog, codexLog, codexNotifyLog] = await Promise.all([
     readTextFile(fromRoot(root, claudeLogPath)),
-    readTextFile(fromRoot(root, codexLogPath))
+    readTextFile(fromRoot(root, codexLogPath)),
+    readTextFile(fromRoot(root, codexNotifyLogPath))
   ]);
-  const logLines = [...claudeLog.split(/\r?\n/), ...codexLog.split(/\r?\n/)].filter(Boolean);
+  const logLines = [...claudeLog.split(/\r?\n/), ...codexLog.split(/\r?\n/), ...codexNotifyLog.split(/\r?\n/)].filter(Boolean);
   const claudeLastLine = latestFinalHookLine(claudeLog.split(/\r?\n/).filter(Boolean));
-  const codexLastLine = latestFinalHookLine(codexLog.split(/\r?\n/).filter(Boolean));
-  const finalLines = logLines.filter((line) => /hook=[a-z]+\.stop status=(success|failed)\b/.test(line));
+  const codexLastLine = latestFinalHookLine([...codexLog.split(/\r?\n/), ...codexNotifyLog.split(/\r?\n/)].filter(Boolean));
+  const finalLines = logLines.filter(isFinalHookLine);
   const lastLine = latestTimestampedLine(finalLines) ?? latestTimestampedLine(logLines);
   return {
     claudeInstalled: existsSync(fromRoot(root, claudeSettingsPath)),
@@ -529,7 +532,11 @@ function latestTimestampedLine(lines: string[]): string | undefined {
 }
 
 function latestFinalHookLine(lines: string[]): string | undefined {
-  return latestTimestampedLine(lines.filter((line) => /hook=[a-z]+\.stop status=(success|failed)\b/.test(line)));
+  return latestTimestampedLine(lines.filter(isFinalHookLine));
+}
+
+function isFinalHookLine(line: string): boolean {
+  return /hook=[a-z]+\.(stop|notify) status=(success|failed)\b/.test(line);
 }
 
 function errorMessage(error: unknown): string {

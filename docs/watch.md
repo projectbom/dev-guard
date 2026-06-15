@@ -24,6 +24,8 @@ dev-guard done
 - Accumulates changed files in `.devguard/runtime.json`.
 - Prints a stable state after changes settle.
 - Auto Mode waits for an agent-specific completion strategy.
+- `watch` never runs `done` by itself; agent hook/notify or a manual `done` remains the completion actor.
+- When another process runs `done`, `watch` refreshes from `.devguard/runtime.json`, `.devguard/state.json`, and `.devguard/history.jsonl`, then moves through processed/idle display state.
 - Manual Mode only accumulates changes until the user runs `dev-guard done`.
 - Does not use idle timeout or polling-based completion guessing.
 - Does not run `update --write`.
@@ -150,6 +152,8 @@ If hook runtime execution is not verified yet, use the manual fallback:
 ```bash
 dev-guard done
 ```
+
+If the terminal appears stuck at `ready_for_done`, run `dev-guard status`. Pending files may already be cleared by an external hook/notify or manual `done`; the watcher will refresh its display from runtime state.
 
 ## Context Overflow Recovery
 

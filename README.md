@@ -88,6 +88,7 @@ dev-guard status
    dev-guard watch
    ```
    Watches project files, accumulates changed paths, and waits for a verified agent completion strategy. When the strategy fires, it runs `dev-guard done`, which writes quality-report, next-codex-prompt, and project-handoff.
+   `watch` does not run `done` itself. If an agent hook/notify or a manual `done` runs in another process, `watch` refreshes from `.devguard/runtime.json`, `.devguard/state.json`, and `.devguard/history.jsonl` and returns to processed/idle state.
 
 4. Manual fallback when hooks are unavailable
    ```bash
@@ -238,6 +239,8 @@ dev-guard watch
 Auto Mode is the default recommendation only after a strategy is installed and runtime verified. Claude Code uses Stop Hook. Codex should prefer notify when the user-level Codex config is available; Codex Stop Hook is an advanced option requiring `/hooks` trust. `done` then writes `quality-report.md`, `next-codex-prompt.md`, and `project-handoff.md`.
 
 Auto Mode does not use idle timeout, polling-based completion guessing, automatic build/test, or automatic git commit.
+
+If `watch` appears to stay at `ready_for_done`, run `dev-guard status` to confirm whether pending files are already cleared. The watcher observes external `done` results but never triggers `done` by itself.
 
 ### Manual Mode Fallback
 

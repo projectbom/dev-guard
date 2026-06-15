@@ -1,18 +1,21 @@
 import { existsSync, watch as fsWatch } from "node:fs";
+import { stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   ensureDevguardWorkspace,
   hashRuntimeFiles,
   isIgnoredWatchPath,
   markRuntimeStable,
+  readProjectState,
   readRuntimeState,
-  recordRuntimeChange
+  recordRuntimeChange,
+  resetRuntimeState
 } from "./runtime-state.js";
 import { getHookStatus } from "./hooks.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 
-type WatchStatus = "idle" | "active" | "ready_for_done";
+type WatchStatus = "idle" | "active" | "ready_for_done" | "processed";
 
 interface WatchOptions {
   stableAfterMs: number;
@@ -63,11 +66,14 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 
   let status: WatchStatus = "idle";
   let stableTimer: NodeJS.Timeout | undefined;
+  let refreshTimer: NodeJS.Timeout | undefined;
   let lastPrintedKey = "";
+  let lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
 
   const printState = async (nextStatus: WatchStatus) => {
     const runtime = await readRuntimeState(root);
-    const key = `${nextStatus}:${runtime.pendingChangedFiles.join("|")}`;
+    const projectState = await readProjectState(root);
+    const key = `${nextStatus}:${runtime.pendingChangedFiles.join("|")}:${projectState.lastProcessedAt ?? "none"}:${projectState.lastQualityVerdict ?? "unknown"}`;
     if (key === lastPrintedKey) {
       return;
     }
@@ -77,6 +83,8 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     console.log(`STATUS: ${status}`);
     if (runtime.pendingChangedFiles.length > 0) {
       console.log(`changed: ${runtime.pendingChangedFiles.slice(0, 8).join(", ")}${runtime.pendingChangedFiles.length > 8 ? `, +${runtime.pendingChangedFiles.length - 8}` : ""}`);
+    } else {
+      console.log("changed: none");
     }
     if (status === "ready_for_done") {
       if (autoMode && runtimeVerified) {
@@ -91,11 +99,48 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   };
 
+  const refreshExternalDoneState = async () => {
+    const [runtime, projectState] = await Promise.all([readRuntimeState(root), readProjectState(root)]);
+    const processedAt = projectState.lastProcessedAt;
+    if (!processedAt || processedAt === lastSeenProcessedAt) {
+      return;
+    }
+    const pendingIsStale = runtime.pendingChangedFiles.length === 0 || (await allPendingFilesAtOrBefore(root, runtime.pendingChangedFiles, processedAt));
+    if (pendingIsStale) {
+      lastSeenProcessedAt = processedAt;
+      clearTimeout(stableTimer);
+      if (runtime.pendingChangedFiles.length > 0 || (runtime.lastStatus ?? "idle") !== "idle") {
+        await resetRuntimeState(root);
+      }
+      lastPrintedKey = "";
+      status = "processed";
+      console.log("");
+      console.log("STATUS: processed");
+      console.log("DONE: agent completion processed changes");
+      console.log(`Last processed: ${processedAt}`);
+      console.log(`Quality: ${projectState.lastQualityVerdict ?? "unknown"}`);
+      console.log(`NEXT: ${projectState.lastQualityVerdict && projectState.lastQualityVerdict !== "PASS" ? `review ${devguardPaths.qualityReport}` : "keep editing"}`);
+      await printState("idle");
+    }
+  };
+
   const handleChange = async (path: string) => {
-    if (!path || isIgnoredWatchPath(path) || isLockfilePath(path, options)) {
+    if (!path) {
+      return;
+    }
+    if (isWatchUiRefreshPath(path)) {
+      await refreshExternalDoneState();
+      return;
+    }
+    if (isIgnoredWatchPath(path) || isLockfilePath(path, options)) {
       return;
     }
     try {
+      const projectState = await readProjectState(root);
+      if (projectState.lastProcessedAt && (await pathMtimeAtOrBefore(root, path, projectState.lastProcessedAt))) {
+        await refreshExternalDoneState();
+        return;
+      }
       clearTimeout(stableTimer);
       const runtime = await recordRuntimeChange(root, path);
       await printState("active");
@@ -115,10 +160,16 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 
   const watcher = await createWatcher(root, handleChange, options);
   await printState(status);
+  refreshTimer = setInterval(() => {
+    void refreshExternalDoneState().catch((error) => {
+      console.error(`watch warning: ${errorMessage(error)}`);
+    });
+  }, 1000);
 
   process.on("SIGINT", async () => {
     await closeWatcher(watcher);
     clearTimeout(stableTimer);
+    clearInterval(refreshTimer);
     console.log("\ndev-guard watch stopped");
     process.exit(0);
   });
@@ -156,7 +207,7 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
       ignoreInitial: true,
       ignored: (path: string) => {
         const normalized = path.replace(`${root}/`, "");
-        return isIgnoredWatchPath(normalized) || isLockfilePath(normalized, options);
+        return (!isWatchUiRefreshPath(normalized) && isIgnoredWatchPath(normalized)) || isLockfilePath(normalized, options);
       },
       depth: options.depth,
       usePolling: options.poll,
@@ -197,6 +248,33 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
     watcher.close();
   });
   return [watcher];
+}
+
+function isWatchUiRefreshPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
+  return normalized === devguardPaths.runtime || normalized === devguardPaths.state || normalized === devguardPaths.history;
+}
+
+async function allPendingFilesAtOrBefore(root: string, paths: string[], timestamp: string): Promise<boolean> {
+  for (const path of paths) {
+    if (!(await pathMtimeAtOrBefore(root, path, timestamp))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function pathMtimeAtOrBefore(root: string, path: string, timestamp: string): Promise<boolean> {
+  const processedMs = Date.parse(timestamp);
+  if (!Number.isFinite(processedMs)) {
+    return false;
+  }
+  try {
+    const metadata = await stat(join(root, path));
+    return metadata.mtimeMs <= processedMs;
+  } catch {
+    return true;
+  }
 }
 
 async function closeWatcher(watcher: unknown): Promise<void> {

@@ -49,7 +49,7 @@ export async function getAgentStrategyReport(root: string): Promise<AgentStrateg
   const codexStopInstalled = hookStatus.codexInstalled && hookStatus.codexHookFile;
   const codexCliAvailable = commandAvailable("codex");
 
-  const claudeRuntimeVerified = await hasFinalLogLine(root, devguardPaths.claudeLog, /hook=claude\.stop status=success\b.*source=agent_runtime\b/);
+  const claudeRuntimeVerified = await hasFinalLogLine(root, devguardPaths.claudeLog, /hook=claude\.stop status=success\b/);
   const codexStopRuntimeVerified = await hasFinalLogLine(root, devguardPaths.codexLog, /hook=codex\.stop status=success\b.*source=agent_runtime\b/);
 
   const claude: AgentStrategyStatus = {

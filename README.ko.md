@@ -176,7 +176,11 @@ dev-guard watch
 
 Auto Mode는 전략이 설치되고 runtime에서 검증된 뒤에만 성공으로 봅니다. Claude Code는 Stop Hook을 사용합니다. Codex는 user-level notify를 우선 검토하고, Stop Hook은 `/hooks` trust가 필요한 고급 옵션입니다. 완료 전략이 실행되면 `dev-guard done`이 `quality-report.md`, `next-codex-prompt.md`, `project-handoff.md`를 생성합니다.
 
+`watch`는 직접 `done`을 실행하지 않습니다. agent hook/notify 또는 사용자의 수동 `done`이 다른 프로세스에서 실행되면 `.devguard/runtime.json`, `.devguard/state.json`, `.devguard/history.jsonl`을 다시 읽어 processed/idle 상태로 화면을 갱신합니다.
+
 Auto Mode는 idle timeout, polling 기반 완료 추정, 자동 build/test, 자동 git commit을 사용하지 않습니다.
+
+`watch` 화면이 `ready_for_done`에 오래 머무르면 `dev-guard status`로 pending이 이미 비워졌는지 확인할 수 있습니다.
 
 ### Manual Mode fallback
 

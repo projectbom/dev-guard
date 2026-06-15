@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { dirname, relative } from "node:path";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import {
   analyzeDiff,
@@ -138,12 +138,16 @@ const defaultRuntime: RuntimeState = {
 
 export async function readRuntimeState(root: string): Promise<RuntimeState> {
   await ensureDevguardWorkspace(root);
-  return readJsonFile<RuntimeState>(fromRoot(root, runtimePath), defaultRuntime);
+  try {
+    return readJsonFile<RuntimeState>(fromRoot(root, runtimePath), defaultRuntime);
+  } catch {
+    return defaultRuntime;
+  }
 }
 
 export async function writeRuntimeState(root: string, state: RuntimeState): Promise<void> {
   await ensureDevguardWorkspace(root);
-  await writeTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(state), null, 2)}\n`);
+  await writeAtomicTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(state), null, 2)}\n`);
 }
 
 export async function resetRuntimeState(root: string): Promise<void> {
@@ -231,6 +235,13 @@ export function isIgnoredWatchPath(path: string): boolean {
 
 function isPathOrChild(path: string, parent: string): boolean {
   return path === parent || path.startsWith(`${parent}/`);
+}
+
+async function writeAtomicTextFile(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
+  await writeFile(tempPath, content, "utf8");
+  await rename(tempPath, path);
 }
 
 export async function processDoneEvent(root: string): Promise<DoneProcessingResult> {
