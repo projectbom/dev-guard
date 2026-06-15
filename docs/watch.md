@@ -116,8 +116,17 @@ dev-guard handoff
 Codex strategy notes:
 
 - Codex notify is preferred when you can configure user-level `~/.codex/config.toml`.
+- Codex notify is a single user-level command. If another notify already exists, install the dev-guard dispatcher instead of overwriting it.
 - Codex Stop Hook is available but requires `/hooks` trust.
 - Codex JSONL listener is not a hook. It is a helper for piping `codex exec --json` JSONL events such as `turn.completed` and `turn.failed`.
+
+Dispatcher install:
+
+```bash
+dev-guard install-hooks --agent codex-notify --install-dispatcher
+```
+
+The dispatcher lives at `~/.codex/dev-guard-notify-dispatcher.sh`. It runs the original notify command, such as Codex Computer Use `turn-ended`, and then runs `.devguard/hooks/codex-notify.sh` when present in the current project. The config backup is written to `~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss`; restore that file to uninstall.
 
 ## Hook Verification
 

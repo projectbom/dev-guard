@@ -122,6 +122,7 @@ dev-guard install-hooks [--force]
 dev-guard install-hooks --agent claude
 dev-guard install-hooks --agent codex
 dev-guard install-hooks --agent codex-notify
+dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --manual
@@ -203,7 +204,21 @@ dev-guard does not treat Claude Code and Codex as the same runtime.
 - Codex advanced: Stop Hook through `.codex/hooks.json` and `.devguard/hooks/codex-stop.sh`; requires `/hooks` trust
 - Optional JSONL helper: `.devguard/hooks/codex-event-listener.ts`
 
-Codex notify is user-level configuration. Official Codex config ignores `notify` in project-local `.codex/config.toml`, so `dev-guard install-hooks` creates the notify script but does not silently edit or claim project-local notify installation.
+Codex notify is user-level configuration. Official Codex config ignores `notify` in project-local `.codex/config.toml`, so `dev-guard install-hooks --agent codex-notify` creates the notify script and inspects the user config without overwriting it.
+
+Codex currently has a single user-level `notify` command. If an existing notify is present, for example the Codex Computer Use `turn-ended` notifier, dev-guard preserves it through a dispatcher:
+
+```bash
+dev-guard install-hooks --agent codex-notify --install-dispatcher
+```
+
+This writes `~/.codex/dev-guard-notify-dispatcher.sh`, backs up `~/.codex/config.toml` to `~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss`, and changes `notify` to the dispatcher. The dispatcher runs the original notify command and then runs `.devguard/hooks/codex-notify.sh` when the current project has one. Failures are isolated so one notify target does not block the other.
+
+To uninstall the dispatcher, restore the backup:
+
+```bash
+cp ~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss ~/.codex/config.toml
+```
 
 Installed strategies are not the same as runtime-verified strategies. Use `dev-guard doctor --agents` to see Claude/Codex strategy state, `dev-guard doctor --hooks --dry-run` to check hook files and command paths, or `dev-guard doctor --hooks` to execute hook scripts directly. The active hook check can run `dev-guard done` and `dev-guard status`.
 

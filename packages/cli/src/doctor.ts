@@ -11,6 +11,7 @@ import { listRunLogs } from "./runs.js";
 import { readDriftTelemetryStats } from "./drift-telemetry.js";
 import { readRuntimeState } from "./runtime-state.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
+import { formatNotifyCommand, getCodexNotifyConfigStatus } from "./codex-notify.js";
 
 export async function runDoctor(root: string, args: string[] = []): Promise<void> {
   if (args.includes("--agents")) {
@@ -170,6 +171,7 @@ async function runAgentDoctor(root: string): Promise<void> {
 
 async function printAgentStrategies(root: string): Promise<void> {
   const report = await getAgentStrategyReport(root);
+  const codexNotify = await getCodexNotifyConfigStatus();
   console.log("Agent Strategies");
   console.log("");
   console.log("Claude Code");
@@ -177,6 +179,12 @@ async function printAgentStrategies(root: string): Promise<void> {
   console.log("");
   console.log("Codex");
   console.log(`- recommended strategy: ${report.codexNotify.name}`);
+  console.log(`- user-level notify configured: ${formatStrategyFlag(codexNotify.notifyConfigured)}`);
+  console.log(`- existing notify detected: ${formatStrategyFlag(codexNotify.existingNotifyDetected)}`);
+  console.log(`- notify command: ${formatNotifyCommand(codexNotify.notify)}`);
+  console.log(`- dispatcher installed: ${formatStrategyFlag(codexNotify.dispatcherInstalled)}`);
+  console.log(`- dispatcher configured: ${formatStrategyFlag(codexNotify.notifyIsDispatcher)}`);
+  console.log(`- dispatcher path: ${codexNotify.dispatcherPath}`);
   console.log(`- notify available: ${formatStrategyFlag(report.codexNotify.available)}`);
   console.log(`- notify installed: ${formatStrategyFlag(report.codexNotify.installed)}`);
   console.log(`- notify script verified: ${formatStrategyFlag(report.codexNotify.scriptVerified)}`);

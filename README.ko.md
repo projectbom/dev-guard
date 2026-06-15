@@ -76,6 +76,7 @@ dev-guard install-hooks [--force]
 dev-guard install-hooks --agent claude
 dev-guard install-hooks --agent codex
 dev-guard install-hooks --agent codex-notify
+dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --manual
@@ -142,7 +143,21 @@ dev-guard는 Claude Code와 Codex를 같은 방식으로 취급하지 않습니�
 - Codex 고급 옵션: `.codex/hooks.json`과 `.devguard/hooks/codex-stop.sh`를 사용하는 Stop Hook. `/hooks` trust 필요
 - 보조 JSONL listener: `.devguard/hooks/codex-event-listener.ts`
 
-Codex `notify`는 user-level 설정입니다. 공식 Codex 설정 문서는 project-local `.codex/config.toml`의 `notify`를 무시한다고 설명하므로, `dev-guard install-hooks`는 notify script를 만들지만 project-local notify 설치가 성공했다고 표시하지 않습니다.
+Codex `notify`는 user-level 설정입니다. 공식 Codex 설정 문서는 project-local `.codex/config.toml`의 `notify`를 무시한다고 설명하므로, `dev-guard install-hooks --agent codex-notify`는 notify script를 만들고 user config를 검사하되 기존 값을 덮어쓰지 않습니다.
+
+Codex notify는 user-level 단일 명령일 수 있습니다. 기존 Computer Use `turn-ended` notify가 있으면 dispatcher로 함께 실행합니다.
+
+```bash
+dev-guard install-hooks --agent codex-notify --install-dispatcher
+```
+
+이 명령은 `~/.codex/dev-guard-notify-dispatcher.sh`를 만들고, `~/.codex/config.toml`을 `~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss`로 백업한 뒤 `notify`를 dispatcher로 바꿉니다. dispatcher는 기존 notify 명령을 보존해서 실행하고, 현재 프로젝트에 `.devguard/hooks/codex-notify.sh`가 있으면 추가로 실행합니다. 한쪽 notify 실패가 다른 쪽 실행을 막지 않습니다.
+
+복구는 백업을 되돌리면 됩니다.
+
+```bash
+cp ~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss ~/.codex/config.toml
+```
 
 전략이 설치된 것과 실제 runtime에서 검증된 것은 다릅니다. `dev-guard doctor --agents`는 Claude/Codex 전략 상태를 보여줍니다. `dev-guard doctor --hooks --dry-run`은 hook 파일/권한/설정 command 경로만 검사하고, `dev-guard doctor --hooks`는 hook script를 직접 실행합니다. 직접 실행 검사는 `dev-guard done`과 `dev-guard status`를 실행할 수 있습니다.
 

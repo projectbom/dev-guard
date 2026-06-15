@@ -10,6 +10,7 @@ dev-guard install-hooks
 dev-guard install-hooks --agent claude
 dev-guard install-hooks --agent codex
 dev-guard install-hooks --agent codex-notify
+dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
 dev-guard watch
 dev-guard done
@@ -88,6 +89,20 @@ It also checks for the legacy `devguard/` directory. If only the legacy director
 Claude Code Stop hooks use `.claude/settings.json` with `hooks.Stop[].hooks[]`. The dev-guard command handler uses `${CLAUDE_PROJECT_DIR}/.devguard/hooks/claude-stop.sh`.
 
 Codex notify is the preferred Codex strategy when the user config can be updated. Official Codex config ignores `notify` in project-local `.codex/config.toml`, so dev-guard only creates `.devguard/hooks/codex-notify.sh` and reports the required user-level `~/.codex/config.toml` step.
+
+Codex has a single user-level `notify` command. If an existing notify is configured, dev-guard must not overwrite it. Use the dispatcher install when you want dev-guard and the existing notify, such as the Codex Computer Use notifier, to run together:
+
+```bash
+dev-guard install-hooks --agent codex-notify --install-dispatcher
+```
+
+This creates `~/.codex/dev-guard-notify-dispatcher.sh`, backs up `~/.codex/config.toml` as `~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss`, and changes `notify` to the dispatcher. The dispatcher preserves the original notify command in `ORIGINAL_NOTIFY=(...)`, forwards all Codex arguments to both commands, and skips dev-guard quietly when the current project has no `.devguard/hooks/codex-notify.sh`.
+
+Uninstall/recovery:
+
+```bash
+cp ~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss ~/.codex/config.toml
+```
 
 Codex Stop hooks use `.codex/hooks.json` with `hooks.Stop[].hooks[]`. The dev-guard command handler resolves from the git root with `"$(git rev-parse --show-toplevel)/.devguard/hooks/codex-stop.sh"`. This strategy requires `/hooks` trust before runtime execution.
 

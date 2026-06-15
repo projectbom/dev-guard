@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fromRoot, readTextFile } from "./fs.js";
 import { getHookStatus, hookConfigPaths } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
+import { getCodexNotifyConfigStatus } from "./codex-notify.js";
 
 export type AgentStrategyName = "claude-stop-hook" | "codex-notify" | "codex-stop-hook" | "codex-jsonl-listener" | "manual";
 
@@ -41,6 +42,7 @@ export async function getAgentStrategyReport(root: string): Promise<AgentStrateg
     isExecutable(root, devguardPaths.codexEventListener)
   ]);
   const codexNotifyInstalled = await isCodexNotifyConfigured(root);
+  const codexNotifyConfig = await getCodexNotifyConfigStatus();
   const codexNotifyRuntimeVerified = await hasFinalLogLine(root, devguardPaths.codexNotifyLog, /hook=codex\.notify status=success\b.*source=agent_runtime\b/);
   const codexJsonlRuntimeVerified = await hasFinalLogLine(root, devguardPaths.codexLog, /hook=codex\.turn\.completed status=success\b/);
   const claudeInstalled = hookStatus.claudeInstalled && hookStatus.claudeHookFile;
@@ -66,12 +68,14 @@ export async function getAgentStrategyReport(root: string): Promise<AgentStrateg
     name: "codex-notify",
     agent: "Codex",
     available: codexCliAvailable,
-    installed: codexNotifyInstalled,
+    installed: codexNotifyInstalled || codexNotifyConfig.notifyIsDispatcher,
     scriptVerified: codexNotifyScriptVerified,
     runtimeVerified: codexNotifyRuntimeVerified,
     requiresUserTrust: false,
     recommended: true,
-    next: codexNotifyInstalled
+    next: codexNotifyConfig.existingNotifyDetected
+      ? "Existing Codex notify detected. Run dev-guard install-hooks --agent codex-notify --install-dispatcher."
+      : codexNotifyInstalled || codexNotifyConfig.notifyIsDispatcher
       ? "Run a Codex turn and check .devguard/logs/codex-notify.log."
       : "Configure user-level ~/.codex/config.toml notify to call .devguard/hooks/codex-notify.sh."
   };

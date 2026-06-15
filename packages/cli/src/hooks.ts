@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { fromRoot, readTextFile, writeTextFile } from "./fs.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
+import { formatNotifyCommand, getCodexNotifyConfigStatus, installCodexNotifyDispatcher } from "./codex-notify.js";
 
 interface InstallHooksResult {
   created: string[];
@@ -50,8 +51,9 @@ export const hookConfigPaths = {
 
 export async function runInstallHooks(root: string, args: string[]): Promise<void> {
   const force = args.includes("--force");
+  const installDispatcher = args.includes("--install-dispatcher");
   const agent = readAgentOption(args);
-  const result = await installHooks(root, { force, agent });
+  const result = await installHooks(root, { force, agent, installDispatcher });
   console.log("dev-guard install-hooks");
   console.log(`agent: ${agent}`);
   if (result.created.length > 0) {
@@ -65,7 +67,7 @@ export async function runInstallHooks(root: string, args: string[]): Promise<voi
   console.log(`report: ${result.reportPath}`);
 }
 
-export async function installHooks(root: string, options: { force?: boolean; agent?: InstallAgent } = {}): Promise<InstallHooksResult> {
+export async function installHooks(root: string, options: { force?: boolean; agent?: InstallAgent; installDispatcher?: boolean } = {}): Promise<InstallHooksResult> {
   const migration = await migrateLegacyDevguardDir(root, { force: options.force });
   const created: string[] = [];
   const skipped: string[] = migration.message ? [migration.message] : [];
@@ -105,7 +107,26 @@ export async function installHooks(root: string, options: { force?: boolean; age
     await installJsonHookConfig(root, codexHooksPath, createCodexHookConfig, { ...options, mergeExisting: false }, created, skipped);
   }
   if (installCodexNotify) {
-    skipped.push("Codex notify config is user-level only; add notify to ~/.codex/config.toml manually using .devguard/hooks/codex-notify.sh");
+    const notifyStatus = await getCodexNotifyConfigStatus();
+    if (options.force || options.installDispatcher) {
+      try {
+        const dispatcher = await installCodexNotifyDispatcher({ force: options.force });
+        if (dispatcher.changed) {
+          created.push(dispatcher.dispatcherPath);
+        }
+        if (dispatcher.backupPath) created.push(`${dispatcher.backupPath} (backup)`);
+        skipped.push(dispatcher.message);
+      } catch (error) {
+        skipped.push(`Codex notify dispatcher install failed (${errorMessage(error)})`);
+      }
+    } else if (notifyStatus.notifyIsDispatcher) {
+      skipped.push("Codex notify dispatcher already configured in ~/.codex/config.toml");
+    } else if (notifyStatus.existingNotifyDetected) {
+      skipped.push(`Existing Codex notify detected: ${formatNotifyCommand(notifyStatus.notify)}`);
+      skipped.push("Run dev-guard install-hooks --agent codex-notify --install-dispatcher to preserve it through ~/.codex/dev-guard-notify-dispatcher.sh");
+    } else {
+      skipped.push("Codex notify config is user-level only; run dev-guard install-hooks --agent codex-notify --install-dispatcher to configure ~/.codex/config.toml");
+    }
   }
   await writeHookStatusReport(root);
   return { created, skipped, reportPath: hookStatusPath };

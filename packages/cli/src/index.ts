@@ -168,7 +168,7 @@ function printHelp(): void {
 
 Quick commands:
   dev-guard init
-  dev-guard install-hooks [--agent <claude|codex|codex-notify|all>]
+  dev-guard install-hooks [--agent <claude|codex|codex-notify|all>] [--install-dispatcher]
   dev-guard watch
   dev-guard done
   dev-guard handoff
@@ -199,7 +199,7 @@ Usage:
   dev-guard "requirement"
   dev-guard done
   dev-guard handoff
-  dev-guard install-hooks [--force] [--agent <claude|codex|codex-notify|all>]
+  dev-guard install-hooks [--force] [--agent <claude|codex|codex-notify|all>] [--install-dispatcher]
   dev-guard status
   dev-guard reset
   dev-guard check [--local] [--include-context-files]
