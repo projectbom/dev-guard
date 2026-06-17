@@ -145,9 +145,20 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       const runtime = await recordRuntimeChange(root, path);
       await printState("active");
       stableTimer = setTimeout(async () => {
-        const latest = await readRuntimeState(root);
-        await markRuntimeStable(root, hashRuntimeFiles(latest.pendingChangedFiles));
-        await printState(latest.pendingChangedFiles.length > 0 ? "ready_for_done" : "idle");
+        try {
+          const latest = await readRuntimeState(root);
+          const projectState = await readProjectState(root);
+          if (projectState.lastProcessedAt && latest.lastChangedAt && Date.parse(latest.lastChangedAt) <= Date.parse(projectState.lastProcessedAt)) {
+            console.warn("watch warning: stale stable write skipped after external done");
+            await resetRuntimeState(root);
+            await refreshExternalDoneState();
+            return;
+          }
+          await markRuntimeStable(root, hashRuntimeFiles(latest.pendingChangedFiles));
+          await printState(latest.pendingChangedFiles.length > 0 ? "ready_for_done" : "idle");
+        } catch (error) {
+          console.error(`watch warning: ${errorMessage(error)}`);
+        }
       }, options.stableAfterMs);
       if (!options.compact) {
         console.log(`event: ${path}; pending=${runtime.pendingChangedFiles.length}`);

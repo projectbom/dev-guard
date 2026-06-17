@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { dirname, relative } from "node:path";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { dirname, join, relative } from "node:path";
+import { mkdir, rename, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import {
   analyzeDiff,
@@ -28,6 +28,8 @@ export interface RuntimeState {
   lastStableAt?: string;
   lastDiffHash?: string;
   lastStatus?: "idle" | "active" | "ready_for_done" | "processed";
+  revision?: number;
+  updatedAt?: string;
 }
 
 export interface ProjectState {
@@ -147,7 +149,11 @@ export async function readRuntimeState(root: string): Promise<RuntimeState> {
 
 export async function writeRuntimeState(root: string, state: RuntimeState): Promise<void> {
   await ensureDevguardWorkspace(root);
-  await writeAtomicTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(state), null, 2)}\n`);
+  try {
+    await writeAtomicTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(state), null, 2)}\n`);
+  } catch (error) {
+    await logRuntimeWriteWarning(root, `runtime_write=failed path=${runtimePath} error=${quoteLogValue(errorMessage(error))}`);
+  }
 }
 
 export async function resetRuntimeState(root: string): Promise<void> {
@@ -161,7 +167,7 @@ export async function readProjectState(root: string): Promise<ProjectState> {
 
 export async function writeProjectState(root: string, state: ProjectState): Promise<void> {
   await ensureDevguardWorkspace(root);
-  await writeTextFile(fromRoot(root, statePath), `${JSON.stringify(state, null, 2)}\n`);
+  await writeAtomicTextFile(fromRoot(root, statePath), `${JSON.stringify(state, null, 2)}\n`);
 }
 
 export async function readHistoryRecords(root: string, limit = 20): Promise<HistoryRecord[]> {
@@ -203,6 +209,12 @@ export async function recordRuntimeChange(root: string, path: string): Promise<R
 
 export async function markRuntimeStable(root: string, diffHash: string): Promise<RuntimeState> {
   const current = await readRuntimeState(root);
+  const project = await readProjectState(root);
+  if (isRuntimeOlderThanProcessed(current, project.lastProcessedAt)) {
+    await logRuntimeWriteWarning(root, "runtime_write=skipped reason=stale_stable_after_done");
+    await writeRuntimeState(root, defaultRuntime);
+    return defaultRuntime;
+  }
   const next: RuntimeState = {
     ...current,
     lastStableAt: new Date().toISOString(),
@@ -239,9 +251,22 @@ function isPathOrChild(path: string, parent: string): boolean {
 
 async function writeAtomicTextFile(path: string, content: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
-  const tempPath = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tempPath, content, "utf8");
-  await rename(tempPath, path);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const tempPath = `${path}.${process.pid}.${Date.now()}.${randomSuffix()}.tmp`;
+    try {
+      await writeFile(tempPath, content, "utf8");
+      await stat(tempPath);
+      await rename(tempPath, path);
+      return;
+    } catch (error) {
+      lastError = error;
+      await logAtomicWriteWarning(path, `atomic_write=retry attempt=${attempt} path=${quoteLogValue(path)} error=${quoteLogValue(errorMessage(error))}`);
+      await sleep(25 * attempt);
+    }
+  }
+  await logAtomicWriteWarning(path, `atomic_write=failed path=${quoteLogValue(path)} error=${quoteLogValue(errorMessage(lastError))}`);
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 export async function processDoneEvent(root: string): Promise<DoneProcessingResult> {
@@ -449,10 +474,45 @@ export function hashRuntimeFiles(files: string[]): string {
 }
 
 function normalizeRuntimeState(state: RuntimeState): RuntimeState {
+  const now = new Date().toISOString();
   return {
     ...state,
-    pendingChangedFiles: [...new Set(state.pendingChangedFiles ?? [])].filter((file) => !isIgnoredWatchPath(file)).sort()
+    pendingChangedFiles: [...new Set(state.pendingChangedFiles ?? [])].filter((file) => !isIgnoredWatchPath(file)).sort(),
+    revision: (state.revision ?? 0) + 1,
+    updatedAt: now
   };
+}
+
+function isRuntimeOlderThanProcessed(runtime: RuntimeState, lastProcessedAt?: string): boolean {
+  if (!lastProcessedAt || !runtime.lastChangedAt) return false;
+  return Date.parse(runtime.lastChangedAt) <= Date.parse(lastProcessedAt);
+}
+
+async function logRuntimeWriteWarning(root: string, message: string): Promise<void> {
+  await appendTextFile(fromRoot(root, devguardPaths.watchLog), `timestamp=${new Date().toISOString()} ${message}\n`).catch(() => undefined);
+  console.warn(`watch warning: ${message}`);
+}
+
+async function logAtomicWriteWarning(path: string, message: string): Promise<void> {
+  const devguardDir = dirname(path);
+  await appendTextFile(join(devguardDir, "logs", "watch.log"), `timestamp=${new Date().toISOString()} ${message}\n`).catch(() => undefined);
+  console.warn(`watch warning: ${message}`);
+}
+
+function randomSuffix(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function quoteLogValue(value: string): string {
+  return JSON.stringify(value);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function normalizeEventPath(root: string, path: string): string {

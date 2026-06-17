@@ -24,6 +24,7 @@ export const devguardPaths = {
   claudeLog: `${DEVGUARD_DIR}/logs/claude-hook.log`,
   codexLog: `${DEVGUARD_DIR}/logs/codex-hook.log`,
   codexNotifyLog: `${DEVGUARD_DIR}/logs/codex-notify.log`,
+  watchLog: `${DEVGUARD_DIR}/logs/watch.log`,
   hookStatus: `${DEVGUARD_DIR}/reports/hook-status.md`,
   lastRunReport: `${DEVGUARD_DIR}/reports/last-run.md`,
   historySummary: `${DEVGUARD_DIR}/reports/history-summary.md`,
