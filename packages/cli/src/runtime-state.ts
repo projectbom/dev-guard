@@ -54,6 +54,8 @@ export interface DoneProcessingResult {
   decisionCandidatesPath: string;
   qualityReportPath: string;
   projectHandoffPath: string;
+  agentContextPath: string;
+  nextClaudePromptPath: string;
   qualityVerdict: QualityVerdict;
   summary: string;
   drift: "low" | "medium" | "high";
@@ -239,6 +241,7 @@ export function isIgnoredWatchPath(path: string): boolean {
     normalized === devguardPaths.history ||
     isPathOrChild(normalized, devguardPaths.reportsDir) ||
     isPathOrChild(normalized, devguardPaths.promptsDir) ||
+    isPathOrChild(normalized, devguardPaths.contextDir) ||
     isPathOrChild(normalized, devguardPaths.logsDir) ||
     isPathOrChild(normalized, devguardPaths.hooksDir) ||
     /\.(png|jpe?g|gif|webp|avif|ico|svg|ttf|otf|woff2?|mp4|mov|mp3|wav|pdf|zip|gz)$/i.test(normalized)
@@ -401,7 +404,11 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     }),
     resetRuntimeState(root)
   ]);
-  await generateProjectHandoff(root);
+  await Promise.all([
+    generateProjectHandoff(root),
+    generateAgentContext(root),
+    generateNextClaudePrompt(root)
+  ]);
   return {
     changedFiles,
     areas,
@@ -412,6 +419,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     decisionCandidatesPath,
     qualityReportPath,
     projectHandoffPath,
+    agentContextPath: devguardPaths.agentContext,
+    nextClaudePromptPath: devguardPaths.nextClaudePrompt,
     qualityVerdict: qualityReport.verdict,
     summary,
     drift
@@ -451,6 +460,133 @@ export async function generateProjectHandoff(root: string): Promise<string> {
   });
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
   return projectHandoffPath;
+}
+
+export async function generateAgentContext(root: string): Promise<string> {
+  await ensureDevguardWorkspace(root);
+  const [project, decisions, qualityContent, historyRecords, state] = await Promise.all([
+    readTextFile(fromRoot(root, devguardPaths.project)),
+    readTextFile(fromRoot(root, devguardPaths.decisions)),
+    readTextFile(fromRoot(root, qualityReportPath)),
+    readHistoryRecords(root, 5),
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {})
+  ]);
+  const nextPromptContent = await readTextFile(fromRoot(root, promptPath));
+  const projectPurpose = firstSectionBullet(project, "프로젝트 목적") ?? "확인 필요";
+  const currentGoal = firstSectionBullet(project, "현재 목표") ?? "확인 필요";
+  const quality = parseQuality(qualityContent);
+  const nextTask = extractNextTask(nextPromptContent, "", JSON.stringify(state));
+  const importantDecisions = extractDecisionLines(decisions);
+  const lastChangedFiles = state.lastChangedFiles ?? [];
+  const lastSummary = state.lastSummary ?? "확인 필요";
+  const recentHistory = historyRecords
+    .slice(-3)
+    .reverse()
+    .map((r) => `${r.timestamp}: ${r.inferredSummary}`);
+  const markdown = renderAgentContext({
+    projectPurpose,
+    currentGoal,
+    lastSummary,
+    recentHistory,
+    lastChangedFiles,
+    qualityVerdict: quality.verdict,
+    qualityWhy: quality.why,
+    nextBestTask: nextTask,
+    importantDecisions
+  });
+  await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
+  await writeTextFile(fromRoot(root, devguardPaths.agentContext), markdown);
+  return devguardPaths.agentContext;
+}
+
+export async function generateNextClaudePrompt(root: string): Promise<string> {
+  await ensureDevguardWorkspace(root);
+  const [qualityContent, state] = await Promise.all([
+    readTextFile(fromRoot(root, qualityReportPath)),
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {})
+  ]);
+  const nextPromptContent = await readTextFile(fromRoot(root, promptPath));
+  const quality = parseQuality(qualityContent);
+  const nextTask = extractNextTask(nextPromptContent, "", JSON.stringify(state));
+  const markdown = renderNextClaudePrompt({ qualityVerdict: quality.verdict, nextBestTask: nextTask });
+  await writeTextFile(fromRoot(root, devguardPaths.nextClaudePrompt), markdown);
+  return devguardPaths.nextClaudePrompt;
+}
+
+function renderAgentContext(input: {
+  projectPurpose: string;
+  currentGoal: string;
+  lastSummary: string;
+  recentHistory: string[];
+  lastChangedFiles: string[];
+  qualityVerdict: string;
+  qualityWhy: string[];
+  nextBestTask: string;
+  importantDecisions: string[];
+}): string {
+  return [
+    "# Agent Context",
+    "",
+    "> dev-guard generated — read this before exploring the repository.",
+    "",
+    "## Current State",
+    `- project purpose: ${input.projectPurpose}`,
+    `- current goal: ${input.currentGoal}`,
+    "",
+    "## Last Completed Work",
+    `- ${input.lastSummary}`,
+    ...input.recentHistory.map((line) => `- ${line}`),
+    "",
+    "## Quality Status",
+    `- verdict: ${input.qualityVerdict}`,
+    ...(input.qualityWhy.length > 0 && input.qualityWhy[0] !== "확인 필요"
+      ? ["- reason:", ...input.qualityWhy.map((item) => `  - ${item}`)]
+      : []),
+    "",
+    "## Next Best Task",
+    `- ${input.nextBestTask}`,
+    "",
+    "## Important Decisions",
+    ...formatBullets(input.importantDecisions),
+    "",
+    "## Important Files",
+    ...formatBullets(input.lastChangedFiles.slice(0, 10).length > 0 ? input.lastChangedFiles.slice(0, 10) : ["확인 필요"]),
+    "",
+    "## Do Not Touch",
+    `- \`${devguardPaths.reportsDir}\`, \`${devguardPaths.promptsDir}\`, \`${devguardPaths.contextDir}\`, \`${devguardPaths.runtime}\` — auto-generated by dev-guard`,
+    "- existing public command UX: watch / done / status / reset",
+    "- auth / database / api / config unless directly required by current task",
+    "- large refactors not explicitly requested",
+    "",
+    "## Additional Context",
+    `- full handoff: \`${devguardPaths.projectHandoff}\``,
+    `- architecture: \`${devguardPaths.architecture}\``,
+    `- decisions: \`${devguardPaths.decisions}\``,
+    `- quality report: \`${devguardPaths.qualityReport}\``,
+    `- next Codex prompt: \`${devguardPaths.nextCodexPrompt}\``
+  ].join("\n") + "\n";
+}
+
+function renderNextClaudePrompt(input: { qualityVerdict: string; nextBestTask: string }): string {
+  return [
+    "# Next Claude Prompt",
+    "",
+    "Before starting any work, read:",
+    "",
+    `1. \`${devguardPaths.agentContext}\` — current state, quality status, next task`,
+    `2. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
+    `3. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
+    "",
+    "Use dev-guard context as the primary source of project state.",
+    "Do not perform repository-wide scans before reading them.",
+    "Only open additional files when specifically required for the current task.",
+    "",
+    "---",
+    "",
+    `Quality: **${input.qualityVerdict}**`,
+    "",
+    `Next Task: ${input.nextBestTask}`
+  ].join("\n") + "\n";
 }
 
 export function classifyAreas(files: string[]): string[] {
@@ -627,6 +763,16 @@ function renderNextPrompt(input: {
     .reverse()
     .map((record) => `- ${record.timestamp}: ${record.inferredSummary}`);
   return [
+    "Before doing any work, read:",
+    "",
+    `1. \`${devguardPaths.agentContext}\``,
+    `2. \`${devguardPaths.projectHandoff}\``,
+    "",
+    "Use them as the primary source of project context.",
+    "Do not perform repository-wide scans before reading them.",
+    "",
+    "---",
+    "",
     "# Codex Handoff Prompt",
     "",
     "아래 인수인계를 기준으로 이어서 작업해줘. 추측보다 파일/명령/검증 결과를 우선하고, 관련 없는 수정은 하지 마.",
@@ -715,6 +861,7 @@ export async function ensureDevguardDirs(root: string): Promise<void> {
   await Promise.all([
     mkdir(dirname(fromRoot(root, reportPath)), { recursive: true }),
     mkdir(dirname(fromRoot(root, promptPath)), { recursive: true }),
+    mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true }),
     mkdir(dirname(fromRoot(root, runtimePath)), { recursive: true }),
     mkdir(dirname(fromRoot(root, historyPath)), { recursive: true })
   ]);
@@ -1161,6 +1308,7 @@ function isGeneratedRuntimePath(file: string): boolean {
     file === devguardPaths.history ||
     file.startsWith(`${devguardPaths.reportsDir}/`) ||
     file.startsWith(`${devguardPaths.promptsDir}/`) ||
+    file.startsWith(`${devguardPaths.contextDir}/`) ||
     file.startsWith(`${devguardPaths.logsDir}/`) ||
     file.startsWith(`${devguardPaths.hooksDir}/`) ||
     file.startsWith(".devguard/runs/") ||

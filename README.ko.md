@@ -202,6 +202,56 @@ cat .devguard/reports/project-handoff.md
 
 새 Claude/Codex 스레드에서는 `.devguard/reports/project-handoff.md`를 읽게 하고, Current State / Quality Status / Next Best Task 기준으로 이어서 작업하게 합니다.
 
+## Multi-Agent Workflow
+
+`dev-guard done` (또는 Auto Mode)은 이제 `.devguard/context/agent-context.md`를 생성합니다. 새 Agent 세션이 가장 먼저 읽는 단일 진입 문서입니다. 레포지토리 전체를 스캔하는 대신 이 파일을 읽으면 됩니다.
+
+### 권장 세션 인수인계 순서
+
+1. `dev-guard watch` — watcher 시작
+2. Claude/Codex가 파일 수정; Stop Hook이 `done` 자동 실행
+3. `dev-guard done` — agent-context.md를 포함한 모든 산출물 생성
+4. 새 Agent 세션 시작
+5. `.devguard/context/agent-context.md` 읽기 — 이어서 작업
+
+### Codex ↔ Claude 전환 시 (또는 다른 Agent로 전환)
+
+새 세션 시작 프롬프트:
+
+```txt
+Read .devguard/context/agent-context.md and continue.
+```
+
+이 파일에는 현재 상태, 최근 완료 작업, 품질 상태, 다음 작업, 주요 결정, 관련 파일, 수정 금지 영역이 포함됩니다.
+
+더 상세한 인수인계가 필요하면 `.devguard/reports/project-handoff.md`도 읽습니다.
+
+### 생성되는 Agent context 파일
+
+`dev-guard done`과 `dev-guard handoff`는 다음 파일을 생성합니다.
+
+- `.devguard/context/agent-context.md` — 새 세션용 단일 진입 컨텍스트 문서
+- `.devguard/prompts/next-claude-prompt.md` — Claude 세션용 시작 프롬프트
+- `.devguard/prompts/next-codex-prompt.md` — Codex 세션용 인수인계 프롬프트 (최상단에 컨텍스트 로딩 안내 추가)
+
+### AGENTS.md / CLAUDE.md
+
+`dev-guard install-agent-instructions`는 `AGENTS.md`와 `CLAUDE.md`에 dev-guard 섹션을 생성하거나 추가합니다. Agent가 레포지토리를 탐색하기 전에 dev-guard 컨텍스트를 먼저 읽도록 **유도**하는 용도입니다.
+
+```bash
+dev-guard install-agent-instructions
+# 기존 섹션 갱신이 필요한 경우:
+dev-guard install-agent-instructions --force
+```
+
+다음 Agent를 지원합니다:
+
+- Claude Code (`CLAUDE.md`를 시작 시 읽음)
+- Codex (`AGENTS.md`를 참고)
+- 프로젝트 레벨 instruction 파일을 인식하는 기타 Agent
+
+이 파일은 강제 규칙이 아니라 **권장 사항**입니다. dev-guard 산출물을 먼저 참고하여 레포지토리 전체 재스캔을 줄이고 컨텍스트 재구축 비용을 낮추도록 유도하는 용도입니다. 기존 파일 내용은 유지하며, dev-guard는 자신의 섹션(HTML 주석 마커로 표시)만 추가하거나 갱신합니다.
+
 ## Quality Flow
 
 `done`은 build/test를 자동 실행하지 않습니다. 대신 어떤 검증이 필요한지 판단합니다.

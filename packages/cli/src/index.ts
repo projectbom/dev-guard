@@ -17,7 +17,8 @@ import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
-import { generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
+import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
+import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 
 async function main(): Promise<void> {
@@ -55,6 +56,11 @@ async function main(): Promise<void> {
 
   if (command === "install-hooks") {
     await runInstallHooks(root, process.argv.slice(3));
+    return;
+  }
+
+  if (command === "install-agent-instructions") {
+    await runInstallAgentInstructions(root, process.argv.slice(3));
     return;
   }
 
@@ -169,6 +175,7 @@ function printHelp(): void {
 Quick commands:
   dev-guard init
   dev-guard install-hooks [--agent <claude|codex|codex-notify|all>] [--install-dispatcher]
+  dev-guard install-agent-instructions [--force]
   dev-guard watch
   dev-guard done
   dev-guard handoff
@@ -178,9 +185,13 @@ Quick commands:
 Recommended Auto Mode:
   1. dev-guard init
   2. dev-guard install-hooks
-  3. dev-guard watch
-  4. Run Claude/Codex; verified completion strategy runs done automatically
-  5. dev-guard status
+  3. dev-guard install-agent-instructions
+  4. dev-guard watch
+  5. Run Claude/Codex; verified completion strategy runs done automatically
+  6. dev-guard status
+
+New session resume:
+  Read .devguard/context/agent-context.md and continue.
 
 Manual fallback:
   dev-guard watch --manual
@@ -224,9 +235,10 @@ Usage:
 Commands:
   init   Create .devguard and docs guard files
   "requirement" Generate task.md and a compact Codex prompt
-  done   Manually process pending changes and generate report/next prompt/handoff
-  handoff Regenerate project-handoff.md from current .devguard/ artifacts
+  done   Manually process pending changes and generate report/next prompt/handoff/agent-context
+  handoff Regenerate project-handoff.md and agent-context.md from current .devguard/ artifacts
   install-hooks Install agent completion strategy scripts/config
+  install-agent-instructions Create or update AGENTS.md / CLAUDE.md with dev-guard context guidance
   status Show pending watch state, recommended mode, and last processed task
   reset  Clear watch runtime state without deleting project state
   check  Analyze current git diff with rule-based checks
@@ -278,8 +290,13 @@ async function runDone(root: string): Promise<void> {
     console.log(`- ${result.decisionCandidatesPath}`);
     console.log(`- ${result.qualityReportPath}`);
     console.log(`- ${result.projectHandoffPath}`);
+    console.log(`- ${result.agentContextPath}`);
+    console.log(`- ${result.nextClaudePromptPath}`);
     console.log("");
     console.log(`Quality: ${result.qualityVerdict}`);
+    console.log("");
+    console.log("새 세션 시작 시:");
+    console.log(`  Read ${result.agentContextPath} and continue.`);
     console.log("");
     console.log("다음 작업:");
     console.log(`${result.promptPath} 확인 후 필요한 수정 진행`);
@@ -292,12 +309,19 @@ async function runDone(root: string): Promise<void> {
 
 async function runHandoff(root: string): Promise<void> {
   try {
-    const path = await generateProjectHandoff(root);
+    const [handoffPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
+      generateProjectHandoff(root),
+      generateAgentContext(root),
+      generateNextClaudePrompt(root)
+    ]);
     console.log("dev-guard handoff");
-    console.log(`generated: ${path}`);
+    console.log("generated:");
+    console.log(`- ${handoffPath}`);
+    console.log(`- ${agentContextPath}`);
+    console.log(`- ${nextClaudePromptPath}`);
     console.log("");
-    console.log("Resume:");
-    console.log(`Start a new Claude/Codex thread and attach/read ${devguardPaths.projectHandoff}`);
+    console.log("Resume prompt for new session:");
+    console.log(`  Read ${devguardPaths.agentContext} and continue.`);
   } catch (error) {
     console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
     process.exitCode = 1;
@@ -379,8 +403,11 @@ async function runStatus(root: string): Promise<void> {
   console.log("Handoff:");
   console.log(devguardPaths.projectHandoff);
   console.log("");
-  console.log("Resume:");
-  console.log(`Start a new Claude/Codex thread and attach/read ${devguardPaths.projectHandoff}`);
+  console.log("Agent Context:");
+  console.log(devguardPaths.agentContext);
+  console.log("");
+  console.log("Resume prompt for new session:");
+  console.log(`  Read ${devguardPaths.agentContext} and continue.`);
   const legacyWarning = legacyDevguardWarning(root);
   if (legacyWarning) {
     console.log("");

@@ -274,6 +274,56 @@ cat .devguard/reports/project-handoff.md
 
 In the new thread, attach or ask the agent to read `.devguard/reports/project-handoff.md`. It summarizes current state, active workflow, recent changes, important decisions, quality status, open risks, the next best task, and a short resume prompt.
 
+## Multi-Agent Workflow
+
+`dev-guard done` (or Auto Mode) now generates `.devguard/context/agent-context.md` — a single-entry document for new agent sessions. Read it instead of scanning the whole repository.
+
+### Recommended session handoff order
+
+1. `dev-guard watch` — start the watcher
+2. Claude/Codex edits files; Stop Hooks run `done` automatically
+3. `dev-guard done` — generates all artifacts including `agent-context.md`
+4. Start a new agent session
+5. Read `.devguard/context/agent-context.md` — pick up from there
+
+### When switching between Codex and Claude (or any agent)
+
+Paste this as the opening prompt in the new session:
+
+```txt
+Read .devguard/context/agent-context.md and continue.
+```
+
+This covers: current state, last completed work, quality status, next task, important decisions, relevant files, and what not to touch.
+
+For a full compressed resume, also read `.devguard/reports/project-handoff.md`.
+
+### Generated agent context files
+
+`dev-guard done` and `dev-guard handoff` produce:
+
+- `.devguard/context/agent-context.md` — single-entry context document for new sessions
+- `.devguard/prompts/next-claude-prompt.md` — structured startup prompt for Claude sessions
+- `.devguard/prompts/next-codex-prompt.md` — structured handoff prompt for Codex sessions (now includes context loading preamble)
+
+### AGENTS.md and CLAUDE.md
+
+`dev-guard install-agent-instructions` creates or updates `AGENTS.md` and `CLAUDE.md` with a dev-guard section that **suggests** agents read the dev-guard context before exploring the repository.
+
+```bash
+dev-guard install-agent-instructions
+# or to update an existing section:
+dev-guard install-agent-instructions --force
+```
+
+These files are project-level guidance for:
+
+- Claude Code (reads `CLAUDE.md` on startup)
+- Codex (reads `AGENTS.md`)
+- Other agents that honor project-level instruction files
+
+The files contain suggestions, not enforced rules. They recommend reading dev-guard artifacts to avoid repository-wide scans and reduce context rebuild cost when starting a new session. Existing content is preserved; dev-guard only appends or updates its own section (marked with HTML comment markers).
+
 ## Quality Flow
 
 `done` does not run build/test automatically. It checks what should be verified.
