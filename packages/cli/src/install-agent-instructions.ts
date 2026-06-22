@@ -7,23 +7,55 @@ const SECTION_END = "<!-- dev-guard-section-end -->";
 
 type InstallResult = "created" | "section_added" | "section_updated" | "already_installed";
 
-function agentsMdSection(): string {
+function sharedDevGuardInstructions(agentName: "Codex" | "Claude"): string[] {
+  const nextPrompt = agentName === "Claude" ? devguardPaths.nextClaudePrompt : devguardPaths.nextCodexPrompt;
   return [
-    SECTION_START,
+    "DevGuard is a CLI context guard for AI coding sessions. It keeps project context, pending changes, quality checks, and next-session handoff files under `.devguard/`.",
     "",
-    "## Agent Instructions",
-    "",
-    "Before doing any work:",
+    "Before changing code:",
     "",
     `1. Read \`${devguardPaths.agentContext}\``,
     `2. Read \`${devguardPaths.projectHandoff}\``,
     `3. Read \`${devguardPaths.qualityReport}\``,
+    "4. Run `dev-guard status` when the current state is unclear.",
     "",
-    "Use dev-guard artifacts as the primary source of project context.",
-    "Do not perform repository-wide scans before reading them.",
-    "Only open additional files when required for the current task.",
-    "Continue from the latest dev-guard state.",
+    "Common commands:",
     "",
+    "- `dev-guard --help`",
+    "- `dev-guard doctor`",
+    "- `dev-guard init`",
+    "- `dev-guard install-agent-instructions`",
+    "- `dev-guard install-hooks`",
+    "- `dev-guard watch`",
+    "- `dev-guard status`",
+    "- `dev-guard done`",
+    "- `dev-guard handoff`",
+    "- `dev-guard prompt`",
+    "- `dev-guard self-check`",
+    "",
+    "Session workflow:",
+    "",
+    "- Start: read the DevGuard context files above, then inspect only the files needed for the task.",
+    "- During work: keep `dev-guard watch` running in another terminal when continuous change tracking is wanted.",
+    "- Finish: run the relevant project checks, then run `dev-guard done` and `dev-guard status` so handoff/status files are current.",
+    `- Next ${agentName} session: use \`${devguardPaths.agentContext}\`, \`${devguardPaths.projectHandoff}\`, or \`${nextPrompt}\` to resume without rediscovering the repo.`,
+    "",
+    "Rules:",
+    "",
+    "- Use DevGuard artifacts as the primary source of current project state.",
+    "- Do not perform repository-wide scans before reading the current DevGuard context.",
+    "- Do not make broad unrelated changes.",
+    "- Do not invent unsupported DevGuard commands; verify commands with `dev-guard --help` or the current CLI source."
+  ];
+}
+
+function agentsMdSection(): string {
+  return [
+    SECTION_START,
+    "",
+    "## DevGuard Instructions for Codex",
+    "",
+    ...sharedDevGuardInstructions("Codex"),
     SECTION_END
   ].join("\n");
 }
@@ -32,19 +64,9 @@ function claudeMdSection(): string {
   return [
     SECTION_START,
     "",
-    "## Startup Instructions",
+    "## DevGuard Instructions for Claude",
     "",
-    "Always read the latest dev-guard context before exploring the repository.",
-    "",
-    "Required reading:",
-    "",
-    `* \`${devguardPaths.agentContext}\``,
-    `* \`${devguardPaths.projectHandoff}\``,
-    `* \`${devguardPaths.qualityReport}\``,
-    "",
-    "Avoid repository-wide scans unless the dev-guard context is insufficient.",
-    "Prefer continuing from dev-guard context rather than rediscovering project state.",
-    "",
+    ...sharedDevGuardInstructions("Claude"),
     SECTION_END
   ].join("\n");
 }

@@ -7,6 +7,7 @@
 ```bash
 npm install -g @dev-guard/cli@latest
 dev-guard --help
+dev-guard doctor
 ```
 
 Run without a global install:
@@ -28,15 +29,17 @@ dev-guard status
 
 ## GPT Setup
 
-The default `watch`, `done`, `status`, and `handoff` workflow does not require GPT/API setup. Configure an OpenAI provider only for AI-assisted commands such as `review`, `task-ai`, and `prompt`.
+The default `watch`, `done`, `status`, and `handoff` workflow does not require GPT/API setup. Configure an OpenAI provider only for AI-assisted commands such as `review` and `task-ai`.
 
 ```bash
+export DEV_GUARD_OPENAI_API_KEY="your_api_key"
+# or:
 export OPENAI_API_KEY="your_api_key"
 dev-guard configure ai --provider openai --model gpt-4o-mini
-dev-guard config show
+dev-guard doctor
 ```
 
-Do not store API keys in project files.
+Do not store API keys in project files, `.env`, markdown, or git-tracked secret files.
 
 ## Agent Instruction Files
 
@@ -55,6 +58,8 @@ dev-guard watch
 # Codex/Claude edits files; verified hook/notify runs dev-guard done
 dev-guard status
 ```
+
+Keep `dev-guard watch` running in another terminal during the AI coding session when you want continuous change tracking. It observes changes; completion is handled by hooks/notify or by manual `dev-guard done`.
 
 Manual fallback:
 
@@ -76,4 +81,3 @@ Full documentation:
 - Korean npm guide: https://github.com/projectbom/dev-guard/blob/main/docs/npm-setup.ko.md
 - English npm guide: https://github.com/projectbom/dev-guard/blob/main/docs/npm-setup.md
 - Repository README: https://github.com/projectbom/dev-guard
-
