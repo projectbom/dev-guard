@@ -23,6 +23,7 @@ export async function runDoctor(root: string, args: string[] = []): Promise<void
     return;
   }
 
+  const initialized = await isDevGuardInitialized(root);
   const [resolved, baseline, projectFiles, runs, telemetry, cacheSize, hookStatus, runtime] = await Promise.all([
     loadConfig(root),
     hasGitBaseline(root).catch(() => false),
@@ -44,6 +45,9 @@ export async function runDoctor(root: string, args: string[] = []): Promise<void
   const apiKeyFound = provider === "openai" ? resolved.env.apiKey.found : false;
 
   console.log("dev-guard doctor");
+  if (!initialized) {
+    console.log("Setup: DevGuard project files are not initialized yet. Run dev-guard init, then dev-guard install-agent-instructions.");
+  }
   console.log(`Provider: ${provider}`);
   console.log(`Model: ${model}`);
   console.log(`API Key: ${provider === "openai" ? (apiKeyFound ? "found" : "missing") : "not required"}`);
@@ -93,6 +97,10 @@ export async function runDoctor(root: string, args: string[] = []): Promise<void
   console.log(`Hook Next: ${expectedHookNextStep(hookStatus, runtime.pendingChangedFiles.length, runtime.lastStatus)}`);
   console.log("");
   await printAgentStrategies(root);
+}
+
+async function isDevGuardInitialized(root: string): Promise<boolean> {
+  return (await existsPath(root, ".devguard/config.json")) || (await existsPath(root, ".devguard/task.md")) || (await existsPath(root, "docs/PROJECT_STATE.md"));
 }
 
 async function runHookDoctor(root: string, options: { dryRun: boolean }): Promise<void> {

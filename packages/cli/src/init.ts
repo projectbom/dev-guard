@@ -64,5 +64,6 @@ export async function runInit(root: string): Promise<void> {
     console.log(`- ${label}: ${result.path}`);
   }
   console.log("- write policy: existing files are preserved; missing files are created only");
-  console.log("- next: edit .devguard/task.md, then run dev-guard scan or dev-guard task-ai \"<requirement>\"");
+  console.log("- next: run dev-guard install-agent-instructions");
+  console.log("- then: run dev-guard install-hooks, or use dev-guard watch --manual and dev-guard done");
 }

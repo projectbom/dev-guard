@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { access } from "node:fs/promises";
 import { runCheck } from "./check.js";
 import { runConfigure } from "./configure.js";
 import { runDoctor } from "./doctor.js";
@@ -17,6 +18,7 @@ import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
+import { fromRoot } from "./fs.js";
 import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
@@ -184,8 +186,8 @@ Quick commands:
 
 Recommended Auto Mode:
   1. dev-guard init
-  2. dev-guard install-hooks
-  3. dev-guard install-agent-instructions
+  2. dev-guard install-agent-instructions
+  3. dev-guard install-hooks
   4. dev-guard watch
   5. Run Claude/Codex; verified completion strategy runs done automatically
   6. dev-guard status
@@ -330,6 +332,7 @@ async function runHandoff(root: string): Promise<void> {
 
 async function runStatus(root: string): Promise<void> {
   console.log("dev-guard status");
+  const initialized = await isDevGuardInitialized(root);
   const [runtime, state, history, hookStatus] = await Promise.all([
     readRuntimeState(root),
     readProjectState(root),
@@ -408,6 +411,13 @@ async function runStatus(root: string): Promise<void> {
   console.log("");
   console.log("Resume prompt for new session:");
   console.log(`  Read ${devguardPaths.agentContext} and continue.`);
+  if (!initialized) {
+    console.log("");
+    console.log("Setup:");
+    console.log("  DevGuard project files are not initialized yet.");
+    console.log("  Run dev-guard init, then dev-guard install-agent-instructions.");
+    console.log("  Optional Auto Mode: dev-guard install-hooks");
+  }
   const legacyWarning = legacyDevguardWarning(root);
   if (legacyWarning) {
     console.log("");
@@ -425,9 +435,9 @@ async function runStatus(root: string): Promise<void> {
     }
   }
   console.log("");
-  console.log(`Next recommended action: ${nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction)}`);
+  console.log(`Next recommended action: ${initialized ? nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction) : "run dev-guard init"}`);
   console.log("Next:");
-  console.log(runtime.pendingChangedFiles.length > 0 ? "  dev-guard done" : "  dev-guard watch");
+  console.log(!initialized ? "  dev-guard init" : runtime.pendingChangedFiles.length > 0 ? "  dev-guard done" : "  dev-guard watch");
 }
 
 async function runReset(root: string): Promise<void> {
@@ -458,6 +468,24 @@ function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | 
     return `review ${devguardPaths.nextCodexPrompt}`;
   }
   return "대기 중";
+}
+
+async function isDevGuardInitialized(root: string): Promise<boolean> {
+  const [config, task, projectState] = await Promise.all([
+    fileExists(fromRoot(root, devguardPaths.config)),
+    fileExists(fromRoot(root, devguardPaths.task)),
+    fileExists(fromRoot(root, "docs/PROJECT_STATE.md"))
+  ]);
+  return config || task || projectState;
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function captureConsole(run: () => Promise<unknown>): Promise<string[]> {

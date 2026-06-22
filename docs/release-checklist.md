@@ -29,6 +29,7 @@ git status --short
 
 - Repository URL points to `https://github.com/projectbom/dev-guard.git`.
 - Package versions are consistent.
+- Package descriptions, keywords, homepage, and bugs URL are present.
 - License is MIT.
 - CLI package keeps `bin.dev-guard`.
 - Publish package contents stay dist-only.

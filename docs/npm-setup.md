@@ -11,6 +11,7 @@ New install:
 ```bash
 npm install -g @dev-guard/cli
 dev-guard --help
+dev-guard doctor
 ```
 
 Update an existing global install to the latest npm release:
@@ -18,6 +19,7 @@ Update an existing global install to the latest npm release:
 ```bash
 npm install -g @dev-guard/cli@latest
 dev-guard --help
+dev-guard doctor
 ```
 
 If your team avoids global installs, run it on demand:
@@ -57,14 +59,16 @@ dev-guard status
 ## 3. GPT Setup
 
 The default `watch`, `done`, `status`, and `handoff` flow works without GPT/API setup.
-Configure a provider only for AI-assisted commands such as `review`, `task-ai`, and `prompt`.
+Configure a provider only for AI-assisted commands such as `review` and `task-ai`.
 
 OpenAI provider setup:
 
 ```bash
+export DEV_GUARD_OPENAI_API_KEY="your_api_key"
+# or:
 export OPENAI_API_KEY="your_api_key"
 dev-guard configure ai --provider openai --model gpt-4o-mini
-dev-guard config show
+dev-guard doctor
 ```
 
 Change only the model:
@@ -74,7 +78,7 @@ dev-guard config set model gpt-5
 dev-guard config show
 ```
 
-Do not store API keys in `.devguard/config.json`, markdown files, or git-tracked files. Pass them through runtime environment variables.
+Do not store API keys in `.devguard/config.json`, `.env`, markdown files, or git-tracked files. Pass them through runtime environment variables.
 
 To disable the AI provider and use local heuristics only:
 
@@ -235,4 +239,3 @@ Use `--force` only when you intentionally need to refresh existing hook config:
 ```bash
 dev-guard install-hooks --force
 ```
-

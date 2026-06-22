@@ -2,7 +2,7 @@
 
 [English](./README.md) | [한국어](./README.ko.md)
 
-dev-guard는 AI/Codex/Claude 작업 흐름을 위한 Alpha 단계 CLI guardrail입니다. 파일 변경을 감시하고, 작업이 끝났을 때 변경 내역/품질/다음 프롬프트를 로컬에서 정리합니다.
+dev-guard는 AI 코딩 세션을 이어가기 위한 CLI context guard입니다. 프로젝트 맥락, 변경 파일, 품질 체크, 다음 세션용 handoff prompt를 로컬 `.devguard/` 파일로 보존해서 Codex/Claude 작업을 레포지토리 재탐색 없이 이어갈 수 있게 합니다.
 
 기본 권장 흐름은 에이전트별 완료 전략 기반 Auto Mode입니다.
 
@@ -15,6 +15,8 @@ dev-guard status
 # context window 초과 시 새 스레드에서 이어가기
 dev-guard handoff
 ```
+
+context window가 끊기거나, 여러 Agent를 오가거나, 긴 AI 코딩 작업을 다음 세션으로 넘겨야 할 때 사용합니다.
 
 ## 문제 정의
 
@@ -30,45 +32,81 @@ dev-guard는 이 흐름을 로컬에서 정리합니다.
 - 다음 Claude/Codex용 handoff prompt 생성
 - 자동 소스 수정/자동 문서 수정 없음
 
+주요 사용 사례:
+
+- context window 초과 후 Codex/Claude 작업 이어가기
+- 한 Agent 세션에서 다른 Agent 세션으로 현재 프로젝트 상태 넘기기
+- 변경 내용과 다음 검증 항목을 로컬 이력으로 압축 저장하기
+- 현재 task, rules, docs, git diff를 바탕으로 다음 세션 prompt 만들기
+
 ## 빠른 시작
 
-개발 환경:
+CLI 설치:
+
+```bash
+npm install -g @dev-guard/cli
+dev-guard --help
+dev-guard doctor
+```
+
+프로젝트에서 시작:
+
+```bash
+dev-guard init
+dev-guard install-agent-instructions
+dev-guard install-hooks
+dev-guard watch
+# Codex/Claude가 파일 수정
+dev-guard done   # Hook을 못 쓰는 경우 수동 fallback
+dev-guard status
+```
+
+일상 루프:
+
+```bash
+dev-guard watch
+# AI Agent와 작업
+dev-guard done
+dev-guard status
+```
+
+새 세션으로 이어가기:
+
+```bash
+dev-guard handoff
+cat .devguard/reports/project-handoff.md
+```
+
+이 monorepo를 개발할 때:
 
 ```bash
 pnpm install
 pnpm run build
-```
-
-이 monorepo 안에서 실행:
-
-```bash
-pnpm cli init
-pnpm cli install-hooks
-pnpm cli watch
-# Claude/Codex가 파일 수정; 검증된 완료 전략이 done 실행
 pnpm cli status
 ```
 
-전역 링크 후:
-
-```bash
-cd packages/cli
-pnpm build
-pnpm link --global
-dev-guard --help
-```
-
-다른 프로젝트에서:
-
-```bash
-dev-guard init
-dev-guard install-hooks
-dev-guard watch
-# Hook이 없거나 실패하면 dev-guard watch --manual 후 dev-guard done
-dev-guard status
-```
-
 npm 설치/업데이트 후 초기세팅, GPT 설정, `AGENTS.md`/`CLAUDE.md` 문구, 이후 CLI 흐름은 [npm 설치/업데이트 사용 가이드](./docs/npm-setup.ko.md)에 한 번에 정리되어 있습니다.
+
+## OpenAI GPT 설정
+
+대부분의 세션 연속성 명령은 API key 없이 동작합니다: `init`, `watch`, `done`, `status`, `handoff`, 로컬 휴리스틱 검사.
+
+OpenAI가 필요한 AI 보조 명령(`review`, `task-ai`)을 사용할 때만 환경 변수로 API key를 설정합니다. DevGuard는 API key를 환경 변수에서만 읽습니다.
+
+```bash
+export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
+# 또는:
+export OPENAI_API_KEY="your_api_key_here"
+```
+
+AI 보조 명령을 쓸 때 provider/model을 설정합니다.
+
+```bash
+dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard doctor
+```
+
+API key는 git에 넣지 않습니다. `.env`, secret이 들어간 `.devguard/config.json`, 로컬 secret 파일을 커밋하지 마세요.
 
 ## 핵심 명령어
 
@@ -192,6 +230,25 @@ dev-guard done
 ```
 
 Hook을 사용할 수 없거나 신뢰되지 않았거나 실패했을 때 사용합니다. `watch`는 변경만 누적하고, 사용자가 직접 `done`을 실행합니다.
+
+## Watch Mode 실전 사용
+
+AI 코딩 세션 동안 지속적인 DevGuard 지원이 필요하면 작업 시작 시 watcher를 실행합니다.
+
+```bash
+dev-guard watch
+```
+
+Codex/Claude가 파일을 수정하는 동안 별도 터미널에서 계속 켜두는 것을 권장합니다. `watch`는 파일 변경을 관찰하고 pending 파일 buffer를 최신으로 유지합니다. idle 시간으로 완료를 추정하지 않고, build/test/commit도 실행하지 않습니다.
+
+완료 처리는 검증된 hook/notify 전략 또는 수동 fallback으로 수행합니다.
+
+```bash
+dev-guard done
+dev-guard status
+```
+
+`done` 이후 DevGuard는 `.devguard/reports/quality-report.md`, `.devguard/reports/project-handoff.md`, `.devguard/prompts/next-codex-prompt.md` 같은 품질/인수인계 산출물을 생성합니다. 다음 세션에서는 이 파일들로 레포지토리를 다시 훑지 않고 이어갈 수 있습니다.
 
 ## Context Overflow 복구
 

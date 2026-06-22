@@ -1,6 +1,6 @@
 # dev-guard CLI
 
-`dev-guard` is a local CLI guardrail for Codex / Claude coding workflows. It watches project changes, processes completed work, and generates quality reports plus handoff prompts under `.devguard/`.
+`dev-guard` is a CLI context guard for Codex / Claude coding sessions. It keeps project context, changed files, quality checks, and next-session handoff prompts under `.devguard/`.
 
 ## Install Or Update
 
@@ -24,6 +24,7 @@ Run from your project root:
 dev-guard init
 dev-guard install-agent-instructions
 dev-guard install-hooks
+dev-guard watch
 dev-guard status
 ```
 

@@ -11,6 +11,7 @@
 ```bash
 npm install -g @dev-guard/cli
 dev-guard --help
+dev-guard doctor
 ```
 
 이미 설치되어 있으면 최신 npm 배포본으로 갱신:
@@ -18,6 +19,7 @@ dev-guard --help
 ```bash
 npm install -g @dev-guard/cli@latest
 dev-guard --help
+dev-guard doctor
 ```
 
 팀에서 전역 설치를 피한다면 프로젝트 안에서 임시 실행할 수 있습니다.
@@ -57,14 +59,16 @@ dev-guard status
 ## 3. GPT 설정
 
 기본 `watch`, `done`, `status`, `handoff` 흐름은 GPT/API 설정 없이 동작합니다.
-GPT 설정은 `review`, `task-ai`, `prompt` 같은 AI 보조 명령을 사용할 때만 필요합니다.
+GPT 설정은 `review`, `task-ai` 같은 AI 보조 명령을 사용할 때만 필요합니다.
 
 OpenAI provider 설정:
 
 ```bash
+export DEV_GUARD_OPENAI_API_KEY="your_api_key"
+# 또는:
 export OPENAI_API_KEY="your_api_key"
 dev-guard configure ai --provider openai --model gpt-4o-mini
-dev-guard config show
+dev-guard doctor
 ```
 
 모델만 바꿀 때:
@@ -74,7 +78,7 @@ dev-guard config set model gpt-5
 dev-guard config show
 ```
 
-API 키는 `.devguard/config.json`, markdown, git 추적 파일에 저장하지 않습니다. 런타임 환경 변수로만 전달합니다.
+API 키는 `.devguard/config.json`, `.env`, markdown, git 추적 파일에 저장하지 않습니다. 런타임 환경 변수로만 전달합니다.
 
 AI provider를 끄거나 로컬 휴리스틱 중심으로만 쓰려면:
 
@@ -235,4 +239,3 @@ dev-guard install-hooks
 ```bash
 dev-guard install-hooks --force
 ```
-

@@ -2,7 +2,7 @@
 
 [English](./README.md) | [한국어](./README.ko.md)
 
-dev-guard is an Alpha CLI guardrail for AI-assisted coding workflows. It watches project changes, turns finished work into a compact handoff report, and generates the next Codex/Claude prompt with local quality checks.
+dev-guard is a CLI context guard for AI coding sessions. It keeps project context, changed files, quality checks, and next-session handoff prompts in local `.devguard/` files so Codex/Claude work can resume without rediscovering the repository.
 
 The default workflow is agent-strategy Auto Mode:
 
@@ -16,7 +16,7 @@ dev-guard status
 dev-guard handoff
 ```
 
-dev-guard supports Korean and English project notes and prompts. The public docs are English-first; the Korean guide is in [README.ko.md](./README.ko.md).
+Use it when an AI coding session spans multiple prompts, multiple agents, or a context window reset.
 
 ## Problem
 
@@ -31,45 +31,81 @@ dev-guard keeps this workflow local and explicit:
 - produce quality verdicts and handoff prompts
 - avoid automatic source edits or document writes
 
+Common use cases:
+
+- Continue a Codex/Claude task after context overflow.
+- Hand off from one agent session to another with current project state.
+- Keep a compact local history of what changed and what should be checked next.
+- Generate a next-session prompt from the current task, rules, docs, and git diff.
+
 ## Quick Start
 
-Install and build:
+Install the CLI:
+
+```bash
+npm install -g @dev-guard/cli
+dev-guard --help
+dev-guard doctor
+```
+
+Start using it in a project:
+
+```bash
+dev-guard init
+dev-guard install-agent-instructions
+dev-guard install-hooks
+dev-guard watch
+# let Codex/Claude edit files
+dev-guard done   # manual fallback when hooks are unavailable
+dev-guard status
+```
+
+Daily loop:
+
+```bash
+dev-guard watch
+# work with an AI agent
+dev-guard done
+dev-guard status
+```
+
+Resume a new session:
+
+```bash
+dev-guard handoff
+cat .devguard/reports/project-handoff.md
+```
+
+Developing this monorepo locally:
 
 ```bash
 pnpm install
 pnpm run build
-```
-
-Run from this monorepo:
-
-```bash
-pnpm cli init
-pnpm cli install-hooks
-pnpm cli watch
-# edit files with Claude/Codex; verified strategy runs done
 pnpm cli status
 ```
 
-After linking globally:
-
-```bash
-cd packages/cli
-pnpm build
-pnpm link --global
-dev-guard --help
-```
-
-Use it in another project:
-
-```bash
-dev-guard init
-dev-guard install-hooks
-dev-guard watch
-# let Claude/Codex work; verified strategy runs done
-dev-guard status
-```
-
 For npm install/update, initial setup, GPT setup, `AGENTS.md` / `CLAUDE.md` text, and ongoing CLI commands, see the [npm install and update guide](./docs/npm-setup.md).
+
+## OpenAI GPT Setup
+
+Most DevGuard session-continuity commands work without an API key: `init`, `watch`, `done`, `status`, `handoff`, and local heuristic checks.
+
+AI-backed commands such as `review` and `task-ai` can use OpenAI. DevGuard reads API keys from environment variables only:
+
+```bash
+export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
+# or:
+export OPENAI_API_KEY="your_api_key_here"
+```
+
+Configure the provider/model when you want AI-backed commands:
+
+```bash
+dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard doctor
+```
+
+Keep API keys out of git. Do not commit `.env`, `.devguard/config.json` with secrets, or local secret files.
 
 ## Recommended Workflow
 
@@ -116,6 +152,25 @@ For npm install/update, initial setup, GPT setup, `AGENTS.md` / `CLAUDE.md` text
    dev-guard reset
    ```
    Clears the pending watch buffer. It does not delete history or project state.
+
+## Watch Mode In Practice
+
+Run `watch` at the start of an AI coding session when you want continuous DevGuard support:
+
+```bash
+dev-guard watch
+```
+
+Keep it running in a separate terminal while Codex/Claude edits files. `watch` observes file changes and keeps the pending file buffer current. It does not infer completion by idle time and does not run build/test/commit.
+
+Completion is handled by a verified hook/notify strategy or by manual fallback:
+
+```bash
+dev-guard done
+dev-guard status
+```
+
+After `done`, DevGuard writes quality and handoff artifacts such as `.devguard/reports/quality-report.md`, `.devguard/reports/project-handoff.md`, and `.devguard/prompts/next-codex-prompt.md`. Use those files to continue in the next session without rediscovering the repository.
 
 ## Core Commands
 

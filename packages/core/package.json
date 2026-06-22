@@ -1,7 +1,8 @@
 {
   "name": "@dev-guard/core",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": false,
+  "description": "Core analysis and prompt utilities for DevGuard AI coding session handoff.",
   "type": "module",
   "license": "MIT",
   "repository": {
@@ -9,6 +10,18 @@
     "url": "git+https://github.com/projectbom/dev-guard.git",
     "directory": "packages/core"
   },
+  "homepage": "https://github.com/projectbom/dev-guard#readme",
+  "bugs": {
+    "url": "https://github.com/projectbom/dev-guard/issues"
+  },
+  "keywords": [
+    "ai",
+    "codex",
+    "claude",
+    "handoff",
+    "cli",
+    "developer-tools"
+  ],
   "files": [
     "dist"
   ],

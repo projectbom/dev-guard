@@ -1,13 +1,26 @@
 {
   "name": "dev-guard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
+  "description": "CLI context guard for AI coding session continuity, handoff, and next-session recovery.",
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/projectbom/dev-guard.git"
   },
+  "homepage": "https://github.com/projectbom/dev-guard#readme",
+  "bugs": {
+    "url": "https://github.com/projectbom/dev-guard/issues"
+  },
+  "keywords": [
+    "ai",
+    "codex",
+    "claude",
+    "handoff",
+    "cli",
+    "developer-tools"
+  ],
   "packageManager": "pnpm@9.15.4",
   "scripts": {
     "build": "pnpm -r build",
