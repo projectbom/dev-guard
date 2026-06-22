@@ -68,6 +68,8 @@ dev-guard watch
 dev-guard status
 ```
 
+npm 설치/업데이트 후 초기세팅, GPT 설정, `AGENTS.md`/`CLAUDE.md` 문구, 이후 CLI 흐름은 [npm 설치/업데이트 사용 가이드](./docs/npm-setup.ko.md)에 한 번에 정리되어 있습니다.
+
 ## 핵심 명령어
 
 ```bash
@@ -286,6 +288,7 @@ Verdict:
 
 ## 상세 문서
 
+- [npm 설치/업데이트 사용 가이드](./docs/npm-setup.ko.md)
 - [Command reference](./docs/commands.md)
 - [Architecture](./docs/architecture.md)
 - [Handoff prompt](./docs/handoff.md)

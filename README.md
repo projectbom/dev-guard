@@ -69,6 +69,8 @@ dev-guard watch
 dev-guard status
 ```
 
+For npm install/update, initial setup, GPT setup, `AGENTS.md` / `CLAUDE.md` text, and ongoing CLI commands, see the [npm install and update guide](./docs/npm-setup.md).
+
 ## Recommended Workflow
 
 1. Initialize local guard files
@@ -397,6 +399,7 @@ Alpha limitations:
 
 ## Advanced Docs
 
+- [npm install and update guide](./docs/npm-setup.md)
 - [Command reference](./docs/commands.md)
 - [Architecture](./docs/architecture.md)
 - [Handoff prompt](./docs/handoff.md)
