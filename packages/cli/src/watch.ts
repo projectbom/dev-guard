@@ -9,7 +9,8 @@ import {
   readProjectState,
   readRuntimeState,
   recordRuntimeChange,
-  resetRuntimeState
+  resetRuntimeState,
+  type RuntimeState
 } from "./runtime-state.js";
 import { getHookStatus } from "./hooks.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
@@ -80,12 +81,13 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     lastPrintedKey = key;
     status = nextStatus;
     console.log("");
-    console.log(`STATUS: ${status}`);
+    console.log(`STATUS: ${formatWatchStatus(status)}`);
     if (runtime.pendingChangedFiles.length > 0) {
       console.log(`changed: ${runtime.pendingChangedFiles.slice(0, 8).join(", ")}${runtime.pendingChangedFiles.length > 8 ? `, +${runtime.pendingChangedFiles.length - 8}` : ""}`);
     } else {
       console.log("changed: none");
     }
+    printRuntimeActivity(runtime);
     if (status === "ready_for_done") {
       if (autoMode && runtimeVerified) {
         console.log("NEXT: wait for verified agent completion strategy; fallback: dev-guard done");
@@ -142,7 +144,11 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
         return;
       }
       clearTimeout(stableTimer);
-      const runtime = await recordRuntimeChange(root, path);
+      const runtime = await recordRuntimeChange(root, path, { idleAfterMs: options.stableAfterMs });
+      console.log("");
+      console.log("Detected change:");
+      console.log(path);
+      console.log("Resetting idle timer...");
       await printState("active");
       stableTimer = setTimeout(async () => {
         try {
@@ -169,7 +175,16 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   };
 
-  const watcher = await createWatcher(root, handleChange, options);
+  let eventQueue = Promise.resolve();
+  const enqueueChange = (path: string) => {
+    eventQueue = eventQueue
+      .then(() => handleChange(path))
+      .catch((error) => {
+        console.error(`watch warning: ${errorMessage(error)}`);
+      });
+  };
+
+  const watcher = await createWatcher(root, enqueueChange, options);
   await printState(status);
   refreshTimer = setInterval(() => {
     void refreshExternalDoneState().catch((error) => {
@@ -209,7 +224,7 @@ function parseWatchOptions(args: string[]): WatchOptions {
   };
 }
 
-async function createWatcher(root: string, onChange: (path: string) => Promise<void>, options: WatchOptions): Promise<unknown> {
+async function createWatcher(root: string, onChange: (path: string) => Promise<void> | void, options: WatchOptions): Promise<unknown> {
   const existingRoots = watchRoots.map((path) => join(root, path)).filter((path) => existsSync(path));
   const paths = existingRoots.length > 0 ? existingRoots : [root];
   const chokidar = await loadChokidar();
@@ -264,6 +279,51 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
 function isWatchUiRefreshPath(path: string): boolean {
   const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
   return normalized === devguardPaths.runtime || normalized === devguardPaths.state || normalized === devguardPaths.history;
+}
+
+function formatWatchStatus(status: WatchStatus): string {
+  if (status === "active") return "working";
+  return status;
+}
+
+function printRuntimeActivity(runtime: RuntimeState): void {
+  if (runtime.lastChangedFile || runtime.lastActivityAt || runtime.changeCountSinceIdle) {
+    console.log("");
+    console.log("Last activity:");
+    if (runtime.lastChangedFile) console.log(runtime.lastChangedFile);
+    if (runtime.lastActivityAt) console.log(`${formatAge(runtime.lastActivityAt)} ago`);
+    console.log("");
+    console.log(`Changes detected: ${runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length}`);
+  }
+  if (runtime.lastStatus === "active") {
+    console.log("");
+    console.log("Reason:");
+    console.log(`- ${runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length} file changes detected`);
+    if (runtime.lastChangedAt) console.log(`- Last change: ${formatAge(runtime.lastChangedAt)} ago`);
+    console.log("- Waiting for filesystem to settle...");
+    console.log("");
+    console.log(`Idle countdown: ${formatRemaining(runtime.idleDeadlineAt)}`);
+  } else if (runtime.lastStatus === "idle" && runtime.idleSinceAt) {
+    console.log("");
+    console.log(`Idle since: ${formatAge(runtime.idleSinceAt)} ago`);
+  }
+}
+
+function formatAge(timestamp: string): string {
+  const ageMs = Date.now() - Date.parse(timestamp);
+  if (!Number.isFinite(ageMs) || ageMs < 0) return "0s";
+  const seconds = Math.round(ageMs / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
+function formatRemaining(timestamp?: string): string {
+  if (!timestamp) return "unknown";
+  const remainingMs = Date.parse(timestamp) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "now";
+  return `~${Math.ceil(remainingMs / 1000)}s`;
 }
 
 async function allPendingFilesAtOrBefore(root: string, paths: string[], timestamp: string): Promise<boolean> {

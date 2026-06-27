@@ -25,9 +25,16 @@ export interface RuntimeState {
   pendingChangedFiles: string[];
   firstChangedAt?: string;
   lastChangedAt?: string;
+  lastChangedFile?: string;
+  lastActivityAt?: string;
   lastStableAt?: string;
   lastDiffHash?: string;
   lastStatus?: "idle" | "active" | "ready_for_done" | "processed";
+  changeCountSinceIdle?: number;
+  idleDeadlineAt?: string;
+  idleSinceAt?: string;
+  buildActive?: boolean;
+  hookActive?: boolean;
   revision?: number;
   updatedAt?: string;
 }
@@ -137,7 +144,8 @@ const hookStatusPath = devguardPaths.hookStatus;
 
 const defaultRuntime: RuntimeState = {
   pendingChangedFiles: [],
-  lastStatus: "idle"
+  lastStatus: "idle",
+  changeCountSinceIdle: 0
 };
 
 export async function readRuntimeState(root: string): Promise<RuntimeState> {
@@ -159,7 +167,7 @@ export async function writeRuntimeState(root: string, state: RuntimeState): Prom
 }
 
 export async function resetRuntimeState(root: string): Promise<void> {
-  await writeRuntimeState(root, defaultRuntime);
+  await writeRuntimeState(root, { ...defaultRuntime, idleSinceAt: new Date().toISOString() });
 }
 
 export async function readProjectState(root: string): Promise<ProjectState> {
@@ -190,7 +198,7 @@ export async function readHistoryRecords(root: string, limit = 20): Promise<Hist
   return records.slice(-limit);
 }
 
-export async function recordRuntimeChange(root: string, path: string): Promise<RuntimeState> {
+export async function recordRuntimeChange(root: string, path: string, options: { idleAfterMs?: number } = {}): Promise<RuntimeState> {
   const normalized = normalizeEventPath(root, path);
   if (!normalized || isIgnoredWatchPath(normalized)) {
     return readRuntimeState(root);
@@ -198,11 +206,17 @@ export async function recordRuntimeChange(root: string, path: string): Promise<R
   const now = new Date().toISOString();
   const current = await readRuntimeState(root);
   const pendingChangedFiles = [...new Set([...current.pendingChangedFiles, normalized])].sort();
+  const wasIdle = !current.lastStatus || current.lastStatus === "idle" || current.lastStatus === "processed";
   const next: RuntimeState = {
     ...current,
     pendingChangedFiles,
     firstChangedAt: current.firstChangedAt ?? now,
     lastChangedAt: now,
+    lastChangedFile: normalized,
+    lastActivityAt: now,
+    changeCountSinceIdle: wasIdle ? 1 : (current.changeCountSinceIdle ?? 0) + 1,
+    idleDeadlineAt: options.idleAfterMs ? new Date(Date.now() + options.idleAfterMs).toISOString() : current.idleDeadlineAt,
+    idleSinceAt: undefined,
     lastStatus: "active"
   };
   await writeRuntimeState(root, next);
@@ -221,6 +235,9 @@ export async function markRuntimeStable(root: string, diffHash: string): Promise
     ...current,
     lastStableAt: new Date().toISOString(),
     lastDiffHash: diffHash,
+    idleDeadlineAt: undefined,
+    idleSinceAt: current.pendingChangedFiles.length > 0 ? current.idleSinceAt : new Date().toISOString(),
+    changeCountSinceIdle: current.pendingChangedFiles.length > 0 ? current.changeCountSinceIdle : 0,
     lastStatus: current.pendingChangedFiles.length > 0 ? "ready_for_done" : "idle"
   };
   await writeRuntimeState(root, next);
