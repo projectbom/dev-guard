@@ -22,6 +22,7 @@ import { fromRoot } from "./fs.js";
 import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
+import { formatWatchDashboard } from "./watch-format.js";
 
 async function main(): Promise<void> {
   const command = process.argv[2];
@@ -340,6 +341,7 @@ async function runStatus(root: string): Promise<void> {
     getHookStatus(root)
   ]);
   const strategyReport = await getAgentStrategyReport(root);
+  const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   await writeHookStatusReport(root);
   console.log(`Pending files: ${runtime.pendingChangedFiles.length}`);
   for (const file of runtime.pendingChangedFiles.slice(0, 12)) {
@@ -349,7 +351,7 @@ async function runStatus(root: string): Promise<void> {
     console.log(`- ... +${runtime.pendingChangedFiles.length - 12} files`);
   }
   console.log(`Runtime status: ${runtime.lastStatus ?? "idle"}`);
-  printWatchRuntimeExplanation(runtime);
+  printWatchRuntimeExplanation(runtime, runtimeVerified);
   if (runtime.pendingChangedFiles.length === 0) {
     console.log("State: 대기 중");
   }
@@ -365,7 +367,6 @@ async function runStatus(root: string): Promise<void> {
   const codexVerified = codexHook === "INSTALLED" && hookStatus.codexLastSuccess === true;
   const hooksInstalled = claudeHook === "INSTALLED" || codexHook === "INSTALLED";
   const hooksVerified = claudeVerified || codexVerified;
-  const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   console.log(`Mode: ${runtimeVerified ? "Auto completion runtime verified" : hooksInstalled ? "Auto completion installed, runtime not verified" : "Manual Mode fallback"}`);
   console.log(`Hooks: Claude ${claudeHook} / ${claudeVerified ? "SCRIPT_VERIFIED" : "NOT_SCRIPT_VERIFIED"}; Codex ${codexHook} / ${codexVerified ? "SCRIPT_VERIFIED" : "NOT_SCRIPT_VERIFIED"}`);
   console.log("");
@@ -471,75 +472,15 @@ function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | 
   return "대기 중";
 }
 
-function printWatchRuntimeExplanation(runtime: Awaited<ReturnType<typeof readRuntimeState>>): void {
-  const status = runtime.lastStatus ?? "idle";
+function printWatchRuntimeExplanation(runtime: Awaited<ReturnType<typeof readRuntimeState>>, runtimeVerified: boolean): void {
+  const dashboard = formatWatchDashboard(runtime, {
+    autoMode: runtimeVerified,
+    manual: false,
+    runtimeVerified
+  });
   console.log("");
-  console.log(`Status: ${status === "active" ? "Working" : status === "idle" ? "Idle" : status}`);
-  if (status === "active") {
-    console.log("");
-    console.log("Reason:");
-    console.log(`- ${runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length} file changes detected`);
-    if (runtime.lastChangedAt) console.log(`- Last change: ${formatAge(runtime.lastChangedAt)} ago`);
-    console.log("- Waiting for filesystem to settle...");
-    console.log("");
-    console.log("Last change:");
-    console.log(runtime.lastChangedFile ?? "unknown");
-    console.log("");
-    console.log("Last activity:");
-    console.log(runtime.lastActivityAt ? `${formatAge(runtime.lastActivityAt)} ago` : "unknown");
-    console.log("");
-    console.log("Changes detected:");
-    console.log(runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length);
-    console.log("");
-    console.log("Idle countdown:");
-    console.log(formatRemaining(runtime.idleDeadlineAt));
-  } else if (status === "idle") {
-    console.log("");
-    console.log("Last activity:");
-    console.log(runtime.lastChangedFile ?? "none");
-    console.log("");
-    console.log("Idle since:");
-    console.log(runtime.idleSinceAt ? `${formatAge(runtime.idleSinceAt)} ago` : "unknown");
-  } else if (status === "ready_for_done") {
-    console.log("");
-    console.log("Reason:");
-    console.log("- Filesystem has settled");
-    console.log("- Waiting for agent hook/notify or manual dev-guard done");
-    console.log("");
-    console.log("Last change:");
-    console.log(runtime.lastChangedFile ?? "unknown");
-    console.log("");
-    console.log("Changes detected:");
-    console.log(runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length);
-  }
-  if (runtime.buildActive) {
-    console.log("");
-    console.log("Detected build process");
-    console.log("Waiting for build completion...");
-  }
-  if (runtime.hookActive) {
-    console.log("");
-    console.log("Running post-change hooks...");
-    console.log("Waiting for completion.");
-  }
+  console.log(dashboard.lines.join("\n"));
   console.log("");
-}
-
-function formatAge(timestamp: string): string {
-  const ageMs = Date.now() - Date.parse(timestamp);
-  if (!Number.isFinite(ageMs) || ageMs < 0) return "0s";
-  const seconds = Math.round(ageMs / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
-}
-
-function formatRemaining(timestamp?: string): string {
-  if (!timestamp) return "unknown";
-  const remainingMs = Date.parse(timestamp) - Date.now();
-  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "now";
-  return `${Math.ceil(remainingMs / 1000)} seconds`;
 }
 
 async function isDevGuardInitialized(root: string): Promise<boolean> {

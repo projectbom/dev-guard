@@ -28,6 +28,7 @@ export interface RuntimeState {
   lastChangedFile?: string;
   lastActivityAt?: string;
   lastStableAt?: string;
+  watchStartedAt?: string;
   lastDiffHash?: string;
   lastStatus?: "idle" | "active" | "ready_for_done" | "processed";
   changeCountSinceIdle?: number;

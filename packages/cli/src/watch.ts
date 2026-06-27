@@ -10,11 +10,12 @@ import {
   readRuntimeState,
   recordRuntimeChange,
   resetRuntimeState,
-  type RuntimeState
+  writeRuntimeState
 } from "./runtime-state.js";
 import { getHookStatus } from "./hooks.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
+import { formatWatchDashboard, formatWatchDashboardKey } from "./watch-format.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done" | "processed";
 
@@ -65,40 +66,41 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   console.log("mode: event-driven; no periodic refresh; no idle-time completion");
   console.log("stop: Ctrl+C");
 
+  await startWatchSession(root);
+
   let status: WatchStatus = "idle";
   let stableTimer: NodeJS.Timeout | undefined;
   let refreshTimer: NodeJS.Timeout | undefined;
   let lastPrintedKey = "";
+  let lastTransitionKey = "";
   let lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
 
   const printState = async (nextStatus: WatchStatus) => {
     const runtime = await readRuntimeState(root);
     const projectState = await readProjectState(root);
-    const key = `${nextStatus}:${runtime.pendingChangedFiles.join("|")}:${projectState.lastProcessedAt ?? "none"}:${projectState.lastQualityVerdict ?? "unknown"}`;
+    const dashboard = formatWatchDashboard(runtime, {
+      autoMode,
+      manual: options.manual,
+      runtimeVerified
+    });
+    const key = `${nextStatus}:${formatWatchDashboardKey(runtime, {
+      autoMode,
+      manual: options.manual,
+      runtimeVerified
+    })}:${projectState.lastProcessedAt ?? "none"}:${projectState.lastQualityVerdict ?? "unknown"}`;
     if (key === lastPrintedKey) {
       return;
     }
     lastPrintedKey = key;
     status = nextStatus;
     console.log("");
-    console.log(`STATUS: ${formatWatchStatus(status)}`);
-    if (runtime.pendingChangedFiles.length > 0) {
-      console.log(`changed: ${runtime.pendingChangedFiles.slice(0, 8).join(", ")}${runtime.pendingChangedFiles.length > 8 ? `, +${runtime.pendingChangedFiles.length - 8}` : ""}`);
-    } else {
-      console.log("changed: none");
+    const transitionKey = `${dashboard.transition}:${runtime.changeCountSinceIdle ?? 0}:${runtime.pendingChangedFiles.length}`;
+    if (transitionKey !== lastTransitionKey) {
+      console.log(dashboard.transition);
+      console.log("");
+      lastTransitionKey = transitionKey;
     }
-    printRuntimeActivity(runtime);
-    if (status === "ready_for_done") {
-      if (autoMode && runtimeVerified) {
-        console.log("NEXT: wait for verified agent completion strategy; fallback: dev-guard done");
-      } else if (autoMode) {
-        console.log("NEXT: automatic completion is not runtime verified yet. Run dev-guard doctor --agents or fallback: dev-guard done");
-      } else {
-        console.log("NEXT: dev-guard done");
-      }
-    } else {
-      console.log(autoMode ? (runtimeVerified ? "NEXT: keep editing; verified agent strategy will run done when the AI task finishes" : "NEXT: keep editing; verify agent strategy with dev-guard doctor --agents or use dev-guard done") : "NEXT: keep editing; run dev-guard done when the AI task is finished");
-    }
+    console.log(dashboard.lines.join("\n"));
   };
 
   const refreshExternalDoneState = async () => {
@@ -114,10 +116,11 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       if (runtime.pendingChangedFiles.length > 0 || (runtime.lastStatus ?? "idle") !== "idle") {
         await resetRuntimeState(root);
       }
+      await startWatchSession(root);
       lastPrintedKey = "";
       status = "processed";
       console.log("");
-      console.log("STATUS: processed");
+      console.log("Completion processed");
       console.log("DONE: agent completion processed changes");
       console.log(`Last processed: ${processedAt}`);
       console.log(`Quality: ${projectState.lastQualityVerdict ?? "unknown"}`);
@@ -145,10 +148,6 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       }
       clearTimeout(stableTimer);
       const runtime = await recordRuntimeChange(root, path, { idleAfterMs: options.stableAfterMs });
-      console.log("");
-      console.log("Detected change:");
-      console.log(path);
-      console.log("Resetting idle timer...");
       await printState("active");
       stableTimer = setTimeout(async () => {
         try {
@@ -167,7 +166,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
         }
       }, options.stableAfterMs);
       if (!options.compact) {
-        console.log(`event: ${path}; pending=${runtime.pendingChangedFiles.length}`);
+        console.log(`event: ${path}; pending=${runtime.pendingChangedFiles.length}; idle_timer=reset`);
       }
     } catch (error) {
       console.error(`watch warning: ${errorMessage(error)}`);
@@ -187,7 +186,13 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   const watcher = await createWatcher(root, enqueueChange, options);
   await printState(status);
   refreshTimer = setInterval(() => {
-    void refreshExternalDoneState().catch((error) => {
+    void (async () => {
+      await refreshExternalDoneState();
+      const runtime = await readRuntimeState(root);
+      if ((runtime.lastStatus ?? "idle") === "active") {
+        await printState("active");
+      }
+    })().catch((error) => {
       console.error(`watch warning: ${errorMessage(error)}`);
     });
   }, 1000);
@@ -281,49 +286,12 @@ function isWatchUiRefreshPath(path: string): boolean {
   return normalized === devguardPaths.runtime || normalized === devguardPaths.state || normalized === devguardPaths.history;
 }
 
-function formatWatchStatus(status: WatchStatus): string {
-  if (status === "active") return "working";
-  return status;
-}
-
-function printRuntimeActivity(runtime: RuntimeState): void {
-  if (runtime.lastChangedFile || runtime.lastActivityAt || runtime.changeCountSinceIdle) {
-    console.log("");
-    console.log("Last activity:");
-    if (runtime.lastChangedFile) console.log(runtime.lastChangedFile);
-    if (runtime.lastActivityAt) console.log(`${formatAge(runtime.lastActivityAt)} ago`);
-    console.log("");
-    console.log(`Changes detected: ${runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length}`);
-  }
-  if (runtime.lastStatus === "active") {
-    console.log("");
-    console.log("Reason:");
-    console.log(`- ${runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length} file changes detected`);
-    if (runtime.lastChangedAt) console.log(`- Last change: ${formatAge(runtime.lastChangedAt)} ago`);
-    console.log("- Waiting for filesystem to settle...");
-    console.log("");
-    console.log(`Idle countdown: ${formatRemaining(runtime.idleDeadlineAt)}`);
-  } else if (runtime.lastStatus === "idle" && runtime.idleSinceAt) {
-    console.log("");
-    console.log(`Idle since: ${formatAge(runtime.idleSinceAt)} ago`);
-  }
-}
-
-function formatAge(timestamp: string): string {
-  const ageMs = Date.now() - Date.parse(timestamp);
-  if (!Number.isFinite(ageMs) || ageMs < 0) return "0s";
-  const seconds = Math.round(ageMs / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
-}
-
-function formatRemaining(timestamp?: string): string {
-  if (!timestamp) return "unknown";
-  const remainingMs = Date.parse(timestamp) - Date.now();
-  if (!Number.isFinite(remainingMs) || remainingMs <= 0) return "now";
-  return `~${Math.ceil(remainingMs / 1000)}s`;
+async function startWatchSession(root: string): Promise<void> {
+  const current = await readRuntimeState(root);
+  await writeRuntimeState(root, {
+    ...current,
+    watchStartedAt: new Date().toISOString()
+  });
 }
 
 async function allPendingFilesAtOrBefore(root: string, paths: string[], timestamp: string): Promise<boolean> {
