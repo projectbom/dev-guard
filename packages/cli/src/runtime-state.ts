@@ -100,6 +100,7 @@ export interface HistoryRecord {
   testCandidates: string[];
   generatedPromptPath: string;
   reportPath: string;
+  qualityVerdict?: string;
 }
 
 interface PackageJson {
@@ -368,6 +369,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     testCandidates,
     nextTaskTitle: nextTask.title
   });
+  historyRecord.qualityVerdict = qualityReport.verdict;
   const reportMarkdown = renderLastRunReport({
     timestamp,
     changedFiles,

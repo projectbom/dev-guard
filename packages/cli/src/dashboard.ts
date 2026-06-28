@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { access, stat } from "node:fs/promises";
 import { fromRoot, readTextFile } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { readProjectState, readRuntimeState, type RuntimeState } from "./runtime-state.js";
+import { readHistoryRecords, readProjectState, readRuntimeState, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
@@ -15,6 +15,26 @@ export interface DashboardServerHandle {
   url: string;
   started: boolean;
   close: () => Promise<void>;
+}
+
+interface SessionSummary {
+  id: string;
+  timestamp: string;
+  fileCount: number;
+  areas: string[];
+  qualityVerdict?: string;
+}
+
+interface TimelineEvent {
+  time: string;
+  type: "session" | "watch_start" | "file_change";
+}
+
+interface TodayStats {
+  sessions: number;
+  filesChanged: number;
+  reportsGenerated: number;
+  lastUpdate: string;
 }
 
 interface DashboardState {
@@ -32,6 +52,10 @@ interface DashboardState {
   message?: string;
   qualityVerdict?: string;
   lastProcessedAt?: string;
+  sessions: SessionSummary[];
+  todayStats: TodayStats;
+  qualityTrend: Array<{ verdict: string; timestamp: string }>;
+  timeline: TimelineEvent[];
   reports: {
     handoffExists: boolean;
     qualityReportExists: boolean;
@@ -129,11 +153,12 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
 
 async function getDashboardState(root: string): Promise<DashboardState> {
   const initialized = await isDevGuardInitialized(root);
-  const [runtime, strategyReport, reports, projectState] = await Promise.all([
+  const [runtime, strategyReport, reports, projectState, history] = await Promise.all([
     readRuntimeState(root),
     getAgentStrategyReport(root),
     readReportState(root),
-    readProjectState(root)
+    readProjectState(root),
+    readHistoryRecords(root, 20)
   ]);
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoMode = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
@@ -144,7 +169,12 @@ async function getDashboardState(root: string): Promise<DashboardState> {
   });
   const watchRunning = isWatchRunning(runtime);
   const recentFiles = recentChangedFiles(runtime);
-  const empty = initialized && !watchRunning && !runtime.watchStartedAt && runtime.pendingChangedFiles.length === 0;
+  const empty = initialized && !watchRunning && !runtime.watchStartedAt && runtime.pendingChangedFiles.length === 0 && history.length === 0;
+
+  const sessions = buildSessionSummaries(history);
+  const todayStats = computeTodayStats(history);
+  const qualityTrend = buildQualityTrend(history, projectState.lastQualityVerdict, projectState.lastProcessedAt);
+  const timeline = buildTimeline(history, runtime);
 
   return {
     status: normalizeStatus(dashboard.status),
@@ -161,8 +191,89 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     message: initialized ? (watchRunning ? undefined : "Watch is not running.") : "DevGuard is not initialized.",
     qualityVerdict: projectState.lastQualityVerdict ?? undefined,
     lastProcessedAt: projectState.lastProcessedAt ?? undefined,
+    sessions,
+    todayStats,
+    qualityTrend,
+    timeline,
     reports
   };
+}
+
+function buildSessionSummaries(history: HistoryRecord[]): SessionSummary[] {
+  return [...history]
+    .reverse()
+    .slice(0, 15)
+    .map((record) => ({
+      id: record.id,
+      timestamp: record.timestamp,
+      fileCount: record.changedFiles.length,
+      areas: record.areas,
+      qualityVerdict: record.qualityVerdict
+    }));
+}
+
+function computeTodayStats(history: HistoryRecord[]): TodayStats {
+  const todayPrefix = new Date().toISOString().slice(0, 10);
+  const todaySessions = history.filter((r) => r.timestamp.startsWith(todayPrefix));
+  const filesToday = new Set<string>();
+  for (const session of todaySessions) {
+    for (const f of session.changedFiles) filesToday.add(f);
+  }
+  const lastSession = todaySessions[todaySessions.length - 1];
+  return {
+    sessions: todaySessions.length,
+    filesChanged: filesToday.size,
+    reportsGenerated: todaySessions.length,
+    lastUpdate: lastSession ? formatTime(lastSession.timestamp) : ""
+  };
+}
+
+function buildQualityTrend(history: HistoryRecord[], currentVerdict?: string, currentTimestamp?: string): Array<{ verdict: string; timestamp: string }> {
+  const trend: Array<{ verdict: string; timestamp: string }> = [];
+
+  // Collect up to 5 records that have a qualityVerdict
+  for (const record of [...history].reverse()) {
+    if (record.qualityVerdict) {
+      trend.push({ verdict: record.qualityVerdict, timestamp: record.timestamp });
+    }
+    if (trend.length >= 5) break;
+  }
+
+  // If the current state verdict isn't already in the trend, add it
+  if (currentVerdict && currentTimestamp) {
+    const alreadyIn = trend.some((t) => t.timestamp === currentTimestamp);
+    if (!alreadyIn) {
+      trend.unshift({ verdict: currentVerdict, timestamp: currentTimestamp });
+      if (trend.length > 5) trend.pop();
+    }
+  }
+
+  return trend.slice(0, 5);
+}
+
+function buildTimeline(history: HistoryRecord[], runtime: RuntimeState): TimelineEvent[] {
+  const events: TimelineEvent[] = [];
+
+  // Last 3 completed sessions
+  for (const record of [...history].reverse().slice(0, 3)) {
+    events.push({ time: record.timestamp, type: "session" });
+  }
+
+  // Watch start
+  if (runtime.watchStartedAt) {
+    events.push({ time: runtime.watchStartedAt, type: "watch_start" });
+  }
+
+  // Last file change (only if within current active session)
+  if (runtime.lastChangedAt && runtime.pendingChangedFiles.length > 0) {
+    events.push({ time: runtime.lastChangedAt, type: "file_change" });
+  }
+
+  // Sort descending by time
+  return events
+    .filter((e) => e.time)
+    .sort((a, b) => Date.parse(b.time) - Date.parse(a.time))
+    .slice(0, 8);
 }
 
 async function readReportState(root: string): Promise<DashboardState["reports"]> {
@@ -349,11 +460,14 @@ function renderPage(): string {
     ul { margin: 0; padding: 0; list-style: none; }
 
     /* ── Layout ── */
-    .page { max-width: 1040px; margin: 0 auto; padding: 24px 20px 48px; }
+    .page { max-width: 1060px; margin: 0 auto; padding: 24px 20px 56px; }
+    .gap { display: grid; gap: 12px; }
+    .g2 { grid-template-columns: 1fr 1fr; }
+    .g2w { grid-template-columns: 1.5fr 1fr; }
+    .g3 { grid-template-columns: 1fr 1fr 1fr; }
 
     /* ── Top bar ── */
     .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
-    .brand { display: flex; align-items: center; gap: 10px; }
     .brand-name { font-size: 17px; font-weight: 700; letter-spacing: -.3px; }
     .brand-sub { font-size: 12px; color: var(--muted); }
     .topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -364,22 +478,17 @@ function renderPage(): string {
     .timestamp { font: 11px/1 var(--mono); color: var(--muted); }
 
     /* ── Status banner ── */
-    .status-banner { border-radius: var(--radius); padding: 20px 22px; margin-bottom: 16px; border: 1px solid transparent; display: flex; align-items: flex-start; gap: 14px; }
-    .status-banner.idle { background: var(--ok-bg); border-color: var(--ok-ring); }
-    .status-banner.working { background: var(--warn-bg); border-color: var(--warn-ring); }
-    .status-banner.finalizing,
-    .status-banner.ready_for_done { background: var(--accent-bg); border-color: #bfdbfe; }
-    .status-banner.processed { background: var(--purple-bg); border-color: var(--purple-ring); }
-    .status-banner.offline { background: var(--surface); border-color: var(--line2); }
-    .status-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
-    .status-text { flex: 1; min-width: 0; }
-    .status-title { font-size: 18px; font-weight: 700; line-height: 1.25; letter-spacing: -.2px; }
-    .status-body { color: var(--ink2); margin-top: 3px; font-size: 14px; }
-    .status-cmd { display: inline-block; margin-top: 8px; font: 13px/1.4 var(--mono); background: rgba(0,0,0,.06); border-radius: 5px; padding: 4px 9px; color: var(--ink); }
-
-    /* ── Card grid ── */
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-    .grid.wide { grid-template-columns: 1.5fr 1fr; }
+    .banner { border-radius: var(--radius); padding: 20px 22px; margin-bottom: 12px; border: 1px solid transparent; display: flex; align-items: flex-start; gap: 14px; }
+    .banner.idle { background: var(--ok-bg); border-color: var(--ok-ring); }
+    .banner.working { background: var(--warn-bg); border-color: var(--warn-ring); }
+    .banner.finalizing, .banner.ready_for_done { background: var(--accent-bg); border-color: #bfdbfe; }
+    .banner.processed { background: var(--purple-bg); border-color: var(--purple-ring); }
+    .banner.offline { background: var(--surface); border-color: var(--line2); }
+    .banner-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
+    .banner-text { flex: 1; min-width: 0; }
+    .banner-title { font-size: 18px; font-weight: 700; line-height: 1.25; letter-spacing: -.2px; }
+    .banner-body { color: var(--ink2); margin-top: 3px; font-size: 14px; }
+    .banner-cmd { display: inline-block; margin-top: 8px; font: 13px/1.4 var(--mono); background: rgba(0,0,0,.06); border-radius: 5px; padding: 4px 9px; color: var(--ink); }
 
     /* ── Card ── */
     .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; }
@@ -391,7 +500,7 @@ function renderPage(): string {
     .activity-label { color: var(--muted); }
     .activity-value { font-weight: 600; text-align: right; }
 
-    /* ── Recent changes card ── */
+    /* ── Current session (files) card ── */
     .file-list { display: grid; gap: 6px; margin-bottom: 8px; }
     .file-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--surface2); border: 1px solid var(--line); border-radius: var(--radius-sm); min-width: 0; }
     .file-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
@@ -399,8 +508,35 @@ function renderPage(): string {
     .file-name { font: 13px/1.2 var(--mono); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .file-path { font: 11px/1.2 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .file-more { font-size: 12px; color: var(--muted); padding: 4px 0; }
-    .no-files { padding: 16px; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; border: 1px dashed var(--line2); border-radius: var(--radius-sm); }
+    .no-files { padding: 14px; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; border: 1px dashed var(--line2); border-radius: var(--radius-sm); }
     .no-files strong { display: block; color: var(--ink2); font-size: 13px; margin-bottom: 2px; }
+
+    /* ── Today's progress card ── */
+    .stat-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .stat-item { background: var(--surface2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; }
+    .stat-value { font-size: 22px; font-weight: 760; line-height: 1; color: var(--ink); margin-bottom: 3px; }
+    .stat-label { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+
+    /* ── Recent sessions card ── */
+    .sessions-day { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 10px 0 6px; border-top: 1px solid var(--line); }
+    .sessions-day:first-child { border-top: none; padding-top: 0; }
+    .session-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--radius-sm); transition: background .1s; }
+    .session-row:hover { background: var(--surface2); }
+    .session-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line2); flex-shrink: 0; }
+    .session-dot.pass { background: var(--ok); }
+    .session-dot.warn { background: var(--warn); }
+    .session-dot.bad { background: var(--bad); }
+    .session-time { font: 13px/1 var(--mono); color: var(--muted); flex-shrink: 0; width: 40px; }
+    .session-label { flex: 1; font-size: 13px; font-weight: 500; color: var(--ink); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .session-meta { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .session-files { font-size: 12px; color: var(--muted); }
+    .session-verdict { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 99px; }
+    .session-verdict.pass { color: var(--ok); background: var(--ok-bg); }
+    .session-verdict.warn { color: var(--warn); background: var(--warn-bg); }
+    .session-verdict.bad { color: var(--bad); background: var(--bad-bg); }
+    .no-sessions { padding: 20px 10px; text-align: center; color: var(--muted); }
+    .no-sessions strong { display: block; font-size: 15px; color: var(--ink); margin-bottom: 4px; }
+    .no-sessions p { font-size: 13px; }
 
     /* ── Health card ── */
     .health-list { display: grid; gap: 8px; }
@@ -411,53 +547,74 @@ function renderPage(): string {
     .health-badge.warn { color: var(--warn); background: var(--warn-bg); }
     .health-badge.missing { color: var(--muted); background: var(--surface2); }
 
+    /* ── Quality trend ── */
+    .trend-dots { display: flex; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); align-items: center; }
+    .trend-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; flex-shrink: 0; }
+    .trend-list { display: flex; gap: 4px; align-items: center; }
+    .trend-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line2); title: attr(data-title); }
+    .trend-dot.pass { background: var(--ok); }
+    .trend-dot.warn { background: var(--warn); }
+    .trend-dot.bad { background: var(--bad); }
+
     /* ── Next action card ── */
     .next-body { font-size: 15px; color: var(--ink); line-height: 1.5; font-weight: 500; }
 
+    /* ── Timeline ── */
+    .tl-list { display: grid; gap: 0; }
+    .tl-item { display: flex; align-items: flex-start; gap: 10px; position: relative; padding: 8px 0; }
+    .tl-item:not(:last-child)::before { content: ''; position: absolute; left: 17px; top: 28px; bottom: 0; width: 1px; background: var(--line); }
+    .tl-icon { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 10px; flex-shrink: 0; margin-top: 2px; }
+    .tl-icon.session { background: var(--ok-bg); border: 1px solid var(--ok-ring); color: var(--ok); }
+    .tl-icon.watch_start { background: var(--accent-bg); border: 1px solid #bfdbfe; color: var(--accent); }
+    .tl-icon.file_change { background: var(--surface2); border: 1px solid var(--line); color: var(--muted); }
+    .tl-text { flex: 1; min-width: 0; }
+    .tl-event { font-size: 13px; font-weight: 500; color: var(--ink); }
+    .tl-time { font: 11px/1 var(--mono); color: var(--muted); margin-top: 2px; }
+    .tl-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
     /* ── Advanced details ── */
-    .advanced-wrap { margin-top: 12px; }
+    .adv-wrap { margin-top: 12px; }
     details { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
     summary { display: flex; align-items: center; gap: 8px; padding: 13px 18px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); cursor: pointer; user-select: none; background: var(--surface); }
     summary::-webkit-details-marker { display: none; }
     summary::before { content: '▶'; font-size: 9px; transition: transform .15s; }
     details[open] summary::before { transform: rotate(90deg); }
     summary:hover { background: var(--surface2); }
-    .details-body { padding: 0 18px 18px; background: var(--surface); }
-    .details-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
-    .detail-item { padding: 10px 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: var(--radius-sm); }
-    .detail-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
-    .detail-value { font: 13px/1.3 var(--mono); color: var(--ink); word-break: break-all; }
-    .report-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-    .report-card { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; }
-    .report-name { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
-    .report-meta { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
-    .report-preview { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
-    .report-preview summary { font-size: 11px; padding: 4px 0; background: transparent; text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--muted); }
-    .report-preview summary:hover { background: transparent; }
-    .report-preview details { border: none; border-radius: 0; overflow: visible; }
+    .adv-body { padding: 0 18px 18px; background: var(--surface); }
+    .adv-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+    .adv-item { padding: 10px 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+    .adv-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+    .adv-value { font: 13px/1.3 var(--mono); color: var(--ink); word-break: break-all; }
+    .rpt-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .rpt-card { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; }
+    .rpt-name { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+    .rpt-meta { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+    .rpt-prev { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
+    .rpt-prev summary { font-size: 11px; padding: 4px 0; background: transparent; text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--muted); }
+    .rpt-prev summary:hover { background: transparent; }
+    .rpt-prev details { border: none; border-radius: 0; overflow: visible; }
     pre { max-height: 200px; overflow: auto; white-space: pre-wrap; background: var(--surface2); border-radius: var(--radius-sm); padding: 10px; font: 11px/1.5 var(--mono); color: var(--ink2); margin: 8px 0 0; }
 
-    /* ── Error state ── */
-    .error-state { padding: 32px; text-align: center; }
-    .error-title { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
-    .error-msg { color: var(--muted); font-size: 13px; }
+    /* ── Error ── */
+    .err { padding: 32px; text-align: center; }
+    .err-title { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+    .err-msg { color: var(--muted); font-size: 13px; }
 
     /* ── Responsive ── */
-    @media (max-width: 700px) {
-      .page { padding: 16px 14px 40px; }
-      .grid, .grid.wide, .details-grid, .report-grid { grid-template-columns: 1fr; }
-      .status-title { font-size: 16px; }
+    @media (max-width: 720px) {
+      .page { padding: 14px 12px 40px; }
+      .g2, .g2w, .g3, .adv-grid, .rpt-grid, .stat-row { grid-template-columns: 1fr; }
+      .banner-title { font-size: 16px; }
+      .session-meta { flex-direction: column; align-items: flex-end; gap: 3px; }
     }
   </style>
 </head>
 <body>
 <div class="page">
   <div class="topbar">
-    <div class="brand">
-      <div>
-        <div class="brand-name">DevGuard</div>
-        <div class="brand-sub" id="brand-sub"></div>
-      </div>
+    <div>
+      <div class="brand-name">DevGuard</div>
+      <div class="brand-sub" id="brand-sub"></div>
     </div>
     <div class="topbar-right">
       <div class="lang-toggle" role="group" id="langToggle" aria-label="Language">
@@ -467,7 +624,6 @@ function renderPage(): string {
       <div class="timestamp" id="ts"></div>
     </div>
   </div>
-
   <div id="root"></div>
 </div>
 
@@ -476,7 +632,6 @@ const STRINGS = ${translationsJson};
 const root = document.getElementById('root');
 const ts = document.getElementById('ts');
 const brandSub = document.getElementById('brand-sub');
-const langToggle = document.getElementById('langToggle');
 const langBtns = [...document.querySelectorAll('[data-lang]')];
 let lang = initLang();
 let last = null;
@@ -484,12 +639,10 @@ let last = null;
 function initLang() {
   const saved = localStorage.getItem('dg.lang');
   if (saved && STRINGS[saved]) return saved;
-  const langs = navigator.languages?.length ? navigator.languages : [navigator.language];
-  return langs.some(l => String(l).toLowerCase().startsWith('ko')) ? 'ko' : 'en';
+  const ls = navigator.languages?.length ? navigator.languages : [navigator.language];
+  return ls.some(l => String(l).toLowerCase().startsWith('ko')) ? 'ko' : 'en';
 }
-
-function t(k) { return STRINGS[lang][k] || STRINGS.en[k] || k; }
-
+function t(k) { return STRINGS[lang]?.[k] || STRINGS.en[k] || k; }
 function setLang(l) {
   if (!STRINGS[l]) return;
   lang = l;
@@ -503,142 +656,205 @@ langBtns.forEach(b => b.addEventListener('click', () => setLang(b.dataset.lang))
 
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
 
-/* ── Status view ── */
+/* ─ Status view ─ */
 function statusView(s) {
-  if (!s.initialized) return {
-    icon: '⚙️', cls: 'offline',
-    title: t('notInitializedTitle'), body: t('notInitializedBody'),
-    cmd: 'dev-guard init',
-    activity: t('activityInit'), next: t('nextInit')
-  };
-  if (!s.watchRunning) return {
-    icon: '⏸', cls: 'offline',
-    title: t('watchNotRunningTitle'), body: t('watchNotRunningBody'),
-    cmd: 'dev-guard watch',
-    activity: t('activityStartWatch'), next: t('nextStartWatch')
-  };
+  if (!s.initialized) return { icon:'⚙️', cls:'offline', title:t('notInitializedTitle'), body:t('notInitializedBody'), cmd:'dev-guard init', activity:t('activityInit'), next:t('nextInit') };
+  if (!s.watchRunning)  return { icon:'⏸', cls:'offline', title:t('watchNotRunningTitle'), body:t('watchNotRunningBody'), cmd:'dev-guard watch', activity:t('activityStartWatch'), next:t('nextStartWatch') };
   const m = {
-    working:       { icon: '🟡', cls: 'working',     title: t('statusWorkingTitle'),    body: t('statusWorkingBody'),    activity: t('activitySettling'),    next: t('nextSettling') },
-    ready_for_done:{ icon: '🔵', cls: 'ready_for_done',title: t('statusReadyTitle'),    body: t('statusReadyBody'),      activity: t('activityAiCompletion'),next: t('nextAiCompletion') },
-    finalizing:    { icon: '🔵', cls: 'finalizing',  title: t('statusFinalizingTitle'), body: t('statusFinalizingBody'), activity: t('activityFinalizing'),  next: t('nextFinalizing') },
-    processed:     { icon: '🟣', cls: 'processed',   title: t('statusProcessedTitle'),  body: t('statusProcessedBody'),  activity: t('activityProcessed'),   next: t('nextProcessed') }
+    working:       { icon:'🟡', cls:'working',     title:t('statusWorkingTitle'),    body:t('statusWorkingBody'),    activity:t('activitySettling'),    next:t('nextSettling') },
+    ready_for_done:{ icon:'🔵', cls:'ready_for_done',title:t('statusReadyTitle'),    body:t('statusReadyBody'),      activity:t('activityAiCompletion'),next:t('nextAiCompletion') },
+    finalizing:    { icon:'🔵', cls:'finalizing',  title:t('statusFinalizingTitle'), body:t('statusFinalizingBody'), activity:t('activityFinalizing'),  next:t('nextFinalizing') },
+    processed:     { icon:'🟣', cls:'processed',   title:t('statusProcessedTitle'),  body:t('statusProcessedBody'),  activity:t('activityProcessed'),   next:t('nextProcessed') }
   };
-  return m[s.status] ?? { icon: '🟢', cls: 'idle', title: t('statusMonitoringTitle'), body: t('statusMonitoringBody'), activity: t('activityMonitoring'), next: t('nextMonitoring') };
+  return m[s.status] ?? { icon:'🟢', cls:'idle', title:t('statusMonitoringTitle'), body:t('statusMonitoringBody'), activity:t('activityMonitoring'), next:t('nextMonitoring') };
 }
 
-/* ── Time helpers ── */
-function ago(v) {
-  if (!v) return t('never');
-  return lang === 'ko' ? v + ' 전' : v + ' ago';
-}
+/* ─ Helpers ─ */
+function ago(v) { return v ? (lang === 'ko' ? v + ' 전' : v + ' ago') : t('never'); }
 function dash(v) { return v || t('unknown'); }
-
-/* ── File helpers ── */
 function basename(p) { return p.split('/').pop() || p; }
-function dirname(p) {
-  const parts = p.split('/');
-  return parts.length > 1 ? parts.slice(0, -1).join('/') + '/' : '';
+function dirname(p) { const ps = p.split('/'); return ps.length > 1 ? ps.slice(0,-1).join('/') + '/' : ''; }
+
+function dayLabel(ts) {
+  const d = new Date(ts);
+  const now = new Date();
+  const yesterday = new Date(now - 86400000);
+  if (d.toDateString() === now.toDateString()) return t('today');
+  if (d.toDateString() === yesterday.toDateString()) return t('yesterday');
+  return d.toLocaleDateString(lang === 'ko' ? 'ko-KR' : 'en-US', { month:'short', day:'numeric' });
+}
+function shortTime(ts) {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString(lang === 'ko' ? 'ko-KR' : 'en-US', { hour:'2-digit', minute:'2-digit', hour12: false });
 }
 
-/* ── Health helpers ── */
-function qualityHealth(verdict) {
-  if (!verdict) return { cls: 'missing', icon: '○', label: t('healthUnknown') };
-  if (verdict === 'PASS') return { cls: 'good', icon: '✓', label: t('healthGood') };
-  return { cls: 'warn', icon: '!', label: t('healthWarning') };
+function sessionLabel(areas) {
+  if (!areas?.length) return t('sessionLabelGeneric');
+  if (areas.includes('docs')) return t('sessionLabelDocs');
+  if (areas.includes('test')) return t('sessionLabelTests');
+  if (areas.includes('cli') && areas.includes('config')) return t('sessionLabelCliConfig');
+  if (areas.includes('cli')) return t('sessionLabelCli');
+  if (areas.includes('config')) return t('sessionLabelConfig');
+  if (areas.includes('api')) return t('sessionLabelApi');
+  const first = areas[0];
+  const label = first.charAt(0).toUpperCase() + first.slice(1);
+  return areas.length > 1 ? label + ' +' + (areas.length - 1) : label;
+}
+
+function verdictInfo(v) {
+  if (!v) return { cls:'', text:t('verdictUnknown') };
+  if (v === 'PASS') return { cls:'pass', text:t('verdictHealthy') };
+  if (v === 'BLOCKED') return { cls:'bad', text:t('verdictBlocked') };
+  return { cls:'warn', text:t('verdictReview') };
+}
+
+/* ─ Health ─ */
+function qualityHealth(v) {
+  if (!v) return { cls:'missing', icon:'○', label:t('healthUnknown') };
+  if (v === 'PASS') return { cls:'good', icon:'✓', label:t('healthGood') };
+  return { cls:'warn', icon:'!', label:t('healthWarning') };
 }
 function boolHealth(exists) {
-  return exists
-    ? { cls: 'good', icon: '✓', label: t('healthGood') }
-    : { cls: 'missing', icon: '○', label: t('healthMissing') };
+  return exists ? { cls:'good', icon:'✓', label:t('healthGood') } : { cls:'missing', icon:'○', label:t('healthMissing') };
 }
 function reportsHealth(s) {
-  if (!s.reports.handoffExists && !s.reports.qualityReportExists) return { cls: 'missing', icon: '○', label: t('reportsNeverUpdated') };
-  const ts = s.reports.qualityReportUpdatedAt || s.reports.handoffUpdatedAt;
-  if (!ts) return { cls: 'good', icon: '✓', label: t('healthGood') };
-  const date = new Date(ts);
-  const label = t('reportsUpdated') + ' ' + (Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString(lang === 'ko' ? 'ko-KR' : 'en-US', { hour: '2-digit', minute: '2-digit', hour12: false }));
-  return { cls: 'good', icon: '✓', label };
+  if (!s.reports.handoffExists && !s.reports.qualityReportExists)
+    return { cls:'missing', icon:'○', label:t('reportsNeverUpdated') };
+  const stamp = s.reports.qualityReportUpdatedAt || s.reports.handoffUpdatedAt;
+  const label = t('reportsUpdated') + (stamp ? ' ' + shortTime(stamp) : '');
+  return { cls:'good', icon:'✓', label };
 }
 function healthBadge(h) {
   return '<span class="health-badge ' + h.cls + '">' + esc(h.icon) + ' ' + esc(h.label) + '</span>';
 }
 
-/* ── Report block (advanced) ── */
-function reportBlock(name, exists, updatedAt, preview) {
-  const dateStr = updatedAt ? new Date(updatedAt).toLocaleString(lang === 'ko' ? 'ko-KR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }) : t('notCreated');
-  return '<div class="report-card">' +
-    '<div class="report-name">' + esc(name) + '</div>' +
-    '<div class="report-meta">' +
-    '<div>' + esc(t('availability')) + ': ' + esc(exists ? t('ready') : t('notCreated')) + '</div>' +
-    '<div>' + esc(t('lastUpdated')) + ': ' + esc(dateStr) + '</div>' +
-    '</div>' +
+/* ─ Report block (advanced) ─ */
+function rptBlock(name, exists, updatedAt, preview) {
+  const ds = updatedAt
+    ? new Date(updatedAt).toLocaleString(lang==='ko'?'ko-KR':'en-US', { dateStyle:'short', timeStyle:'short' })
+    : t('notCreated');
+  return '<div class="rpt-card">' +
+    '<div class="rpt-name">' + esc(name) + '</div>' +
+    '<div class="rpt-meta"><div>' + esc(t('availability')) + ': ' + esc(exists ? t('ready') : t('notCreated')) + '</div>' +
+    '<div>' + esc(t('lastUpdated')) + ': ' + esc(ds) + '</div></div>' +
     (exists && preview
-      ? '<details class="report-preview"><summary>' + esc(t('preview')) + '</summary><pre>' + esc(preview) + '</pre></details>'
+      ? '<details class="rpt-prev"><summary>' + esc(t('preview')) + '</summary><pre>' + esc(preview) + '</pre></details>'
       : '') +
     '</div>';
 }
 
-/* ── Main render ── */
+/* ─ Timeline icon ─ */
+function tlIcon(type) {
+  if (type === 'session')     return '✓';
+  if (type === 'watch_start') return '◉';
+  return '·';
+}
+function tlLabel(type) {
+  if (type === 'session')     return t('timelineSession');
+  if (type === 'watch_start') return t('timelineWatchStart');
+  return t('timelineFileChange');
+}
+
+/* ─ Main render ─ */
 function render(s) {
   last = s;
   const v = statusView(s);
 
   /* Status banner */
-  const banner = '<div class="status-banner ' + esc(v.cls) + '">' +
-    '<div class="status-icon" aria-hidden="true">' + v.icon + '</div>' +
-    '<div class="status-text">' +
-    '<div class="status-title">' + esc(v.title) + '</div>' +
-    '<div class="status-body">' + esc(v.body) + '</div>' +
-    (v.cmd ? '<code class="status-cmd">' + esc(v.cmd) + '</code>' : '') +
+  const banner = '<div class="banner ' + esc(v.cls) + '">' +
+    '<div class="banner-icon" aria-hidden="true">' + v.icon + '</div>' +
+    '<div class="banner-text">' +
+    '<div class="banner-title">' + esc(v.title) + '</div>' +
+    '<div class="banner-body">' + esc(v.body) + '</div>' +
+    (v.cmd ? '<code class="banner-cmd">' + esc(v.cmd) + '</code>' : '') +
     '</div></div>';
 
   /* Activity card */
-  const activityRows = [
+  const actRows = [
     s.watchingSince ? '<div class="activity-row"><span class="activity-label">' + esc(t('sessionStarted')) + '</span><span class="activity-value">' + esc(s.watchingSince) + '</span></div>' : '',
     s.lastActivity  ? '<div class="activity-row"><span class="activity-label">' + esc(t('lastChange')) + '</span><span class="activity-value">' + esc(ago(s.lastActivity)) + '</span></div>' : '',
     s.changeCount > 0 ? '<div class="activity-row"><span class="activity-label">' + esc(t('changesCount')) + '</span><span class="activity-value">' + esc(s.changeCount) + '</span></div>' : ''
   ].filter(Boolean).join('');
-  const activityCard = '<div class="card">' +
+  const actCard = '<div class="card">' +
     '<div class="card-title">' + esc(t('currentActivityTitle')) + '</div>' +
-    '<div class="activity-what">' + esc(v.activity) + '</div>' +
-    activityRows +
-    '</div>';
+    '<div class="activity-what">' + esc(v.activity) + '</div>' + actRows + '</div>';
 
-  /* Recent changes card */
+  /* Current session files card */
   let filesHtml;
   if (!s.recentFiles.length) {
     filesHtml = '<div class="no-files"><strong>' + esc(t('noRecentFilesTitle')) + '</strong>' + esc(t('noRecentFilesBody')) + '</div>';
   } else {
     filesHtml = '<div class="file-list">' +
-      s.recentFiles.map(f => {
-        const name = basename(f);
-        const dir = dirname(f);
-        return '<div class="file-item">' +
-          '<div class="file-dot"></div>' +
-          '<div class="file-text">' +
-          '<div class="file-name">' + esc(name) + '</div>' +
-          (dir ? '<div class="file-path">' + esc(dir) + '</div>' : '') +
-          '</div></div>';
-      }).join('') +
-      '</div>' +
-      (s.moreFileCount > 0 ? '<div class="file-more">+' + esc(s.moreFileCount) + ' ' + esc(t('moreFiles')) + '</div>' : '');
+      s.recentFiles.map(f => '<div class="file-item"><div class="file-dot"></div><div class="file-text"><div class="file-name">' + esc(basename(f)) + '</div>' + (dirname(f) ? '<div class="file-path">' + esc(dirname(f)) + '</div>' : '') + '</div></div>').join('') +
+      '</div>' + (s.moreFileCount > 0 ? '<div class="file-more">+' + esc(s.moreFileCount) + ' ' + esc(t('moreFiles')) + '</div>' : '');
   }
   const filesCard = '<div class="card">' +
-    '<div class="card-title">' + esc(t('recentChangesTitle')) + '</div>' +
-    filesHtml +
-    '</div>';
+    '<div class="card-title">' + esc(t('recentChangesTitle')) + '</div>' + filesHtml + '</div>';
+
+  /* Today's progress card */
+  const todayHasData = s.todayStats.sessions > 0;
+  const statItems = [
+    { label: t('todaySessionsLabel'),  value: todayHasData ? s.todayStats.sessions   : t('todayNone') },
+    { label: t('todayFilesLabel'),     value: todayHasData ? s.todayStats.filesChanged: t('todayNone') },
+    { label: t('todayReportsLabel'),   value: todayHasData ? s.todayStats.reportsGenerated : t('todayNone') },
+    { label: t('todayLastUpdateLabel'),value: todayHasData ? s.todayStats.lastUpdate  : t('todayNone') }
+  ];
+  const progressCard = '<div class="card">' +
+    '<div class="card-title">' + esc(t('todayProgressTitle')) + '</div>' +
+    '<div class="stat-row">' +
+    statItems.map(i => '<div class="stat-item"><div class="stat-value">' + esc(i.value) + '</div><div class="stat-label">' + esc(i.label) + '</div></div>').join('') +
+    '</div></div>';
+
+  /* Recent sessions card */
+  let sessionsHtml;
+  if (!s.sessions.length) {
+    sessionsHtml = '<div class="no-sessions"><strong>' + esc(t('noSessionsTitle')) + '</strong><p>' + esc(t('noSessionsBody')) + '</p></div>';
+  } else {
+    // Group by day
+    const groups = {};
+    for (const sess of s.sessions) {
+      const day = dayLabel(sess.timestamp);
+      if (!groups[day]) groups[day] = [];
+      groups[day].push(sess);
+    }
+    sessionsHtml = Object.entries(groups).map(([day, items]) =>
+      '<div class="sessions-day">' + esc(day) + '</div>' +
+      items.map(sess => {
+        const vi = verdictInfo(sess.qualityVerdict);
+        return '<div class="session-row">' +
+          '<div class="session-dot ' + vi.cls + '"></div>' +
+          '<div class="session-time">' + esc(shortTime(sess.timestamp)) + '</div>' +
+          '<div class="session-label">' + esc(sessionLabel(sess.areas)) + '</div>' +
+          '<div class="session-meta">' +
+          '<span class="session-files">' + esc(sess.fileCount) + ' ' + esc(t('sessionFiles')) + '</span>' +
+          (sess.qualityVerdict ? '<span class="session-verdict ' + vi.cls + '">' + esc(vi.text) + '</span>' : '') +
+          '</div></div>';
+      }).join('')
+    ).join('');
+  }
+  const sessionsCard = '<div class="card" style="overflow:hidden">' +
+    '<div class="card-title">' + esc(t('recentSessionsTitle')) + '</div>' +
+    sessionsHtml + '</div>';
 
   /* Health card */
   const qh = qualityHealth(s.qualityVerdict);
   const ch = boolHealth(s.reports.agentContextExists);
   const rh = reportsHealth(s);
+  const trendDots = s.qualityTrend.length
+    ? '<div class="trend-dots"><span class="trend-label">' + esc(t('qualityTrendTitle')) + '</span><div class="trend-list">' +
+      s.qualityTrend.map(item => {
+        const cls = item.verdict === 'PASS' ? 'pass' : item.verdict === 'BLOCKED' ? 'bad' : 'warn';
+        return '<div class="trend-dot ' + cls + '" title="' + esc(shortTime(item.timestamp)) + '"></div>';
+      }).join('') +
+      '</div></div>'
+    : '';
   const healthCard = '<div class="card">' +
     '<div class="card-title">' + esc(t('healthTitle')) + '</div>' +
     '<div class="health-list">' +
     '<div class="health-row"><span class="health-label">' + esc(t('healthQuality')) + '</span>' + healthBadge(qh) + '</div>' +
     '<div class="health-row"><span class="health-label">' + esc(t('healthContext')) + '</span>' + healthBadge(ch) + '</div>' +
     '<div class="health-row"><span class="health-label">' + esc(t('healthReports')) + '</span>' + healthBadge(rh) + '</div>' +
-    '</div></div>';
+    '</div>' + trendDots + '</div>';
 
   /* Next action card */
   const nextCard = '<div class="card">' +
@@ -646,26 +862,47 @@ function render(s) {
     '<div class="next-body">' + esc(v.next) + '</div>' +
     '</div>';
 
+  /* Timeline */
+  let tlHtml;
+  if (!s.timeline.length) {
+    tlHtml = '<div class="tl-empty">' + esc(t('timelineEmpty')) + '</div>';
+  } else {
+    tlHtml = '<div class="tl-list">' +
+      s.timeline.map(ev =>
+        '<div class="tl-item">' +
+        '<div class="tl-icon ' + esc(ev.type) + '">' + esc(tlIcon(ev.type)) + '</div>' +
+        '<div class="tl-text">' +
+        '<div class="tl-event">' + esc(tlLabel(ev.type)) + '</div>' +
+        '<div class="tl-time">' + esc(shortTime(ev.time)) + '</div>' +
+        '</div></div>'
+      ).join('') +
+      '</div>';
+  }
+  const timelineCard = '<div class="card">' +
+    '<div class="card-title">' + esc(t('timelineTitle')) + '</div>' + tlHtml + '</div>';
+
   /* Advanced details */
-  const detailItems = [
+  const advItems = [
     { label: t('sessionDuration'), value: dash(s.elapsed) },
     { label: t('internalStatus'), value: s.status || '—' },
     { label: t('idleCountdown'), value: s.idleCountdown || t('noCountdown') }
-  ].map(d => '<div class="detail-item"><div class="detail-label">' + esc(d.label) + '</div><div class="detail-value">' + esc(d.value) + '</div></div>').join('');
-
-  const advanced = '<div class="advanced-wrap"><details>' +
+  ];
+  const advanced = '<div class="adv-wrap"><details>' +
     '<summary>' + esc(t('advancedTitle')) + '</summary>' +
-    '<div class="details-body">' +
-    '<div class="details-grid">' + detailItems + '</div>' +
-    '<div class="report-grid">' +
-    reportBlock(t('reportHandoff'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
-    reportBlock(t('reportQuality'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
-    reportBlock(t('reportContext'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
+    '<div class="adv-body">' +
+    '<div class="adv-grid">' + advItems.map(i => '<div class="adv-item"><div class="adv-label">' + esc(i.label) + '</div><div class="adv-value">' + esc(i.value) + '</div></div>').join('') + '</div>' +
+    '<div class="rpt-grid">' +
+    rptBlock(t('reportHandoff'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
+    rptBlock(t('reportQuality'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
+    rptBlock(t('reportContext'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
     '</div></div></details></div>';
 
-  root.innerHTML = banner +
-    '<div class="grid wide" style="margin-top:12px">' + activityCard + filesCard + '</div>' +
-    '<div class="grid" style="margin-top:12px">' + healthCard + nextCard + '</div>' +
+  root.innerHTML =
+    banner +
+    '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
+    '<div class="gap g2w" style="margin-top:12px">' + progressCard + sessionsCard + '</div>' +
+    '<div class="gap g2" style="margin-top:12px">' + healthCard + nextCard + '</div>' +
+    '<div style="margin-top:12px">' + timelineCard + '</div>' +
     advanced;
 }
 
@@ -674,9 +911,9 @@ async function tick() {
     const res = await fetch('/api/state', { cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     render(await res.json());
-    ts.textContent = t('dashboardUpdated') + ' ' + new Date().toLocaleTimeString(lang === 'ko' ? 'ko-KR' : 'en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+    ts.textContent = t('dashboardUpdated') + ' ' + new Date().toLocaleTimeString(lang === 'ko' ? 'ko-KR' : 'en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12: false });
   } catch (e) {
-    root.innerHTML = '<div class="error-state"><div class="error-title">' + esc(t('dashboardUnavailableTitle')) + '</div><div class="error-msg">' + esc(e.message) + '</div></div>';
+    root.innerHTML = '<div class="err"><div class="err-title">' + esc(t('dashboardUnavailableTitle')) + '</div><div class="err-msg">' + esc(e.message) + '</div></div>';
   }
 }
 

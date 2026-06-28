@@ -27,7 +27,6 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Current activity card
     currentActivityTitle: "Current Activity",
-    activityLabel: "What's happening",
     activityInit: "Waiting for setup",
     activityStartWatch: "Not monitoring yet",
     activityMonitoring: "Watching for file changes",
@@ -41,11 +40,39 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     never: "Not yet",
     unknown: "—",
 
-    // Recent changes card
-    recentChangesTitle: "Recent Changes",
+    // Recent changes card (current session)
+    recentChangesTitle: "Current Session",
     noRecentFilesTitle: "No changes yet",
     noRecentFilesBody: "Start editing and DevGuard will track changes automatically.",
     moreFiles: "more files",
+
+    // Today's progress card
+    todayProgressTitle: "Today's Progress",
+    todaySessionsLabel: "Sessions",
+    todayFilesLabel: "Files changed",
+    todayReportsLabel: "Reports",
+    todayLastUpdateLabel: "Last update",
+    todayNone: "—",
+
+    // Recent sessions card
+    recentSessionsTitle: "Recent Sessions",
+    today: "Today",
+    yesterday: "Yesterday",
+    noSessionsTitle: "Welcome to DevGuard",
+    noSessionsBody: "Start coding. Your first session will appear here.",
+    sessionLabelGeneric: "Code update",
+    sessionLabelCli: "CLI update",
+    sessionLabelCliConfig: "CLI & config update",
+    sessionLabelConfig: "Config update",
+    sessionLabelDocs: "Documentation update",
+    sessionLabelTests: "Test update",
+    sessionLabelApi: "API update",
+    sessionFiles: "files",
+    sessionHandoffReady: "Handoff ready",
+    verdictHealthy: "Healthy",
+    verdictReview: "Review needed",
+    verdictBlocked: "Blocked",
+    verdictUnknown: "—",
 
     // Project health card
     healthTitle: "Project Health",
@@ -59,6 +86,9 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     reportsUpdated: "Updated",
     reportsNeverUpdated: "Not generated yet",
 
+    // Quality trend
+    qualityTrendTitle: "Recent Quality",
+
     // Next action card
     nextActionTitle: "Next Action",
     nextInit: "Run dev-guard init to set up this project.",
@@ -69,6 +99,13 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     nextFinalizing: "Returning to monitoring when complete.",
     nextProcessed: "Session reports are ready. Continue with your next task.",
 
+    // Timeline
+    timelineTitle: "Activity Timeline",
+    timelineSession: "Session completed",
+    timelineWatchStart: "Monitoring started",
+    timelineFileChange: "File changed",
+    timelineEmpty: "No recent activity.",
+
     // Advanced details (collapsed)
     advancedTitle: "Advanced Details",
     sessionDuration: "Session duration",
@@ -76,7 +113,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     idleCountdown: "Settling timer",
     noCountdown: "—",
 
-    // Reports section (inside advanced)
+    // Reports (inside advanced)
     reportHandoff: "Handoff",
     reportQuality: "Quality Report",
     reportContext: "Agent Context",
@@ -116,7 +153,6 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Current activity card
     currentActivityTitle: "현재 동작",
-    activityLabel: "진행 중인 작업",
     activityInit: "초기 설정을 기다리는 중",
     activityStartWatch: "아직 모니터링 시작 전",
     activityMonitoring: "파일 변경을 감시하는 중",
@@ -130,11 +166,39 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     never: "아직 없음",
     unknown: "—",
 
-    // Recent changes card
-    recentChangesTitle: "최근 변경 파일",
+    // Recent changes card (current session)
+    recentChangesTitle: "현재 세션",
     noRecentFilesTitle: "변경된 파일이 없습니다",
     noRecentFilesBody: "파일을 수정하면 DevGuard가 자동으로 변경을 추적합니다.",
     moreFiles: "개 더",
+
+    // Today's progress card
+    todayProgressTitle: "오늘의 작업",
+    todaySessionsLabel: "세션",
+    todayFilesLabel: "변경 파일",
+    todayReportsLabel: "보고서",
+    todayLastUpdateLabel: "마지막 갱신",
+    todayNone: "—",
+
+    // Recent sessions card
+    recentSessionsTitle: "최근 세션",
+    today: "오늘",
+    yesterday: "어제",
+    noSessionsTitle: "DevGuard에 오신 것을 환영합니다",
+    noSessionsBody: "코딩을 시작하면 첫 번째 세션이 여기에 표시됩니다.",
+    sessionLabelGeneric: "코드 변경",
+    sessionLabelCli: "CLI 업데이트",
+    sessionLabelCliConfig: "CLI 및 설정 업데이트",
+    sessionLabelConfig: "설정 업데이트",
+    sessionLabelDocs: "문서 업데이트",
+    sessionLabelTests: "테스트 업데이트",
+    sessionLabelApi: "API 업데이트",
+    sessionFiles: "개 파일",
+    sessionHandoffReady: "인수인계 준비됨",
+    verdictHealthy: "정상",
+    verdictReview: "검토 필요",
+    verdictBlocked: "블록됨",
+    verdictUnknown: "—",
 
     // Project health card
     healthTitle: "프로젝트 상태",
@@ -148,6 +212,9 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     reportsUpdated: "갱신됨",
     reportsNeverUpdated: "아직 생성되지 않음",
 
+    // Quality trend
+    qualityTrendTitle: "최근 품질",
+
     // Next action card
     nextActionTitle: "다음 할 일",
     nextInit: "dev-guard init을 실행해 프로젝트를 설정하세요.",
@@ -158,6 +225,13 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     nextFinalizing: "처리가 끝나면 모니터링으로 돌아갑니다.",
     nextProcessed: "세션 보고서가 준비되었습니다. 다음 작업을 진행하세요.",
 
+    // Timeline
+    timelineTitle: "활동 타임라인",
+    timelineSession: "세션 완료",
+    timelineWatchStart: "모니터링 시작",
+    timelineFileChange: "파일 변경",
+    timelineEmpty: "최근 활동이 없습니다.",
+
     // Advanced details (collapsed)
     advancedTitle: "상세 정보",
     sessionDuration: "세션 시간",
@@ -165,7 +239,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     idleCountdown: "안정화 타이머",
     noCountdown: "—",
 
-    // Reports section (inside advanced)
+    // Reports (inside advanced)
     reportHandoff: "인수인계",
     reportQuality: "품질 보고서",
     reportContext: "에이전트 컨텍스트",
