@@ -7,9 +7,9 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     loading: "Loading...",
     dashboardUpdated: "Updated",
     language: "Language",
+    refresh: "Refresh",
 
     // Status card
-    currentStatus: "Status",
     notInitializedTitle: "Setup required",
     notInitializedBody: "Run dev-guard init to get started.",
     watchNotRunningTitle: "Not monitoring",
@@ -40,11 +40,33 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     never: "Not yet",
     unknown: "—",
 
-    // Recent changes card (current session)
+    // Current session card
     recentChangesTitle: "Current Session",
     noRecentFilesTitle: "No changes yet",
     noRecentFilesBody: "Start editing and DevGuard will track changes automatically.",
     moreFiles: "more files",
+
+    // Action Center
+    actionCenterTitle: "Action Center",
+    actionHandoffTitle: "Project Handoff",
+    actionHandoffSubAvail: "Ready for next session",
+    actionHandoffSubMissing: "Not generated yet",
+    actionHandoffHint: "Run dev-guard handoff to generate",
+    actionQualityTitle: "Quality Report",
+    actionQualitySubAvail: "Latest check results",
+    actionQualitySubMissing: "Not generated yet",
+    actionContextTitle: "Agent Context",
+    actionContextSubAvail: "Current project context",
+    actionContextSubMissing: "Not generated yet",
+    actionPromptTitle: "Next Session Prompt",
+    actionPromptSubAvail: "Ready to copy",
+    actionPromptSubMissing: "Not available yet",
+    actionPromptHint: "Generated automatically after each session",
+    actionOpen: "Open",
+    actionCopy: "Copy",
+    actionCopied: "Copied!",
+    actionCopyFailed: "Failed",
+    actionUpdatedPrefix: "Updated",
 
     // Today's progress card
     todayProgressTitle: "Today's Progress",
@@ -68,7 +90,6 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     sessionLabelTests: "Test update",
     sessionLabelApi: "API update",
     sessionFiles: "files",
-    sessionHandoffReady: "Handoff ready",
     verdictHealthy: "Healthy",
     verdictReview: "Review needed",
     verdictBlocked: "Blocked",
@@ -112,8 +133,6 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     internalStatus: "Internal status",
     idleCountdown: "Settling timer",
     noCountdown: "—",
-
-    // Reports (inside advanced)
     reportHandoff: "Handoff",
     reportQuality: "Quality Report",
     reportContext: "Agent Context",
@@ -125,7 +144,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Misc
     dashboardUnavailableTitle: "Dashboard unavailable",
-    commandLabel: "Command"
+    timeAgoSuffix: "ago"
   },
   ko: {
     // App shell
@@ -133,9 +152,9 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     loading: "불러오는 중...",
     dashboardUpdated: "갱신됨",
     language: "언어",
+    refresh: "새로고침",
 
     // Status card
-    currentStatus: "상태",
     notInitializedTitle: "초기 설정이 필요합니다",
     notInitializedBody: "dev-guard init을 실행해 프로젝트를 설정하세요.",
     watchNotRunningTitle: "모니터링이 꺼져 있습니다",
@@ -166,11 +185,33 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     never: "아직 없음",
     unknown: "—",
 
-    // Recent changes card (current session)
+    // Current session card
     recentChangesTitle: "현재 세션",
     noRecentFilesTitle: "변경된 파일이 없습니다",
     noRecentFilesBody: "파일을 수정하면 DevGuard가 자동으로 변경을 추적합니다.",
     moreFiles: "개 더",
+
+    // Action Center
+    actionCenterTitle: "액션 센터",
+    actionHandoffTitle: "프로젝트 인수인계",
+    actionHandoffSubAvail: "다음 세션 준비 완료",
+    actionHandoffSubMissing: "아직 생성되지 않음",
+    actionHandoffHint: "dev-guard handoff를 실행해 생성하세요",
+    actionQualityTitle: "품질 보고서",
+    actionQualitySubAvail: "최신 검사 결과",
+    actionQualitySubMissing: "아직 생성되지 않음",
+    actionContextTitle: "에이전트 컨텍스트",
+    actionContextSubAvail: "현재 프로젝트 컨텍스트",
+    actionContextSubMissing: "아직 생성되지 않음",
+    actionPromptTitle: "다음 세션 프롬프트",
+    actionPromptSubAvail: "복사 준비 완료",
+    actionPromptSubMissing: "아직 없음",
+    actionPromptHint: "각 세션 이후 자동으로 생성됩니다",
+    actionOpen: "열기",
+    actionCopy: "복사",
+    actionCopied: "복사됨!",
+    actionCopyFailed: "실패",
+    actionUpdatedPrefix: "갱신됨",
 
     // Today's progress card
     todayProgressTitle: "오늘의 작업",
@@ -194,7 +235,6 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     sessionLabelTests: "테스트 업데이트",
     sessionLabelApi: "API 업데이트",
     sessionFiles: "개 파일",
-    sessionHandoffReady: "인수인계 준비됨",
     verdictHealthy: "정상",
     verdictReview: "검토 필요",
     verdictBlocked: "블록됨",
@@ -238,8 +278,6 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     internalStatus: "내부 상태",
     idleCountdown: "안정화 타이머",
     noCountdown: "—",
-
-    // Reports (inside advanced)
     reportHandoff: "인수인계",
     reportQuality: "품질 보고서",
     reportContext: "에이전트 컨텍스트",
@@ -251,6 +289,6 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Misc
     dashboardUnavailableTitle: "대시보드를 사용할 수 없습니다",
-    commandLabel: "명령어"
+    timeAgoSuffix: "전"
   }
 };
