@@ -35,6 +35,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "--help-advanced") {
+    printAdvancedHelp();
+    return;
+  }
+
   if (command === "help") {
     if (process.argv[3] === "advanced") {
       printAdvancedHelp();
@@ -185,26 +190,25 @@ async function main(): Promise<void> {
 }
 
 function printHelp(): void {
-  console.log(`dev-guard
+  console.log(`DevGuard
 
-Commands:
-  dev-guard init     Set up DevGuard in this project (run once)
-  dev-guard watch    Monitor your AI coding session
-  dev-guard knowledge  Generate project knowledge for AI sessions
-  dev-guard doctor   Check configuration and hook status
+Getting Started
 
-That is all most users need.
+  dev-guard watch
 
-Session resume:
-  Read .devguard/context/agent-context.md and continue.
+  Monitor your AI coding session.
+  Automatically prepares the project on first run.
 
-Troubleshooting:
-  dev-guard status   — show current state
-  dev-guard done     — manual recovery (watch crashed / hooks failed)
-  dev-guard reset    — clear pending buffer
+Other Commands
 
-Advanced options and configuration:
-  dev-guard help advanced
+  doctor      Check setup and agent integration
+  configure   Configure DevGuard settings
+  knowledge   Generate Project Knowledge
+  update      Preview project documentation updates
+
+More
+
+  dev-guard --help-advanced
 `);
 }
 
@@ -286,27 +290,29 @@ All commands:
   dev-guard self-check
 
 Commands:
-  init                    Create .devguard and docs guard files; generate default config
+  watch                   Monitor AI coding session; prepares project on first run
   "requirement"           Generate task.md and a compact Codex prompt
   done                    Manual recovery — normally watch auto-finalizes
   handoff                 Regenerate project-handoff.md and agent-context.md
   knowledge               Generate and summarize .devguard/project/project-knowledge.json
-  install-hooks           Install agent completion strategy scripts/config
-  install-agent-instructions  Create or update AGENTS.md / CLAUDE.md
   status                  Show pending watch state, hook state, quality verdict
+  configure / config      Configure dev-guard settings (AI provider, watch tuning)
+  update                  Generate project docs update candidates from current git diff
+  doctor                  Print config/provider/git/hook diagnostics
+
+Advanced / recovery:
+  init                    Create .devguard and docs guard files; generated automatically by watch
+  install-hooks           Install agent completion strategy scripts/config; generated automatically by watch
+  install-agent-instructions  Create or update AGENTS.md / CLAUDE.md; generated automatically by watch when safe
   reset                   Clear watch runtime state without deleting project state
   check                   Analyze current git diff with rule-based checks
-  configure / config      Configure dev-guard settings (AI provider, watch tuning)
   scan                    Cache project structure and file summaries into .devguard
   refresh                 Incrementally update project memory cache
-  watch                   Monitor AI coding session; auto-finalizes after changes settle
   dashboard               Reconnect to dashboard or inspect current watch state
-  doctor                  Print config/provider/git/hook diagnostics
   telemetry               Print privacy-safe drift telemetry summary
   report                  Print compact current-work summary for ChatGPT/Codex handoff
   review                  AI-review current changes against task/rules/mistakes
   fix-prompt              Generate a Codex-ready fix prompt from AI review
-  update                  Generate project docs update candidates from current git diff
   prompt                  Generate a Codex-ready task prompt from project context
   infer-task              Preview (or write) a task.md inferred from the current git diff
   task-ai                 Generate .devguard/task.md from natural language

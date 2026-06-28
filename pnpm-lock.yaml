@@ -18,8 +18,8 @@ importers:
   packages/cli:
     dependencies:
       '@dev-guard/core':
-        specifier: 0.3.0
-        version: 0.3.0
+        specifier: 0.4.0
+        version: 0.4.0
       chokidar:
         specifier: ^4.0.3
         version: 4.0.3
@@ -28,8 +28,8 @@ importers:
 
 packages:
 
-  '@dev-guard/core@0.3.0':
-    resolution: {integrity: sha512-9nI3MPC9XlYpAI386PH6tCf1PcYYUnkxPzK9xtpRo8nitqvIobcbllbukPAxfuSXZ2l1pICAyOtiqpyp1LYhQw==}
+  '@dev-guard/core@0.4.0':
+    resolution: {integrity: sha512-sx9/VBG2OvTtD0qsqtxysiOkRCFCVrWYzwNG3vSvdJ3LhEcAo472KA3o7LCVt4/mbBdXYkDBYmRSO26nUvQO9Q==}
 
   '@types/node@22.19.19':
     resolution: {integrity: sha512-dyh/xO2Fh5bYrfWaaqGrRQQGkNdmYw6AmaAUvYeUMNTWQtvb796ikLdmTchRmOlOiIJ1TDXfWgVx1QkUlQ6Hew==}
@@ -52,7 +52,7 @@ packages:
 
 snapshots:
 
-  '@dev-guard/core@0.3.0': {}
+  '@dev-guard/core@0.4.0': {}
 
   '@types/node@22.19.19':
     dependencies:

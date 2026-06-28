@@ -1,6 +1,6 @@
 {
   "name": "@dev-guard/cli",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": false,
   "description": "CLI context guard for AI coding session continuity, handoff, and next-session recovery.",
   "type": "module",
@@ -38,7 +38,7 @@
     "cli": "node dist/index.js"
   },
   "dependencies": {
-    "@dev-guard/core": "0.4.0",
+    "@dev-guard/core": "0.4.1",
     "chokidar": "^4.0.3"
   }
 }

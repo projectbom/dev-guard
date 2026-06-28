@@ -95,6 +95,7 @@ interface DashboardState {
     architectureModules: number;
     framework?: string;
   };
+  setup?: RuntimeState["setupStatus"];
 }
 
 export async function runDashboard(root: string, args: string[]): Promise<void> {
@@ -250,7 +251,8 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     qualityTrend,
     timeline,
     reports,
-    knowledge
+    knowledge,
+    setup: runtime.setupStatus
   };
 }
 
@@ -564,12 +566,17 @@ function renderPage(): string {
     .banner.working { background: var(--warn-bg); border-color: var(--warn-ring); }
     .banner.finalizing, .banner.ready_for_done { background: var(--accent-bg); border-color: #bfdbfe; }
     .banner.processed { background: var(--purple-bg); border-color: var(--purple-ring); }
+    .banner.setup { background: var(--accent-bg); border-color: #bfdbfe; }
     .banner.offline { background: var(--surface); border-color: var(--line2); }
     .banner-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
     .banner-text { flex: 1; min-width: 0; }
     .banner-title { font-size: 18px; font-weight: 700; line-height: 1.25; letter-spacing: -.2px; }
     .banner-body { color: var(--ink2); margin-top: 3px; font-size: 14px; }
     .banner-cmd { display: inline-block; margin-top: 8px; font: 13px/1.4 var(--mono); background: rgba(0,0,0,.06); border-radius: 5px; padding: 4px 9px; }
+    .setup-list { display: grid; gap: 6px; margin: -2px 0 12px; padding: 12px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); }
+    .setup-item { display: flex; align-items: center; gap: 8px; color: var(--ink2); font-size: 13px; }
+    .setup-mark { width: 18px; color: var(--accent); font-weight: 800; text-align: center; }
+    .setup-item.warning .setup-mark { color: var(--warn); }
 
     /* ── Action Center ── */
     .ac-section { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; margin-bottom: 12px; }
@@ -763,7 +770,8 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 
 /* ─ Status view ─ */
 function statusView(s) {
-  if (!s.initialized) return { icon:'⚙️', cls:'offline', title:t('notInitializedTitle'), body:t('notInitializedBody'), cmd:'dev-guard init', activity:t('activityInit'), next:t('nextInit') };
+  if (s.setup?.active) return { icon:'🔵', cls:'setup', title:t('setupTitle'), body:t('setupBody'), activity:t('activityInit'), next:t('nextStartWatch') };
+  if (!s.initialized) return { icon:'⚙️', cls:'offline', title:t('notInitializedTitle'), body:t('notInitializedBody'), cmd:'dev-guard watch', activity:t('activityInit'), next:t('nextInit') };
   if (!s.watchRunning)  return { icon:'⏸', cls:'offline', title:t('watchNotRunningTitle'), body:t('watchNotRunningBody'), cmd:'dev-guard watch', activity:t('activityStartWatch'), next:t('nextStartWatch') };
   const m = {
     working:       { icon:'🟡', cls:'working',      title:t('statusWorkingTitle'),    body:t('statusWorkingBody'),    activity:t('activitySettling'),    next:t('nextSettling') },
@@ -901,6 +909,14 @@ function render(s) {
     (v.cmd ? '<code class="banner-cmd">' + esc(v.cmd) + '</code>' : '') +
     '</div></div>';
 
+  const setupList = s.setup?.active
+    ? '<div class="setup-list">' + (s.setup.steps || []).map(step => {
+        const mark = step.status === 'done' ? '✓' : step.status === 'warning' ? '!' : step.status === 'running' ? '…' : '○';
+        const cls = step.status === 'warning' ? ' warning' : '';
+        return '<div class="setup-item' + cls + '"><span class="setup-mark">' + esc(mark) + '</span><span>' + esc(step.label) + '</span></div>';
+      }).join('') + '</div>'
+    : '';
+
   /* Action Center — always shown, cards disabled when file missing */
   const handoffSub = s.reports.handoffExists
     ? (s.reports.handoffUpdatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.reports.handoffUpdatedAt) : t('actionHandoffSubAvail'))
@@ -1034,7 +1050,7 @@ function render(s) {
     '</div></div></details></div>';
 
   root.innerHTML =
-    banner + actionCenter +
+    banner + setupList + actionCenter +
     '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
     '<div class="gap g2w" style="margin-top:12px">' + progressCard + sessionsCard + '</div>' +
     '<div class="gap g2" style="margin-top:12px">' + healthCard + nextCard + '</div>' +

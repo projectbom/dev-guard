@@ -11,7 +11,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Status card
     notInitializedTitle: "Setup required",
-    notInitializedBody: "Run dev-guard init to get started.",
+    notInitializedBody: "Run dev-guard watch to prepare and monitor this project.",
     watchNotRunningTitle: "Not monitoring",
     watchNotRunningBody: "Run dev-guard watch to start monitoring your AI coding session.",
     statusMonitoringTitle: "Monitoring project",
@@ -24,6 +24,8 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     statusFinalizingBody: "Generating reports and refreshing project context.",
     statusProcessedTitle: "Up to date",
     statusProcessedBody: "Session reports are fresh. You can start your next task.",
+    setupTitle: "Preparing Project",
+    setupBody: "DevGuard is setting up this project for the first run.",
 
     // Current activity card
     currentActivityTitle: "Current Activity",
@@ -118,7 +120,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Next action card
     nextActionTitle: "Next Action",
-    nextInit: "Run dev-guard init to set up this project.",
+    nextInit: "Run dev-guard watch to prepare and monitor this project.",
     nextStartWatch: "Run dev-guard watch to start monitoring.",
     nextMonitoring: "Nothing required. Continue coding.",
     nextSettling: "DevGuard will finalize automatically when changes settle.",
@@ -162,7 +164,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Status card
     notInitializedTitle: "초기 설정이 필요합니다",
-    notInitializedBody: "dev-guard init을 실행해 프로젝트를 설정하세요.",
+    notInitializedBody: "dev-guard watch를 실행하면 프로젝트 준비와 모니터링이 시작됩니다.",
     watchNotRunningTitle: "모니터링이 꺼져 있습니다",
     watchNotRunningBody: "dev-guard watch를 실행하면 AI 코딩 세션을 실시간으로 추적합니다.",
     statusMonitoringTitle: "프로젝트를 모니터링하는 중",
@@ -175,6 +177,8 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     statusFinalizingBody: "보고서를 생성하고 프로젝트 컨텍스트를 갱신하는 중입니다.",
     statusProcessedTitle: "최신 상태",
     statusProcessedBody: "세션 보고서가 갱신되었습니다. 다음 작업을 시작할 수 있습니다.",
+    setupTitle: "프로젝트 준비 중",
+    setupBody: "DevGuard가 첫 실행에 필요한 설정을 준비하고 있습니다.",
 
     // Current activity card
     currentActivityTitle: "현재 동작",
@@ -269,7 +273,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
 
     // Next action card
     nextActionTitle: "다음 할 일",
-    nextInit: "dev-guard init을 실행해 프로젝트를 설정하세요.",
+    nextInit: "dev-guard watch를 실행하면 프로젝트 준비와 모니터링이 시작됩니다.",
     nextStartWatch: "dev-guard watch를 실행해 모니터링을 시작하세요.",
     nextMonitoring: "할 일이 없습니다. 계속 코딩하세요.",
     nextSettling: "변경이 멈추면 DevGuard가 자동으로 처리합니다.",

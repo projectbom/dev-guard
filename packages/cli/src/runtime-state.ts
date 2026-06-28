@@ -17,7 +17,7 @@ import {
 import { appendTextFile, fromRoot, readJsonFile, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
 import { getDiffForChangeFiles, getGitChanges, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
-import { devguardPaths } from "./paths.js";
+import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { generateProjectKnowledge } from "./knowledge.js";
 
 const execFileAsync = promisify(execFile);
@@ -40,6 +40,21 @@ export interface RuntimeState {
   hookActive?: boolean;
   revision?: number;
   updatedAt?: string;
+  setupStatus?: SetupStatus;
+}
+
+export interface SetupStatus {
+  active: boolean;
+  startedAt?: string;
+  completedAt?: string;
+  steps: SetupStatusStep[];
+}
+
+export interface SetupStatusStep {
+  key: "config" | "agent_instructions" | "hooks" | "knowledge" | "dashboard";
+  label: string;
+  status: "pending" | "running" | "done" | "warning" | "skipped";
+  detail?: string;
 }
 
 export interface ProjectState {
@@ -252,6 +267,8 @@ export async function markRuntimeStable(root: string, diffHash: string): Promise
 export function isIgnoredWatchPath(path: string): boolean {
   const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
   return (
+    normalized === DEVGUARD_DIR ||
+    normalized.startsWith(`${DEVGUARD_DIR}/`) ||
     normalized.startsWith("node_modules/") ||
     normalized.startsWith(".next/") ||
     normalized.startsWith("dist/") ||

@@ -13,12 +13,12 @@ import {
   resetRuntimeState,
   writeRuntimeState
 } from "./runtime-state.js";
-import { getHookStatus } from "./hooks.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard, formatWatchDashboardKey } from "./watch-format.js";
 import { openDashboardBrowser, startDashboardServer, type DashboardServerHandle } from "./dashboard.js";
 import { defaultWatchConfig, loadWatchConfig, type WatchConfig } from "./config.js";
+import { prepareWatchProject } from "./prepare.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done" | "finalizing" | "processed";
 
@@ -33,57 +33,39 @@ interface WatchOptions {
   autoCompleteDelayMs: number;
 }
 
-const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", DEVGUARD_DIR];
-const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, ${devguardPaths.runtime}, ${devguardPaths.state}, ${devguardPaths.history}, ${devguardPaths.reportsDir}/**, ${devguardPaths.promptsDir}/**, ${devguardPaths.logsDir}/**, ${devguardPaths.hooksDir}/**`;
+const watchRoots = [".", "app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", DEVGUARD_DIR];
+const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, ${DEVGUARD_DIR}/**`;
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
-  await ensureDevguardWorkspace(root);
   const watchConfig = await loadWatchConfig(root);
   const options = parseWatchOptions(args, watchConfig);
-  const hookStatus = await getHookStatus(root);
+  let dashboard: DashboardServerHandle | undefined;
+  let dashboardOpenFailed = false;
+  let dashboardWarning: string | undefined;
+  if (options.dashboard) {
+    try {
+      dashboard = await startDashboardServer(root);
+      dashboardOpenFailed = !(await openDashboardBrowser(dashboard.url));
+    } catch (error) {
+      dashboardWarning = errorMessage(error);
+    }
+  }
+
+  const prepareResult = await prepareWatchProject(root, {
+    dashboardEnabled: options.dashboard,
+    dashboardReady: Boolean(dashboard)
+  });
+  const showPreparation = prepareResult.didWork || prepareResult.warnings.length > 0;
+  printStartup({ prepareResult, showPreparation, dashboard, dashboardOpenFailed, dashboardWarning, dashboardEnabled: options.dashboard });
+
+  await ensureDevguardWorkspace(root);
   const strategyReport = await getAgentStrategyReport(root);
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoStrategyInstalled = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
   const autoMode = !options.manual && autoStrategyInstalled;
   await startWatchSession(root);
-  let dashboard: DashboardServerHandle | undefined;
-  if (options.dashboard) {
-    try {
-      dashboard = await startDashboardServer(root);
-    } catch (error) {
-      console.error(`dashboard warning: ${errorMessage(error)}`);
-    }
-  }
 
   const autoCompleteEnabled = options.autoCompleteDelayMs > 0;
-
-  if (dashboard) {
-    console.log("DevGuard");
-    console.log("");
-    console.log("✓ Watching project");
-    console.log("");
-    console.log("Dashboard");
-    console.log(dashboard.url);
-    console.log("");
-    console.log("Monitoring AI coding session...");
-    console.log("");
-    console.log("Press Ctrl+C to stop.");
-    const opened = await openDashboardBrowser(dashboard.url);
-    if (!opened) {
-      console.log("");
-      console.log("Open this URL in your browser:");
-      console.log(dashboard.url);
-    }
-  } else {
-    console.log("dev-guard watch");
-    if (options.manual) {
-      console.log("Mode: Manual — run dev-guard done when the AI task is finished.");
-    } else {
-      console.log(`Mode: Auto — finalizes ${autoCompleteEnabled ? `${options.autoCompleteDelayMs / 1000}s after changes settle` : "via hooks only"}.`);
-    }
-    console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
-    console.log("stop: Ctrl+C");
-  }
 
   let status: WatchStatus = "idle";
   let stableTimer: NodeJS.Timeout | undefined;
@@ -203,13 +185,17 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
 
     if (pendingDuringFinalize.length > 0) {
-      const deferred = pendingDuringFinalize;
+      const deferred = pendingDuringFinalize.filter((path) => !isIgnoredWatchPath(path) && !isLockfilePath(path, options));
       pendingDuringFinalize = [];
       lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
       lastPrintedKey = "";
       await startWatchSession(root);
-      for (const p of deferred) {
-        await handleChange(p);
+      if (deferred.length > 0) {
+        for (const p of deferred) {
+          await handleChange(p);
+        }
+      } else {
+        await printState("idle");
       }
     } else {
       lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
@@ -335,6 +321,55 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   await new Promise<void>(() => {
     // Keep process alive until SIGINT.
   });
+}
+
+function printStartup(input: {
+  prepareResult: Awaited<ReturnType<typeof prepareWatchProject>>;
+  showPreparation: boolean;
+  dashboard?: DashboardServerHandle;
+  dashboardOpenFailed: boolean;
+  dashboardWarning?: string;
+  dashboardEnabled: boolean;
+}): void {
+  console.log("DevGuard");
+  console.log("");
+
+  if (input.showPreparation) {
+    console.log("Preparing project...");
+    console.log("");
+    for (const step of input.prepareResult.steps) {
+      if (!input.dashboardEnabled && step.key === "dashboard") {
+        continue;
+      }
+      const marker = step.status === "warning" ? "!" : "✓";
+      console.log(`${marker} ${step.label}`);
+      if (step.detail) {
+        console.log(`  ${step.detail}`);
+      }
+    }
+    if (input.dashboardWarning) {
+      console.log(`! Dashboard warning: ${input.dashboardWarning}`);
+    }
+    console.log("");
+  }
+
+  console.log("Watching project...");
+
+  if (input.dashboardWarning) {
+    console.log("");
+    console.log(`Dashboard warning: ${input.dashboardWarning}`);
+  }
+
+  if (input.dashboardEnabled && input.dashboard && input.dashboardOpenFailed) {
+    console.log("");
+    console.log("Dashboard");
+    console.log(input.dashboard.url);
+  }
+
+  if (!input.dashboardEnabled) {
+    console.log("");
+    console.log("Dashboard disabled by --no-dashboard.");
+  }
 }
 
 /**

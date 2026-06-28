@@ -4,14 +4,12 @@
 
 dev-guard is a CLI context guard for AI coding sessions. It keeps project context, changed files, quality checks, and next-session handoff prompts in local `.devguard/` files so Codex/Claude work can resume without rediscovering the repository.
 
-The default workflow requires only one command:
+The default workflow requires only one command after installation:
 
 ```bash
-dev-guard init
 dev-guard watch
 # let Claude/Codex edit files
 # DevGuard automatically finalizes after changes settle — no done required
-dev-guard status
 # if a session overflows, start a new thread with:
 dev-guard handoff
 ```
@@ -44,20 +42,16 @@ Install the CLI:
 
 ```bash
 npm install -g @dev-guard/cli
-dev-guard --help
-dev-guard doctor
 ```
 
 Start using it in a project:
 
 ```bash
-dev-guard init
-dev-guard install-agent-instructions
+cd my-project
 dev-guard watch
-# let Codex/Claude edit files
-# DevGuard auto-finalizes after changes settle — no extra commands needed
-dev-guard status
 ```
+
+On first launch, `watch` automatically prepares the project, creates default `.devguard/` configuration, installs DevGuard-managed AI instruction files when safe, installs completion hooks best-effort, generates Project Knowledge, starts the dashboard, and opens the browser.
 
 Daily loop:
 
@@ -109,44 +103,38 @@ Keep API keys out of git. Do not commit `.env`, `.devguard/config.json` with sec
 
 ## Recommended Workflow
 
-1. Initialize local guard files
-   ```bash
-   dev-guard init
-   ```
-   Creates the initial `.devguard` guard files. The event-based workflow also creates `.devguard/` runtime docs when needed.
-
-2. Start the watcher
+1. Start the watcher
    ```bash
    dev-guard watch
    ```
-   Watches project files, launches the local dashboard, accumulates changed paths. After filesystem inactivity (default: 20s settle + 8s grace), DevGuard **automatically** runs the equivalent of `done` — writing quality-report, next-codex-prompt, and project-handoff — then returns to monitoring. No additional commands required.
+   On first run, this prepares `.devguard/`, safe AI instruction files, completion hooks, Project Knowledge, and the local dashboard. On later runs, it starts immediately. After filesystem inactivity (default: 20s settle + 8s grace), DevGuard **automatically** runs the equivalent of `done` — writing quality-report, next-codex-prompt, and project-handoff — then returns to monitoring. No additional commands required.
 
-3. Optional: Install agent Stop Hooks for early completion
+2. Optional advanced recovery: reinstall agent completion hooks
    ```bash
    dev-guard install-hooks
    ```
-   Installs available agent completion strategy files. Claude Code uses a Stop Hook. Codex notify is the recommended Codex path. When a hook fires before the auto-complete timer, it takes precedence and cancels the timer.
+   Normal users do not need this. `watch` installs available completion strategy files automatically when missing. Run this manually only for recovery or troubleshooting.
 
-4. Manual fallback when watch is unavailable
+3. Manual fallback when automatic completion is unavailable
    ```bash
    dev-guard watch --manual
    dev-guard done
    ```
    `--manual` or `--no-auto-complete` disables auto-finalization. Run `done` explicitly to process pending changes. Also use `done` for recovery when watch crashed or hooks failed.
 
-5. Check status
+4. Check status
    ```bash
    dev-guard status
    ```
    Shows pending changes, last run summary, quality verdict, recent history, hook state, the handoff path, and the next recommended action.
 
-6. Resume after context overflow
+5. Resume after context overflow
    ```bash
    dev-guard handoff
    ```
    Regenerates `.devguard/reports/project-handoff.md` from current `.devguard/` artifacts only. Start a new Claude/Codex thread and ask it to read that file.
 
-7. Reset only runtime state when needed
+6. Reset only runtime state when needed
    ```bash
    dev-guard reset
    ```
@@ -221,7 +209,7 @@ The local dashboard starts automatically when `dev-guard watch` runs. It binds t
 
 The UI follows the browser language automatically and includes an English/Korean language toggle.
 
-It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not initialized it shows `dev-guard init`; if `watch` is not running it shows `dev-guard watch`.
+It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not monitoring the project, it tells the user to run `dev-guard watch`.
 
 Advanced terminal-only mode:
 
@@ -425,7 +413,7 @@ For a full compressed resume, also read `.devguard/reports/project-handoff.md`.
 
 ### AGENTS.md and CLAUDE.md
 
-`dev-guard install-agent-instructions` creates or updates `AGENTS.md` and `CLAUDE.md` with a dev-guard section that **suggests** agents read the dev-guard context before exploring the repository.
+`dev-guard watch` creates DevGuard-managed `AGENTS.md` and `CLAUDE.md` files automatically when they are missing. If those files already exist without DevGuard markers, DevGuard treats them as user-managed and leaves them unchanged. The advanced `install-agent-instructions` command is for recovery or explicit updates.
 
 ```bash
 dev-guard install-agent-instructions

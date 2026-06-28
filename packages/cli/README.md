@@ -6,8 +6,6 @@
 
 ```bash
 npm install -g @dev-guard/cli@latest
-dev-guard --help
-dev-guard doctor
 ```
 
 Run without a global install:
@@ -16,17 +14,16 @@ Run without a global install:
 npx @dev-guard/cli --help
 ```
 
-## Initial Setup
+## Quick Start
 
 Run from your project root:
 
 ```bash
-dev-guard init
-dev-guard install-agent-instructions
-dev-guard install-hooks
+cd my-project
 dev-guard watch
-dev-guard status
 ```
+
+On first launch, `watch` automatically creates default `.devguard/` configuration, installs DevGuard-managed AI instruction files when safe, installs completion hooks best-effort, generates Project Knowledge, starts the local dashboard, and opens the browser.
 
 ## GPT Setup
 
@@ -44,7 +41,9 @@ Do not store API keys in project files, `.env`, markdown, or git-tracked secret 
 
 ## Agent Instruction Files
 
-`dev-guard install-agent-instructions` creates or updates `AGENTS.md` and `CLAUDE.md` with instructions to read:
+`dev-guard watch` creates DevGuard-managed `AGENTS.md` and `CLAUDE.md` instructions when those files are missing. It never overwrites user-managed files without a DevGuard marker. The advanced `dev-guard install-agent-instructions` command can be used for recovery.
+
+The instructions tell agents to read:
 
 - `.devguard/project/project-knowledge.json`
 - `.devguard/context/agent-context.md`
@@ -101,6 +100,17 @@ Advanced terminal-only mode:
 ```bash
 dev-guard watch --no-dashboard
 ```
+
+Advanced setup/recovery commands:
+
+```bash
+dev-guard init
+dev-guard install-agent-instructions
+dev-guard install-hooks
+dev-guard dashboard
+```
+
+Normal users should not need these for first run.
 
 Full documentation:
 

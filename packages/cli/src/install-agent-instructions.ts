@@ -6,6 +6,13 @@ const SECTION_START = "<!-- dev-guard-section-start -->";
 const SECTION_END = "<!-- dev-guard-section-end -->";
 
 type InstallResult = "created" | "section_added" | "section_updated" | "already_installed";
+type AutoInstallResult = "created" | "already_installed" | "user_managed";
+
+export interface AgentInstructionInstallSummary {
+  agents: AutoInstallResult;
+  claude: AutoInstallResult;
+  warnings: string[];
+}
 
 function sharedDevGuardInstructions(agentName: "Codex" | "Claude"): string[] {
   const nextPrompt = agentName === "Claude" ? devguardPaths.nextClaudePrompt : devguardPaths.nextCodexPrompt;
@@ -106,6 +113,18 @@ async function installSection(filePath: string, section: string, force: boolean)
   return "section_added";
 }
 
+async function ensureGeneratedSection(filePath: string, section: string): Promise<AutoInstallResult> {
+  const exists = await fileExists(filePath);
+  if (!exists) {
+    await writeFile(filePath, section + "\n", "utf8");
+    return "created";
+  }
+
+  const existing = await readFile(filePath, "utf8");
+  const hasSection = existing.includes(SECTION_START) && existing.includes(SECTION_END);
+  return hasSection ? "already_installed" : "user_managed";
+}
+
 function describeResult(result: InstallResult): string {
   switch (result) {
     case "created":
@@ -142,4 +161,21 @@ export async function runInstallAgentInstructions(root: string, args: string[]):
   console.log("");
   console.log("Resume prompt for new sessions:");
   console.log(`  Read ${devguardPaths.agentContext} and continue.`);
+}
+
+export async function ensureAgentInstructions(root: string): Promise<AgentInstructionInstallSummary> {
+  const agentsMdPath = join(root, "AGENTS.md");
+  const claudeMdPath = join(root, "CLAUDE.md");
+  const [agents, claude] = await Promise.all([
+    ensureGeneratedSection(agentsMdPath, agentsMdSection()),
+    ensureGeneratedSection(claudeMdPath, claudeMdSection())
+  ]);
+  const warnings: string[] = [];
+  if (agents === "user_managed") {
+    warnings.push("AGENTS.md exists without a DevGuard section; left unchanged.");
+  }
+  if (claude === "user_managed") {
+    warnings.push("CLAUDE.md exists without a DevGuard section; left unchanged.");
+  }
+  return { agents, claude, warnings };
 }

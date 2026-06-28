@@ -63,13 +63,17 @@ const initFiles: InitFile[] = [
   }
 ];
 
-export async function runInit(root: string): Promise<void> {
-  const results = await Promise.all(
+export async function ensureInitialProjectFiles(root: string): Promise<Array<{ path: string; status: "created" | "exists" }>> {
+  return Promise.all(
     initFiles.map(async (file) => {
       const status = await writeFileIfMissing(fromRoot(root, file.path), file.content);
       return { path: file.path, status };
     })
   );
+}
+
+export async function runInit(root: string): Promise<void> {
+  const results = await ensureInitialProjectFiles(root);
 
   console.log("dev-guard init");
   for (const result of results) {

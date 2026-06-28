@@ -4,14 +4,12 @@
 
 dev-guard는 AI 코딩 세션을 이어가기 위한 CLI context guard입니다. 프로젝트 맥락, 변경 파일, 품질 체크, 다음 세션용 handoff prompt를 로컬 `.devguard/` 파일로 보존해서 Codex/Claude 작업을 레포지토리 재탐색 없이 이어갈 수 있게 합니다.
 
-기본 워크플로우에 필요한 명령어는 단 하나입니다.
+설치 후 기본 워크플로우에 필요한 명령어는 단 하나입니다.
 
 ```bash
-dev-guard init
 dev-guard watch
 # Claude/Codex가 파일 수정
 # 파일 시스템이 안정되면 DevGuard가 자동으로 세션을 완료 처리합니다 — done 불필요
-dev-guard status
 # context window 초과 시 새 스레드에서 이어가기
 dev-guard handoff
 ```
@@ -45,20 +43,16 @@ CLI 설치:
 
 ```bash
 npm install -g @dev-guard/cli
-dev-guard --help
-dev-guard doctor
 ```
 
 프로젝트에서 시작:
 
 ```bash
-dev-guard init
-dev-guard install-agent-instructions
+cd my-project
 dev-guard watch
-# Codex/Claude가 파일 수정
-# 파일 시스템이 안정되면 DevGuard가 자동 완료 처리 — 추가 명령 불필요
-dev-guard status
 ```
+
+첫 실행에서 `watch`가 프로젝트를 자동으로 준비합니다. 기본 `.devguard/` 설정을 만들고, 안전한 경우 AI instruction 파일을 설치하며, completion hook을 best-effort로 설치하고, Project Knowledge를 생성한 뒤 대시보드를 시작하고 브라우저를 엽니다.
 
 일상 루프:
 
@@ -111,6 +105,25 @@ API key는 git에 넣지 않습니다. `.env`, secret이 들어간 `.devguard/co
 ## 핵심 명령어
 
 ```bash
+dev-guard watch [--depth 8] [--poll] [--stable-after 20]
+dev-guard watch --no-dashboard
+dev-guard watch --manual
+dev-guard knowledge
+dev-guard done
+dev-guard handoff
+dev-guard status
+dev-guard reset
+```
+
+- `watch`: 권장 시작 명령. 첫 실행에서 `.devguard/`, AI instruction, completion hook, Project Knowledge, 대시보드를 자동 준비합니다.
+- `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
+- `handoff`: 현재 `.devguard/` 산출물만 읽어서 `project-handoff.md` 재생성
+- `status`: pending 상태, 최근 작업, quality verdict, 다음 권장 작업 출력
+- `reset`: runtime pending buffer만 초기화
+
+고급/복구 명령:
+
+```bash
 dev-guard init
 dev-guard install-hooks [--force]
 dev-guard install-hooks --agent claude
@@ -118,24 +131,11 @@ dev-guard install-hooks --agent codex
 dev-guard install-hooks --agent codex-notify
 dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
-dev-guard watch [--depth 8] [--poll] [--stable-after 20]
-dev-guard watch --no-dashboard
-dev-guard watch --manual
-dev-guard knowledge
+dev-guard install-agent-instructions
 dev-guard dashboard [--port 3737]
-dev-guard done
-dev-guard handoff
-dev-guard status
-dev-guard reset
 ```
 
-- `init`: 초기 guard 파일 생성
-- `watch`: 권장 watcher, 로컬 대시보드 시작, 변경 파일 감시 및 검증된 완료 전략 기반 done 대기
-- `install-hooks`: Claude Code / Codex 완료 전략 스크립트와 설정 설치
-- `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
-- `handoff`: 현재 `.devguard/` 산출물만 읽어서 `project-handoff.md` 재생성
-- `status`: pending 상태, 최근 작업, quality verdict, 다음 권장 작업 출력
-- `reset`: runtime pending buffer만 초기화
+일반 사용자는 위 명령을 직접 실행할 필요가 없습니다. `watch`가 누락된 설정을 자동으로 준비합니다. 기존 `AGENTS.md` 또는 `CLAUDE.md`가 사용자가 직접 관리하는 파일이면 DevGuard는 덮어쓰지 않고 경고만 표시합니다.
 
 ## 생성되는 파일 구조
 
@@ -252,7 +252,7 @@ Hook을 사용할 수 없거나 신뢰되지 않았거나 실패했을 때 사�
 
 UI는 브라우저 언어를 자동으로 따르며 English/한국어 토글을 제공합니다.
 
-임의 파일 브라우징, 환경 변수 노출, shell 실행 기능은 없습니다. DevGuard가 초기화되지 않았으면 `dev-guard init`을 안내하고, `watch`가 실행 중이 아니면 `dev-guard watch`를 안내합니다.
+임의 파일 브라우징, 환경 변수 노출, shell 실행 기능은 없습니다. DevGuard가 프로젝트를 모니터링 중이 아니면 `dev-guard watch` 실행을 안내합니다.
 
 터미널만 쓰고 싶을 때는 고급 옵션을 사용합니다.
 
@@ -324,7 +324,7 @@ Read .devguard/context/agent-context.md and continue.
 
 ### AGENTS.md / CLAUDE.md
 
-`dev-guard install-agent-instructions`는 `AGENTS.md`와 `CLAUDE.md`에 dev-guard 섹션을 생성하거나 추가합니다. Agent가 레포지토리를 탐색하기 전에 dev-guard 컨텍스트를 먼저 읽도록 **유도**하는 용도입니다.
+`dev-guard watch`는 `AGENTS.md`와 `CLAUDE.md`가 없을 때 DevGuard가 관리하는 instruction 파일을 자동 생성합니다. 이미 파일이 있고 DevGuard marker가 없으면 사용자가 직접 관리하는 파일로 보고 그대로 둡니다. `install-agent-instructions`는 복구나 명시적 갱신이 필요할 때 쓰는 고급 명령입니다.
 
 ```bash
 dev-guard install-agent-instructions
