@@ -18,6 +18,7 @@ export const devguardPaths = {
   reportsDir: `${DEVGUARD_DIR}/reports`,
   promptsDir: `${DEVGUARD_DIR}/prompts`,
   contextDir: `${DEVGUARD_DIR}/context`,
+  projectDir: `${DEVGUARD_DIR}/project`,
   claudeHook: `${DEVGUARD_DIR}/hooks/claude-stop.sh`,
   codexHook: `${DEVGUARD_DIR}/hooks/codex-stop.sh`,
   codexNotifyHook: `${DEVGUARD_DIR}/hooks/codex-notify.sh`,
@@ -34,7 +35,8 @@ export const devguardPaths = {
   projectHandoff: `${DEVGUARD_DIR}/reports/project-handoff.md`,
   nextCodexPrompt: `${DEVGUARD_DIR}/prompts/next-codex-prompt.md`,
   nextClaudePrompt: `${DEVGUARD_DIR}/prompts/next-claude-prompt.md`,
-  agentContext: `${DEVGUARD_DIR}/context/agent-context.md`
+  agentContext: `${DEVGUARD_DIR}/context/agent-context.md`,
+  projectKnowledge: `${DEVGUARD_DIR}/project/project-knowledge.json`
 } as const;
 
 export function legacyDevguardPath(path = ""): string {

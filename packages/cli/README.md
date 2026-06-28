@@ -46,6 +46,7 @@ Do not store API keys in project files, `.env`, markdown, or git-tracked secret 
 
 `dev-guard install-agent-instructions` creates or updates `AGENTS.md` and `CLAUDE.md` with instructions to read:
 
+- `.devguard/project/project-knowledge.json`
 - `.devguard/context/agent-context.md`
 - `.devguard/reports/project-handoff.md`
 - `.devguard/reports/quality-report.md`
@@ -75,6 +76,16 @@ Resume a new session:
 ```bash
 dev-guard handoff
 cat .devguard/reports/project-handoff.md
+```
+
+## Project Knowledge
+
+DevGuard writes `.devguard/project/project-knowledge.json`, a static project structure file for AI sessions. It summarizes framework, package manager, entry points, pages, components, APIs, database hints, commands, important files, and architecture modules.
+
+Regenerate it manually:
+
+```bash
+dev-guard knowledge
 ```
 
 ## Local Dashboard

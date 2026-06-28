@@ -18,6 +18,7 @@ import { appendTextFile, fromRoot, readJsonFile, readTextFile, writeFileIfMissin
 import { getDiffForChangeFiles, getGitChanges, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
+import { generateProjectKnowledge } from "./knowledge.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -65,6 +66,7 @@ export interface DoneProcessingResult {
   projectHandoffPath: string;
   agentContextPath: string;
   nextClaudePromptPath: string;
+  projectKnowledgePath: string;
   qualityVerdict: QualityVerdict;
   summary: string;
   drift: "low" | "medium" | "high";
@@ -428,7 +430,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   await Promise.all([
     generateProjectHandoff(root),
     generateAgentContext(root),
-    generateNextClaudePrompt(root)
+    generateNextClaudePrompt(root),
+    generateProjectKnowledge(root)
   ]);
   return {
     changedFiles,
@@ -442,6 +445,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     projectHandoffPath,
     agentContextPath: devguardPaths.agentContext,
     nextClaudePromptPath: devguardPaths.nextClaudePrompt,
+    projectKnowledgePath: devguardPaths.projectKnowledge,
     qualityVerdict: qualityReport.verdict,
     summary,
     drift
@@ -580,6 +584,7 @@ function renderAgentContext(input: {
     "- large refactors not explicitly requested",
     "",
     "## Additional Context",
+    `- project knowledge: \`${devguardPaths.projectKnowledge}\``,
     `- full handoff: \`${devguardPaths.projectHandoff}\``,
     `- architecture: \`${devguardPaths.architecture}\``,
     `- decisions: \`${devguardPaths.decisions}\``,
@@ -595,8 +600,9 @@ function renderNextClaudePrompt(input: { qualityVerdict: string; nextBestTask: s
     "Before starting any work, read:",
     "",
     `1. \`${devguardPaths.agentContext}\` — current state, quality status, next task`,
-    `2. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
-    `3. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
+    `2. \`${devguardPaths.projectKnowledge}\` — static project structure for AI sessions`,
+    `3. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
+    `4. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
     "",
     "Use dev-guard context as the primary source of project state.",
     "Do not perform repository-wide scans before reading them.",

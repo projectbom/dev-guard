@@ -203,6 +203,18 @@ dev-guard watch --manual
 dev-guard watch --no-auto-complete
 ```
 
+## Project Knowledge
+
+DevGuard generates `.devguard/project/project-knowledge.json` as a static project structure file for AI sessions. It is not a search index or semantic code index. It summarizes framework, package manager, entry points, pages, components, APIs, database hints, commands, important files, and architecture modules so agents can understand the project before broad repository exploration.
+
+The file is refreshed after session completion and can be regenerated manually:
+
+```bash
+dev-guard knowledge
+```
+
+Generated `AGENTS.md` and `CLAUDE.md` instructions tell agents to read project knowledge before opening source files broadly.
+
 ## Local Dashboard
 
 The local dashboard starts automatically when `dev-guard watch` runs. It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/state` once per second. It explains what DevGuard is doing now, why it is waiting, what happens next, recent file changes, and whether next-session, project-health, and project-context information is ready.
@@ -230,6 +242,7 @@ dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --no-dashboard
 dev-guard watch --manual
+dev-guard knowledge
 dev-guard dashboard [--port 3737]
 dev-guard done
 dev-guard handoff

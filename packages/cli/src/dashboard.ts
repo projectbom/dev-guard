@@ -4,6 +4,7 @@ import { access, stat } from "node:fs/promises";
 import { fromRoot, readTextFile } from "./fs.js";
 import { devguardPaths } from "./paths.js";
 import { readHistoryRecords, readProjectState, readRuntimeState, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
+import { readProjectKnowledge } from "./knowledge.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
@@ -18,7 +19,8 @@ const FILE_KEYS: Record<string, string> = {
   context: devguardPaths.agentContext,
   nextclaude: devguardPaths.nextClaudePrompt,
   nextcodex: devguardPaths.nextCodexPrompt,
-  lastrun: devguardPaths.lastRunReport
+  lastrun: devguardPaths.lastRunReport,
+  knowledge: devguardPaths.projectKnowledge
 };
 
 export interface DashboardServerHandle {
@@ -85,6 +87,13 @@ interface DashboardState {
     handoffPreview?: string;
     qualityReportPreview?: string;
     agentContextPreview?: string;
+  };
+  knowledge: {
+    exists: boolean;
+    updatedAt?: string;
+    filesIndexed: number;
+    architectureModules: number;
+    framework?: string;
   };
 }
 
@@ -197,12 +206,13 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
 
 async function getDashboardState(root: string): Promise<DashboardState> {
   const initialized = await isDevGuardInitialized(root);
-  const [runtime, strategyReport, reports, projectState, history] = await Promise.all([
+  const [runtime, strategyReport, reports, projectState, history, knowledge] = await Promise.all([
     readRuntimeState(root),
     getAgentStrategyReport(root),
     readReportState(root),
     readProjectState(root),
-    readHistoryRecords(root, 20)
+    readHistoryRecords(root, 20),
+    readKnowledgeState(root)
   ]);
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoMode = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
@@ -239,7 +249,22 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     todayStats,
     qualityTrend,
     timeline,
-    reports
+    reports,
+    knowledge
+  };
+}
+
+async function readKnowledgeState(root: string): Promise<DashboardState["knowledge"]> {
+  const [knowledge, file] = await Promise.all([
+    readProjectKnowledge(root),
+    checkFileInfo(root, devguardPaths.projectKnowledge)
+  ]);
+  return {
+    exists: Boolean(knowledge),
+    updatedAt: file.updatedAt,
+    filesIndexed: knowledge?.summary.filesIndexed ?? 0,
+    architectureModules: knowledge?.architecture.modules.length ?? 0,
+    framework: knowledge?.summary.framework
   };
 }
 
@@ -893,6 +918,12 @@ function render(s) {
     : t('actionPromptSubMissing');
   const promptOpenKey = s.reports.nextClaudePromptExists ? 'nextclaude' : s.reports.nextCodexPromptExists ? 'nextcodex' : null;
   const promptCopyKey = promptOpenKey;
+  const knowledgeSub = s.knowledge.exists
+    ? t('knowledgeReady') + ' · ' + s.knowledge.filesIndexed + ' ' + t('knowledgeFiles') + ' · ' + s.knowledge.architectureModules + ' ' + t('knowledgeModules')
+    : t('knowledgeMissing');
+  const knowledgeHint = s.knowledge.exists
+    ? (s.knowledge.updatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.knowledge.updatedAt) : s.knowledge.framework || null)
+    : t('knowledgeHint');
 
   const actionCenter = '<div class="ac-section">' +
     '<div class="ac-title">' + esc(t('actionCenterTitle')) + '</div>' +
@@ -901,6 +932,7 @@ function render(s) {
     actionCard({ name: t('actionQualityTitle'), sub: qualitySub, hint: null, avail: s.reports.qualityReportExists, openKey: 'quality', copyKey: null }) +
     actionCard({ name: t('actionContextTitle'), sub: contextSub, hint: null, avail: s.reports.agentContextExists, openKey: 'context', copyKey: null }) +
     actionCard({ name: t('actionPromptTitle'), sub: promptSub, hint: promptExists ? null : t('actionPromptHint'), avail: promptExists, openKey: promptOpenKey, copyKey: promptCopyKey }) +
+    actionCard({ name: t('knowledgeTitle'), sub: knowledgeSub, hint: knowledgeHint, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge' }) +
     '</div></div>';
 
   /* Activity card */

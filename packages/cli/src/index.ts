@@ -7,6 +7,7 @@ import { runDoctor } from "./doctor.js";
 import { runInferTask } from "./infer-task.js";
 import { getHookStatus, runInstallHooks, writeHookStatusReport } from "./hooks.js";
 import { runInit } from "./init.js";
+import { runKnowledge } from "./knowledge.js";
 import { legacyDevguardWarning } from "./migration.js";
 import { devguardPaths } from "./paths.js";
 import { parsePromptOptions, runPrompt } from "./prompt.js";
@@ -55,6 +56,11 @@ async function main(): Promise<void> {
 
   if (command === "handoff") {
     await runHandoff(root);
+    return;
+  }
+
+  if (command === "knowledge") {
+    await runKnowledge(root);
     return;
   }
 
@@ -184,6 +190,7 @@ function printHelp(): void {
 Commands:
   dev-guard init     Set up DevGuard in this project (run once)
   dev-guard watch    Monitor your AI coding session
+  dev-guard knowledge  Generate project knowledge for AI sessions
   dev-guard doctor   Check configuration and hook status
 
 That is all most users need.
@@ -247,6 +254,7 @@ All commands:
   dev-guard "requirement"
   dev-guard done
   dev-guard handoff
+  dev-guard knowledge
   dev-guard status
   dev-guard reset
   dev-guard check [--local] [--include-context-files]
@@ -282,6 +290,7 @@ Commands:
   "requirement"           Generate task.md and a compact Codex prompt
   done                    Manual recovery — normally watch auto-finalizes
   handoff                 Regenerate project-handoff.md and agent-context.md
+  knowledge               Generate and summarize .devguard/project/project-knowledge.json
   install-hooks           Install agent completion strategy scripts/config
   install-agent-instructions  Create or update AGENTS.md / CLAUDE.md
   status                  Show pending watch state, hook state, quality verdict
@@ -339,6 +348,7 @@ async function runDone(root: string): Promise<void> {
     console.log(`- ${result.projectHandoffPath}`);
     console.log(`- ${result.agentContextPath}`);
     console.log(`- ${result.nextClaudePromptPath}`);
+    console.log(`- ${result.projectKnowledgePath}`);
     console.log("");
     console.log(`Quality: ${result.qualityVerdict}`);
     console.log("");

@@ -121,6 +121,7 @@ dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --no-dashboard
 dev-guard watch --manual
+dev-guard knowledge
 dev-guard dashboard [--port 3737]
 dev-guard done
 dev-guard handoff
@@ -175,6 +176,18 @@ dev-guard reset
 `project-handoff.md`는 context window 초과 후 새 Claude/Codex 스레드에서 바로 이어가기 위한 압축 인수인계 문서입니다.
 
 자세한 내용은 [docs/handoff.md](./docs/handoff.md)를 참고하세요.
+
+## Project Knowledge
+
+DevGuard는 AI 세션이 레포지토리를 넓게 탐색하기 전에 읽을 수 있도록 `.devguard/project/project-knowledge.json`을 생성합니다. 이 파일은 검색 기능이나 semantic code index가 아니라 정적 프로젝트 구조 문서입니다. framework, package manager, entry point, page, component, API, database hint, command, important file, architecture module을 요약합니다.
+
+세션 완료 후 갱신되며, 필요하면 수동으로 다시 생성할 수 있습니다.
+
+```bash
+dev-guard knowledge
+```
+
+생성되는 `AGENTS.md`와 `CLAUDE.md` 안내문은 agent가 source file을 넓게 열기 전에 project knowledge를 먼저 읽도록 안내합니다.
 
 ## 에이전트별 완료 전략
 
