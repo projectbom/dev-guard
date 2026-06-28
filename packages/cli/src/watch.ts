@@ -18,6 +18,7 @@ import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard, formatWatchDashboardKey } from "./watch-format.js";
 import { openDashboardBrowser, startDashboardServer, type DashboardServerHandle } from "./dashboard.js";
+import { defaultWatchConfig, loadWatchConfig, type WatchConfig } from "./config.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done" | "finalizing" | "processed";
 
@@ -37,11 +38,10 @@ const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, 
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   await ensureDevguardWorkspace(root);
-  const options = parseWatchOptions(args);
+  const watchConfig = await loadWatchConfig(root);
+  const options = parseWatchOptions(args, watchConfig);
   const hookStatus = await getHookStatus(root);
   const strategyReport = await getAgentStrategyReport(root);
-  const claudeHookInstalled = hookStatus.claudeInstalled && hookStatus.claudeHookFile;
-  const codexHookInstalled = hookStatus.codexInstalled && hookStatus.codexHookFile;
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoStrategyInstalled = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
   const autoMode = !options.manual && autoStrategyInstalled;
@@ -76,32 +76,12 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   } else {
     console.log("dev-guard watch");
-    console.log(`Mode: ${options.manual ? "Manual Mode" : "Auto Mode"}`);
-    if (autoCompleteEnabled) {
-      console.log(`Auto-finalization: enabled (grace period: ${options.autoCompleteDelayMs / 1000}s after filesystem settles)`);
+    if (options.manual) {
+      console.log("Mode: Manual — run dev-guard done when the AI task is finished.");
     } else {
-      console.log("Auto-finalization: disabled (manual mode)");
+      console.log(`Mode: Auto — finalizes ${autoCompleteEnabled ? `${options.autoCompleteDelayMs / 1000}s after changes settle` : "via hooks only"}.`);
     }
-    console.log("Auto completion strategy:");
-    console.log(`Claude: Stop Hook ${strategyReport.claude.installed ? "installed" : "not installed"}; runtime verified: ${strategyReport.claude.runtimeVerified ? "yes" : "no"}`);
-    console.log(`Codex: Notify recommended (${strategyReport.codexNotify.installed ? "installed" : "not installed"}); Stop Hook ${codexHookInstalled ? "installed" : "not installed"}${strategyReport.codexStopHook.requiresUserTrust ? " but requires /hooks trust" : ""}`);
-    console.log(`Runtime verified: ${runtimeVerified ? "yes" : "no"}`);
-    console.log(`Fallback: dev-guard done`);
-    console.log("");
-    console.log("Watching for file changes...");
-    if (autoCompleteEnabled) {
-      console.log("After changes settle, DevGuard will automatically finalize the session.");
-      console.log("dev-guard done is available as a manual recovery command.");
-    } else {
-      console.log("Tip:");
-      console.log("Run dev-guard install-hooks to enable agent Stop Hook strategies.");
-      console.log("Manual Mode enabled; run dev-guard done when the AI task is finished.");
-    }
-    console.log("");
     console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
-    console.log(`excluded: ${excludedSummary}`);
-    console.log(`depth: ${options.depth}; poll: ${options.poll ? "on" : "off"}; lockfiles: ${options.includeLockfiles ? "included" : "excluded"}; manual: ${options.manual ? "on" : "off"}`);
-    console.log(`auto-complete: ${autoCompleteEnabled ? `${options.autoCompleteDelayMs / 1000}s grace period` : "disabled"}`);
     console.log("stop: Ctrl+C");
   }
 
@@ -174,11 +154,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
         console.log(`Completion processed. Quality: ${projectState.lastQualityVerdict ?? "unknown"}`);
       } else {
         console.log("");
-        console.log("Completion processed");
-        console.log("DONE: agent completion processed changes");
-        console.log(`Last processed: ${processedAt}`);
-        console.log(`Quality: ${projectState.lastQualityVerdict ?? "unknown"}`);
-        console.log(`NEXT: ${projectState.lastQualityVerdict && projectState.lastQualityVerdict !== "PASS" ? `review ${devguardPaths.qualityReport}` : "keep editing"}`);
+        console.log(`done: quality=${projectState.lastQualityVerdict ?? "unknown"}; ${projectState.lastQualityVerdict && projectState.lastQualityVerdict !== "PASS" ? `review ${devguardPaths.qualityReport}` : "keep editing"}`);
       }
       await printState("idle");
     }
@@ -191,7 +167,6 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     isAutoFinalizing = true;
     pendingDuringFinalize = [];
 
-    // Write "finalizing" status to runtime state so dashboard reflects it
     try {
       const current = await readRuntimeState(root);
       await writeRuntimeState(root, { ...current, lastStatus: "finalizing" });
@@ -208,26 +183,26 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     try {
       const result = await processDoneEvent(root);
       if (!options.compact) {
-        console.log(`\nauto: processed ${result.changedFiles.length} file(s); quality=${result.qualityVerdict}`);
-        console.log(`NEXT: ${result.qualityVerdict !== "PASS" ? `review ${devguardPaths.qualityReport}` : "keep editing"}`);
+        console.log(`auto: done — ${result.changedFiles.length} file(s); quality=${result.qualityVerdict}`);
+        if (result.qualityVerdict !== "PASS") {
+          console.log(`review: ${devguardPaths.qualityReport}`);
+        }
       }
     } catch (error) {
       finalizeError = error;
-      console.error(`auto-complete warning: ${errorMessage(error)}`);
-      console.error("recovery: run dev-guard done manually");
+      console.error(`auto: finalization failed — ${errorMessage(error)}`);
+      console.error("recovery: run dev-guard done");
     }
 
     isAutoFinalizing = false;
 
     if (finalizeError) {
-      // Restore state so manual recovery is possible
       lastPrintedKey = "";
       await printState("idle");
       return;
     }
 
     if (pendingDuringFinalize.length > 0) {
-      // Changes arrived during finalization — replay them through normal handleChange flow
       const deferred = pendingDuringFinalize;
       pendingDuringFinalize = [];
       lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
@@ -290,10 +265,9 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
           await markRuntimeStable(root, hashRuntimeFiles(latest.pendingChangedFiles));
           const afterStable = await readRuntimeState(root);
           if (afterStable.pendingChangedFiles.length > 0 && autoCompleteEnabled) {
-            // Briefly show the state, then start the auto-complete grace timer
             await printState("ready_for_done");
             if (!options.compact) {
-              console.log(`auto: changes settled; finalizing in ${options.autoCompleteDelayMs / 1000}s (edit to cancel)...`);
+              console.log(`auto: settling done; finalizing in ${options.autoCompleteDelayMs / 1000}s...`);
             }
             autoCompleteTimer = setTimeout(() => {
               void runAutoComplete();
@@ -306,7 +280,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
         }
       }, options.stableAfterMs);
       if (!options.compact) {
-        console.log(`event: ${path}; pending=${runtime.pendingChangedFiles.length}; idle_timer=reset`);
+        console.log(`change: ${path}`);
       }
     } catch (error) {
       console.error(`watch warning: ${errorMessage(error)}`);
@@ -363,29 +337,53 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   });
 }
 
-function parseWatchOptions(args: string[]): WatchOptions {
-  const stableAfterSec = readNumberOption(args, "--stable-after", 20);
-  const depth = readNumberOption(args, "--depth", 8);
-  const autoCompleteDelaySec = readNumberOption(args, "--auto-complete-delay", 8);
-  const manual = args.includes("--manual") || args.includes("--no-auto");
+/**
+ * Resolve WatchOptions by merging config file defaults with explicit CLI flag overrides.
+ * A CLI flag only overrides config when it is explicitly present in args.
+ */
+function parseWatchOptions(args: string[], config: WatchConfig): WatchOptions {
+  // Number options: CLI overrides config only when flag is explicitly present
+  const stableAfterSec = args.includes("--stable-after")
+    ? readNumberOption(args, "--stable-after", defaultWatchConfig.stableAfter)
+    : (config.stableAfter ?? defaultWatchConfig.stableAfter);
+
+  const autoCompleteDelaySec = args.includes("--auto-complete-delay")
+    ? readNumberOption(args, "--auto-complete-delay", defaultWatchConfig.autoCompleteDelay)
+    : (config.autoCompleteDelay ?? defaultWatchConfig.autoCompleteDelay);
+
+  const depth = args.includes("--depth")
+    ? readNumberOption(args, "--depth", defaultWatchConfig.depth)
+    : (config.depth ?? defaultWatchConfig.depth);
+
   if (stableAfterSec <= 0) {
-    throw new Error("dev-guard watch --stable-after must be positive.");
-  }
-  if (depth < 1) {
-    throw new Error("dev-guard watch --depth must be 1 or greater.");
+    throw new Error("watch.stableAfter / --stable-after must be positive.");
   }
   if (autoCompleteDelaySec <= 0) {
-    throw new Error("dev-guard watch --auto-complete-delay must be positive.");
+    throw new Error("watch.autoCompleteDelay / --auto-complete-delay must be positive.");
   }
-  const autoCompleteEnabled = !manual && !args.includes("--no-auto-complete");
+  if (depth < 1) {
+    throw new Error("watch.depth / --depth must be 1 or greater.");
+  }
+
+  // Boolean options: CLI flag takes explicit precedence over config
+  const manual = args.includes("--manual") || args.includes("--no-auto");
+
+  const poll = args.includes("--poll") ? true : (config.poll ?? defaultWatchConfig.poll);
+  const compact = (args.includes("--compact") || args.includes("--ultra")) ? true : (config.compact ?? defaultWatchConfig.compact);
+  const includeLockfiles = args.includes("--include-lockfiles") ? true : (config.includeLockfiles ?? defaultWatchConfig.includeLockfiles);
+  const dashboard = args.includes("--no-dashboard") ? false : (config.dashboard ?? defaultWatchConfig.dashboard);
+
+  // Auto-complete: disabled by --manual, --no-auto-complete, or config.autoComplete=false
+  const autoCompleteEnabled = !manual && !args.includes("--no-auto-complete") && (config.autoComplete ?? defaultWatchConfig.autoComplete);
+
   return {
     stableAfterMs: stableAfterSec * 1000,
-    compact: args.includes("--compact") || args.includes("--ultra"),
+    compact,
     depth,
-    poll: args.includes("--poll"),
-    includeLockfiles: args.includes("--include-lockfiles"),
+    poll,
+    includeLockfiles,
     manual,
-    dashboard: !args.includes("--no-dashboard"),
+    dashboard,
     autoCompleteDelayMs: autoCompleteEnabled ? autoCompleteDelaySec * 1000 : 0
   };
 }
@@ -413,17 +411,16 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
     watcher.on("error", (error: Error) => {
       console.error(`watch warning: ${error.message}`);
       console.error("recovery:");
-      console.error("- run from a narrower project path");
       console.error("- retry with dev-guard watch --poll");
-      console.error("- lower watched depth with dev-guard watch --depth 4");
+      console.error("- lower depth: dev-guard watch --depth 4  (or set watch.depth in .devguard/config.json)");
       console.error("- increase the OS file descriptor limit");
-      console.error("- run dev-guard done manually when the task is finished");
+      console.error("- run dev-guard done manually");
       void watcher.close?.();
     });
     return watcher;
   }
 
-  console.log("watch backend: node fs.watch fallback (top-level only; install dependencies for chokidar recursive watching)");
+  console.log("watch backend: node fs.watch fallback (top-level only; install dependencies for recursive watching)");
   const watcher = fsWatch(root, { recursive: false }, (_event, filename) => {
     if (filename) {
       void onChange(filename.toString());
@@ -436,7 +433,7 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
     }
     fallbackErrored = true;
     console.error(`watch warning: ${error.message}`);
-    console.error("recovery: retry with --poll, reduce --depth, increase OS file limit, or run dev-guard done manually");
+    console.error("recovery: retry with --poll, reduce --depth, or run dev-guard done manually");
     watcher.close();
   });
   return [watcher];

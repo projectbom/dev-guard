@@ -14,14 +14,27 @@ export async function runConfigure(root: string, args: string[]): Promise<void> 
     const key = args[1];
     const value = args[2];
     if (!key || value === undefined) {
-      throw new Error("사용법: dev-guard config set <provider|model|temperature|maxTokens|reasoningEffort|baseURL> <value>");
+      throw new Error(
+        "Usage: dev-guard config set <key> <value>\n" +
+        "AI keys:    provider  model  temperature  maxTokens  reasoningEffort  baseURL\n" +
+        "Watch keys: watch.dashboard  watch.autoComplete  watch.autoCompleteDelay\n" +
+        "            watch.stableAfter  watch.poll  watch.depth  watch.compact  watch.includeLockfiles"
+      );
     }
     const next = await writeConfigValue(root, key, value);
     console.log("dev-guard config set");
     console.log(`- ${key}: ${value}`);
     console.log("- wrote: .devguard/config.json");
-    console.log(`- provider: ${next.ai?.provider ?? defaultConfig.ai.provider}`);
-    console.log(`- model: ${next.ai?.model ?? defaultConfig.ai.model}`);
+    if (key.startsWith("watch.")) {
+      const watch = next.watch ?? {};
+      console.log(`- watch.autoComplete: ${watch.autoComplete ?? true}`);
+      console.log(`- watch.autoCompleteDelay: ${watch.autoCompleteDelay ?? 8}s`);
+      console.log(`- watch.stableAfter: ${watch.stableAfter ?? 20}s`);
+      console.log(`- watch.dashboard: ${watch.dashboard ?? true}`);
+    } else {
+      console.log(`- provider: ${next.ai?.provider ?? defaultConfig.ai.provider}`);
+      console.log(`- model: ${next.ai?.model ?? defaultConfig.ai.model}`);
+    }
     return;
   }
 

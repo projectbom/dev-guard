@@ -181,28 +181,22 @@ async function main(): Promise<void> {
 function printHelp(): void {
   console.log(`dev-guard
 
-Quick start:
-  dev-guard init
-  dev-guard install-agent-instructions
-  dev-guard watch
-  (edit with Claude/Codex — DevGuard auto-finalizes after changes settle)
+Commands:
+  dev-guard init     Set up DevGuard in this project (run once)
+  dev-guard watch    Monitor your AI coding session
+  dev-guard doctor   Check configuration and hook status
 
-Normal workflow:
-  1. dev-guard watch
-  2. Edit files with Claude/Codex
-  3. DevGuard detects changes, waits for filesystem to settle, then
-     automatically generates reports and returns to monitoring.
-  4. No additional commands required.
+That is all most users need.
 
-New session resume:
+Session resume:
   Read .devguard/context/agent-context.md and continue.
 
-Manual recovery (advanced):
-  dev-guard done    — use only when watch crashed, hooks failed, or debugging
-  dev-guard status  — check current state and hook status
-  dev-guard reset   — clear pending buffer without deleting project state
+Troubleshooting:
+  dev-guard status   — show current state
+  dev-guard done     — manual recovery (watch crashed / hooks failed)
+  dev-guard reset    — clear pending buffer
 
-More:
+Advanced options and configuration:
   dev-guard help advanced
 `);
 }
@@ -210,60 +204,105 @@ More:
 function printAdvancedHelp(): void {
   console.log(`dev-guard advanced
 
-Usage:
+Configuration file: .devguard/config.json
+  Edit to persist watch settings without CLI flags.
+
+  Watch section defaults:
+    {
+      "watch": {
+        "dashboard": true,
+        "autoComplete": true,
+        "autoCompleteDelay": 8,
+        "stableAfter": 20,
+        "poll": false,
+        "depth": 8,
+        "compact": false,
+        "includeLockfiles": false
+      }
+    }
+
+  Set individual values:
+    dev-guard config set watch.dashboard false
+    dev-guard config set watch.autoCompleteDelay 15
+    dev-guard config set watch.stableAfter 30
+    dev-guard config show
+
+Watch options (all have config file equivalents):
+  --manual | --no-auto       Disable auto-finalization; run done manually
+  --no-auto-complete         Disable auto-finalization only (hooks still fire)
+  --no-dashboard             Skip browser dashboard
+  --auto-complete-delay <s>  Grace period before auto-finalize (default: 8)
+  --stable-after <s>         Seconds of inactivity before "settled" (default: 20)
+  --depth <n>                Chokidar recursive depth (default: 8)
+  --poll                     Use filesystem polling instead of events
+  --include-lockfiles        Track lockfile changes
+  --compact | --ultra        Suppress per-event console output
+
+Hooks (agent Stop Hook strategies):
+  dev-guard install-hooks [--force] [--agent <claude|codex|codex-notify|all>] [--install-dispatcher]
+  dev-guard install-agent-instructions [--force]
+
+All commands:
   dev-guard init
   dev-guard "requirement"
   dev-guard done
   dev-guard handoff
-  dev-guard install-hooks [--force] [--agent <claude|codex|codex-notify|all>] [--install-dispatcher]
   dev-guard status
   dev-guard reset
   dev-guard check [--local] [--include-context-files]
   dev-guard configure ai --provider openai --model gpt-4o-mini
-  dev-guard config set <provider|model|temperature|maxTokens|reasoningEffort|baseURL> <value>
+  dev-guard config set <key> <value>
   dev-guard config show
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
-  dev-guard watch [--manual|--no-auto] [--no-auto-complete] [--auto-complete-delay <sec>] [--no-dashboard] [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
+  dev-guard watch [--manual|--no-auto] [--no-auto-complete] [--auto-complete-delay <s>]
+                  [--no-dashboard] [--stable-after <s>] [--depth <n>]
+                  [--poll] [--include-lockfiles] [--compact|--ultra]
   dev-guard dashboard [--port <port>] [--no-open]
   dev-guard doctor [--hooks] [--agents] [--dry-run]
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
-  dev-guard review [--heuristic] [--fix-prompt] [--copy] [--output <file>] [--copy-fix] [--include-context-files] [--staged] [--commit <ref>] [--run <id|latest>] [--no-run] [--task] [--from-diff]
-  dev-guard fix-prompt [--copy] [--output <file>] [--include-context-files] [--staged] [--commit <ref>] [--run <id|latest>] [--no-run]
+  dev-guard review [--heuristic] [--fix-prompt] [--copy] [--output <file>] [--copy-fix]
+                   [--include-context-files] [--staged] [--commit <ref>]
+                   [--run <id|latest>] [--no-run] [--task] [--from-diff]
+  dev-guard fix-prompt [--copy] [--output <file>] [--include-context-files]
+                       [--staged] [--commit <ref>] [--run <id|latest>] [--no-run]
   dev-guard update [--write] [--include-context-files]
-  dev-guard prompt [--compact] [--ultra-compact] [--density <ultra|compact|verbose>] [--max-prompt-tokens <n>] [--copy] [--output <file>] [--include-context-files] [--save-run]
+  dev-guard prompt [--compact] [--ultra-compact] [--density <ultra|compact|verbose>]
+                   [--max-prompt-tokens <n>] [--copy] [--output <file>]
+                   [--include-context-files] [--save-run]
   dev-guard infer-task [--write]
-  dev-guard task-ai "<requirement>" [--write] [--prompt] [--copy] [--save-run] [--context-files <n>] [--no-code-context] [--no-cache|--fresh] [--debug-context]
+  dev-guard task-ai "<requirement>" [--write] [--prompt] [--copy] [--save-run]
+                     [--context-files <n>] [--no-code-context] [--no-cache|--fresh] [--debug-context]
   dev-guard self "<requirement>" [--copy] [--check]
   dev-guard self-check
 
 Commands:
-  init   Create .devguard and docs guard files
-  "requirement" Generate task.md and a compact Codex prompt
-  done   Manual session finalization. Normally NOT required — watch auto-finalizes. Use only when watch crashed, hooks failed, or for debugging.
-  handoff Regenerate project-handoff.md and agent-context.md from current .devguard/ artifacts
-  install-hooks Install agent completion strategy scripts/config
-  install-agent-instructions Create or update AGENTS.md / CLAUDE.md with dev-guard context guidance
-  status Show pending watch state, recommended mode, and last processed task
-  reset  Clear watch runtime state without deleting project state
-  check  Analyze current git diff with rule-based checks
-  configure Configure dev-guard settings
-  scan   Cache project structure and file summaries into .devguard
-  refresh Incrementally update project memory cache
-  watch  Start DevGuard monitoring; auto-finalizes after filesystem settles (no manual done needed)
-  dashboard Reconnect to an existing dashboard session or inspect current watch state
-  doctor Print config/provider/git diagnostics, hook diagnostics with --hooks, and agent strategy diagnostics with --agents
-  telemetry Print privacy-safe drift telemetry summary
-  report Print a compact current-work summary for ChatGPT/Codex handoff
-  review AI-review current changes against task/rules/mistakes
-  fix-prompt Generate a Codex-ready fix prompt from AI review
-  update Generate project docs update candidates from current git diff
-  prompt Generate a Codex-ready task prompt from project context
-  infer-task Preview (or write) a task.md inferred from the current git diff
-  task-ai Generate .devguard/task.md from natural language with an AI provider
-  self   Dogfood dev-guard on this repo and print an ultra-compact Codex prompt
-  self-check Run build, local check, heuristic review, and doctor sequentially
+  init                    Create .devguard and docs guard files; generate default config
+  "requirement"           Generate task.md and a compact Codex prompt
+  done                    Manual recovery — normally watch auto-finalizes
+  handoff                 Regenerate project-handoff.md and agent-context.md
+  install-hooks           Install agent completion strategy scripts/config
+  install-agent-instructions  Create or update AGENTS.md / CLAUDE.md
+  status                  Show pending watch state, hook state, quality verdict
+  reset                   Clear watch runtime state without deleting project state
+  check                   Analyze current git diff with rule-based checks
+  configure / config      Configure dev-guard settings (AI provider, watch tuning)
+  scan                    Cache project structure and file summaries into .devguard
+  refresh                 Incrementally update project memory cache
+  watch                   Monitor AI coding session; auto-finalizes after changes settle
+  dashboard               Reconnect to dashboard or inspect current watch state
+  doctor                  Print config/provider/git/hook diagnostics
+  telemetry               Print privacy-safe drift telemetry summary
+  report                  Print compact current-work summary for ChatGPT/Codex handoff
+  review                  AI-review current changes against task/rules/mistakes
+  fix-prompt              Generate a Codex-ready fix prompt from AI review
+  update                  Generate project docs update candidates from current git diff
+  prompt                  Generate a Codex-ready task prompt from project context
+  infer-task              Preview (or write) a task.md inferred from the current git diff
+  task-ai                 Generate .devguard/task.md from natural language
+  self                    Dogfood dev-guard on this repo
+  self-check              Run build, check, heuristic review, and doctor
 `);
 }
 

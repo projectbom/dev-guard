@@ -9,16 +9,29 @@ import {
   taskTemplate
 } from "@dev-guard/core";
 import { fromRoot, writeFileIfMissing } from "./fs.js";
+import { defaultWatchConfig } from "./config.js";
 
 interface InitFile {
   path: string;
   content: string;
 }
 
+// Config template with watch defaults included so first-time users get a
+// fully configured file without having to know any CLI flags.
+const fullConfigTemplate = {
+  ...configTemplate,
+  watch: {
+    dashboard: defaultWatchConfig.dashboard,
+    autoComplete: defaultWatchConfig.autoComplete,
+    autoCompleteDelay: defaultWatchConfig.autoCompleteDelay,
+    stableAfter: defaultWatchConfig.stableAfter
+  }
+};
+
 const initFiles: InitFile[] = [
   {
     path: ".devguard/config.json",
-    content: `${JSON.stringify(configTemplate, null, 2)}\n`
+    content: `${JSON.stringify(fullConfigTemplate, null, 2)}\n`
   },
   {
     path: ".devguard/task.md",
@@ -64,6 +77,6 @@ export async function runInit(root: string): Promise<void> {
     console.log(`- ${label}: ${result.path}`);
   }
   console.log("- write policy: existing files are preserved; missing files are created only");
-  console.log("- next: run dev-guard install-agent-instructions");
-  console.log("- then: run dev-guard install-hooks, or use dev-guard watch --manual and dev-guard done");
+  console.log("- next: run dev-guard watch");
+  console.log("- tip: run dev-guard install-agent-instructions to add CLAUDE.md / AGENTS.md guidance");
 }
