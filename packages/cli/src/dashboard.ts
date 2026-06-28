@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { access, stat } from "node:fs/promises";
 import { fromRoot, readTextFile } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { readRuntimeState, type RuntimeState } from "./runtime-state.js";
+import { readProjectState, readRuntimeState, type RuntimeState } from "./runtime-state.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
@@ -19,9 +19,6 @@ export interface DashboardServerHandle {
 
 interface DashboardState {
   status: string;
-  stage: string;
-  waitingFor: string;
-  next: string;
   watchingSince: string;
   elapsed: string;
   lastActivity: string;
@@ -33,6 +30,8 @@ interface DashboardState {
   initialized: boolean;
   empty: boolean;
   message?: string;
+  qualityVerdict?: string;
+  lastProcessedAt?: string;
   reports: {
     handoffExists: boolean;
     qualityReportExists: boolean;
@@ -130,10 +129,11 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
 
 async function getDashboardState(root: string): Promise<DashboardState> {
   const initialized = await isDevGuardInitialized(root);
-  const [runtime, strategyReport, reports] = await Promise.all([
+  const [runtime, strategyReport, reports, projectState] = await Promise.all([
     readRuntimeState(root),
     getAgentStrategyReport(root),
-    readReportState(root)
+    readReportState(root),
+    readProjectState(root)
   ]);
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoMode = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
@@ -148,12 +148,9 @@ async function getDashboardState(root: string): Promise<DashboardState> {
 
   return {
     status: normalizeStatus(dashboard.status),
-    stage: dashboard.stage,
-    waitingFor: initialized ? (watchRunning ? dashboard.waitingFor : "dev-guard watch") : "dev-guard init",
-    next: initialized ? (watchRunning ? dashboard.next : "Run dev-guard watch") : "Run dev-guard init",
-    watchingSince: runtime.watchStartedAt ? formatTime(runtime.watchStartedAt) : "unknown",
-    elapsed: runtime.watchStartedAt ? formatDurationSince(runtime.watchStartedAt) : "unknown",
-    lastActivity: runtime.lastActivityAt ? formatDurationSince(runtime.lastActivityAt) : "none",
+    watchingSince: runtime.watchStartedAt ? formatTime(runtime.watchStartedAt) : "",
+    elapsed: runtime.watchStartedAt ? formatDurationSince(runtime.watchStartedAt) : "",
+    lastActivity: runtime.lastActivityAt ? formatDurationSince(runtime.lastActivityAt) : "",
     idleCountdown: normalizeStatus(dashboard.status) === "working" && runtime.lastStatus !== "finalizing" ? formatCountdown(runtime.idleDeadlineAt) : null,
     changeCount: runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length,
     recentFiles,
@@ -162,6 +159,8 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     initialized,
     empty,
     message: initialized ? (watchRunning ? undefined : "Watch is not running.") : "DevGuard is not initialized.",
+    qualityVerdict: projectState.lastQualityVerdict ?? undefined,
+    lastProcessedAt: projectState.lastProcessedAt ?? undefined,
     reports
   };
 }
@@ -217,7 +216,7 @@ function recentChangedFiles(runtime: RuntimeState): string[] {
   const files = new Set<string>();
   if (runtime.lastChangedFile) files.add(runtime.lastChangedFile);
   for (const file of runtime.pendingChangedFiles) files.add(file);
-  return [...files].slice(0, 3);
+  return [...files].slice(0, 5);
 }
 
 function normalizeStatus(status: string): string {
@@ -229,12 +228,12 @@ function normalizeStatus(status: string): string {
 
 function formatTime(timestamp: string): string {
   const date = new Date(timestamp);
-  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }) : "unknown";
+  return Number.isFinite(date.getTime()) ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false }) : "";
 }
 
 function formatDurationSince(timestamp: string): string {
   const started = Date.parse(timestamp);
-  if (!Number.isFinite(started)) return "unknown";
+  if (!Number.isFinite(started)) return "";
   const seconds = Math.max(0, Math.round((Date.now() - started) / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
@@ -310,208 +309,381 @@ function renderPage(): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>DevGuard Dashboard</title>
+  <title>DevGuard</title>
   <style>
-    :root { color-scheme: light; --bg:#f7f8fa; --panel:#ffffff; --ink:#17191f; --muted:#636a75; --soft:#f1f3f5; --line:#dfe3e8; --accent:#2563eb; --ok:#11843b; --warn:#a05a00; --done:#6842c2; }
-    * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    main { max-width:1060px; margin:0 auto; padding:24px; }
-    header { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:16px; }
-    h1 { margin:0; font-size:25px; line-height:1.1; letter-spacing:0; }
-    h2 { margin:0 0 10px; font-size:15px; line-height:1.2; }
-    h3 { margin:0 0 5px; font-size:12px; color:var(--muted); font-weight:700; }
-    p { margin:0; }
-    .subtle { color:var(--muted); }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; }
-    .topbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
-    .toggle { display:inline-flex; gap:2px; padding:2px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
-    .toggle button { border:0; background:transparent; color:var(--muted); border-radius:6px; padding:5px 8px; font:inherit; cursor:pointer; }
-    .toggle button.active { background:var(--ink); color:#fff; }
-    .layout { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(280px, .65fr); gap:14px; align-items:start; }
-    .stack { display:grid; gap:14px; }
-    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
-    .summary { padding:20px; }
-    .summaryHead { display:flex; align-items:center; gap:11px; margin-bottom:10px; }
-    .icon { width:34px; height:34px; display:grid; place-items:center; border-radius:999px; background:var(--soft); font-size:18px; }
-    .summaryTitle { font-size:22px; font-weight:760; line-height:1.2; }
-    .summaryBody { color:var(--muted); max-width:720px; font-size:15px; }
-    .summary.idle .icon { background:#dcfce7; }
-    .summary.working .icon { background:#fff1d6; }
-    .summary.ready_for_done .icon { background:#dbeafe; }
-    .summary.processed .icon { background:#ede9fe; }
-    .facts { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; margin-top:16px; }
-    .fact { background:var(--soft); border:1px solid #e8ebef; border-radius:7px; padding:12px; min-height:82px; }
-    .fact strong { display:block; font-size:13px; margin-bottom:4px; }
-    .fact div { color:var(--muted); }
-    .timeline { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
-    .metric { border-top:1px solid var(--line); padding-top:10px; }
-    .metricValue { font-weight:720; font-size:16px; overflow-wrap:anywhere; }
-    .fileList { list-style:none; padding:0; margin:10px 0 0; display:grid; gap:7px; }
-    .fileList li { background:var(--soft); border:1px solid #e8ebef; border-radius:7px; padding:8px 10px; overflow-wrap:anywhere; }
-    .emptyState { border:1px dashed var(--line); background:#fbfcfd; border-radius:7px; padding:14px; color:var(--muted); }
-    .reportGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
-    .report { border:1px solid var(--line); border-radius:7px; padding:12px; min-height:150px; }
-    .reportTitle { font-size:15px; font-weight:740; margin-bottom:8px; }
-    .meta { display:grid; gap:5px; color:var(--muted); font-size:13px; }
-    .badge { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid var(--line); border-radius:999px; padding:2px 8px; color:var(--ink); background:#fff; font-size:12px; }
-    details { border-top:1px solid var(--line); padding-top:10px; margin-top:10px; }
-    summary { cursor:pointer; font-weight:700; }
-    pre { max-height:220px; overflow:auto; white-space:pre-wrap; background:var(--soft); border-radius:6px; padding:10px; font-size:12px; }
-    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    @media (max-width: 860px) { main { padding:16px; } header { display:block; } .topbar { justify-content:flex-start; margin-top:12px; } .layout, .facts, .timeline, .reportGrid { grid-template-columns:1fr; } }
+    /* ── Tokens ── */
+    :root {
+      color-scheme: light;
+      --bg: #f5f6f8;
+      --surface: #ffffff;
+      --surface2: #f8f9fb;
+      --ink: #111318;
+      --ink2: #424751;
+      --muted: #6b7280;
+      --line: #e4e7ec;
+      --line2: #d1d5db;
+      --accent: #2563eb;
+      --accent-bg: #eff6ff;
+      --ok: #16a34a;
+      --ok-bg: #f0fdf4;
+      --ok-ring: #bbf7d0;
+      --warn: #d97706;
+      --warn-bg: #fffbeb;
+      --warn-ring: #fde68a;
+      --bad: #dc2626;
+      --bad-bg: #fef2f2;
+      --bad-ring: #fecaca;
+      --purple: #7c3aed;
+      --purple-bg: #f5f3ff;
+      --purple-ring: #ddd6fe;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --radius: 10px;
+      --radius-sm: 6px;
+    }
+
+    /* ── Reset ── */
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
+    h1, h2, h3, p { margin: 0; }
+    ul { margin: 0; padding: 0; list-style: none; }
+
+    /* ── Layout ── */
+    .page { max-width: 1040px; margin: 0 auto; padding: 24px 20px 48px; }
+
+    /* ── Top bar ── */
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand-name { font-size: 17px; font-weight: 700; letter-spacing: -.3px; }
+    .brand-sub { font-size: 12px; color: var(--muted); }
+    .topbar-right { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .lang-toggle { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--line2); border-radius: 8px; background: var(--surface); }
+    .lang-toggle button { border: 0; background: transparent; color: var(--muted); border-radius: 6px; padding: 4px 10px; font: 12px/1 var(--sans); font-weight: 600; cursor: pointer; transition: background .12s, color .12s; }
+    .lang-toggle button.active { background: var(--ink); color: #fff; }
+    .lang-toggle button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+    .timestamp { font: 11px/1 var(--mono); color: var(--muted); }
+
+    /* ── Status banner ── */
+    .status-banner { border-radius: var(--radius); padding: 20px 22px; margin-bottom: 16px; border: 1px solid transparent; display: flex; align-items: flex-start; gap: 14px; }
+    .status-banner.idle { background: var(--ok-bg); border-color: var(--ok-ring); }
+    .status-banner.working { background: var(--warn-bg); border-color: var(--warn-ring); }
+    .status-banner.finalizing,
+    .status-banner.ready_for_done { background: var(--accent-bg); border-color: #bfdbfe; }
+    .status-banner.processed { background: var(--purple-bg); border-color: var(--purple-ring); }
+    .status-banner.offline { background: var(--surface); border-color: var(--line2); }
+    .status-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
+    .status-text { flex: 1; min-width: 0; }
+    .status-title { font-size: 18px; font-weight: 700; line-height: 1.25; letter-spacing: -.2px; }
+    .status-body { color: var(--ink2); margin-top: 3px; font-size: 14px; }
+    .status-cmd { display: inline-block; margin-top: 8px; font: 13px/1.4 var(--mono); background: rgba(0,0,0,.06); border-radius: 5px; padding: 4px 9px; color: var(--ink); }
+
+    /* ── Card grid ── */
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .grid.wide { grid-template-columns: 1.5fr 1fr; }
+
+    /* ── Card ── */
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; }
+    .card-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 12px; }
+
+    /* ── Activity card ── */
+    .activity-what { font-size: 15px; font-weight: 600; color: var(--ink); margin-bottom: 14px; }
+    .activity-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
+    .activity-label { color: var(--muted); }
+    .activity-value { font-weight: 600; text-align: right; }
+
+    /* ── Recent changes card ── */
+    .file-list { display: grid; gap: 6px; margin-bottom: 8px; }
+    .file-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--surface2); border: 1px solid var(--line); border-radius: var(--radius-sm); min-width: 0; }
+    .file-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
+    .file-text { min-width: 0; flex: 1; }
+    .file-name { font: 13px/1.2 var(--mono); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-path { font: 11px/1.2 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-more { font-size: 12px; color: var(--muted); padding: 4px 0; }
+    .no-files { padding: 16px; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; border: 1px dashed var(--line2); border-radius: var(--radius-sm); }
+    .no-files strong { display: block; color: var(--ink2); font-size: 13px; margin-bottom: 2px; }
+
+    /* ── Health card ── */
+    .health-list { display: grid; gap: 8px; }
+    .health-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 12px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--surface2); }
+    .health-label { font-size: 13px; color: var(--ink2); font-weight: 500; }
+    .health-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 99px; }
+    .health-badge.good { color: var(--ok); background: var(--ok-bg); }
+    .health-badge.warn { color: var(--warn); background: var(--warn-bg); }
+    .health-badge.missing { color: var(--muted); background: var(--surface2); }
+
+    /* ── Next action card ── */
+    .next-body { font-size: 15px; color: var(--ink); line-height: 1.5; font-weight: 500; }
+
+    /* ── Advanced details ── */
+    .advanced-wrap { margin-top: 12px; }
+    details { border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    summary { display: flex; align-items: center; gap: 8px; padding: 13px 18px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); cursor: pointer; user-select: none; background: var(--surface); }
+    summary::-webkit-details-marker { display: none; }
+    summary::before { content: '▶'; font-size: 9px; transition: transform .15s; }
+    details[open] summary::before { transform: rotate(90deg); }
+    summary:hover { background: var(--surface2); }
+    .details-body { padding: 0 18px 18px; background: var(--surface); }
+    .details-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
+    .detail-item { padding: 10px 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+    .detail-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
+    .detail-value { font: 13px/1.3 var(--mono); color: var(--ink); word-break: break-all; }
+    .report-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .report-card { border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 12px; }
+    .report-name { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+    .report-meta { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
+    .report-preview { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
+    .report-preview summary { font-size: 11px; padding: 4px 0; background: transparent; text-transform: none; letter-spacing: 0; font-weight: 600; color: var(--muted); }
+    .report-preview summary:hover { background: transparent; }
+    .report-preview details { border: none; border-radius: 0; overflow: visible; }
+    pre { max-height: 200px; overflow: auto; white-space: pre-wrap; background: var(--surface2); border-radius: var(--radius-sm); padding: 10px; font: 11px/1.5 var(--mono); color: var(--ink2); margin: 8px 0 0; }
+
+    /* ── Error state ── */
+    .error-state { padding: 32px; text-align: center; }
+    .error-title { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+    .error-msg { color: var(--muted); font-size: 13px; }
+
+    /* ── Responsive ── */
+    @media (max-width: 700px) {
+      .page { padding: 16px 14px 40px; }
+      .grid, .grid.wide, .details-grid, .report-grid { grid-template-columns: 1fr; }
+      .status-title { font-size: 16px; }
+    }
   </style>
 </head>
 <body>
-  <main>
-    <header>
-      <div><h1>DevGuard</h1><div class="subtle" id="subtitle"></div></div>
-      <div class="topbar">
-        <div class="toggle" role="group" id="languageToggle">
-          <button type="button" data-lang="en">EN</button>
-          <button type="button" data-lang="ko">KO</button>
-        </div>
-        <div class="subtle mono" id="updated"></div>
+<div class="page">
+  <div class="topbar">
+    <div class="brand">
+      <div>
+        <div class="brand-name">DevGuard</div>
+        <div class="brand-sub" id="brand-sub"></div>
       </div>
-    </header>
-    <div id="app" class="emptyState"></div>
-  </main>
-  <script>
-    const STRINGS = ${translationsJson};
-    const app = document.getElementById('app');
-    const updated = document.getElementById('updated');
-    const subtitle = document.getElementById('subtitle');
-    const languageToggle = document.getElementById('languageToggle');
-    const langButtons = [...document.querySelectorAll('[data-lang]')];
-    let currentLanguage = initialLanguage();
-    const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+    </div>
+    <div class="topbar-right">
+      <div class="lang-toggle" role="group" id="langToggle" aria-label="Language">
+        <button type="button" data-lang="en">EN</button>
+        <button type="button" data-lang="ko">KO</button>
+      </div>
+      <div class="timestamp" id="ts"></div>
+    </div>
+  </div>
 
-    function initialLanguage() {
-      const saved = localStorage.getItem('devguard.dashboard.language');
-      if (saved && STRINGS[saved]) return saved;
-      const browserLanguages = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
-      return browserLanguages.some(lang => String(lang).toLowerCase().startsWith('ko')) ? 'ko' : 'en';
-    }
+  <div id="root"></div>
+</div>
 
-    function t(key) {
-      return STRINGS[currentLanguage][key] || STRINGS.en[key] || key;
-    }
+<script>
+const STRINGS = ${translationsJson};
+const root = document.getElementById('root');
+const ts = document.getElementById('ts');
+const brandSub = document.getElementById('brand-sub');
+const langToggle = document.getElementById('langToggle');
+const langBtns = [...document.querySelectorAll('[data-lang]')];
+let lang = initLang();
+let last = null;
 
-    function setLanguage(lang) {
-      if (!STRINGS[lang]) return;
-      currentLanguage = lang;
-      localStorage.setItem('devguard.dashboard.language', lang);
-      document.documentElement.lang = lang;
-      languageToggle.setAttribute('aria-label', t('language'));
-      langButtons.forEach(button => button.classList.toggle('active', button.dataset.lang === lang));
-      subtitle.textContent = t('appSubtitle');
-      if (!lastState) app.textContent = t('loading');
-      if (lastState) render(lastState);
-    }
+function initLang() {
+  const saved = localStorage.getItem('dg.lang');
+  if (saved && STRINGS[saved]) return saved;
+  const langs = navigator.languages?.length ? navigator.languages : [navigator.language];
+  return langs.some(l => String(l).toLowerCase().startsWith('ko')) ? 'ko' : 'en';
+}
 
-    langButtons.forEach(button => button.addEventListener('click', () => setLanguage(button.dataset.lang)));
+function t(k) { return STRINGS[lang][k] || STRINGS.en[k] || k; }
 
-    function statusView(s) {
-      if (!s.initialized) return { icon:'⚙️', className:'idle', title:t('notInitializedTitle'), body:t('notInitializedBody'), activity:t('activityInit'), next:t('nextInit'), action:'dev-guard init' };
-      if (!s.watchRunning) return { icon:'⏸', className:'idle', title:t('watchNotRunningTitle'), body:t('watchNotRunningBody'), activity:t('activityStartWatch'), next:t('nextStartWatch'), action:'dev-guard watch' };
-      if (s.status === 'working') return { icon:'🟡', className:'working', title:t('statusWorkingTitle'), body:t('statusWorkingBody'), activity:t('activitySettling'), next:t('nextSettling') };
-      if (s.status === 'ready_for_done') return { icon:'⚙️', className:'processed', title:t('statusReadyTitle'), body:t('statusReadyBody'), activity:t('activityAiCompletion'), next:t('nextAiCompletion') };
-      if (s.status === 'finalizing') return { icon:'⚙️', className:'processed', title:t('statusFinalizingTitle'), body:t('statusFinalizingBody'), activity:t('activityFinalizing'), next:t('nextFinalizing') };
-      if (s.status === 'processed') return { icon:'🟣', className:'processed', title:t('statusProcessedTitle'), body:t('statusProcessedBody'), activity:t('activityProcessed'), next:t('nextProcessed') };
-      return { icon:'🟢', className:'idle', title:t('statusMonitoringTitle'), body:t('statusMonitoringBody'), activity:t('activityMonitoring'), next:t('nextMonitoring') };
-    }
+function setLang(l) {
+  if (!STRINGS[l]) return;
+  lang = l;
+  localStorage.setItem('dg.lang', l);
+  document.documentElement.lang = l;
+  langBtns.forEach(b => b.classList.toggle('active', b.dataset.lang === l));
+  brandSub.textContent = t('appSubtitle');
+  if (last) render(last); else root.textContent = t('loading');
+}
+langBtns.forEach(b => b.addEventListener('click', () => setLang(b.dataset.lang)));
 
-    function activityTime(value) {
-      if (!value || value === 'none') return t('never');
-      return currentLanguage === 'ko' ? value + ' 전' : value + ' ago';
-    }
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
 
-    function plainValue(value) {
-      if (!value || value === 'unknown') return t('unknown');
-      return value;
-    }
+/* ── Status view ── */
+function statusView(s) {
+  if (!s.initialized) return {
+    icon: '⚙️', cls: 'offline',
+    title: t('notInitializedTitle'), body: t('notInitializedBody'),
+    cmd: 'dev-guard init',
+    activity: t('activityInit'), next: t('nextInit')
+  };
+  if (!s.watchRunning) return {
+    icon: '⏸', cls: 'offline',
+    title: t('watchNotRunningTitle'), body: t('watchNotRunningBody'),
+    cmd: 'dev-guard watch',
+    activity: t('activityStartWatch'), next: t('nextStartWatch')
+  };
+  const m = {
+    working:       { icon: '🟡', cls: 'working',     title: t('statusWorkingTitle'),    body: t('statusWorkingBody'),    activity: t('activitySettling'),    next: t('nextSettling') },
+    ready_for_done:{ icon: '🔵', cls: 'ready_for_done',title: t('statusReadyTitle'),    body: t('statusReadyBody'),      activity: t('activityAiCompletion'),next: t('nextAiCompletion') },
+    finalizing:    { icon: '🔵', cls: 'finalizing',  title: t('statusFinalizingTitle'), body: t('statusFinalizingBody'), activity: t('activityFinalizing'),  next: t('nextFinalizing') },
+    processed:     { icon: '🟣', cls: 'processed',   title: t('statusProcessedTitle'),  body: t('statusProcessedBody'),  activity: t('activityProcessed'),   next: t('nextProcessed') }
+  };
+  return m[s.status] ?? { icon: '🟢', cls: 'idle', title: t('statusMonitoringTitle'), body: t('statusMonitoringBody'), activity: t('activityMonitoring'), next: t('nextMonitoring') };
+}
 
-    function formatUpdatedAt(value) {
-      if (!value) return t('notCreated');
-      const date = new Date(value);
-      if (Number.isNaN(date.getTime())) return t('unknown');
-      return date.toLocaleString(currentLanguage === 'ko' ? 'ko-KR' : 'en-US', { dateStyle:'medium', timeStyle:'short' });
-    }
+/* ── Time helpers ── */
+function ago(v) {
+  if (!v) return t('never');
+  return lang === 'ko' ? v + ' 전' : v + ' ago';
+}
+function dash(v) { return v || t('unknown'); }
 
-    function reportBlock(title, exists, updatedAt, preview) {
-      return '<div class="report"><div class="reportTitle">' + esc(title) + '</div>' +
-        '<div class="meta">' +
-        '<div><strong>' + esc(t('availability')) + ':</strong> <span class="badge">' + esc(exists ? t('ready') : t('notCreated')) + '</span></div>' +
-        '<div><strong>' + esc(t('lastUpdated')) + ':</strong> ' + esc(formatUpdatedAt(updatedAt)) + '</div>' +
-        '</div>' +
-        (exists && preview ? '<details><summary>' + esc(t('preview')) + '</summary><pre>' + esc(preview) + '</pre></details>' : '') +
-        '</div>';
-    }
+/* ── File helpers ── */
+function basename(p) { return p.split('/').pop() || p; }
+function dirname(p) {
+  const parts = p.split('/');
+  return parts.length > 1 ? parts.slice(0, -1).join('/') + '/' : '';
+}
 
-    function recentFiles(s) {
-      if (!s.recentFiles.length) {
-        return '<div class="emptyState"><strong>' + esc(t('noRecentFilesTitle')) + '</strong><p>' + esc(t('noRecentFilesBody')) + '</p></div>';
-      }
-      return '<ul class="fileList">' + s.recentFiles.map(f => '<li class="mono">' + esc(f) + '</li>').join('') + '</ul>' +
-        (s.moreFileCount > 0 ? '<p class="subtle">+' + esc(s.moreFileCount) + ' ' + esc(t('moreFiles')) + '</p>' : '');
-    }
+/* ── Health helpers ── */
+function qualityHealth(verdict) {
+  if (!verdict) return { cls: 'missing', icon: '○', label: t('healthUnknown') };
+  if (verdict === 'PASS') return { cls: 'good', icon: '✓', label: t('healthGood') };
+  return { cls: 'warn', icon: '!', label: t('healthWarning') };
+}
+function boolHealth(exists) {
+  return exists
+    ? { cls: 'good', icon: '✓', label: t('healthGood') }
+    : { cls: 'missing', icon: '○', label: t('healthMissing') };
+}
+function reportsHealth(s) {
+  if (!s.reports.handoffExists && !s.reports.qualityReportExists) return { cls: 'missing', icon: '○', label: t('reportsNeverUpdated') };
+  const ts = s.reports.qualityReportUpdatedAt || s.reports.handoffUpdatedAt;
+  if (!ts) return { cls: 'good', icon: '✓', label: t('healthGood') };
+  const date = new Date(ts);
+  const label = t('reportsUpdated') + ' ' + (Number.isNaN(date.getTime()) ? '' : date.toLocaleTimeString(lang === 'ko' ? 'ko-KR' : 'en-US', { hour: '2-digit', minute: '2-digit', hour12: false }));
+  return { cls: 'good', icon: '✓', label };
+}
+function healthBadge(h) {
+  return '<span class="health-badge ' + h.cls + '">' + esc(h.icon) + ' ' + esc(h.label) + '</span>';
+}
 
-    let lastState;
-    function render(s) {
-      lastState = s;
-      const view = statusView(s);
-      app.className = '';
-      app.innerHTML = \`
-        <div class="layout">
-          <div class="stack">
-            <section class="summary \${esc(view.className)}">
-              <h2>\${esc(t('currentStatus'))}</h2>
-              <div class="summaryHead"><span class="icon" aria-hidden="true">\${view.icon}</span><div class="summaryTitle">\${esc(view.title)}</div></div>
-              <p class="summaryBody">\${esc(view.body)}</p>
-              \${view.action ? '<pre>' + esc(view.action) + '</pre>' : ''}
-              <div class="facts">
-                <div class="fact"><strong>\${esc(t('currentActivity'))}</strong><div>\${esc(view.activity)}</div></div>
-                <div class="fact"><strong>\${esc(t('whatHappensNext'))}</strong><div>\${esc(view.next)}</div></div>
-                <div class="fact"><strong>\${esc(t('idleCountdown'))}</strong><div>\${esc(s.idleCountdown || t('noCountdown'))}</div></div>
-              </div>
-            </section>
-            <section>
-              <h2>\${esc(t('recentFiles'))}</h2>
-              <p class="subtle">\${esc(t('changesTracked'))}: \${esc(s.changeCount)}</p>
-              \${recentFiles(s)}
-            </section>
-            <section>
-              <h2>\${esc(t('projectInformation'))}</h2>
-              <div class="reportGrid">
-                \${reportBlock(t('nextSession'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview)}
-                \${reportBlock(t('projectHealth'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview)}
-                \${reportBlock(t('projectContext'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview)}
-              </div>
-            </section>
-          </div>
-          <section>
-            <h2>\${esc(t('timeline'))}</h2>
-            <div class="timeline">
-              <div class="metric"><h3>\${esc(t('monitoringStarted'))}</h3><div class="metricValue">\${esc(plainValue(s.watchingSince))}</div></div>
-              <div class="metric"><h3>\${esc(t('sessionDuration'))}</h3><div class="metricValue">\${esc(plainValue(s.elapsed))}</div></div>
-              <div class="metric"><h3>\${esc(t('lastFileChange'))}</h3><div class="metricValue">\${esc(activityTime(s.lastActivity))}</div></div>
-            </div>
-          </section>
-        </div>\`;
-    }
-    async function tick() {
-      try {
-        const res = await fetch('/api/state', { cache: 'no-store' });
-        render(await res.json());
-        updated.textContent = t('dashboardUpdated') + ' ' + new Date().toLocaleTimeString();
-      } catch (error) {
-        app.className = 'emptyState';
-        app.innerHTML = '<h2>' + esc(t('dashboardUnavailableTitle')) + '</h2><p>' + esc(error.message) + '</p>';
-      }
-    }
-    setLanguage(currentLanguage);
-    tick();
-    setInterval(tick, 1000);
-  </script>
+/* ── Report block (advanced) ── */
+function reportBlock(name, exists, updatedAt, preview) {
+  const dateStr = updatedAt ? new Date(updatedAt).toLocaleString(lang === 'ko' ? 'ko-KR' : 'en-US', { dateStyle: 'short', timeStyle: 'short' }) : t('notCreated');
+  return '<div class="report-card">' +
+    '<div class="report-name">' + esc(name) + '</div>' +
+    '<div class="report-meta">' +
+    '<div>' + esc(t('availability')) + ': ' + esc(exists ? t('ready') : t('notCreated')) + '</div>' +
+    '<div>' + esc(t('lastUpdated')) + ': ' + esc(dateStr) + '</div>' +
+    '</div>' +
+    (exists && preview
+      ? '<details class="report-preview"><summary>' + esc(t('preview')) + '</summary><pre>' + esc(preview) + '</pre></details>'
+      : '') +
+    '</div>';
+}
+
+/* ── Main render ── */
+function render(s) {
+  last = s;
+  const v = statusView(s);
+
+  /* Status banner */
+  const banner = '<div class="status-banner ' + esc(v.cls) + '">' +
+    '<div class="status-icon" aria-hidden="true">' + v.icon + '</div>' +
+    '<div class="status-text">' +
+    '<div class="status-title">' + esc(v.title) + '</div>' +
+    '<div class="status-body">' + esc(v.body) + '</div>' +
+    (v.cmd ? '<code class="status-cmd">' + esc(v.cmd) + '</code>' : '') +
+    '</div></div>';
+
+  /* Activity card */
+  const activityRows = [
+    s.watchingSince ? '<div class="activity-row"><span class="activity-label">' + esc(t('sessionStarted')) + '</span><span class="activity-value">' + esc(s.watchingSince) + '</span></div>' : '',
+    s.lastActivity  ? '<div class="activity-row"><span class="activity-label">' + esc(t('lastChange')) + '</span><span class="activity-value">' + esc(ago(s.lastActivity)) + '</span></div>' : '',
+    s.changeCount > 0 ? '<div class="activity-row"><span class="activity-label">' + esc(t('changesCount')) + '</span><span class="activity-value">' + esc(s.changeCount) + '</span></div>' : ''
+  ].filter(Boolean).join('');
+  const activityCard = '<div class="card">' +
+    '<div class="card-title">' + esc(t('currentActivityTitle')) + '</div>' +
+    '<div class="activity-what">' + esc(v.activity) + '</div>' +
+    activityRows +
+    '</div>';
+
+  /* Recent changes card */
+  let filesHtml;
+  if (!s.recentFiles.length) {
+    filesHtml = '<div class="no-files"><strong>' + esc(t('noRecentFilesTitle')) + '</strong>' + esc(t('noRecentFilesBody')) + '</div>';
+  } else {
+    filesHtml = '<div class="file-list">' +
+      s.recentFiles.map(f => {
+        const name = basename(f);
+        const dir = dirname(f);
+        return '<div class="file-item">' +
+          '<div class="file-dot"></div>' +
+          '<div class="file-text">' +
+          '<div class="file-name">' + esc(name) + '</div>' +
+          (dir ? '<div class="file-path">' + esc(dir) + '</div>' : '') +
+          '</div></div>';
+      }).join('') +
+      '</div>' +
+      (s.moreFileCount > 0 ? '<div class="file-more">+' + esc(s.moreFileCount) + ' ' + esc(t('moreFiles')) + '</div>' : '');
+  }
+  const filesCard = '<div class="card">' +
+    '<div class="card-title">' + esc(t('recentChangesTitle')) + '</div>' +
+    filesHtml +
+    '</div>';
+
+  /* Health card */
+  const qh = qualityHealth(s.qualityVerdict);
+  const ch = boolHealth(s.reports.agentContextExists);
+  const rh = reportsHealth(s);
+  const healthCard = '<div class="card">' +
+    '<div class="card-title">' + esc(t('healthTitle')) + '</div>' +
+    '<div class="health-list">' +
+    '<div class="health-row"><span class="health-label">' + esc(t('healthQuality')) + '</span>' + healthBadge(qh) + '</div>' +
+    '<div class="health-row"><span class="health-label">' + esc(t('healthContext')) + '</span>' + healthBadge(ch) + '</div>' +
+    '<div class="health-row"><span class="health-label">' + esc(t('healthReports')) + '</span>' + healthBadge(rh) + '</div>' +
+    '</div></div>';
+
+  /* Next action card */
+  const nextCard = '<div class="card">' +
+    '<div class="card-title">' + esc(t('nextActionTitle')) + '</div>' +
+    '<div class="next-body">' + esc(v.next) + '</div>' +
+    '</div>';
+
+  /* Advanced details */
+  const detailItems = [
+    { label: t('sessionDuration'), value: dash(s.elapsed) },
+    { label: t('internalStatus'), value: s.status || '—' },
+    { label: t('idleCountdown'), value: s.idleCountdown || t('noCountdown') }
+  ].map(d => '<div class="detail-item"><div class="detail-label">' + esc(d.label) + '</div><div class="detail-value">' + esc(d.value) + '</div></div>').join('');
+
+  const advanced = '<div class="advanced-wrap"><details>' +
+    '<summary>' + esc(t('advancedTitle')) + '</summary>' +
+    '<div class="details-body">' +
+    '<div class="details-grid">' + detailItems + '</div>' +
+    '<div class="report-grid">' +
+    reportBlock(t('reportHandoff'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
+    reportBlock(t('reportQuality'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
+    reportBlock(t('reportContext'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
+    '</div></div></details></div>';
+
+  root.innerHTML = banner +
+    '<div class="grid wide" style="margin-top:12px">' + activityCard + filesCard + '</div>' +
+    '<div class="grid" style="margin-top:12px">' + healthCard + nextCard + '</div>' +
+    advanced;
+}
+
+async function tick() {
+  try {
+    const res = await fetch('/api/state', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    render(await res.json());
+    ts.textContent = t('dashboardUpdated') + ' ' + new Date().toLocaleTimeString(lang === 'ko' ? 'ko-KR' : 'en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  } catch (e) {
+    root.innerHTML = '<div class="error-state"><div class="error-title">' + esc(t('dashboardUnavailableTitle')) + '</div><div class="error-msg">' + esc(e.message) + '</div></div>';
+  }
+}
+
+setLang(lang);
+tick();
+setInterval(tick, 1000);
+</script>
 </body>
 </html>`;
 }
