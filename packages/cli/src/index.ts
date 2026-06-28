@@ -189,7 +189,6 @@ Quick commands:
   dev-guard done
   dev-guard handoff
   dev-guard status
-  dev-guard dashboard [--port 3737] [--open]
   dev-guard reset
 
 Recommended Auto Mode:
@@ -229,8 +228,8 @@ Usage:
   dev-guard config show
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
-  dev-guard watch [--manual|--no-auto] [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
-  dev-guard dashboard [--port <port>] [--open]
+  dev-guard watch [--manual|--no-auto] [--no-dashboard] [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
+  dev-guard dashboard [--port <port>] [--no-open]
   dev-guard doctor [--hooks] [--agents] [--dry-run]
   dev-guard telemetry
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
@@ -256,8 +255,8 @@ Commands:
   configure Configure dev-guard settings
   scan   Cache project structure and file summaries into .devguard
   refresh Incrementally update project memory cache
-  watch  Recommended watcher; waits for a runtime-verified completion strategy, or manual done fallback
-  dashboard Start a local-only browser dashboard for watch/status state
+  watch  Start DevGuard monitoring and launch the local dashboard
+  dashboard Reconnect to an existing dashboard session or inspect current watch state
   doctor Print config/provider/git diagnostics, hook diagnostics with --hooks, and agent strategy diagnostics with --agents
   telemetry Print privacy-safe drift telemetry summary
   report Print a compact current-work summary for ChatGPT/Codex handoff

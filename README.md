@@ -125,7 +125,7 @@ Keep API keys out of git. Do not commit `.env`, `.devguard/config.json` with sec
    ```bash
    dev-guard watch
    ```
-   Watches project files, accumulates changed paths, and waits for a verified agent completion strategy. When the strategy fires, it runs `dev-guard done`, which writes quality-report, next-codex-prompt, and project-handoff.
+   Watches project files, launches the local dashboard, accumulates changed paths, and waits for a verified agent completion strategy. When the strategy fires, it runs `dev-guard done`, which writes quality-report, next-codex-prompt, and project-handoff.
    `watch` does not run `done` itself. If an agent hook/notify or a manual `done` runs in another process, `watch` refreshes from `.devguard/runtime.json`, `.devguard/state.json`, and `.devguard/history.jsonl` and returns to processed/idle state.
 
 4. Manual fallback when hooks are unavailable
@@ -161,7 +161,7 @@ Run `watch` at the start of an AI coding session when you want continuous DevGua
 dev-guard watch
 ```
 
-Keep it running in a separate terminal while Codex/Claude edits files. `watch` observes file changes and keeps the pending file buffer current. It does not infer completion by idle time and does not run build/test/commit.
+Keep it running in a separate terminal while Codex/Claude edits files. `watch` starts the local dashboard automatically, observes file changes, and keeps the pending file buffer current. It does not infer completion by idle time and does not run build/test/commit.
 
 Completion is handled by a verified hook/notify strategy or by manual fallback:
 
@@ -174,18 +174,17 @@ After `done`, DevGuard writes quality and handoff artifacts such as `.devguard/r
 
 ## Local Dashboard
 
-Run the optional local dashboard when you want a browser view of the current watch/status state:
-
-```bash
-dev-guard watch
-dev-guard dashboard --open
-```
-
-The dashboard binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/state` once per second. It explains what DevGuard is doing now, why it is waiting, what happens next, recent file changes, and whether next-session, project-health, and project-context information is ready.
+The local dashboard starts automatically when `dev-guard watch` runs. It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/state` once per second. It explains what DevGuard is doing now, why it is waiting, what happens next, recent file changes, and whether next-session, project-health, and project-context information is ready.
 
 The UI follows the browser language automatically and includes an English/Korean language toggle.
 
 It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not initialized it shows `dev-guard init`; if `watch` is not running it shows `dev-guard watch`.
+
+Advanced terminal-only mode:
+
+```bash
+dev-guard watch --no-dashboard
+```
 
 ## Core Commands
 
@@ -198,8 +197,9 @@ dev-guard install-hooks --agent codex-notify
 dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
+dev-guard watch --no-dashboard
 dev-guard watch --manual
-dev-guard dashboard [--port 3737] [--open]
+dev-guard dashboard [--port 3737]
 dev-guard done
 dev-guard handoff
 dev-guard status

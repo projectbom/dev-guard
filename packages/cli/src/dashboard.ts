@@ -11,6 +11,12 @@ import { dashboardTranslations } from "./dashboard-i18n.js";
 const DEFAULT_PORT = 3737;
 const HOST = "127.0.0.1";
 
+export interface DashboardServerHandle {
+  url: string;
+  started: boolean;
+  close: () => Promise<void>;
+}
+
 interface DashboardState {
   status: string;
   stage: string;
@@ -42,31 +48,63 @@ interface DashboardState {
 
 export async function runDashboard(root: string, args: string[]): Promise<void> {
   const port = readPort(args);
-  const openBrowser = args.includes("--open");
-  const server = createServer((request, response) => {
-    void handleRequest(root, request, response);
-  });
-
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, HOST, resolve);
-  });
-
-  const url = `http://${HOST}:${port}`;
-  console.log("DevGuard dashboard running");
+  const shouldOpenBrowser = !args.includes("--no-open");
+  const dashboard = await startDashboardServer(root, { port });
+  console.log(dashboard.started ? "DevGuard dashboard running" : "DevGuard dashboard already running");
   console.log("");
   console.log("URL:");
-  console.log(url);
+  console.log(dashboard.url);
+
+  if (shouldOpenBrowser) {
+    const opened = await openDashboardBrowser(dashboard.url);
+    if (!opened) {
+      console.log("");
+      console.log("Dashboard");
+      console.log(dashboard.url);
+    }
+  }
+
+  if (!dashboard.started) {
+    return;
+  }
+
   console.log("");
   console.log("Press Ctrl+C to stop.");
 
-  if (openBrowser) {
-    tryOpenBrowser(url);
-  }
-
   process.on("SIGINT", () => {
-    server.close(() => process.exit(0));
+    void dashboard.close().finally(() => process.exit(0));
   });
+}
+
+export async function startDashboardServer(root: string, options: { port?: number } = {}): Promise<DashboardServerHandle> {
+  const port = options.port ?? DEFAULT_PORT;
+  const server = createServer((request, response) => {
+    void handleRequest(root, request, response);
+  });
+  const url = `http://${HOST}:${port}`;
+  const started = await new Promise<boolean>((resolve, reject) => {
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EADDRINUSE") {
+        resolve(false);
+        return;
+      }
+      reject(error);
+    });
+    server.listen(port, HOST, () => resolve(true));
+  });
+
+  return {
+    url,
+    started,
+    close: () =>
+      new Promise<void>((resolve) => {
+        if (!started) {
+          resolve();
+          return;
+        }
+        server.close(() => resolve());
+      })
+  };
 }
 
 async function handleRequest(root: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -224,10 +262,19 @@ function readPort(args: string[]): number {
   return port;
 }
 
-function tryOpenBrowser(url: string): void {
-  const child = spawn("open", [url], { detached: true, stdio: "ignore" });
-  child.on("error", () => undefined);
-  child.unref();
+export async function openDashboardBrowser(url: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const child = spawn("open", [url], { stdio: "ignore" });
+    let settled = false;
+    const finish = (opened: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(opened);
+    };
+    child.once("error", () => finish(false));
+    child.once("exit", (code) => finish(code === 0));
+    setTimeout(() => finish(true), 800).unref();
+  });
 }
 
 function sendJson(response: ServerResponse, data: unknown, statusCode = 200): void {

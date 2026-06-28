@@ -16,6 +16,7 @@ import { getHookStatus } from "./hooks.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard, formatWatchDashboardKey } from "./watch-format.js";
+import { openDashboardBrowser, startDashboardServer, type DashboardServerHandle } from "./dashboard.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done" | "processed";
 
@@ -26,6 +27,7 @@ interface WatchOptions {
   poll: boolean;
   includeLockfiles: boolean;
   manual: boolean;
+  dashboard: boolean;
 }
 
 const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", DEVGUARD_DIR];
@@ -41,32 +43,59 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoStrategyInstalled = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
   const autoMode = !options.manual && autoStrategyInstalled;
-  console.log("dev-guard watch");
-  console.log(`Mode: ${autoMode ? "Auto Mode" : "Manual Mode"}`);
-  console.log("Auto completion strategy:");
-  console.log(`Claude: Stop Hook ${strategyReport.claude.installed ? "installed" : "not installed"}; runtime verified: ${strategyReport.claude.runtimeVerified ? "yes" : "no"}`);
-  console.log(`Codex: Notify recommended (${strategyReport.codexNotify.installed ? "installed" : "not installed"}); Stop Hook ${codexHookInstalled ? "installed" : "not installed"}${strategyReport.codexStopHook.requiresUserTrust ? " but requires /hooks trust" : ""}`);
-  console.log(`Runtime verified: ${runtimeVerified ? "yes" : "no"}`);
-  console.log(`Fallback: dev-guard done`);
-  console.log(`Done trigger: ${autoMode ? "verified agent strategy when runtime calls it" : "manual dev-guard done"}`);
-  if (autoMode) {
-    console.log("");
-    console.log("Watching for file changes...");
-    console.log(runtimeVerified ? "When the verified agent completion strategy fires, dev-guard done will run automatically." : "Automatic completion is installed but runtime verification is still required.");
-  } else {
-    console.log("");
-    console.log("Watching for file changes...");
-    console.log("Tip:");
-    console.log(options.manual ? "Manual Mode enabled; run dev-guard done when the AI task is finished." : "Run dev-guard install-hooks to enable Auto Mode.");
-  }
-  console.log("");
-  console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
-  console.log(`excluded: ${excludedSummary}`);
-  console.log(`depth: ${options.depth}; poll: ${options.poll ? "on" : "off"}; lockfiles: ${options.includeLockfiles ? "included" : "excluded"}; manual: ${options.manual ? "on" : "off"}`);
-  console.log("mode: event-driven; no periodic refresh; no idle-time completion");
-  console.log("stop: Ctrl+C");
-
   await startWatchSession(root);
+  let dashboard: DashboardServerHandle | undefined;
+  if (options.dashboard) {
+    try {
+      dashboard = await startDashboardServer(root);
+    } catch (error) {
+      console.error(`dashboard warning: ${errorMessage(error)}`);
+    }
+  }
+
+  if (dashboard) {
+    console.log("DevGuard");
+    console.log("");
+    console.log("✓ Watching project");
+    console.log("");
+    console.log("Dashboard");
+    console.log(dashboard.url);
+    console.log("");
+    console.log("Monitoring AI coding session...");
+    console.log("");
+    console.log("Press Ctrl+C to stop.");
+    const opened = await openDashboardBrowser(dashboard.url);
+    if (!opened) {
+      console.log("");
+      console.log("Open this URL in your browser:");
+      console.log(dashboard.url);
+    }
+  } else {
+    console.log("dev-guard watch");
+    console.log(`Mode: ${autoMode ? "Auto Mode" : "Manual Mode"}`);
+    console.log("Auto completion strategy:");
+    console.log(`Claude: Stop Hook ${strategyReport.claude.installed ? "installed" : "not installed"}; runtime verified: ${strategyReport.claude.runtimeVerified ? "yes" : "no"}`);
+    console.log(`Codex: Notify recommended (${strategyReport.codexNotify.installed ? "installed" : "not installed"}); Stop Hook ${codexHookInstalled ? "installed" : "not installed"}${strategyReport.codexStopHook.requiresUserTrust ? " but requires /hooks trust" : ""}`);
+    console.log(`Runtime verified: ${runtimeVerified ? "yes" : "no"}`);
+    console.log(`Fallback: dev-guard done`);
+    console.log(`Done trigger: ${autoMode ? "verified agent strategy when runtime calls it" : "manual dev-guard done"}`);
+    if (autoMode) {
+      console.log("");
+      console.log("Watching for file changes...");
+      console.log(runtimeVerified ? "When the verified agent completion strategy fires, dev-guard done will run automatically." : "Automatic completion is installed but runtime verification is still required.");
+    } else {
+      console.log("");
+      console.log("Watching for file changes...");
+      console.log("Tip:");
+      console.log(options.manual ? "Manual Mode enabled; run dev-guard done when the AI task is finished." : "Run dev-guard install-hooks to enable Auto Mode.");
+    }
+    console.log("");
+    console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
+    console.log(`excluded: ${excludedSummary}`);
+    console.log(`depth: ${options.depth}; poll: ${options.poll ? "on" : "off"}; lockfiles: ${options.includeLockfiles ? "included" : "excluded"}; manual: ${options.manual ? "on" : "off"}`);
+    console.log("mode: event-driven; no periodic refresh; no idle-time completion");
+    console.log("stop: Ctrl+C");
+  }
 
   let status: WatchStatus = "idle";
   let stableTimer: NodeJS.Timeout | undefined;
@@ -93,6 +122,14 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
     lastPrintedKey = key;
     status = nextStatus;
+    if (options.dashboard) {
+      const transitionKey = `${dashboard.transition}:${runtime.changeCountSinceIdle ?? 0}:${runtime.pendingChangedFiles.length}`;
+      if (transitionKey !== lastTransitionKey) {
+        console.log(`\n${dashboard.transition}`);
+        lastTransitionKey = transitionKey;
+      }
+      return;
+    }
     console.log("");
     const transitionKey = `${dashboard.transition}:${runtime.changeCountSinceIdle ?? 0}:${runtime.pendingChangedFiles.length}`;
     if (transitionKey !== lastTransitionKey) {
@@ -119,12 +156,17 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       await startWatchSession(root);
       lastPrintedKey = "";
       status = "processed";
-      console.log("");
-      console.log("Completion processed");
-      console.log("DONE: agent completion processed changes");
-      console.log(`Last processed: ${processedAt}`);
-      console.log(`Quality: ${projectState.lastQualityVerdict ?? "unknown"}`);
-      console.log(`NEXT: ${projectState.lastQualityVerdict && projectState.lastQualityVerdict !== "PASS" ? `review ${devguardPaths.qualityReport}` : "keep editing"}`);
+      if (options.dashboard) {
+        console.log("");
+        console.log(`Completion processed. Quality: ${projectState.lastQualityVerdict ?? "unknown"}`);
+      } else {
+        console.log("");
+        console.log("Completion processed");
+        console.log("DONE: agent completion processed changes");
+        console.log(`Last processed: ${processedAt}`);
+        console.log(`Quality: ${projectState.lastQualityVerdict ?? "unknown"}`);
+        console.log(`NEXT: ${projectState.lastQualityVerdict && projectState.lastQualityVerdict !== "PASS" ? `review ${devguardPaths.qualityReport}` : "keep editing"}`);
+      }
       await printState("idle");
     }
   };
@@ -184,7 +226,9 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   };
 
   const watcher = await createWatcher(root, enqueueChange, options);
-  await printState(status);
+  if (!options.dashboard) {
+    await printState(status);
+  }
   refreshTimer = setInterval(() => {
     void (async () => {
       await refreshExternalDoneState();
@@ -206,6 +250,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 
   process.on("SIGINT", async () => {
     await closeWatcher(watcher);
+    await dashboard?.close();
     clearTimeout(stableTimer);
     clearInterval(refreshTimer);
     console.log("\ndev-guard watch stopped");
@@ -232,7 +277,8 @@ function parseWatchOptions(args: string[]): WatchOptions {
     depth,
     poll: args.includes("--poll"),
     includeLockfiles: args.includes("--include-lockfiles"),
-    manual: args.includes("--manual") || args.includes("--no-auto")
+    manual: args.includes("--manual") || args.includes("--no-auto"),
+    dashboard: !args.includes("--no-dashboard")
   };
 }
 

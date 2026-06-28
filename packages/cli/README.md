@@ -60,7 +60,7 @@ dev-guard watch
 dev-guard status
 ```
 
-Keep `dev-guard watch` running in another terminal during the AI coding session when you want continuous change tracking. It observes changes; completion is handled by hooks/notify or by manual `dev-guard done`.
+Keep `dev-guard watch` running in another terminal during the AI coding session when you want continuous change tracking. It starts the local dashboard automatically and observes changes; completion is handled by hooks/notify or by manual `dev-guard done`.
 
 Manual fallback:
 
@@ -79,18 +79,17 @@ cat .devguard/reports/project-handoff.md
 
 ## Local Dashboard
 
-Run the optional dashboard when you want a browser view of the current DevGuard watch/status state:
-
-```bash
-dev-guard watch
-dev-guard dashboard --open
-```
-
-It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and refreshes `/api/state` every second. The page explains what DevGuard is doing now, why it is waiting, what happens next, recent file changes, and whether next-session, project-health, and project-context information is ready.
+The local dashboard starts automatically when `dev-guard watch` runs. It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and refreshes `/api/state` every second. The page explains what DevGuard is doing now, why it is waiting, what happens next, recent file changes, and whether next-session, project-health, and project-context information is ready.
 
 The UI follows the browser language automatically and includes an English/Korean language toggle.
 
 The dashboard does not expose arbitrary file browsing, environment variables, or shell execution.
+
+Advanced terminal-only mode:
+
+```bash
+dev-guard watch --no-dashboard
+```
 
 Full documentation:
 

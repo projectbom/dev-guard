@@ -119,8 +119,9 @@ dev-guard install-hooks --agent codex-notify
 dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
+dev-guard watch --no-dashboard
 dev-guard watch --manual
-dev-guard dashboard [--port 3737] [--open]
+dev-guard dashboard [--port 3737]
 dev-guard done
 dev-guard handoff
 dev-guard status
@@ -128,7 +129,7 @@ dev-guard reset
 ```
 
 - `init`: 초기 guard 파일 생성
-- `watch`: 권장 watcher, 변경 파일 감시 및 검증된 완료 전략 기반 done 대기
+- `watch`: 권장 watcher, 로컬 대시보드 시작, 변경 파일 감시 및 검증된 완료 전략 기반 done 대기
 - `install-hooks`: Claude Code / Codex 완료 전략 스크립트와 설정 설치
 - `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
 - `handoff`: 현재 `.devguard/` 산출물만 읽어서 `project-handoff.md` 재생성
@@ -234,18 +235,17 @@ Hook을 사용할 수 없거나 신뢰되지 않았거나 실패했을 때 사�
 
 ## 로컬 대시보드
 
-브라우저에서 현재 watch/status 상태를 보고 싶을 때 선택적으로 실행합니다.
-
-```bash
-dev-guard watch
-dev-guard dashboard --open
-```
-
-대시보드는 `127.0.0.1`에만 바인딩되고 기본 주소는 `http://127.0.0.1:3737`입니다. `/api/state`를 1초마다 polling해서 DevGuard가 지금 무엇을 하는지, 왜 기다리는지, 다음에 무엇이 일어나는지, 최근 변경 파일, 다음 세션/프로젝트 상태/프로젝트 컨텍스트 정보가 준비됐는지 보여줍니다.
+로컬 대시보드는 `dev-guard watch`를 실행하면 자동으로 시작됩니다. 대시보드는 `127.0.0.1`에만 바인딩되고 기본 주소는 `http://127.0.0.1:3737`입니다. `/api/state`를 1초마다 polling해서 DevGuard가 지금 무엇을 하는지, 왜 기다리는지, 다음에 무엇이 일어나는지, 최근 변경 파일, 다음 세션/프로젝트 상태/프로젝트 컨텍스트 정보가 준비됐는지 보여줍니다.
 
 UI는 브라우저 언어를 자동으로 따르며 English/한국어 토글을 제공합니다.
 
 임의 파일 브라우징, 환경 변수 노출, shell 실행 기능은 없습니다. DevGuard가 초기화되지 않았으면 `dev-guard init`을 안내하고, `watch`가 실행 중이 아니면 `dev-guard watch`를 안내합니다.
+
+터미널만 쓰고 싶을 때는 고급 옵션을 사용합니다.
+
+```bash
+dev-guard watch --no-dashboard
+```
 
 ## Watch Mode 실전 사용
 
@@ -255,7 +255,7 @@ AI 코딩 세션 동안 지속적인 DevGuard 지원이 필요하면 작업 시�
 dev-guard watch
 ```
 
-Codex/Claude가 파일을 수정하는 동안 별도 터미널에서 계속 켜두는 것을 권장합니다. `watch`는 파일 변경을 관찰하고 pending 파일 buffer를 최신으로 유지합니다. idle 시간으로 완료를 추정하지 않고, build/test/commit도 실행하지 않습니다.
+Codex/Claude가 파일을 수정하는 동안 별도 터미널에서 계속 켜두는 것을 권장합니다. `watch`는 로컬 대시보드를 자동으로 시작하고, 파일 변경을 관찰하며 pending 파일 buffer를 최신으로 유지합니다. idle 시간으로 완료를 추정하지 않고, build/test/commit도 실행하지 않습니다.
 
 완료 처리는 검증된 hook/notify 전략 또는 수동 fallback으로 수행합니다.
 
