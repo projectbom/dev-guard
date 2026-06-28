@@ -241,7 +241,9 @@ dev-guard watch
 dev-guard dashboard --open
 ```
 
-대시보드는 `127.0.0.1`에만 바인딩되고 기본 주소는 `http://127.0.0.1:3737`입니다. `/api/state`를 1초마다 polling해서 현재 status, stage, waiting reason, next transition, watch elapsed time, last activity, idle countdown, recent files, handoff/quality/agent-context report 존재 여부를 보여줍니다.
+대시보드는 `127.0.0.1`에만 바인딩되고 기본 주소는 `http://127.0.0.1:3737`입니다. `/api/state`를 1초마다 polling해서 DevGuard가 지금 무엇을 하는지, 왜 기다리는지, 다음에 무엇이 일어나는지, 최근 변경 파일, 다음 세션/프로젝트 상태/프로젝트 컨텍스트 정보가 준비됐는지 보여줍니다.
+
+UI는 브라우저 언어를 자동으로 따르며 English/한국어 토글을 제공합니다.
 
 임의 파일 브라우징, 환경 변수 노출, shell 실행 기능은 없습니다. DevGuard가 초기화되지 않았으면 `dev-guard init`을 안내하고, `watch`가 실행 중이 아니면 `dev-guard watch`를 안내합니다.
 

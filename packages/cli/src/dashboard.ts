@@ -1,11 +1,12 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { spawn } from "node:child_process";
-import { access } from "node:fs/promises";
+import { access, stat } from "node:fs/promises";
 import { fromRoot, readTextFile } from "./fs.js";
 import { devguardPaths } from "./paths.js";
 import { readRuntimeState, type RuntimeState } from "./runtime-state.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
+import { dashboardTranslations } from "./dashboard-i18n.js";
 
 const DEFAULT_PORT = 3737;
 const HOST = "127.0.0.1";
@@ -18,6 +19,7 @@ interface DashboardState {
   watchingSince: string;
   elapsed: string;
   lastActivity: string;
+  idleCountdown: string | null;
   changeCount: number;
   recentFiles: string[];
   moreFileCount: number;
@@ -29,6 +31,9 @@ interface DashboardState {
     handoffExists: boolean;
     qualityReportExists: boolean;
     agentContextExists: boolean;
+    handoffUpdatedAt?: string;
+    qualityReportUpdatedAt?: string;
+    agentContextUpdatedAt?: string;
     handoffPreview?: string;
     qualityReportPreview?: string;
     agentContextPreview?: string;
@@ -110,7 +115,8 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     next: initialized ? (watchRunning ? dashboard.next : "Run dev-guard watch") : "Run dev-guard init",
     watchingSince: runtime.watchStartedAt ? formatTime(runtime.watchStartedAt) : "unknown",
     elapsed: runtime.watchStartedAt ? formatDurationSince(runtime.watchStartedAt) : "unknown",
-    lastActivity: runtime.lastActivityAt ? `${formatDurationSince(runtime.lastActivityAt)} ago` : "none",
+    lastActivity: runtime.lastActivityAt ? formatDurationSince(runtime.lastActivityAt) : "none",
+    idleCountdown: normalizeStatus(dashboard.status) === "working" ? formatCountdown(runtime.idleDeadlineAt) : null,
     changeCount: runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length,
     recentFiles,
     moreFileCount: Math.max(0, runtime.pendingChangedFiles.length - recentFiles.length),
@@ -132,19 +138,22 @@ async function readReportState(root: string): Promise<DashboardState["reports"]>
     handoffExists: handoff.exists,
     qualityReportExists: quality.exists,
     agentContextExists: context.exists,
+    handoffUpdatedAt: handoff.updatedAt,
+    qualityReportUpdatedAt: quality.updatedAt,
+    agentContextUpdatedAt: context.updatedAt,
     handoffPreview: handoff.preview,
     qualityReportPreview: quality.preview,
     agentContextPreview: context.preview
   };
 }
 
-async function readKnownPreview(root: string, path: string): Promise<{ exists: boolean; preview?: string }> {
+async function readKnownPreview(root: string, path: string): Promise<{ exists: boolean; updatedAt?: string; preview?: string }> {
   const absolute = fromRoot(root, path);
   if (!(await fileExists(absolute))) {
     return { exists: false };
   }
-  const text = await readTextFile(absolute);
-  return { exists: true, preview: text.slice(0, 1800) };
+  const [text, info] = await Promise.all([readTextFile(absolute), stat(absolute)]);
+  return { exists: true, updatedAt: info.mtime.toISOString(), preview: text.slice(0, 1800) };
 }
 
 async function isDevGuardInitialized(root: string): Promise<boolean> {
@@ -197,6 +206,14 @@ function formatDurationSince(timestamp: string): string {
   return restMinutes ? `${hours}h ${restMinutes}m` : `${hours}h`;
 }
 
+function formatCountdown(timestamp?: string): string | null {
+  if (!timestamp) return null;
+  const target = Date.parse(timestamp);
+  if (!Number.isFinite(target)) return null;
+  const seconds = Math.max(0, Math.ceil((target - Date.now()) / 1000));
+  return seconds < 60 ? `~${seconds}s` : `~${Math.ceil(seconds / 60)}m`;
+}
+
 function readPort(args: string[]): number {
   const index = args.indexOf("--port");
   if (index < 0) return DEFAULT_PORT;
@@ -239,6 +256,7 @@ function errorMessage(error: unknown): string {
 }
 
 function renderPage(): string {
+  const translationsJson = JSON.stringify(dashboardTranslations);
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -246,90 +264,187 @@ function renderPage(): string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>DevGuard Dashboard</title>
   <style>
-    :root { color-scheme: light; --bg:#f6f7f9; --panel:#ffffff; --ink:#16181d; --muted:#626975; --line:#dfe3e8; --accent:#1f6feb; --ok:#147d43; --warn:#9a6700; --bad:#b42318; }
+    :root { color-scheme: light; --bg:#f7f8fa; --panel:#ffffff; --ink:#17191f; --muted:#636a75; --soft:#f1f3f5; --line:#dfe3e8; --accent:#2563eb; --ok:#11843b; --warn:#a05a00; --done:#6842c2; }
     * { box-sizing: border-box; }
-    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    main { max-width:1100px; margin:0 auto; padding:28px; }
-    header { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:22px; }
-    h1 { margin:0; font-size:28px; letter-spacing:0; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    main { max-width:1060px; margin:0 auto; padding:24px; }
+    header { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:16px; }
+    h1 { margin:0; font-size:25px; line-height:1.1; letter-spacing:0; }
+    h2 { margin:0 0 10px; font-size:15px; line-height:1.2; }
+    h3 { margin:0 0 5px; font-size:12px; color:var(--muted); font-weight:700; }
+    p { margin:0; }
     .subtle { color:var(--muted); }
-    .grid { display:grid; grid-template-columns: 1.2fr .8fr; gap:16px; }
-    .cards { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:12px; margin-top:16px; }
-    section, .card { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px; }
-    .statusRow { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
-    .pill { display:inline-flex; align-items:center; height:32px; padding:0 12px; border-radius:999px; border:1px solid var(--line); font-weight:700; text-transform:capitalize; }
-    .pill.working { background:#fff4ce; color:var(--warn); border-color:#f2d675; }
-    .pill.idle { background:#dafbe1; color:var(--ok); border-color:#aceebb; }
-    .pill.ready_for_done { background:#ddf4ff; color:var(--accent); border-color:#b6e3ff; }
-    .pill.processed { background:#eee7ff; color:#6639ba; border-color:#d8c9ff; }
-    h2 { margin:0 0 10px; font-size:16px; }
-    h3 { margin:0 0 6px; font-size:13px; color:var(--muted); font-weight:650; }
-    .big { font-size:24px; font-weight:750; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; }
-    ul { margin:8px 0 0; padding-left:18px; }
-    li { margin:4px 0; overflow-wrap:anywhere; }
-    details { border-top:1px solid var(--line); padding-top:12px; margin-top:12px; }
+    .topbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
+    .toggle { display:inline-flex; gap:2px; padding:2px; border:1px solid var(--line); border-radius:8px; background:var(--panel); }
+    .toggle button { border:0; background:transparent; color:var(--muted); border-radius:6px; padding:5px 8px; font:inherit; cursor:pointer; }
+    .toggle button.active { background:var(--ink); color:#fff; }
+    .layout { display:grid; grid-template-columns:minmax(0, 1.35fr) minmax(280px, .65fr); gap:14px; align-items:start; }
+    .stack { display:grid; gap:14px; }
+    section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; }
+    .summary { padding:20px; }
+    .summaryHead { display:flex; align-items:center; gap:11px; margin-bottom:10px; }
+    .icon { width:34px; height:34px; display:grid; place-items:center; border-radius:999px; background:var(--soft); font-size:18px; }
+    .summaryTitle { font-size:22px; font-weight:760; line-height:1.2; }
+    .summaryBody { color:var(--muted); max-width:720px; font-size:15px; }
+    .summary.idle .icon { background:#dcfce7; }
+    .summary.working .icon { background:#fff1d6; }
+    .summary.ready_for_done .icon { background:#dbeafe; }
+    .summary.processed .icon { background:#ede9fe; }
+    .facts { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; margin-top:16px; }
+    .fact { background:var(--soft); border:1px solid #e8ebef; border-radius:7px; padding:12px; min-height:82px; }
+    .fact strong { display:block; font-size:13px; margin-bottom:4px; }
+    .fact div { color:var(--muted); }
+    .timeline { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .metric { border-top:1px solid var(--line); padding-top:10px; }
+    .metricValue { font-weight:720; font-size:16px; overflow-wrap:anywhere; }
+    .fileList { list-style:none; padding:0; margin:10px 0 0; display:grid; gap:7px; }
+    .fileList li { background:var(--soft); border:1px solid #e8ebef; border-radius:7px; padding:8px 10px; overflow-wrap:anywhere; }
+    .emptyState { border:1px dashed var(--line); background:#fbfcfd; border-radius:7px; padding:14px; color:var(--muted); }
+    .reportGrid { display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; }
+    .report { border:1px solid var(--line); border-radius:7px; padding:12px; min-height:150px; }
+    .reportTitle { font-size:15px; font-weight:740; margin-bottom:8px; }
+    .meta { display:grid; gap:5px; color:var(--muted); font-size:13px; }
+    .badge { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid var(--line); border-radius:999px; padding:2px 8px; color:var(--ink); background:#fff; font-size:12px; }
+    details { border-top:1px solid var(--line); padding-top:10px; margin-top:10px; }
     summary { cursor:pointer; font-weight:700; }
-    pre { max-height:260px; overflow:auto; white-space:pre-wrap; background:#f0f2f5; border-radius:6px; padding:12px; }
-    .empty { border:1px dashed var(--line); background:#fbfcfd; }
-    @media (max-width: 860px) { main { padding:18px; } .grid, .cards { grid-template-columns:1fr; } header { display:block; } }
+    pre { max-height:220px; overflow:auto; white-space:pre-wrap; background:var(--soft); border-radius:6px; padding:10px; font-size:12px; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    @media (max-width: 860px) { main { padding:16px; } header { display:block; } .topbar { justify-content:flex-start; margin-top:12px; } .layout, .facts, .timeline, .reportGrid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
   <main>
     <header>
-      <div><h1>DevGuard</h1><div class="subtle">Local AI coding session control panel</div></div>
-      <div class="subtle mono" id="updated">Updating...</div>
+      <div><h1>DevGuard</h1><div class="subtle" id="subtitle"></div></div>
+      <div class="topbar">
+        <div class="toggle" role="group" id="languageToggle">
+          <button type="button" data-lang="en">EN</button>
+          <button type="button" data-lang="ko">KO</button>
+        </div>
+        <div class="subtle mono" id="updated"></div>
+      </div>
     </header>
-    <div id="app" class="empty card">Loading dashboard state...</div>
+    <div id="app" class="emptyState"></div>
   </main>
   <script>
+    const STRINGS = ${translationsJson};
     const app = document.getElementById('app');
     const updated = document.getElementById('updated');
+    const subtitle = document.getElementById('subtitle');
+    const languageToggle = document.getElementById('languageToggle');
+    const langButtons = [...document.querySelectorAll('[data-lang]')];
+    let currentLanguage = initialLanguage();
     const esc = (s) => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-    function reportBlock(title, exists, preview) {
-      return '<div class="card"><h3>' + esc(title) + '</h3><div class="big">' + (exists ? 'Available' : 'Missing') + '</div>' +
-        (exists && preview ? '<details><summary>Preview</summary><pre>' + esc(preview) + '</pre></details>' : '') + '</div>';
+
+    function initialLanguage() {
+      const saved = localStorage.getItem('devguard.dashboard.language');
+      if (saved && STRINGS[saved]) return saved;
+      const browserLanguages = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language];
+      return browserLanguages.some(lang => String(lang).toLowerCase().startsWith('ko')) ? 'ko' : 'en';
     }
-    function render(s) {
-      if (!s.initialized) {
-        app.className = 'empty card';
-        app.innerHTML = '<h2>DevGuard is not initialized.</h2><p>Run:</p><pre>dev-guard init</pre>';
-        return;
+
+    function t(key) {
+      return STRINGS[currentLanguage][key] || STRINGS.en[key] || key;
+    }
+
+    function setLanguage(lang) {
+      if (!STRINGS[lang]) return;
+      currentLanguage = lang;
+      localStorage.setItem('devguard.dashboard.language', lang);
+      document.documentElement.lang = lang;
+      languageToggle.setAttribute('aria-label', t('language'));
+      langButtons.forEach(button => button.classList.toggle('active', button.dataset.lang === lang));
+      subtitle.textContent = t('appSubtitle');
+      if (!lastState) app.textContent = t('loading');
+      if (lastState) render(lastState);
+    }
+
+    langButtons.forEach(button => button.addEventListener('click', () => setLanguage(button.dataset.lang)));
+
+    function statusView(s) {
+      if (!s.initialized) return { icon:'⚙️', className:'idle', title:t('notInitializedTitle'), body:t('notInitializedBody'), activity:t('activityInit'), next:t('nextInit'), action:'dev-guard init' };
+      if (!s.watchRunning) return { icon:'⏸', className:'idle', title:t('watchNotRunningTitle'), body:t('watchNotRunningBody'), activity:t('activityStartWatch'), next:t('nextStartWatch'), action:'dev-guard watch' };
+      if (s.status === 'working') return { icon:'🟡', className:'working', title:t('statusWorkingTitle'), body:t('statusWorkingBody'), activity:t('activitySettling'), next:t('nextSettling') };
+      if (s.status === 'ready_for_done') return { icon:'🔵', className:'ready_for_done', title:t('statusReadyTitle'), body:t('statusReadyBody'), activity:t('activityAiCompletion'), next:t('nextAiCompletion') };
+      if (s.status === 'processed') return { icon:'🟣', className:'processed', title:t('statusProcessedTitle'), body:t('statusProcessedBody'), activity:t('activityProcessed'), next:t('nextProcessed') };
+      return { icon:'🟢', className:'idle', title:t('statusMonitoringTitle'), body:t('statusMonitoringBody'), activity:t('activityMonitoring'), next:t('nextMonitoring') };
+    }
+
+    function activityTime(value) {
+      if (!value || value === 'none') return t('never');
+      return currentLanguage === 'ko' ? value + ' 전' : value + ' ago';
+    }
+
+    function plainValue(value) {
+      if (!value || value === 'unknown') return t('unknown');
+      return value;
+    }
+
+    function formatUpdatedAt(value) {
+      if (!value) return t('notCreated');
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return t('unknown');
+      return date.toLocaleString(currentLanguage === 'ko' ? 'ko-KR' : 'en-US', { dateStyle:'medium', timeStyle:'short' });
+    }
+
+    function reportBlock(title, exists, updatedAt, preview) {
+      return '<div class="report"><div class="reportTitle">' + esc(title) + '</div>' +
+        '<div class="meta">' +
+        '<div><strong>' + esc(t('availability')) + ':</strong> <span class="badge">' + esc(exists ? t('ready') : t('notCreated')) + '</span></div>' +
+        '<div><strong>' + esc(t('lastUpdated')) + ':</strong> ' + esc(formatUpdatedAt(updatedAt)) + '</div>' +
+        '</div>' +
+        (exists && preview ? '<details><summary>' + esc(t('preview')) + '</summary><pre>' + esc(preview) + '</pre></details>' : '') +
+        '</div>';
+    }
+
+    function recentFiles(s) {
+      if (!s.recentFiles.length) {
+        return '<div class="emptyState"><strong>' + esc(t('noRecentFilesTitle')) + '</strong><p>' + esc(t('noRecentFilesBody')) + '</p></div>';
       }
-      const files = s.recentFiles.length ? s.recentFiles.map(f => '<li class="mono">' + esc(f) + '</li>').join('') : '<li>none</li>';
+      return '<ul class="fileList">' + s.recentFiles.map(f => '<li class="mono">' + esc(f) + '</li>').join('') + '</ul>' +
+        (s.moreFileCount > 0 ? '<p class="subtle">+' + esc(s.moreFileCount) + ' ' + esc(t('moreFiles')) + '</p>' : '');
+    }
+
+    let lastState;
+    function render(s) {
+      lastState = s;
+      const view = statusView(s);
       app.className = '';
       app.innerHTML = \`
-        \${!s.watchRunning ? '<section class="empty"><h2>Watch is not running.</h2><p>Run:</p><pre>dev-guard watch</pre></section><br>' : ''}
-        <div class="grid">
+        <div class="layout">
+          <div class="stack">
+            <section class="summary \${esc(view.className)}">
+              <h2>\${esc(t('currentStatus'))}</h2>
+              <div class="summaryHead"><span class="icon" aria-hidden="true">\${view.icon}</span><div class="summaryTitle">\${esc(view.title)}</div></div>
+              <p class="summaryBody">\${esc(view.body)}</p>
+              \${view.action ? '<pre>' + esc(view.action) + '</pre>' : ''}
+              <div class="facts">
+                <div class="fact"><strong>\${esc(t('currentActivity'))}</strong><div>\${esc(view.activity)}</div></div>
+                <div class="fact"><strong>\${esc(t('whatHappensNext'))}</strong><div>\${esc(view.next)}</div></div>
+                <div class="fact"><strong>\${esc(t('idleCountdown'))}</strong><div>\${esc(s.idleCountdown || t('noCountdown'))}</div></div>
+              </div>
+            </section>
+            <section>
+              <h2>\${esc(t('recentFiles'))}</h2>
+              <p class="subtle">\${esc(t('changesTracked'))}: \${esc(s.changeCount)}</p>
+              \${recentFiles(s)}
+            </section>
+            <section>
+              <h2>\${esc(t('projectInformation'))}</h2>
+              <div class="reportGrid">
+                \${reportBlock(t('nextSession'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview)}
+                \${reportBlock(t('projectHealth'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview)}
+                \${reportBlock(t('projectContext'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview)}
+              </div>
+            </section>
+          </div>
           <section>
-            <div class="statusRow"><span class="pill \${esc(s.status)}">\${esc(s.status.replaceAll('_',' '))}</span><strong>\${esc(s.stage)}</strong></div>
-            <div class="cards">
-              <div><h3>Waiting For</h3><div>\${esc(s.waitingFor)}</div></div>
-              <div><h3>Next</h3><div>\${esc(s.next)}</div></div>
-              <div><h3>Idle Countdown</h3><div class="big">\${esc(s.next.startsWith('Idle in') ? s.next.replace('Idle in ', '') : '—')}</div></div>
-            </div>
-          </section>
-          <section>
-            <h2>Timeline</h2>
-            <div><h3>Watching since</h3><div>\${esc(s.watchingSince)}</div></div>
-            <div><h3>Elapsed</h3><div>\${esc(s.elapsed)}</div></div>
-            <div><h3>Last activity</h3><div>\${esc(s.lastActivity)}</div></div>
-          </section>
-        </div>
-        <div class="grid" style="margin-top:16px">
-          <section>
-            <h2>Recent Files</h2>
-            <div class="subtle">Changes detected: \${esc(s.changeCount)}</div>
-            <ul>\${files}</ul>
-            \${s.moreFileCount > 0 ? '<div class="subtle">+' + esc(s.moreFileCount) + ' more</div>' : ''}
-          </section>
-          <section>
-            <h2>Reports</h2>
-            <div class="cards">
-              \${reportBlock('Project handoff', s.reports.handoffExists, s.reports.handoffPreview)}
-              \${reportBlock('Quality report', s.reports.qualityReportExists, s.reports.qualityReportPreview)}
-              \${reportBlock('Agent context', s.reports.agentContextExists, s.reports.agentContextPreview)}
+            <h2>\${esc(t('timeline'))}</h2>
+            <div class="timeline">
+              <div class="metric"><h3>\${esc(t('monitoringStarted'))}</h3><div class="metricValue">\${esc(plainValue(s.watchingSince))}</div></div>
+              <div class="metric"><h3>\${esc(t('sessionDuration'))}</h3><div class="metricValue">\${esc(plainValue(s.elapsed))}</div></div>
+              <div class="metric"><h3>\${esc(t('lastFileChange'))}</h3><div class="metricValue">\${esc(activityTime(s.lastActivity))}</div></div>
             </div>
           </section>
         </div>\`;
@@ -338,12 +453,13 @@ function renderPage(): string {
       try {
         const res = await fetch('/api/state', { cache: 'no-store' });
         render(await res.json());
-        updated.textContent = 'Updated ' + new Date().toLocaleTimeString();
+        updated.textContent = t('dashboardUpdated') + ' ' + new Date().toLocaleTimeString();
       } catch (error) {
-        app.className = 'empty card';
-        app.innerHTML = '<h2>Dashboard unavailable</h2><p>' + esc(error.message) + '</p>';
+        app.className = 'emptyState';
+        app.innerHTML = '<h2>' + esc(t('dashboardUnavailableTitle')) + '</h2><p>' + esc(error.message) + '</p>';
       }
     }
+    setLanguage(currentLanguage);
     tick();
     setInterval(tick, 1000);
   </script>

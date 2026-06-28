@@ -181,7 +181,9 @@ dev-guard watch
 dev-guard dashboard --open
 ```
 
-The dashboard binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/state` once per second. It shows current status, stage, waiting reason, next transition, watch elapsed time, last activity, idle countdown, recent files, and whether handoff/quality/agent-context reports exist.
+The dashboard binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/state` once per second. It explains what DevGuard is doing now, why it is waiting, what happens next, recent file changes, and whether next-session, project-health, and project-context information is ready.
+
+The UI follows the browser language automatically and includes an English/Korean language toggle.
 
 It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not initialized it shows `dev-guard init`; if `watch` is not running it shows `dev-guard watch`.
 
