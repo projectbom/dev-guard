@@ -172,6 +172,19 @@ dev-guard status
 
 After `done`, DevGuard writes quality and handoff artifacts such as `.devguard/reports/quality-report.md`, `.devguard/reports/project-handoff.md`, and `.devguard/prompts/next-codex-prompt.md`. Use those files to continue in the next session without rediscovering the repository.
 
+## Local Dashboard
+
+Run the optional local dashboard when you want a browser view of the current watch/status state:
+
+```bash
+dev-guard watch
+dev-guard dashboard --open
+```
+
+The dashboard binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/state` once per second. It shows current status, stage, waiting reason, next transition, watch elapsed time, last activity, idle countdown, recent files, and whether handoff/quality/agent-context reports exist.
+
+It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not initialized it shows `dev-guard init`; if `watch` is not running it shows `dev-guard watch`.
+
 ## Core Commands
 
 ```bash
@@ -184,6 +197,7 @@ dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --manual
+dev-guard dashboard [--port 3737] [--open]
 dev-guard done
 dev-guard handoff
 dev-guard status

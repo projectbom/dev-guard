@@ -189,6 +189,13 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     void (async () => {
       await refreshExternalDoneState();
       const runtime = await readRuntimeState(root);
+      const now = Date.now();
+      if (!runtime.watchHeartbeatAt || now - Date.parse(runtime.watchHeartbeatAt) > 4_000) {
+        await writeRuntimeState(root, {
+          ...runtime,
+          watchHeartbeatAt: new Date(now).toISOString()
+        });
+      }
       if ((runtime.lastStatus ?? "idle") === "active") {
         await printState("active");
       }
@@ -290,7 +297,8 @@ async function startWatchSession(root: string): Promise<void> {
   const current = await readRuntimeState(root);
   await writeRuntimeState(root, {
     ...current,
-    watchStartedAt: new Date().toISOString()
+    watchStartedAt: new Date().toISOString(),
+    watchHeartbeatAt: new Date().toISOString()
   });
 }
 

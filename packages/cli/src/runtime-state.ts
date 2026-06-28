@@ -29,6 +29,7 @@ export interface RuntimeState {
   lastActivityAt?: string;
   lastStableAt?: string;
   watchStartedAt?: string;
+  watchHeartbeatAt?: string;
   lastDiffHash?: string;
   lastStatus?: "idle" | "active" | "ready_for_done" | "processed";
   changeCountSinceIdle?: number;

@@ -120,6 +120,7 @@ dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --manual
+dev-guard dashboard [--port 3737] [--open]
 dev-guard done
 dev-guard handoff
 dev-guard status
@@ -230,6 +231,19 @@ dev-guard done
 ```
 
 Hook을 사용할 수 없거나 신뢰되지 않았거나 실패했을 때 사용합니다. `watch`는 변경만 누적하고, 사용자가 직접 `done`을 실행합니다.
+
+## 로컬 대시보드
+
+브라우저에서 현재 watch/status 상태를 보고 싶을 때 선택적으로 실행합니다.
+
+```bash
+dev-guard watch
+dev-guard dashboard --open
+```
+
+대시보드는 `127.0.0.1`에만 바인딩되고 기본 주소는 `http://127.0.0.1:3737`입니다. `/api/state`를 1초마다 polling해서 현재 status, stage, waiting reason, next transition, watch elapsed time, last activity, idle countdown, recent files, handoff/quality/agent-context report 존재 여부를 보여줍니다.
+
+임의 파일 브라우징, 환경 변수 노출, shell 실행 기능은 없습니다. DevGuard가 초기화되지 않았으면 `dev-guard init`을 안내하고, `watch`가 실행 중이 아니면 `dev-guard watch`를 안내합니다.
 
 ## Watch Mode 실전 사용
 

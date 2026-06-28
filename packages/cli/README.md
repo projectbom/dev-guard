@@ -77,6 +77,19 @@ dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
+## Local Dashboard
+
+Run the optional dashboard when you want a browser view of the current DevGuard watch/status state:
+
+```bash
+dev-guard watch
+dev-guard dashboard --open
+```
+
+It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and refreshes `/api/state` every second. The page shows status, stage, waiting reason, next transition, watch elapsed time, last activity, idle countdown, recent files, and whether the handoff, quality, and agent-context reports exist.
+
+The dashboard does not expose arbitrary file browsing, environment variables, or shell execution.
+
 Full documentation:
 
 - Korean npm guide: https://github.com/projectbom/dev-guard/blob/main/docs/npm-setup.ko.md
