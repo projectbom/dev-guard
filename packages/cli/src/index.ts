@@ -181,30 +181,26 @@ async function main(): Promise<void> {
 function printHelp(): void {
   console.log(`dev-guard
 
-Quick commands:
+Quick start:
   dev-guard init
-  dev-guard install-hooks [--agent <claude|codex|codex-notify|all>] [--install-dispatcher]
-  dev-guard install-agent-instructions [--force]
+  dev-guard install-agent-instructions
   dev-guard watch
-  dev-guard done
-  dev-guard handoff
-  dev-guard status
-  dev-guard reset
+  (edit with Claude/Codex — DevGuard auto-finalizes after changes settle)
 
-Recommended Auto Mode:
-  1. dev-guard init
-  2. dev-guard install-agent-instructions
-  3. dev-guard install-hooks
-  4. dev-guard watch
-  5. Run Claude/Codex; verified completion strategy runs done automatically
-  6. dev-guard status
+Normal workflow:
+  1. dev-guard watch
+  2. Edit files with Claude/Codex
+  3. DevGuard detects changes, waits for filesystem to settle, then
+     automatically generates reports and returns to monitoring.
+  4. No additional commands required.
 
 New session resume:
   Read .devguard/context/agent-context.md and continue.
 
-Manual fallback:
-  dev-guard watch --manual
-  dev-guard done
+Manual recovery (advanced):
+  dev-guard done    — use only when watch crashed, hooks failed, or debugging
+  dev-guard status  — check current state and hook status
+  dev-guard reset   — clear pending buffer without deleting project state
 
 More:
   dev-guard help advanced
@@ -228,7 +224,7 @@ Usage:
   dev-guard config show
   dev-guard scan [--full] [--ai]
   dev-guard refresh [--full] [--ai] [--dry-run]
-  dev-guard watch [--manual|--no-auto] [--no-dashboard] [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
+  dev-guard watch [--manual|--no-auto] [--no-auto-complete] [--auto-complete-delay <sec>] [--no-dashboard] [--stable-after <sec>] [--depth <n>] [--poll] [--include-lockfiles] [--compact|--ultra]
   dev-guard dashboard [--port <port>] [--no-open]
   dev-guard doctor [--hooks] [--agents] [--dry-run]
   dev-guard telemetry
@@ -245,7 +241,7 @@ Usage:
 Commands:
   init   Create .devguard and docs guard files
   "requirement" Generate task.md and a compact Codex prompt
-  done   Manually process pending changes and generate report/next prompt/handoff/agent-context
+  done   Manual session finalization. Normally NOT required — watch auto-finalizes. Use only when watch crashed, hooks failed, or for debugging.
   handoff Regenerate project-handoff.md and agent-context.md from current .devguard/ artifacts
   install-hooks Install agent completion strategy scripts/config
   install-agent-instructions Create or update AGENTS.md / CLAUDE.md with dev-guard context guidance
@@ -255,7 +251,7 @@ Commands:
   configure Configure dev-guard settings
   scan   Cache project structure and file summaries into .devguard
   refresh Incrementally update project memory cache
-  watch  Start DevGuard monitoring and launch the local dashboard
+  watch  Start DevGuard monitoring; auto-finalizes after filesystem settles (no manual done needed)
   dashboard Reconnect to an existing dashboard session or inspect current watch state
   doctor Print config/provider/git diagnostics, hook diagnostics with --hooks, and agent strategy diagnostics with --agents
   telemetry Print privacy-safe drift telemetry summary
@@ -274,7 +270,8 @@ Commands:
 async function runDone(root: string): Promise<void> {
   try {
     const result = await processDoneEvent(root);
-    console.log("작업 완료 처리됨");
+    console.log("dev-guard done (manual finalization)");
+    console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");
     console.log("변경 파일:");
     for (const file of result.changedFiles.slice(0, 20)) {
@@ -447,7 +444,7 @@ async function runStatus(root: string): Promise<void> {
   console.log("");
   console.log(`Next recommended action: ${initialized ? nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction) : "run dev-guard init"}`);
   console.log("Next:");
-  console.log(!initialized ? "  dev-guard init" : runtime.pendingChangedFiles.length > 0 ? "  dev-guard done" : "  dev-guard watch");
+  console.log(!initialized ? "  dev-guard init" : runtime.pendingChangedFiles.length > 0 ? "  dev-guard watch  (auto-finalizes pending changes; or: dev-guard done for manual recovery)" : "  dev-guard watch");
 }
 
 async function runReset(root: string): Promise<void> {
@@ -463,7 +460,7 @@ function errorMessage(error: unknown): string {
 
 function nextRecommendedAction(pendingCount: number, drift?: "low" | "medium" | "high", quality?: string, qualityAction?: string): string {
   if (pendingCount > 0) {
-    return "run dev-guard done";
+    return "run dev-guard watch (auto-finalizes) or dev-guard done (manual recovery)";
   }
   if (quality === "BLOCKED") {
     return "fix blocked quality items before commit";

@@ -154,7 +154,7 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     watchingSince: runtime.watchStartedAt ? formatTime(runtime.watchStartedAt) : "unknown",
     elapsed: runtime.watchStartedAt ? formatDurationSince(runtime.watchStartedAt) : "unknown",
     lastActivity: runtime.lastActivityAt ? formatDurationSince(runtime.lastActivityAt) : "none",
-    idleCountdown: normalizeStatus(dashboard.status) === "working" ? formatCountdown(runtime.idleDeadlineAt) : null,
+    idleCountdown: normalizeStatus(dashboard.status) === "working" && runtime.lastStatus !== "finalizing" ? formatCountdown(runtime.idleDeadlineAt) : null,
     changeCount: runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length,
     recentFiles,
     moreFileCount: Math.max(0, runtime.pendingChangedFiles.length - recentFiles.length),
@@ -223,6 +223,7 @@ function recentChangedFiles(runtime: RuntimeState): string[] {
 function normalizeStatus(status: string): string {
   if (status === "Working") return "working";
   if (status === "Ready for done") return "ready_for_done";
+  if (status === "Finalizing") return "finalizing";
   return status.toLowerCase();
 }
 
@@ -413,7 +414,8 @@ function renderPage(): string {
       if (!s.initialized) return { icon:'⚙️', className:'idle', title:t('notInitializedTitle'), body:t('notInitializedBody'), activity:t('activityInit'), next:t('nextInit'), action:'dev-guard init' };
       if (!s.watchRunning) return { icon:'⏸', className:'idle', title:t('watchNotRunningTitle'), body:t('watchNotRunningBody'), activity:t('activityStartWatch'), next:t('nextStartWatch'), action:'dev-guard watch' };
       if (s.status === 'working') return { icon:'🟡', className:'working', title:t('statusWorkingTitle'), body:t('statusWorkingBody'), activity:t('activitySettling'), next:t('nextSettling') };
-      if (s.status === 'ready_for_done') return { icon:'🔵', className:'ready_for_done', title:t('statusReadyTitle'), body:t('statusReadyBody'), activity:t('activityAiCompletion'), next:t('nextAiCompletion') };
+      if (s.status === 'ready_for_done') return { icon:'⚙️', className:'processed', title:t('statusReadyTitle'), body:t('statusReadyBody'), activity:t('activityAiCompletion'), next:t('nextAiCompletion') };
+      if (s.status === 'finalizing') return { icon:'⚙️', className:'processed', title:t('statusFinalizingTitle'), body:t('statusFinalizingBody'), activity:t('activityFinalizing'), next:t('nextFinalizing') };
       if (s.status === 'processed') return { icon:'🟣', className:'processed', title:t('statusProcessedTitle'), body:t('statusProcessedBody'), activity:t('activityProcessed'), next:t('nextProcessed') };
       return { icon:'🟢', className:'idle', title:t('statusMonitoringTitle'), body:t('statusMonitoringBody'), activity:t('activityMonitoring'), next:t('nextMonitoring') };
     }

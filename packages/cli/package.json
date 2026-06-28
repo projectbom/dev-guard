@@ -38,7 +38,7 @@
     "cli": "node dist/index.js"
   },
   "dependencies": {
-    "@dev-guard/core": "0.2.1",
+    "@dev-guard/core": "0.3.0",
     "chokidar": "^4.0.3"
   }
 }

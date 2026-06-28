@@ -4,13 +4,13 @@
 
 dev-guard is a CLI context guard for AI coding sessions. It keeps project context, changed files, quality checks, and next-session handoff prompts in local `.devguard/` files so Codex/Claude work can resume without rediscovering the repository.
 
-The default workflow is agent-strategy Auto Mode:
+The default workflow requires only one command:
 
 ```bash
 dev-guard init
-dev-guard install-hooks
 dev-guard watch
-# let Claude/Codex edit files; Stop Hooks run done automatically
+# let Claude/Codex edit files
+# DevGuard automatically finalizes after changes settle — no done required
 dev-guard status
 # if a session overflows, start a new thread with:
 dev-guard handoff
@@ -25,8 +25,8 @@ AI coding agents often finish a task without preserving enough context for the n
 dev-guard keeps this workflow local and explicit:
 
 - watch file changes while an AI agent works
-- process completion when a verified agent completion strategy runs
-- keep `done` available as the manual fallback
+- automatically finalize after the filesystem settles — no manual commands needed
+- keep `done` available as a manual recovery command for crashes and debugging
 - keep append-only history
 - produce quality verdicts and handoff prompts
 - avoid automatic source edits or document writes
@@ -53,10 +53,9 @@ Start using it in a project:
 ```bash
 dev-guard init
 dev-guard install-agent-instructions
-dev-guard install-hooks
 dev-guard watch
 # let Codex/Claude edit files
-dev-guard done   # manual fallback when hooks are unavailable
+# DevGuard auto-finalizes after changes settle — no extra commands needed
 dev-guard status
 ```
 
@@ -65,8 +64,9 @@ Daily loop:
 ```bash
 dev-guard watch
 # work with an AI agent
-dev-guard done
-dev-guard status
+# DevGuard detects changes, waits for filesystem to settle,
+# then automatically generates reports and returns to monitoring
+dev-guard status  # optional: check quality verdict
 ```
 
 Resume a new session:
@@ -115,25 +115,24 @@ Keep API keys out of git. Do not commit `.env`, `.devguard/config.json` with sec
    ```
    Creates the initial `.devguard` guard files. The event-based workflow also creates `.devguard/` runtime docs when needed.
 
-2. Enable Auto Mode once
-   ```bash
-   dev-guard install-hooks
-   ```
-   Installs available agent completion strategy files. Claude Code uses a Stop Hook. Codex notify is the recommended Codex path when configured at user level; Codex Stop Hook remains available but requires `/hooks` trust.
-
-3. Start the watcher
+2. Start the watcher
    ```bash
    dev-guard watch
    ```
-   Watches project files, launches the local dashboard, accumulates changed paths, and waits for a verified agent completion strategy. When the strategy fires, it runs `dev-guard done`, which writes quality-report, next-codex-prompt, and project-handoff.
-   `watch` does not run `done` itself. If an agent hook/notify or a manual `done` runs in another process, `watch` refreshes from `.devguard/runtime.json`, `.devguard/state.json`, and `.devguard/history.jsonl` and returns to processed/idle state.
+   Watches project files, launches the local dashboard, accumulates changed paths. After filesystem inactivity (default: 20s settle + 8s grace), DevGuard **automatically** runs the equivalent of `done` — writing quality-report, next-codex-prompt, and project-handoff — then returns to monitoring. No additional commands required.
 
-4. Manual fallback when hooks are unavailable
+3. Optional: Install agent Stop Hooks for early completion
+   ```bash
+   dev-guard install-hooks
+   ```
+   Installs available agent completion strategy files. Claude Code uses a Stop Hook. Codex notify is the recommended Codex path. When a hook fires before the auto-complete timer, it takes precedence and cancels the timer.
+
+4. Manual fallback when watch is unavailable
    ```bash
    dev-guard watch --manual
    dev-guard done
    ```
-   Manual Mode only accumulates pending changes until you explicitly run `done`.
+   `--manual` or `--no-auto-complete` disables auto-finalization. Run `done` explicitly to process pending changes. Also use `done` for recovery when watch crashed or hooks failed.
 
 5. Check status
    ```bash
@@ -155,22 +154,54 @@ Keep API keys out of git. Do not commit `.env`, `.devguard/config.json` with sec
 
 ## Watch Mode In Practice
 
-Run `watch` at the start of an AI coding session when you want continuous DevGuard support:
+Run `watch` at the start of an AI coding session:
 
 ```bash
 dev-guard watch
 ```
 
-Keep it running in a separate terminal while Codex/Claude edits files. `watch` starts the local dashboard automatically, observes file changes, and keeps the pending file buffer current. It does not infer completion by idle time and does not run build/test/commit.
+Keep it running in a separate terminal while Codex/Claude edits files. `watch` starts the local dashboard automatically, observes file changes, and keeps the pending file buffer current.
 
-Completion is handled by a verified hook/notify strategy or by manual fallback:
+**Automatic finalization flow:**
+
+1. File changes are detected.
+2. Filesystem settles (no new changes for 20s by default).
+3. After an 8-second grace period, DevGuard auto-finalizes the session.
+4. Quality report, next-session prompt, and project handoff are generated.
+5. `watch` returns to monitoring — no user action required.
+
+If you edit during the grace period, the timer resets and the cycle starts again.
+
+After finalization, DevGuard writes quality and handoff artifacts:
+- `.devguard/reports/quality-report.md`
+- `.devguard/reports/project-handoff.md`
+- `.devguard/prompts/next-codex-prompt.md`
+
+Use those files to continue in the next session without rediscovering the repository.
+
+### `dev-guard done` — manual recovery only
+
+`done` is no longer needed in the normal workflow. Use it only when:
+
+- `watch` crashed or was interrupted
+- Hooks failed to fire
+- You need to manually trigger finalization for debugging
 
 ```bash
 dev-guard done
-dev-guard status
 ```
 
-After `done`, DevGuard writes quality and handoff artifacts such as `.devguard/reports/quality-report.md`, `.devguard/reports/project-handoff.md`, and `.devguard/prompts/next-codex-prompt.md`. Use those files to continue in the next session without rediscovering the repository.
+### Tuning auto-finalization
+
+```bash
+# Custom grace period (default: 8s)
+dev-guard watch --auto-complete-delay 15
+
+# Disable auto-finalization entirely (manual mode)
+dev-guard watch --manual
+# or:
+dev-guard watch --no-auto-complete
+```
 
 ## Local Dashboard
 

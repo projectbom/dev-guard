@@ -6,6 +6,7 @@ import {
   hashRuntimeFiles,
   isIgnoredWatchPath,
   markRuntimeStable,
+  processDoneEvent,
   readProjectState,
   readRuntimeState,
   recordRuntimeChange,
@@ -18,7 +19,7 @@ import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard, formatWatchDashboardKey } from "./watch-format.js";
 import { openDashboardBrowser, startDashboardServer, type DashboardServerHandle } from "./dashboard.js";
 
-type WatchStatus = "idle" | "active" | "ready_for_done" | "processed";
+type WatchStatus = "idle" | "active" | "ready_for_done" | "finalizing" | "processed";
 
 interface WatchOptions {
   stableAfterMs: number;
@@ -28,6 +29,7 @@ interface WatchOptions {
   includeLockfiles: boolean;
   manual: boolean;
   dashboard: boolean;
+  autoCompleteDelayMs: number;
 }
 
 const watchRoots = ["app", "components", "lib", "hooks", "utils", "constants", "styles", "supabase", "src", "packages", "docs", DEVGUARD_DIR];
@@ -53,6 +55,8 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   }
 
+  const autoCompleteEnabled = options.autoCompleteDelayMs > 0;
+
   if (dashboard) {
     console.log("DevGuard");
     console.log("");
@@ -72,34 +76,41 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   } else {
     console.log("dev-guard watch");
-    console.log(`Mode: ${autoMode ? "Auto Mode" : "Manual Mode"}`);
+    console.log(`Mode: ${options.manual ? "Manual Mode" : "Auto Mode"}`);
+    if (autoCompleteEnabled) {
+      console.log(`Auto-finalization: enabled (grace period: ${options.autoCompleteDelayMs / 1000}s after filesystem settles)`);
+    } else {
+      console.log("Auto-finalization: disabled (manual mode)");
+    }
     console.log("Auto completion strategy:");
     console.log(`Claude: Stop Hook ${strategyReport.claude.installed ? "installed" : "not installed"}; runtime verified: ${strategyReport.claude.runtimeVerified ? "yes" : "no"}`);
     console.log(`Codex: Notify recommended (${strategyReport.codexNotify.installed ? "installed" : "not installed"}); Stop Hook ${codexHookInstalled ? "installed" : "not installed"}${strategyReport.codexStopHook.requiresUserTrust ? " but requires /hooks trust" : ""}`);
     console.log(`Runtime verified: ${runtimeVerified ? "yes" : "no"}`);
     console.log(`Fallback: dev-guard done`);
-    console.log(`Done trigger: ${autoMode ? "verified agent strategy when runtime calls it" : "manual dev-guard done"}`);
-    if (autoMode) {
-      console.log("");
-      console.log("Watching for file changes...");
-      console.log(runtimeVerified ? "When the verified agent completion strategy fires, dev-guard done will run automatically." : "Automatic completion is installed but runtime verification is still required.");
+    console.log("");
+    console.log("Watching for file changes...");
+    if (autoCompleteEnabled) {
+      console.log("After changes settle, DevGuard will automatically finalize the session.");
+      console.log("dev-guard done is available as a manual recovery command.");
     } else {
-      console.log("");
-      console.log("Watching for file changes...");
       console.log("Tip:");
-      console.log(options.manual ? "Manual Mode enabled; run dev-guard done when the AI task is finished." : "Run dev-guard install-hooks to enable Auto Mode.");
+      console.log("Run dev-guard install-hooks to enable agent Stop Hook strategies.");
+      console.log("Manual Mode enabled; run dev-guard done when the AI task is finished.");
     }
     console.log("");
     console.log(`watching: ${watchRoots.filter((path) => existsSync(join(root, path))).join(", ") || "."}`);
     console.log(`excluded: ${excludedSummary}`);
     console.log(`depth: ${options.depth}; poll: ${options.poll ? "on" : "off"}; lockfiles: ${options.includeLockfiles ? "included" : "excluded"}; manual: ${options.manual ? "on" : "off"}`);
-    console.log("mode: event-driven; no periodic refresh; no idle-time completion");
+    console.log(`auto-complete: ${autoCompleteEnabled ? `${options.autoCompleteDelayMs / 1000}s grace period` : "disabled"}`);
     console.log("stop: Ctrl+C");
   }
 
   let status: WatchStatus = "idle";
   let stableTimer: NodeJS.Timeout | undefined;
+  let autoCompleteTimer: NodeJS.Timeout | undefined;
   let refreshTimer: NodeJS.Timeout | undefined;
+  let isAutoFinalizing = false;
+  let pendingDuringFinalize: string[] = [];
   let lastPrintedKey = "";
   let lastTransitionKey = "";
   let lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
@@ -150,6 +161,8 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     if (pendingIsStale) {
       lastSeenProcessedAt = processedAt;
       clearTimeout(stableTimer);
+      clearTimeout(autoCompleteTimer);
+      autoCompleteTimer = undefined;
       if (runtime.pendingChangedFiles.length > 0 || (runtime.lastStatus ?? "idle") !== "idle") {
         await resetRuntimeState(root);
       }
@@ -171,6 +184,66 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   };
 
+  const runAutoComplete = async () => {
+    if (isAutoFinalizing) {
+      return;
+    }
+    isAutoFinalizing = true;
+    pendingDuringFinalize = [];
+
+    // Write "finalizing" status to runtime state so dashboard reflects it
+    try {
+      const current = await readRuntimeState(root);
+      await writeRuntimeState(root, { ...current, lastStatus: "finalizing" });
+    } catch {
+      // Non-fatal: dashboard may briefly show wrong state
+    }
+    await printState("finalizing");
+
+    if (!options.compact) {
+      console.log("auto: finalizing session...");
+    }
+
+    let finalizeError: unknown;
+    try {
+      const result = await processDoneEvent(root);
+      if (!options.compact) {
+        console.log(`\nauto: processed ${result.changedFiles.length} file(s); quality=${result.qualityVerdict}`);
+        console.log(`NEXT: ${result.qualityVerdict !== "PASS" ? `review ${devguardPaths.qualityReport}` : "keep editing"}`);
+      }
+    } catch (error) {
+      finalizeError = error;
+      console.error(`auto-complete warning: ${errorMessage(error)}`);
+      console.error("recovery: run dev-guard done manually");
+    }
+
+    isAutoFinalizing = false;
+
+    if (finalizeError) {
+      // Restore state so manual recovery is possible
+      lastPrintedKey = "";
+      await printState("idle");
+      return;
+    }
+
+    if (pendingDuringFinalize.length > 0) {
+      // Changes arrived during finalization — replay them through normal handleChange flow
+      const deferred = pendingDuringFinalize;
+      pendingDuringFinalize = [];
+      lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
+      lastPrintedKey = "";
+      await startWatchSession(root);
+      for (const p of deferred) {
+        await handleChange(p);
+      }
+    } else {
+      lastSeenProcessedAt = (await readProjectState(root)).lastProcessedAt;
+      lastPrintedKey = "";
+      await startWatchSession(root);
+      await printState("idle");
+    }
+  };
+
   const handleChange = async (path: string) => {
     if (!path) {
       return;
@@ -182,6 +255,19 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     if (isIgnoredWatchPath(path) || isLockfilePath(path, options)) {
       return;
     }
+
+    // If auto-finalization is actively running, buffer the change for replay afterwards
+    if (isAutoFinalizing) {
+      pendingDuringFinalize.push(path);
+      return;
+    }
+
+    // Cancel any pending auto-complete grace timer if new changes arrive
+    if (autoCompleteTimer !== undefined) {
+      clearTimeout(autoCompleteTimer);
+      autoCompleteTimer = undefined;
+    }
+
     try {
       const projectState = await readProjectState(root);
       if (projectState.lastProcessedAt && (await pathMtimeAtOrBefore(root, path, projectState.lastProcessedAt))) {
@@ -202,7 +288,19 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
             return;
           }
           await markRuntimeStable(root, hashRuntimeFiles(latest.pendingChangedFiles));
-          await printState(latest.pendingChangedFiles.length > 0 ? "ready_for_done" : "idle");
+          const afterStable = await readRuntimeState(root);
+          if (afterStable.pendingChangedFiles.length > 0 && autoCompleteEnabled) {
+            // Briefly show the state, then start the auto-complete grace timer
+            await printState("ready_for_done");
+            if (!options.compact) {
+              console.log(`auto: changes settled; finalizing in ${options.autoCompleteDelayMs / 1000}s (edit to cancel)...`);
+            }
+            autoCompleteTimer = setTimeout(() => {
+              void runAutoComplete();
+            }, options.autoCompleteDelayMs);
+          } else {
+            await printState(afterStable.pendingChangedFiles.length > 0 ? "ready_for_done" : "idle");
+          }
         } catch (error) {
           console.error(`watch warning: ${errorMessage(error)}`);
         }
@@ -231,7 +329,9 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   }
   refreshTimer = setInterval(() => {
     void (async () => {
-      await refreshExternalDoneState();
+      if (!isAutoFinalizing) {
+        await refreshExternalDoneState();
+      }
       const runtime = await readRuntimeState(root);
       const now = Date.now();
       if (!runtime.watchHeartbeatAt || now - Date.parse(runtime.watchHeartbeatAt) > 4_000) {
@@ -252,6 +352,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     await closeWatcher(watcher);
     await dashboard?.close();
     clearTimeout(stableTimer);
+    clearTimeout(autoCompleteTimer);
     clearInterval(refreshTimer);
     console.log("\ndev-guard watch stopped");
     process.exit(0);
@@ -265,20 +366,27 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 function parseWatchOptions(args: string[]): WatchOptions {
   const stableAfterSec = readNumberOption(args, "--stable-after", 20);
   const depth = readNumberOption(args, "--depth", 8);
+  const autoCompleteDelaySec = readNumberOption(args, "--auto-complete-delay", 8);
+  const manual = args.includes("--manual") || args.includes("--no-auto");
   if (stableAfterSec <= 0) {
     throw new Error("dev-guard watch --stable-after must be positive.");
   }
   if (depth < 1) {
     throw new Error("dev-guard watch --depth must be 1 or greater.");
   }
+  if (autoCompleteDelaySec <= 0) {
+    throw new Error("dev-guard watch --auto-complete-delay must be positive.");
+  }
+  const autoCompleteEnabled = !manual && !args.includes("--no-auto-complete");
   return {
     stableAfterMs: stableAfterSec * 1000,
     compact: args.includes("--compact") || args.includes("--ultra"),
     depth,
     poll: args.includes("--poll"),
     includeLockfiles: args.includes("--include-lockfiles"),
-    manual: args.includes("--manual") || args.includes("--no-auto"),
-    dashboard: !args.includes("--no-dashboard")
+    manual,
+    dashboard: !args.includes("--no-dashboard"),
+    autoCompleteDelayMs: autoCompleteEnabled ? autoCompleteDelaySec * 1000 : 0
   };
 }
 

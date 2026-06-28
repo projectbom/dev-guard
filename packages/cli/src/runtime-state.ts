@@ -31,7 +31,7 @@ export interface RuntimeState {
   watchStartedAt?: string;
   watchHeartbeatAt?: string;
   lastDiffHash?: string;
-  lastStatus?: "idle" | "active" | "ready_for_done" | "processed";
+  lastStatus?: "idle" | "active" | "ready_for_done" | "finalizing" | "processed";
   changeCountSinceIdle?: number;
   idleDeadlineAt?: string;
   idleSinceAt?: string;
@@ -1130,11 +1130,12 @@ function renderProjectHandoff(input: {
     ...missingInputs([input.project, input.architecture, input.tasks]),
     "",
     "## Active Workflow",
-    "- `dev-guard watch` keeps the pending file buffer current.",
+    "- `dev-guard watch` keeps the pending file buffer current and auto-finalizes after the filesystem settles.",
     "- Claude/Codex edits files in the normal agent session.",
-    "- Trusted Claude Code / Codex Stop Hooks run `dev-guard done` automatically.",
+    "- After filesystem inactivity, watch waits a grace period then automatically runs the equivalent of `dev-guard done`.",
+    "- Trusted Claude Code / Codex Stop Hooks also trigger `dev-guard done` if they fire first.",
     "- `dev-guard done` writes history, quality-report, next-codex-prompt, and project-handoff.",
-    "- Manual fallback: run `dev-guard done`, then `dev-guard handoff` if only the resume file must be refreshed.",
+    "- Manual fallback: run `dev-guard done` only when watch crashed, hooks failed, or manual recovery is needed.",
     "- `dev-guard status` shows hook state, quality state, and the handoff path.",
     "",
     "## Recent Changes",
@@ -1167,12 +1168,12 @@ function renderProjectHandoff(input: {
     `- ${nextTask}`,
     "",
     "## Do Not Change",
-    "- Do not add idle-timeout based completion detection.",
     "- Do not add polling-based completion guessing.",
     "- Do not call LLM APIs automatically.",
     "- Do not run git commit automatically.",
     "- Do not change the existing watch/done/status/reset UX.",
     "- Do not change the verified Claude/Codex hook structure unless official docs require it.",
+    "- Auto-finalization grace period is configurable via --auto-complete-delay; default is 8 seconds.",
     "",
     "## Resume Prompt",
     ".devguard/reports/project-handoff.md를 읽고 Current State, Quality Status, Next Best Task를 기준으로 이어서 작업해라. 구현되지 않은 기능을 추측하지 말고 현재 파일 기준으로 확인한 뒤 진행해라."
@@ -1340,7 +1341,7 @@ function isGeneratedRuntimePath(file: string): boolean {
 function inferDecisionCandidates(input: { areas: string[]; changedFiles: string[]; judgments: string[]; summary: string }): string[] {
   const candidates = new Set<string>();
   if (input.changedFiles.some((file) => file.includes("watch"))) {
-    candidates.add("watch 자체는 time/idle 기반 완료 추정을 하지 않으며 Auto Mode 완료 처리는 Stop Hook이 담당한다.");
+    candidates.add("watch는 파일 시스템 안정 후 자동 완료 처리를 수행하며, Stop Hook도 함께 지원한다.");
     candidates.add("watch는 polling fallback과 depth 제한을 지원한다.");
   }
   if (input.changedFiles.some((file) => file.includes("runtime-state"))) {

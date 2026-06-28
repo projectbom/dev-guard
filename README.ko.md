@@ -4,13 +4,13 @@
 
 dev-guard는 AI 코딩 세션을 이어가기 위한 CLI context guard입니다. 프로젝트 맥락, 변경 파일, 품질 체크, 다음 세션용 handoff prompt를 로컬 `.devguard/` 파일로 보존해서 Codex/Claude 작업을 레포지토리 재탐색 없이 이어갈 수 있게 합니다.
 
-기본 권장 흐름은 에이전트별 완료 전략 기반 Auto Mode입니다.
+기본 워크플로우에 필요한 명령어는 단 하나입니다.
 
 ```bash
 dev-guard init
-dev-guard install-hooks
 dev-guard watch
-# Claude/Codex가 파일 수정; 검증된 완료 전략이 done 실행
+# Claude/Codex가 파일 수정
+# 파일 시스템이 안정되면 DevGuard가 자동으로 세션을 완료 처리합니다 — done 불필요
 dev-guard status
 # context window 초과 시 새 스레드에서 이어가기
 dev-guard handoff
@@ -25,8 +25,8 @@ AI 에이전트 작업은 끝난 뒤 맥락이 쉽게 끊깁니다. 다음 작�
 dev-guard는 이 흐름을 로컬에서 정리합니다.
 
 - 작업 중 파일 변경 감시
-- 검증된 에이전트별 완료 전략으로 완료 처리
-- Hook을 쓸 수 없을 때는 수동 `done` fallback 유지
+- 파일 시스템이 안정된 후 자동으로 세션 완료 처리 — 별도 명령 불필요
+- 크래시/훅 실패 시 수동 `done` fallback 유지 (복구 전용)
 - 작업 이력 누적
 - 품질 verdict 생성
 - 다음 Claude/Codex용 handoff prompt 생성
@@ -54,10 +54,9 @@ dev-guard doctor
 ```bash
 dev-guard init
 dev-guard install-agent-instructions
-dev-guard install-hooks
 dev-guard watch
 # Codex/Claude가 파일 수정
-dev-guard done   # Hook을 못 쓰는 경우 수동 fallback
+# 파일 시스템이 안정되면 DevGuard가 자동 완료 처리 — 추가 명령 불필요
 dev-guard status
 ```
 
@@ -66,8 +65,9 @@ dev-guard status
 ```bash
 dev-guard watch
 # AI Agent와 작업
-dev-guard done
-dev-guard status
+# DevGuard가 변경을 감지하고 파일 시스템이 안정되면 자동으로
+# 보고서를 생성하고 모니터링으로 돌아갑니다
+dev-guard status  # 선택 사항: 품질 verdict 확인
 ```
 
 새 세션으로 이어가기:

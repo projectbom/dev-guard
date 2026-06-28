@@ -94,7 +94,10 @@ function currentStage(runtime: RuntimeState, options: WatchDashboardOptions): st
     return "Filesystem Settling";
   }
   if (status === "ready_for_done") {
-    return options.manual ? "Ready for dev-guard done" : "Waiting for completion";
+    return options.manual ? "Ready for dev-guard done" : "Finalizing changes...";
+  }
+  if (status === "finalizing") {
+    return "Finalizing changes...";
   }
   if (status === "processed") {
     return "Completion Processed";
@@ -117,10 +120,10 @@ function waitingReason(runtime: RuntimeState, options: WatchDashboardOptions): s
     if (options.manual) {
       return "Manual dev-guard done";
     }
-    if (options.runtimeVerified) {
-      return "Agent completion strategy or manual dev-guard done";
-    }
-    return "Runtime verification or manual dev-guard done";
+    return "Auto-finalization timer";
+  }
+  if (status === "finalizing") {
+    return "Auto-finalization completing";
   }
   if (status === "processed") {
     return "Idle state refresh";
@@ -143,19 +146,17 @@ function nextTransition(runtime: RuntimeState, options: WatchDashboardOptions, n
     if (options.manual) {
       return "Waiting for dev-guard done";
     }
-    if (options.runtimeVerified) {
-      return "Waiting for verified agent completion; fallback: dev-guard done";
-    }
-    return "Run dev-guard doctor --agents or fallback: dev-guard done";
+    return "Auto-finalizing session...";
+  }
+  if (status === "finalizing") {
+    return "Generating reports and returning to monitoring";
   }
   if (status === "processed") {
     return "Returning to idle";
   }
-  return options.autoMode && options.runtimeVerified
-    ? "Watching; verified agent strategy will run done when the AI task finishes"
-    : options.manual
-      ? "Watching; run dev-guard done when the AI task is finished"
-      : "Watching; verify agent strategy or use dev-guard done";
+  return options.manual
+    ? "Watching; run dev-guard done when the AI task is finished"
+    : "Watching; DevGuard will auto-finalize after changes settle";
 }
 
 function transitionLine(runtime: RuntimeState, stage: string): string {
@@ -164,7 +165,10 @@ function transitionLine(runtime: RuntimeState, stage: string): string {
     return `Changes detected (${runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length})`;
   }
   if (status === "ready_for_done") {
-    return "Ready for completion";
+    return "Finalizing changes...";
+  }
+  if (status === "finalizing") {
+    return "Finalizing changes...";
   }
   if (status === "processed") {
     return "Completion processed";
@@ -177,7 +181,8 @@ function transitionLine(runtime: RuntimeState, stage: string): string {
 
 function displayStatus(status: string): string {
   if (status === "active") return "Working";
-  if (status === "ready_for_done") return "Ready for done";
+  if (status === "ready_for_done") return "Finalizing";
+  if (status === "finalizing") return "Finalizing";
   if (status === "processed") return "Processed";
   return "Idle";
 }
