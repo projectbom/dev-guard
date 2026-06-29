@@ -120,7 +120,7 @@ Keep API keys out of git. Do not commit `.env`, `.devguard/config.json` with sec
    dev-guard watch --manual
    dev-guard done
    ```
-   `--manual` or `--no-auto-complete` disables auto-finalization. Run `done` explicitly to process pending changes. Also use `done` for recovery when watch crashed or hooks failed.
+   `--manual` or `--no-auto-complete` disables auto-finalization. Use the dashboard Review Complete button when reviewing in the browser. In terminal-only workflows, run `dev-guard done` after review is complete to close the current session and regenerate reports. Also use `done` for recovery when watch crashed or hooks failed.
 
 4. Check status
    ```bash
@@ -210,6 +210,8 @@ The local dashboard starts automatically when `dev-guard watch` runs. It binds t
 The UI follows the browser language automatically and includes an English/Korean language toggle.
 
 It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not monitoring the project, it tells the user to run `dev-guard watch`.
+
+The dashboard is the normal user workflow: it recommends the next actions with reasons, helps you open the Quality Report, shows session impact, and provides Review Complete when review is done. The CLI remains available for automation, terminal-only workflows, and recovery.
 
 Advanced terminal-only mode:
 
@@ -354,7 +356,7 @@ dev-guard watch --manual
 dev-guard done
 ```
 
-Use Manual Mode when hooks are unavailable, untrusted, or failed. `watch` only accumulates pending changes; you decide when to run `done`.
+Use Manual Mode when hooks are unavailable, untrusted, or failed. `watch` only accumulates pending changes. After you review the result and run the app, use `dev-guard done` to close the current session and regenerate quality/handoff files.
 
 Useful commands:
 

@@ -70,6 +70,8 @@ dev-guard done
 dev-guard status
 ```
 
+Use `dev-guard done` in terminal-only workflows after you have reviewed the result and run the app. Dashboard users can use the Review Complete button instead.
+
 Resume a new session:
 
 ```bash
@@ -94,6 +96,8 @@ The local dashboard starts automatically when `dev-guard watch` runs. It binds t
 The UI follows the browser language automatically and includes an English/Korean language toggle.
 
 The dashboard does not expose arbitrary file browsing, environment variables, or shell execution.
+
+Use the dashboard for the normal review workflow: follow recommended actions with reasons, open the Quality Report, inspect session impact, run the app, then click Review Complete. Use CLI commands for automation, terminal-only workflows, and recovery.
 
 Advanced terminal-only mode:
 

@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { access, stat } from "node:fs/promises";
 import { fromRoot, readTextFile } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { readHistoryRecords, readProjectState, readRuntimeState, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
+import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
 import { readProjectKnowledge } from "./knowledge.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
@@ -62,7 +62,9 @@ interface DashboardState {
   idleCountdown: string | null;
   changeCount: number;
   recentFiles: string[];
+  sessionFiles: string[];
   moreFileCount: number;
+  sessionFileCount: number;
   watchRunning: boolean;
   initialized: boolean;
   empty: boolean;
@@ -161,6 +163,19 @@ export async function startDashboardServer(root: string, options: { port?: numbe
 
 async function handleRequest(root: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
   const url = new URL(request.url ?? "/", `http://${HOST}`);
+  if (request.method === "POST" && url.pathname === "/api/review-complete") {
+    try {
+      const result = await processDoneEvent(root);
+      sendJson(response, {
+        ok: true,
+        qualityVerdict: result.qualityVerdict,
+        changedFiles: result.changedFiles.length
+      });
+    } catch (error) {
+      sendJson(response, { ok: false, error: errorMessage(error) }, 500);
+    }
+    return;
+  }
   if (request.method !== "GET") {
     sendText(response, 405, "Method not allowed");
     return;
@@ -223,7 +238,8 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     runtimeVerified
   });
   const watchRunning = isWatchRunning(runtime);
-  const recentFiles = recentChangedFiles(runtime);
+  const sessionFiles = sessionChangedFiles(runtime, projectState);
+  const recentFiles = sessionFiles.slice(0, 5);
   const empty = initialized && !watchRunning && !runtime.watchStartedAt && runtime.pendingChangedFiles.length === 0 && history.length === 0;
 
   const sessions = buildSessionSummaries(history);
@@ -239,7 +255,9 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     idleCountdown: normalizeStatus(dashboard.status) === "working" && runtime.lastStatus !== "finalizing" ? formatCountdown(runtime.idleDeadlineAt) : null,
     changeCount: runtime.changeCountSinceIdle ?? runtime.pendingChangedFiles.length,
     recentFiles,
-    moreFileCount: Math.max(0, runtime.pendingChangedFiles.length - recentFiles.length),
+    sessionFiles,
+    moreFileCount: Math.max(0, sessionFiles.length - recentFiles.length),
+    sessionFileCount: sessionFiles.length,
     watchRunning,
     initialized,
     empty,
@@ -403,11 +421,14 @@ function isWatchRunning(runtime: RuntimeState): boolean {
   return Number.isFinite(age) && age >= 0 && age < 8_000;
 }
 
-function recentChangedFiles(runtime: RuntimeState): string[] {
+function sessionChangedFiles(runtime: RuntimeState, projectState: Awaited<ReturnType<typeof readProjectState>>): string[] {
   const files = new Set<string>();
   if (runtime.lastChangedFile) files.add(runtime.lastChangedFile);
   for (const file of runtime.pendingChangedFiles) files.add(file);
-  return [...files].slice(0, 5);
+  if (files.size === 0 && projectState.lastChangedFiles) {
+    for (const file of projectState.lastChangedFiles) files.add(file);
+  }
+  return [...files];
 }
 
 function normalizeStatus(status: string): string {
@@ -581,22 +602,30 @@ function renderPage(): string {
     /* ── Action Center ── */
     .ac-section { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; margin-bottom: 12px; }
     .ac-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 14px; }
-    .ac-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
-    .ac-card { display: flex; flex-direction: column; gap: 5px; padding: 14px 14px 12px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); transition: border-color .12s, box-shadow .12s; }
+    .ac-list { display: grid; gap: 8px; }
+    .ac-card { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; padding: 14px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); transition: border-color .12s, box-shadow .12s; }
     .ac-card:hover { border-color: var(--line2); box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+    .ac-card.primary { border-color: #bfdbfe; background: var(--accent-bg); }
     .ac-card.missing { background: var(--surface2); }
-    .ac-avail { font-size: 13px; font-weight: 700; color: var(--ok); }
-    .ac-avail.missing { color: var(--muted); }
-    .ac-name { font-size: 14px; font-weight: 700; color: var(--ink); line-height: 1.3; }
-    .ac-sub { font-size: 12px; color: var(--muted); line-height: 1.4; flex: 1; }
-    .ac-hint { font: 11px/1.4 var(--mono); color: var(--muted); background: var(--bg); border-radius: 4px; padding: 4px 6px; margin-top: 2px; }
-    .ac-btns { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-    .ac-btn { display: inline-flex; align-items: center; justify-content: center; font: 12px/1 var(--sans); font-weight: 600; padding: 6px 13px; border-radius: var(--r-sm); border: none; cursor: pointer; text-decoration: none; transition: background .1s, color .1s; white-space: nowrap; min-height: 30px; }
+    .ac-name { font-size: 14px; font-weight: 740; color: var(--ink); line-height: 1.3; }
+    .ac-reason { font-size: 12px; color: var(--muted); line-height: 1.45; margin-top: 3px; }
+    .ac-meta { font: 11px/1.4 var(--mono); color: var(--muted); margin-top: 5px; }
+    .ac-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+    .ac-btn { display: inline-flex; align-items: center; justify-content: center; font: 12px/1 var(--sans); font-weight: 650; padding: 6px 13px; border-radius: var(--r-sm); border: none; cursor: pointer; text-decoration: none; transition: background .1s, color .1s; white-space: nowrap; min-height: 30px; }
     .ac-btn-primary { background: var(--accent); color: #fff; }
     .ac-btn-primary:hover { background: var(--accent-dk); }
     .ac-btn-secondary { background: var(--surface2); border: 1px solid var(--line2); color: var(--ink2); }
     .ac-btn-secondary:hover { background: var(--line); color: var(--ink); }
     .ac-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    /* ── Assistant prompt / summary ── */
+    .prompt-list { display: grid; gap: 7px; margin-top: 10px; }
+    .prompt-item { display: flex; gap: 8px; align-items: flex-start; color: var(--ink2); font-size: 13px; line-height: 1.45; }
+    .prompt-item span { color: var(--accent); font-weight: 800; line-height: 1.4; }
+    .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    .summary-item { border: 1px solid var(--line); background: var(--surface2); border-radius: var(--r-sm); padding: 11px 12px; }
+    .summary-value { font-size: 16px; font-weight: 760; color: var(--ink); line-height: 1.2; }
+    .summary-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-top: 3px; }
 
     /* ── Card ── */
     .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; }
@@ -663,7 +692,26 @@ function renderPage(): string {
     .trend-dot.bad { background: var(--bad); }
 
     /* ── Next action ── */
-    .next-body { font-size: 15px; color: var(--ink); line-height: 1.5; font-weight: 500; }
+    .next-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 22px; margin-bottom: 12px; }
+    .next-card.pass { border-color: var(--ok-ring); background: var(--ok-bg); }
+    .next-card.warn { border-color: var(--warn-ring); background: var(--warn-bg); }
+    .next-card.blocked { border-color: var(--bad-ring); background: var(--bad-bg); }
+    .next-top { display: flex; align-items: flex-start; gap: 13px; }
+    .next-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
+    .next-title { font-size: 19px; line-height: 1.25; font-weight: 760; letter-spacing: -.2px; }
+    .next-body { font-size: 14px; color: var(--ink2); line-height: 1.5; font-weight: 500; margin-top: 4px; max-width: 720px; }
+    .next-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+    .next-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 34px; border-radius: var(--r-sm); border: 1px solid var(--line2); background: var(--surface); color: var(--ink); padding: 8px 13px; font: 13px/1 var(--sans); font-weight: 700; cursor: pointer; }
+    .next-btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    .next-card.blocked .next-btn.primary { min-height: 40px; padding: 10px 16px; font-size: 14px; box-shadow: 0 1px 6px rgba(37,99,235,.18); }
+    .next-btn.danger { border-color: var(--bad); background: var(--bad); color: #fff; }
+    .next-btn:disabled { opacity: .65; cursor: wait; }
+    .review-steps { display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 14px; max-width: 560px; }
+    .review-step { display: flex; align-items: center; background: rgba(255,255,255,.78); border: 1px solid rgba(0,0,0,.08); border-radius: var(--r-sm); padding: 11px 12px; font-size: 13px; font-weight: 680; color: var(--ink2); }
+    .review-step span { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: var(--surface); border: 1px solid var(--line2); color: var(--muted); font: 11px/1 var(--mono); margin-right: 9px; flex-shrink: 0; }
+    .review-step:first-child { border-color: var(--accent); color: var(--ink); }
+    .review-step:first-child span { border-color: var(--accent); color: var(--accent); }
+    .review-message { margin-top: 10px; color: var(--bad); font-size: 13px; font-weight: 600; }
 
     /* ── Timeline ── */
     .tl-list { display: grid; gap: 0; }
@@ -707,12 +755,12 @@ function renderPage(): string {
 
     /* ── Responsive ── */
     @media (max-width: 860px) {
-      .ac-grid { grid-template-columns: repeat(2, 1fr); }
+      .ac-card { grid-template-columns: 1fr; }
+      .ac-btns { justify-content: flex-start; }
     }
     @media (max-width: 720px) {
       .page { padding: 14px 12px 40px; }
-      .g2, .g2w, .adv-grid, .rpt-grid, .stat-row { grid-template-columns: 1fr; }
-      .ac-grid { grid-template-columns: 1fr; }
+      .g2, .g2w, .adv-grid, .rpt-grid, .stat-row, .review-steps, .summary-grid { grid-template-columns: 1fr; }
       .banner-title { font-size: 16px; }
       .session-meta { flex-direction: column; align-items: flex-end; gap: 3px; }
     }
@@ -746,6 +794,7 @@ const refreshBtn = document.getElementById('refreshBtn');
 const langBtns = [...document.querySelectorAll('[data-lang]')];
 let lang = initLang();
 let last = null;
+let reviewCompleteUntil = 0;
 
 function initLang() {
   const saved = localStorage.getItem('dg.lang');
@@ -862,23 +911,153 @@ async function copyFile(key, btn) {
   }
 }
 
-/* ─ Action card builder ─ */
-function actionCard(opts) {
-  const { name, sub, hint, avail, openKey, copyKey } = opts;
-  const cls = avail ? '' : 'missing';
-  const availIcon = avail ? '✓' : '○';
-  const availCls = avail ? '' : 'missing';
+async function completeReview(btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = t('reviewCompleteRunning');
+  try {
+    const res = await fetch('/api/review-complete', { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) throw new Error(data.error || 'review failed');
+    btn.textContent = t('reviewCompleteDone');
+    reviewCompleteUntil = Date.now() + 4500;
+    setTimeout(() => tick(), 300);
+  } catch (e) {
+    btn.textContent = orig;
+    btn.disabled = false;
+    const msg = document.getElementById('reviewMessage');
+    if (msg) msg.textContent = t('reviewCompleteFailed');
+  }
+}
+
+/* ─ Recommended action builder ─ */
+function recommendedActionCard(opts, index) {
+  const { name, reason, meta, avail, openKey, copyKey, onClick, primary } = opts;
+  const cls = (avail ? '' : 'missing') + (primary ? ' primary' : '');
   let btns = '';
   if (avail) {
     if (openKey) btns += '<a class="ac-btn ac-btn-primary" href="/api/file?path=' + esc(openKey) + '" target="_blank" rel="noopener">' + esc(t('actionOpen')) + '</a>';
     if (copyKey) btns += '<button class="ac-btn ac-btn-secondary" onclick="copyFile(' + JSON.stringify(copyKey) + ', this)">' + esc(t('actionCopy')) + '</button>';
+    if (onClick) btns += '<button class="ac-btn ac-btn-secondary" onclick="' + esc(onClick) + '">' + esc(t('reviewComplete')) + '</button>';
   }
   return '<div class="ac-card ' + cls + '">' +
-    '<div class="ac-avail ' + availCls + '">' + esc(availIcon) + ' ' + (avail ? '<span style="font-size:11px;font-weight:600;color:var(--ok)">' + esc(sub) + '</span>' : '<span style="font-size:11px;font-weight:600;color:var(--muted)">' + esc(sub) + '</span>') + '</div>' +
-    '<div class="ac-name">' + esc(name) + '</div>' +
-    (hint ? '<div class="ac-hint">' + esc(hint) + '</div>' : '') +
+    '<div><div class="ac-name">' + esc(index + 1) + '. ' + esc(name) + '</div>' +
+    '<div class="ac-reason">' + esc(reason) + '</div>' +
+    (meta ? '<div class="ac-meta">' + esc(meta) + '</div>' : '') + '</div>' +
     (btns ? '<div class="ac-btns">' + btns + '</div>' : '') +
     '</div>';
+}
+
+function sessionImpact(s) {
+  const files = s.sessionFiles || s.recentFiles || [];
+  const docs = files.filter(f => /(^|\/)(README|docs\/)|\.(md|mdx)$/i.test(f)).length;
+  const api = files.filter(f => /(^|\/)(api|routes?)\/|route\.[tj]s|server|handler/i.test(f)).length;
+  const config = files.filter(f => /(^|\/)(package\.json|tsconfig|vite\.config|next\.config|config|\.env)/i.test(f)).length;
+  const ui = files.filter(f => /(^|\/)(app|components|src\/app|src\/components|styles)\//i.test(f)).length;
+  const dashboard = files.filter(f => /dashboard/i.test(f)).length;
+  const architecture = api + config + dashboard;
+  let architectureText = t('architectureNoMajorChanges');
+  if (api > 0) architectureText = t('architectureApiChanged');
+  else if (config > 0) architectureText = t('architectureConfigChanged');
+  else if (dashboard > 0) architectureText = t('architectureDashboardChanged');
+  return { files, docs, api, config, ui, dashboard, architecture, architectureText };
+}
+
+function recommendedActions(s) {
+  const impact = sessionImpact(s);
+  const promptExists = s.reports.nextClaudePromptExists || s.reports.nextCodexPromptExists;
+  const promptKey = s.reports.nextClaudePromptExists ? 'nextclaude' : s.reports.nextCodexPromptExists ? 'nextcodex' : null;
+  const knowledgeReason = impact.architecture > 0
+    ? t('actionReasonKnowledgeArchitecture')
+    : s.knowledge.exists ? t('actionReasonKnowledgeReady') : t('actionReasonKnowledgeMissing');
+  const actions = [];
+  if (s.qualityVerdict === 'BLOCKED') {
+    actions.push({ name: t('actionReviewQuality'), reason: t('actionReasonBlocked'), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
+    actions.push({ name: t('reviewComplete'), reason: t('actionReasonReviewComplete'), avail: true, onClick: 'completeReview(this)' });
+    actions.push({ name: t('knowledgeTitle'), reason: knowledgeReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
+    actions.push({ name: t('actionPromptTitle'), reason: t('actionReasonPromptFix'), avail: promptExists, openKey: promptKey, copyKey: promptKey });
+    return actions;
+  }
+  if (s.qualityVerdict === 'NEEDS_REVIEW') {
+    actions.push({ name: t('actionReviewQuality'), reason: t('actionReasonNeedsReview'), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
+    actions.push({ name: t('actionContinueWorking'), reason: t('actionReasonContinue'), avail: promptExists, openKey: promptKey, copyKey: promptKey });
+    actions.push({ name: t('knowledgeTitle'), reason: knowledgeReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
+    actions.push({ name: t('actionHandoffTitle'), reason: t('actionReasonHandoff'), avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
+    return actions;
+  }
+  actions.push({ name: t('actionContinueFeature'), reason: t('actionReasonPass'), avail: promptExists, openKey: promptKey, copyKey: promptKey, primary: true });
+  actions.push({ name: t('knowledgeTitle'), reason: knowledgeReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
+  actions.push({ name: t('actionHandoffTitle'), reason: t('actionReasonHandoff'), avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
+  return actions;
+}
+
+function assistantPromptLines(s) {
+  const impact = sessionImpact(s);
+  if (s.qualityVerdict === 'BLOCKED') {
+    return [t('promptBlockedQuality'), t('promptBlockedFix'), t('promptBlockedValidate'), impact.architecture > 0 ? t('promptKnowledgeUpdate') : t('promptKnowledgeCheck')];
+  }
+  if (s.qualityVerdict === 'NEEDS_REVIEW') {
+    return [t('promptNeedsReviewReport'), t('promptNeedsReviewContinue'), impact.architecture > 0 ? t('promptKnowledgeUpdate') : t('promptKnowledgeCheck')];
+  }
+  return [t('promptPassContinue'), t('promptPassFocus'), t('promptPassNoReview')];
+}
+
+function sessionSummaryItems(s) {
+  const impact = sessionImpact(s);
+  const quality = s.qualityVerdict === 'PASS' ? t('verdictHealthy') : s.qualityVerdict === 'BLOCKED' ? t('verdictBlocked') : s.qualityVerdict === 'NEEDS_REVIEW' ? t('verdictReview') : t('verdictUnknown');
+  return [
+    { label: t('summaryFiles'), value: String(s.sessionFileCount || impact.files.length || 0) },
+    { label: t('summaryDocs'), value: String(impact.docs) },
+    { label: t('summaryQuality'), value: quality },
+    { label: t('summaryArchitecture'), value: impact.architectureText }
+  ];
+}
+
+function nextActionView(s, v) {
+  if (Date.now() < reviewCompleteUntil) {
+    return {
+      cls: 'pass',
+      icon: '✓',
+      title: t('reviewCompletedTitle'),
+      body: t('reviewCompletedBody')
+    };
+  }
+  if (s.qualityVerdict === 'BLOCKED') {
+    return {
+      cls: 'blocked',
+      icon: '⛔',
+      title: t('reviewRequiredTitle'),
+      body: t('reviewRequiredBody'),
+      primary: t('openQualityReport'),
+      primaryHref: '/api/file?path=quality',
+      complete: true,
+      steps: [t('reviewStepReport'), t('reviewStepRunApp'), t('reviewStepComplete')]
+    };
+  }
+  if (s.qualityVerdict === 'NEEDS_REVIEW') {
+    return {
+      cls: 'warn',
+      icon: '!',
+      title: t('reviewRecommendedTitle'),
+      body: t('reviewRecommendedBody'),
+      primary: s.reports.qualityReportExists ? t('openQualityReport') : null,
+      primaryHref: '/api/file?path=quality'
+    };
+  }
+  if (s.qualityVerdict === 'PASS' && (s.status === 'idle' || s.status === 'processed')) {
+    return {
+      cls: 'pass',
+      icon: '✓',
+      title: t('monitoringReadyTitle'),
+      body: t('monitoringReadyBody')
+    };
+  }
+  return {
+    cls: s.status === 'working' || s.status === 'ready_for_done' || s.status === 'finalizing' ? 'warn' : '',
+    icon: s.status === 'working' || s.status === 'ready_for_done' || s.status === 'finalizing' ? '…' : '✓',
+    title: t('nextActionTitle'),
+    body: v.next
+  };
 }
 
 /* ─ Advanced report block ─ */
@@ -940,15 +1119,12 @@ function render(s) {
   const knowledgeHint = s.knowledge.exists
     ? (s.knowledge.updatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.knowledge.updatedAt) : s.knowledge.framework || null)
     : t('knowledgeHint');
+  const actions = recommendedActions(s);
 
   const actionCenter = '<div class="ac-section">' +
-    '<div class="ac-title">' + esc(t('actionCenterTitle')) + '</div>' +
-    '<div class="ac-grid">' +
-    actionCard({ name: t('actionHandoffTitle'), sub: handoffSub, hint: s.reports.handoffExists ? null : t('actionHandoffHint'), avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' }) +
-    actionCard({ name: t('actionQualityTitle'), sub: qualitySub, hint: null, avail: s.reports.qualityReportExists, openKey: 'quality', copyKey: null }) +
-    actionCard({ name: t('actionContextTitle'), sub: contextSub, hint: null, avail: s.reports.agentContextExists, openKey: 'context', copyKey: null }) +
-    actionCard({ name: t('actionPromptTitle'), sub: promptSub, hint: promptExists ? null : t('actionPromptHint'), avail: promptExists, openKey: promptOpenKey, copyKey: promptCopyKey }) +
-    actionCard({ name: t('knowledgeTitle'), sub: knowledgeSub, hint: knowledgeHint, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge' }) +
+    '<div class="ac-title">' + esc(t('recommendedTitle')) + '</div>' +
+    '<div class="ac-list">' +
+    actions.map((action, index) => recommendedActionCard(action, index)).join('') +
     '</div></div>';
 
   /* Activity card */
@@ -1020,9 +1196,29 @@ function render(s) {
     '<div class="health-row"><span class="health-label">' + esc(t('healthReports')) + '</span>' + healthBadge(rh) + '</div>' +
     '</div>' + trendDots + '</div>';
 
+  const summaryCard = '<div class="card"><div class="card-title">' + esc(t('sessionSummaryTitle')) + '</div>' +
+    '<div class="summary-grid">' + sessionSummaryItems(s).map(item =>
+      '<div class="summary-item"><div class="summary-value">' + esc(item.value) + '</div><div class="summary-label">' + esc(item.label) + '</div></div>'
+    ).join('') + '</div></div>';
+
   /* Next action card */
-  const nextCard = '<div class="card"><div class="card-title">' + esc(t('nextActionTitle')) + '</div>' +
-    '<div class="next-body">' + esc(v.next) + '</div></div>';
+  const na = nextActionView(s, v);
+  const reviewSteps = na.steps?.length
+    ? '<div class="review-steps">' + na.steps.map((step, i) => '<div class="review-step"><span>' + (i + 1) + '</span>' + esc(step) + '</div>').join('') + '</div>'
+    : '';
+  const nextButtons = (na.primary || na.complete)
+    ? '<div class="next-actions">' +
+      (na.primary ? '<a class="next-btn primary" href="' + esc(na.primaryHref) + '" target="_blank" rel="noopener">' + esc(na.primary) + '</a>' : '') +
+      (na.complete ? '<button class="next-btn danger" onclick="completeReview(this)">' + esc(t('reviewComplete')) + '</button>' : '') +
+      '</div><div id="reviewMessage" class="review-message" aria-live="polite"></div>'
+    : '';
+  const nextCard = '<div class="next-card ' + esc(na.cls) + '">' +
+    '<div class="next-top"><div class="next-icon" aria-hidden="true">' + esc(na.icon) + '</div><div>' +
+    '<div class="next-title">' + esc(na.title) + '</div>' +
+    '<div class="next-body">' + esc(na.body) + '</div>' +
+    '<div class="prompt-list">' + assistantPromptLines(s).map(line => '<div class="prompt-item"><span>•</span><div>' + esc(line) + '</div></div>').join('') + '</div>' +
+    reviewSteps + nextButtons +
+    '</div></div></div>';
 
   /* Timeline */
   const tlHtml = !s.timeline.length
@@ -1050,11 +1246,10 @@ function render(s) {
     '</div></div></details></div>';
 
   root.innerHTML =
-    banner + setupList + actionCenter +
+    nextCard + banner + setupList + actionCenter +
     '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
-    '<div class="gap g2w" style="margin-top:12px">' + progressCard + sessionsCard + '</div>' +
-    '<div class="gap g2" style="margin-top:12px">' + healthCard + nextCard + '</div>' +
-    '<div style="margin-top:12px">' + timelineCard + '</div>' +
+    '<div class="gap g2w" style="margin-top:12px">' + summaryCard + sessionsCard + '</div>' +
+    '<div class="gap g2" style="margin-top:12px">' + healthCard + timelineCard + '</div>' +
     advanced;
 }
 
