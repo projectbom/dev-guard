@@ -49,6 +49,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (process.argv.slice(3).some((arg) => arg === "--help" || arg === "-h")) {
+    printHelp();
+    return;
+  }
+
   if (command === "init") {
     await runInit(root);
     return;

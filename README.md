@@ -379,7 +379,7 @@ dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-In the new thread, attach or ask the agent to read `.devguard/reports/project-handoff.md`. It summarizes current state, active workflow, recent changes, important decisions, quality status, open risks, the next best task, and a short resume prompt.
+In the new thread, attach or ask the agent to read `.devguard/reports/project-handoff.md`. It is a compact resume organized around `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, and `Project` so the next agent can continue without reading a long chat history.
 
 ## Multi-Agent Workflow
 
@@ -411,7 +411,7 @@ For a full compressed resume, also read `.devguard/reports/project-handoff.md`.
 
 - `.devguard/context/agent-context.md` — single-entry context document for new sessions
 - `.devguard/prompts/next-claude-prompt.md` — structured startup prompt for Claude sessions
-- `.devguard/prompts/next-codex-prompt.md` — structured handoff prompt for Codex sessions (now includes context loading preamble)
+- `.devguard/prompts/next-codex-prompt.md` — compact execution prompt for Codex sessions
 
 ### AGENTS.md and CLAUDE.md
 

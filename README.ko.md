@@ -290,7 +290,7 @@ dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-새 Claude/Codex 스레드에서는 `.devguard/reports/project-handoff.md`를 읽게 하고, Current State / Quality Status / Next Best Task 기준으로 이어서 작업하게 합니다.
+새 Claude/Codex 스레드에서는 `.devguard/reports/project-handoff.md`를 읽게 합니다. 이 파일은 `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, `Project` 중심의 압축 resume라 긴 대화 기록 없이 이어서 작업할 수 있습니다.
 
 ## Multi-Agent Workflow
 
@@ -322,7 +322,7 @@ Read .devguard/context/agent-context.md and continue.
 
 - `.devguard/context/agent-context.md` — 새 세션용 단일 진입 컨텍스트 문서
 - `.devguard/prompts/next-claude-prompt.md` — Claude 세션용 시작 프롬프트
-- `.devguard/prompts/next-codex-prompt.md` — Codex 세션용 인수인계 프롬프트 (최상단에 컨텍스트 로딩 안내 추가)
+- `.devguard/prompts/next-codex-prompt.md` — Codex 세션용 압축 실행 프롬프트
 
 ### AGENTS.md / CLAUDE.md
 

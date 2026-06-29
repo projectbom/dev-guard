@@ -9,22 +9,26 @@
 .devguard/reports/project-handoff.md
 ```
 
-`next-codex-prompt.md` is a ready-to-paste task prompt. `project-handoff.md` is the compressed context-overflow recovery file for a fresh Claude/Codex thread. The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
+`next-codex-prompt.md` is a compact execution prompt. `project-handoff.md` is the compressed context-overflow recovery file for a fresh Claude/Codex thread. The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
 
 ## Prompt Sections
 
 `next-codex-prompt.md` includes:
 
-- `Current Project Context`: summary from `.devguard/project.md`, `architecture.md`, and `decisions.md`
-- `Recent Work Summary`: current done result and recent history
-- `Changed Files`: changed paths, inferred roles, and areas
-- `Risk / Drift Candidates`: what needs attention and how to check it
-- `Quality Gate`: PASS / NEEDS_REVIEW / BLOCKED, verification commands, before-commit checklist
-- `Do Not Change`: guardrails for the next agent
-- `Already Decided / Decision Candidates`: decisions to preserve or manually record
-- `Next Task`: one priority task only
-- `Verification Commands`: commands discovered from package scripts
-- `Completion Report Format`: how the next agent should report back
+- `Next`: the smallest executable next step
+- `State`: goal, completion status, quality verdict, and verification commands
+- `Changed`: semantic change summary plus compact file list
+- `Outstanding`: unresolved warnings or blocked items
+- `Context`: recent session context and project knowledge pointer
+- `Guardrails`: scope constraints for the next agent
+
+`project-handoff.md` is even more compressed. It is ordered by quality state:
+
+- `BLOCKED`: `Outstanding` and `Quality` come first.
+- `NEEDS_REVIEW`: `Goal`, `Outstanding`, `Quality`, then `Next`.
+- `PASS`: `Goal`, `Next`, and `Changed` come first.
+
+It also includes a short `Handoff Quality` self-check with coverage, redundancy, and readability.
 
 ## Source Inputs
 
@@ -66,4 +70,4 @@ dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-Start a new Claude/Codex thread and ask it to read `.devguard/reports/project-handoff.md`. The file includes current state, active workflow, recent changes, important decisions, quality status, open risks, one next best task, do-not-change constraints, and a short resume prompt.
+Start a new Claude/Codex thread and ask it to read `.devguard/reports/project-handoff.md`. The file includes `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, `Project`, and a short resume prompt.

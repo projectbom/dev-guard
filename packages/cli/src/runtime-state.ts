@@ -803,107 +803,40 @@ function renderNextPrompt(input: {
   nextTask: NextTaskPlan;
   qualityReport: QualityReport;
 }): string {
-  const focusFiles = input.changedFiles.slice(0, 12);
   const semanticChanges = summarizeMeaningfulChanges(input.changedFiles, input.areas, input.summary);
   const outstanding = outstandingIssuesFromQuality(input.qualityReport, input.riskDetails.map((risk) => risk.content));
   const executableSteps = executableNextSteps(input.qualityReport, input.nextTask);
-  const recentLines = input.recentHistory
-    .slice(-3)
-    .reverse()
-    .map((record) => `- ${record.timestamp}: ${record.inferredSummary}`);
+  const recent = formatRecentSessionContext(input.recentHistory).slice(0, 2);
+  const fileLine = compactFileList(input.changedFiles);
   return [
-    "Before doing any work, read:",
-    "",
-    `1. \`${devguardPaths.agentContext}\``,
-    `2. \`${devguardPaths.projectHandoff}\``,
-    "",
-    "Use them as the primary source of project context.",
-    "Do not perform repository-wide scans before reading them.",
-    "",
-    "---",
-    "",
     "# Codex Handoff Prompt",
     "",
-    "아래 순서대로 바로 이어서 작업해줘. 추측보다 파일/명령/검증 결과를 우선하고, 관련 없는 수정은 하지 마.",
+    `Read \`${devguardPaths.projectHandoff}\` and \`${devguardPaths.agentContext}\` first. Do not scan broadly before that.`,
     "",
-    "## Execute Next",
+    "## Next",
     ...formatBullets(executableSteps),
     "",
-    "## Current Goal",
-    `- ${input.nextTask.goal}`,
+    "## State",
+    `- goal: ${input.nextTask.goal}`,
     `- status: ${completionStatus(input.qualityReport.verdict, input.drift)}`,
-    `- scope: ${input.nextTask.scope.join("; ")}`,
+    `- quality: ${input.qualityReport.verdict}`,
+    `- verify: ${compactCommandList(input.qualityReport.requiredVerification)}`,
     "",
-    "## What Changed",
+    "## Changed",
     ...formatBullets(semanticChanges),
-    "- files:",
-    ...formatBullets(focusFiles.map((file) => `${file} - ${inferFileRole(file)}; area=${classifyAreas([file]).join(",")}`)),
-    ...(input.changedFiles.length > focusFiles.length ? [`- ... +${input.changedFiles.length - focusFiles.length} files`] : []),
+    `- files: ${fileLine}`,
     "",
-    "## Outstanding Issues",
+    "## Outstanding",
     ...formatBullets(outstanding),
     "",
-    "## Quality Gate",
-    `- verdict: ${input.qualityReport.verdict}`,
-    "- required verification:",
-    ...formatBullets(input.qualityReport.requiredVerification),
-    "- before commit:",
-    ...formatBullets(input.qualityReport.beforeCommit),
-    "- blocked/warn items:",
-    ...formatBullets(
-      input.qualityReport.checklist
-        .filter((item) => item.status !== "PASS")
-        .map((item) => `${item.status}: ${item.label} - ${item.detail}`)
-    ),
+    "## Context",
+    ...formatBullets(recent),
+    `- project: ${compactProjectContextLine(input.projectContext)}`,
     "",
-    "## Recent Session Context",
-    ...formatBullets(recentLines.map((line) => line.replace(/^- /, ""))),
-    "- repeatedly touched areas:",
-    ...formatBullets(formatCounts(countItems(input.recentHistory.flatMap((record) => record.areas))).slice(0, 5)),
-    "",
-    "## Project Context",
-    `- purpose: ${input.projectContext.projectPurpose}`,
-    `- current goal: ${input.projectContext.currentGoal}`,
-    `- not doing: ${input.projectContext.notDoing}`,
-    `- tech stack: ${input.projectContext.techStack}`,
-    `- structure: ${input.projectContext.structure}`,
-    "",
-    "## Risk / Drift Candidates",
-    ...formatRiskDetails(input.riskDetails),
-    "",
-    "## Do Not Change",
-    "- 이번 작업과 관련 없는 영역",
+    "## Guardrails",
+    "- Do not introduce new features.",
     `- ${devguardPaths.reportsDir}, ${devguardPaths.promptsDir}, ${devguardPaths.runtime} 직접 수정 금지`,
-    "- 사용자가 명시하지 않은 대규모 리팩터링 금지",
-    "- 기존 공개 명령어 UX 유지: watch/done/status/reset",
-    "- 기존 문서 원본 직접 수정 금지. 필요한 내용은 후보 파일 또는 보고로 남길 것",
-    "- auth/database/api/config 변경은 현재 작업과 직접 관련 있을 때만 수정",
-    "",
-    "## Already Decided / Decision Candidates",
-    ...formatBullets(input.decisionCandidates.length > 0 ? input.decisionCandidates : ["새 결정 후보 없음"]),
-    "",
-    "## Next Task",
-    `- priority: ${input.nextTask.title}`,
-    `- goal: ${input.nextTask.goal}`,
-    "- scope:",
-    ...formatBullets(input.nextTask.scope),
-    "- likely files:",
-    ...formatBullets(input.nextTask.likelyFiles),
-    "- do not edit:",
-    ...formatBullets(input.nextTask.doNotEdit),
-    "- success:",
-    ...formatBullets(input.nextTask.success),
-    "",
-    "## Verification Commands",
-    ...formatBullets(input.testCommands),
-    "",
-    "## Completion Report Format",
-    "1. 수정한 파일",
-    "2. 수행한 작업",
-    "3. 수정하지 않은 범위",
-    "4. 검증 결과",
-    "5. 남은 리스크",
-    "6. 다음 권장 작업"
+    "- Keep watch/done/status/reset UX unchanged."
   ].join("\n") + "\n";
 }
 
@@ -938,6 +871,11 @@ function outstandingIssuesFromQuality(report: QualityReport, riskHints: string[]
   return [...issues].slice(0, 8);
 }
 
+function compactOutstanding(items: string[], verdict: string): string[] {
+  if (verdict === "PASS") return ["none"];
+  return items.filter((item) => item !== "none").slice(0, verdict === "BLOCKED" ? 5 : 3);
+}
+
 function executableNextSteps(report: QualityReport, nextTask: NextTaskPlan): string[] {
   if (report.verdict === "BLOCKED") {
     return [
@@ -962,10 +900,86 @@ function executableNextSteps(report: QualityReport, nextTask: NextTaskPlan): str
   ];
 }
 
+function executableNextStepsFromParsedQuality(quality: { verdict: string; requiredVerification: string[] }, nextTask: string): string[] {
+  if (quality.verdict === "BLOCKED") {
+    return [
+      "- Review BLOCKED items in the quality report.",
+      "- Fix only the blocked issue.",
+      `- Run: ${compactCommandList(quality.requiredVerification)}`
+    ];
+  }
+  if (quality.verdict === "NEEDS_REVIEW") {
+    return [
+      `- Continue: ${nextTask}`,
+      `- Run: ${compactCommandList(quality.requiredVerification)}`,
+      `- Review: ${devguardPaths.qualityReport}`
+    ];
+  }
+  return [`- Continue: ${nextTask}`, `- Run: ${compactCommandList(quality.requiredVerification)}`];
+}
+
 function completionStatus(verdict: string, drift?: string): string {
   if (verdict === "PASS" && drift !== "high") return "completed";
   if (verdict === "BLOCKED" || drift === "high") return "blocked";
   return "partially completed";
+}
+
+function compactFileList(files: string[], limit = 4): string {
+  if (files.length === 0) return "none";
+  const visible = files.slice(0, limit).join(", ");
+  return files.length > limit ? `${visible}, +${files.length - limit}` : visible;
+}
+
+function compactCommandList(commands: string[], limit = 3): string {
+  if (commands.length === 0) return "확인 필요";
+  const visible = commands.slice(0, limit).join("; ");
+  return commands.length > limit ? `${visible}; +${commands.length - limit}` : visible;
+}
+
+function compactProjectContextLine(projectContext: ProjectContextSummary): string {
+  const parts = [projectContext.techStack, projectContext.structure].filter((item) => item && item !== "확인 필요");
+  return parts.length > 0 ? parts.join("; ") : `see ${devguardPaths.projectKnowledge}`;
+}
+
+function compactQualityLine(quality: { verdict: string; why: string[]; requiredVerification: string[] }): string {
+  const why = quality.why.filter((item) => item !== "확인 필요").slice(0, 2).join(" / ");
+  const verify = compactCommandList(quality.requiredVerification);
+  return `${quality.verdict}${why ? ` - ${why}` : ""}; verify: ${verify}`;
+}
+
+function compactKnowledgeLine(content: string): string {
+  try {
+    const parsed = JSON.parse(content) as {
+      summary?: { framework?: string; language?: string; packageManager?: string; filesIndexed?: number; entryPoints?: string[] };
+      architecture?: { modules?: Array<{ name?: string }> };
+    };
+    const modules = parsed.architecture?.modules?.map((module) => module.name).filter(Boolean).slice(0, 5).join(", ");
+    return [
+      parsed.summary?.framework,
+      parsed.summary?.packageManager,
+      typeof parsed.summary?.filesIndexed === "number" ? `${parsed.summary.filesIndexed} files` : undefined,
+      modules ? `modules: ${modules}` : undefined
+    ].filter(Boolean).join("; ") || "확인 필요";
+  } catch {
+    return "확인 필요";
+  }
+}
+
+function handoffQualityScore(input: { missingCount: number; outstandingCount: number; lineCountEstimate: number }): string[] {
+  const coverage = input.missingCount === 0 ? "Complete" : `Missing ${input.missingCount}`;
+  const redundancy = input.lineCountEstimate <= 55 ? "Low" : input.lineCountEstimate <= 75 ? "Medium" : "High";
+  const readability = input.outstandingCount <= 4 && input.lineCountEstimate <= 60 ? "High" : "Medium";
+  return [`Coverage: ${coverage}`, `Redundancy: ${redundancy}`, `Readability: ${readability}`];
+}
+
+function handoffSectionOrder(verdict: string): string[] {
+  if (verdict === "BLOCKED") {
+    return ["Outstanding", "Quality", "Goal", "Next", "Changed", "History", "Project", "Decisions", "Workflow", "Missing"];
+  }
+  if (verdict === "PASS") {
+    return ["Goal", "Next", "Changed", "History", "Project", "Quality", "Decisions", "Workflow", "Missing"];
+  }
+  return ["Goal", "Outstanding", "Quality", "Next", "Changed", "History", "Project", "Decisions", "Workflow", "Missing"];
 }
 
 function parseProjectState(stateJson: string): ProjectState {
@@ -1277,80 +1291,44 @@ function renderProjectHandoff(input: {
   const changedFiles = state.lastChangedFiles ?? lastHistoryFiles(input.records);
   const latestSummary = state.lastSummary ?? latestHistorySummary(input.records);
   const semanticChanges = summarizeMeaningfulChanges(changedFiles, classifyAreas(changedFiles), latestSummary);
-  const risks = openRisks(input);
+  const risks = compactOutstanding(openRisks(input), quality.verdict);
   const recentSessions = formatRecentSessionContext(input.records);
-  return [
-    "# Project Handoff",
-    "",
-    "## Current Goal",
-    `- ${nextTask}`,
-    `- status: ${completionStatus(quality.verdict, state.lastDrift)}`,
-    `- source: ${devguardPaths.nextCodexPrompt}, ${devguardPaths.qualityReport}, ${devguardPaths.history}`,
-    "",
-    "## Current Status",
-    ...formatBullets(currentStateSummary(input)),
-    ...missingInputs([input.project, input.architecture, input.tasks]),
-    "",
-    "## What Changed",
-    ...formatBullets(semanticChanges),
-    "- supporting files:",
-    ...formatBullets(changedFiles.slice(0, 12)),
-    ...(changedFiles.length > 12 ? [`- ... +${changedFiles.length - 12} files`] : []),
-    "",
-    "## Session History Context",
-    ...formatBullets(recentSessions),
-    "",
-    "## Outstanding Issues",
-    ...formatBullets(risks),
-    "",
-    "## Quality Summary",
-    `- verdict: ${quality.verdict}`,
-    "- reason:",
-    ...formatBullets(quality.why),
-    "- required verification:",
-    ...formatBullets(quality.requiredVerification),
-    ...missingInputs([input.qualityReport]),
-    "",
-    "## Recommended Next Task",
-    `- ${nextTask}`,
-    "",
-    "## Important Project Knowledge",
-    ...formatBullets(projectKnowledgeBullets(input.projectKnowledge.content)),
-    ...missingInputs([input.projectKnowledge]),
-    "",
-    "## Recent Raw History",
-    ...formatBullets(
-      input.records.length > 0
-        ? input.records
-            .slice(-5)
-            .reverse()
-            .map((record) => `${record.timestamp}: ${record.inferredSummary}`)
-        : extractBullets(input.historySummary.content, 5)
-    ),
-    ...missingInputs([input.historySummary]),
-    "",
-    "## Important Decisions",
-    ...formatBullets(decisions),
-    ...missingInputs([input.decisions, input.decisionCandidates]),
-    "",
-    "## Active Workflow",
-    "- `dev-guard watch` is the normal entry point and keeps project monitoring active.",
-    "- `watch` starts the dashboard and auto-finalizes after filesystem changes settle.",
-    "- Trusted Claude/Codex hooks or notify can also run `dev-guard done` when the agent task completes.",
-    "- `dev-guard done` writes history, quality-report, next prompts, project-handoff, agent-context, and project knowledge.",
-    "- Manual fallback: run `dev-guard done` only when watch crashed, hooks failed, or manual recovery is needed.",
-    "",
-    "## Do Not Change",
-    "- Do not add polling-based completion guessing.",
-    "- Do not call LLM APIs automatically.",
-    "- Do not run git commit automatically.",
-    "- Do not change the existing watch/done/status/reset UX.",
-    "- Do not change the verified Claude/Codex hook structure unless official docs require it.",
-    "- Auto-finalization grace period is configurable via --auto-complete-delay; default is 8 seconds.",
+  const missing = missingInputs([input.project, input.architecture, input.tasks, input.qualityReport, input.projectKnowledge, input.historySummary]);
+  const sections = new Map<string, string[]>([
+    ["Goal", [`- ${nextTask}`, `- status: ${completionStatus(quality.verdict, state.lastDrift)}`]],
+    ["Next", executableNextStepsFromParsedQuality(quality, nextTask)],
+    ["Outstanding", formatBullets(risks)],
+    ["Quality", [`- ${compactQualityLine(quality)}`]],
+    ["Changed", [...semanticChanges.slice(0, 3).map((item) => `- ${item}`), `- files: ${compactFileList(changedFiles)}`]],
+    ["History", recentSessions.slice(0, 3).map((item) => `- ${item}`)],
+    ["Project", [`- ${compactKnowledgeLine(input.projectKnowledge.content)}`]],
+    ["Decisions", decisions.filter((item) => item !== "확인 필요").slice(0, 3).map((item) => `- ${item}`)],
+    ["Workflow", [
+      "- `dev-guard watch` is the normal entry point; `done` writes reports, prompts, handoff, context, and project knowledge.",
+      "- Do not add polling completion, LLM API calls, git commits, or unrelated UX changes."
+    ]]
+  ]);
+  if (missing.length > 0) sections.set("Missing", missing);
+  const order = handoffSectionOrder(quality.verdict);
+  const body: string[] = ["# Project Handoff", ""];
+  for (const title of order) {
+    const lines = sections.get(title)?.filter(Boolean) ?? [];
+    if (lines.length === 0) continue;
+    body.push(`## ${title}`, ...lines, "");
+  }
+  const score = handoffQualityScore({
+    missingCount: missing.length,
+    outstandingCount: risks.filter((item) => item !== "none").length,
+    lineCountEstimate: body.length + 8
+  });
+  body.push(
+    "## Handoff Quality",
+    ...formatBullets(score),
     "",
     "## Resume Prompt",
-    ".devguard/reports/project-handoff.md를 읽고 Current Goal, Outstanding Issues, Quality Summary, Recommended Next Task 순서로 이어서 작업해라. 구현되지 않은 기능을 추측하지 말고 현재 파일 기준으로 확인한 뒤 진행해라."
-  ].join("\n") + "\n";
+    "Read this file, then continue from Next and Outstanding. Verify with current files before changing code."
+  );
+  return body.join("\n") + "\n";
 }
 
 async function readRequiredText(root: string, path: string): Promise<RequiredText> {

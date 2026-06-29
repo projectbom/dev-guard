@@ -148,7 +148,7 @@ dev-guard handoff
 
 - `.devguard/reports/project-handoff.md`
 
-Use it when a Claude/Codex context window overflows and you need a compact resume file for a new thread. The file includes current state, active workflow, recent changes, important decisions, quality status, open risks, next best task, do-not-change constraints, and a short resume prompt.
+Use it when a Claude/Codex context window overflows and you need a compact resume file for a new thread. The file is organized around `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, and `Project`, with the most important section ordered first by quality state.
 
 ## Advanced / Legacy Commands
 
