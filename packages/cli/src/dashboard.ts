@@ -54,6 +54,12 @@ interface FileInfo {
   updatedAt?: string;
 }
 
+interface QualitySummary {
+  warningCount: number;
+  blockedCount: number;
+  requiredVerificationCount: number;
+}
+
 interface DashboardState {
   status: string;
   watchingSince: string;
@@ -89,6 +95,7 @@ interface DashboardState {
     handoffPreview?: string;
     qualityReportPreview?: string;
     agentContextPreview?: string;
+    qualitySummary: QualitySummary;
   };
   knowledge: {
     exists: boolean;
@@ -380,17 +387,44 @@ async function readReportState(root: string): Promise<DashboardState["reports"]>
     nextCodexPromptUpdatedAt: nextCodex.updatedAt,
     handoffPreview: handoff.preview,
     qualityReportPreview: quality.preview,
-    agentContextPreview: context.preview
+    agentContextPreview: context.preview,
+    qualitySummary: summarizeQualityReport(quality.text ?? quality.preview ?? "")
   };
 }
 
-async function readKnownPreview(root: string, path: string): Promise<{ exists: boolean; updatedAt?: string; preview?: string }> {
+function summarizeQualityReport(markdown: string): QualitySummary {
+  return {
+    warningCount: countSectionItems(markdown, "Warnings"),
+    blockedCount: countSectionItems(markdown, "Blocked Items"),
+    requiredVerificationCount: countSectionItems(markdown, "Required Verification")
+  };
+}
+
+function countSectionItems(markdown: string, heading: string): number {
+  const pattern = new RegExp(`^## ${escapeRegExp(heading)}\\s*$`, "m");
+  const match = pattern.exec(markdown);
+  if (!match) return 0;
+  const start = match.index + match[0].length;
+  const next = markdown.slice(start).search(/\n## /);
+  const section = next >= 0 ? markdown.slice(start, start + next) : markdown.slice(start);
+  return section
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("- ") && !/^- none$/i.test(line))
+    .length;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function readKnownPreview(root: string, path: string): Promise<{ exists: boolean; updatedAt?: string; preview?: string; text?: string }> {
   const absolute = fromRoot(root, path);
   if (!(await fileExists(absolute))) {
     return { exists: false };
   }
   const [text, info] = await Promise.all([readTextFile(absolute), stat(absolute)]);
-  return { exists: true, updatedAt: info.mtime.toISOString(), preview: text.slice(0, 1800) };
+  return { exists: true, updatedAt: info.mtime.toISOString(), preview: text.slice(0, 1800), text };
 }
 
 async function checkFileInfo(root: string, path: string): Promise<FileInfo> {
@@ -626,6 +660,8 @@ function renderPage(): string {
     .summary-item { border: 1px solid var(--line); background: var(--surface2); border-radius: var(--r-sm); padding: 11px 12px; }
     .summary-value { font-size: 16px; font-weight: 760; color: var(--ink); line-height: 1.2; }
     .summary-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-top: 3px; }
+    .summary-evidence { margin-top: 8px; display: grid; gap: 3px; }
+    .summary-evidence div { font: 11px/1.35 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* ── Card ── */
     .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; }
@@ -948,68 +984,128 @@ function recommendedActionCard(opts, index) {
     '</div>';
 }
 
+function fmt(key, vars) {
+  return t(key).replace(/\\{(\\w+)\\}/g, (_, name) => vars[name] ?? '');
+}
+
+function shortFileList(files, max = 3) {
+  const names = (files || []).slice(0, max).map(f => basename(f));
+  const extra = Math.max(0, (files || []).length - max);
+  return extra > 0 ? names.concat('+' + extra).join(', ') : names.join(', ');
+}
+
 function sessionImpact(s) {
   const files = s.sessionFiles || s.recentFiles || [];
-  const docs = files.filter(f => /(^|\/)(README|docs\/)|\.(md|mdx)$/i.test(f)).length;
-  const api = files.filter(f => /(^|\/)(api|routes?)\/|route\.[tj]s|server|handler/i.test(f)).length;
-  const config = files.filter(f => /(^|\/)(package\.json|tsconfig|vite\.config|next\.config|config|\.env)/i.test(f)).length;
-  const ui = files.filter(f => /(^|\/)(app|components|src\/app|src\/components|styles)\//i.test(f)).length;
-  const dashboard = files.filter(f => /dashboard/i.test(f)).length;
-  const architecture = api + config + dashboard;
-  let architectureText = t('architectureNoMajorChanges');
-  if (api > 0) architectureText = t('architectureApiChanged');
-  else if (config > 0) architectureText = t('architectureConfigChanged');
-  else if (dashboard > 0) architectureText = t('architectureDashboardChanged');
-  return { files, docs, api, config, ui, dashboard, architecture, architectureText };
+  const docsFiles = files.filter(f => /(^|\/)(README[^/]*|docs\/)|\.(md|mdx)$/i.test(f));
+  const apiFiles = files.filter(f => /(^|\/)(app|src\/app|pages|src\/pages)\/api\/|(^|\/)api\/.*\.[tj]s$|(^|\/)routes\/.*\.[tj]s$|\/route\.[tj]s$/i.test(f));
+  const dashboardFiles = files.filter(f => /(^|\/)packages\/cli\/src\/dashboard(?:-[^/]*)?\.[tj]s$|(^|\/)packages\/cli\/src\/dashboard\//i.test(f));
+  const configFiles = files.filter(f => /(^|\/)(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|tsconfig[^/]*\.json|vite\.config\.[tj]s|next\.config\.[tj]s|eslint\.config\.[tj]s|\.env[^/]*)$/i.test(f) || /(^|\/)config\//i.test(f));
+  const cliFiles = files.filter(f => /^packages\/cli\/src\/.+\.[tj]s$/i.test(f) && !dashboardFiles.includes(f));
+  const primary =
+    apiFiles.length > 0 ? { key: 'api', label: t('architectureApiChanged'), files: apiFiles } :
+    cliFiles.length > 0 ? { key: 'cli', label: t('architectureCliChanged'), files: cliFiles } :
+    dashboardFiles.length > 0 ? { key: 'dashboard', label: t('architectureDashboardChanged'), files: dashboardFiles } :
+    configFiles.length > 0 ? { key: 'config', label: t('architectureConfigChanged'), files: configFiles } :
+    docsFiles.length > 0 ? { key: 'docs', label: t('architectureDocsChanged'), files: docsFiles } :
+    { key: 'none', label: t('architectureNoMajorChanges'), files: [] };
+  return {
+    files,
+    docsFiles,
+    apiFiles,
+    configFiles,
+    dashboardFiles,
+    cliFiles,
+    architecture: apiFiles.length + cliFiles.length + dashboardFiles.length + configFiles.length,
+    architectureText: primary.label,
+    primaryImpact: primary.key,
+    evidenceFiles: primary.files
+  };
+}
+
+function qualityReason(s, blocked) {
+  const q = s.reports.qualitySummary || {};
+  if (blocked) {
+    if (q.blockedCount > 0) return fmt('reasonBlockedCount', { count: q.blockedCount });
+    if (q.warningCount > 0) return fmt('reasonWarningsDetected', { count: q.warningCount });
+    return t('actionReasonBlocked');
+  }
+  if (q.warningCount > 0) return fmt('reasonWarningsDetected', { count: q.warningCount });
+  if (q.requiredVerificationCount > 0) return fmt('reasonVerificationCount', { count: q.requiredVerificationCount });
+  return t('actionReasonNeedsReview');
+}
+
+function knowledgeReason(s, impact) {
+  if (!s.knowledge.exists) return t('actionReasonKnowledgeMissing');
+  if (impact.evidenceFiles.length > 0) {
+    return fmt('reasonChangedFiles', { files: shortFileList(impact.evidenceFiles, 2) });
+  }
+  return t('actionReasonKnowledgeReady');
+}
+
+function handoffReason(s, impact) {
+  const count = s.sessionFileCount || impact.files.length || 0;
+  return count > 0 ? fmt('reasonFilesChanged', { count }) : t('actionReasonHandoff');
+}
+
+function impactEvidence(impact) {
+  if (!impact.evidenceFiles.length) return [t('summaryNoImpactEvidence')];
+  return impact.evidenceFiles.slice(0, 3).map(file => fmt('summaryFileChanged', { file: basename(file) }));
 }
 
 function recommendedActions(s) {
   const impact = sessionImpact(s);
   const promptExists = s.reports.nextClaudePromptExists || s.reports.nextCodexPromptExists;
   const promptKey = s.reports.nextClaudePromptExists ? 'nextclaude' : s.reports.nextCodexPromptExists ? 'nextcodex' : null;
-  const knowledgeReason = impact.architecture > 0
-    ? t('actionReasonKnowledgeArchitecture')
-    : s.knowledge.exists ? t('actionReasonKnowledgeReady') : t('actionReasonKnowledgeMissing');
+  const knowledgeActionReason = knowledgeReason(s, impact);
+  const handoffActionReason = handoffReason(s, impact);
   const actions = [];
   if (s.qualityVerdict === 'BLOCKED') {
-    actions.push({ name: t('actionReviewQuality'), reason: t('actionReasonBlocked'), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
+    actions.push({ name: t('actionReviewQuality'), reason: qualityReason(s, true), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
     actions.push({ name: t('reviewComplete'), reason: t('actionReasonReviewComplete'), avail: true, onClick: 'completeReview(this)' });
-    actions.push({ name: t('knowledgeTitle'), reason: knowledgeReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
+    actions.push({ name: t('knowledgeTitle'), reason: knowledgeActionReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
     actions.push({ name: t('actionPromptTitle'), reason: t('actionReasonPromptFix'), avail: promptExists, openKey: promptKey, copyKey: promptKey });
     return actions;
   }
   if (s.qualityVerdict === 'NEEDS_REVIEW') {
-    actions.push({ name: t('actionReviewQuality'), reason: t('actionReasonNeedsReview'), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
+    actions.push({ name: t('actionReviewQuality'), reason: qualityReason(s, false), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
     actions.push({ name: t('actionContinueWorking'), reason: t('actionReasonContinue'), avail: promptExists, openKey: promptKey, copyKey: promptKey });
-    actions.push({ name: t('knowledgeTitle'), reason: knowledgeReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
-    actions.push({ name: t('actionHandoffTitle'), reason: t('actionReasonHandoff'), avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
+    actions.push({ name: t('knowledgeTitle'), reason: knowledgeActionReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
+    actions.push({ name: t('actionHandoffTitle'), reason: handoffActionReason, avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
     return actions;
   }
   actions.push({ name: t('actionContinueFeature'), reason: t('actionReasonPass'), avail: promptExists, openKey: promptKey, copyKey: promptKey, primary: true });
-  actions.push({ name: t('knowledgeTitle'), reason: knowledgeReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
-  actions.push({ name: t('actionHandoffTitle'), reason: t('actionReasonHandoff'), avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
+  actions.push({ name: t('knowledgeTitle'), reason: knowledgeActionReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
+  actions.push({ name: t('actionHandoffTitle'), reason: handoffActionReason, avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
   return actions;
 }
 
 function assistantPromptLines(s) {
-  const impact = sessionImpact(s);
   if (s.qualityVerdict === 'BLOCKED') {
-    return [t('promptBlockedQuality'), t('promptBlockedFix'), t('promptBlockedValidate'), impact.architecture > 0 ? t('promptKnowledgeUpdate') : t('promptKnowledgeCheck')];
+    return [t('promptBlockedQuality'), t('promptBlockedValidate'), t('promptBlockedComplete')];
   }
   if (s.qualityVerdict === 'NEEDS_REVIEW') {
-    return [t('promptNeedsReviewReport'), t('promptNeedsReviewContinue'), impact.architecture > 0 ? t('promptKnowledgeUpdate') : t('promptKnowledgeCheck')];
+    return [t('promptNeedsReviewReport'), t('promptNeedsReviewContinue')];
   }
-  return [t('promptPassContinue'), t('promptPassFocus'), t('promptPassNoReview')];
+  return [t('promptPassContinue')];
 }
 
 function sessionSummaryItems(s) {
   const impact = sessionImpact(s);
   const quality = s.qualityVerdict === 'PASS' ? t('verdictHealthy') : s.qualityVerdict === 'BLOCKED' ? t('verdictBlocked') : s.qualityVerdict === 'NEEDS_REVIEW' ? t('verdictReview') : t('verdictUnknown');
+  const q = s.reports.qualitySummary || {};
+  const fileEvidence = impact.files.length ? impact.files.slice(0, 3).map(f => basename(f)) : [t('summaryNoFiles')];
+  const qualityEvidence = q.blockedCount > 0
+    ? [fmt('reasonBlockedCount', { count: q.blockedCount })]
+    : q.warningCount > 0
+      ? [fmt('reasonWarningsDetected', { count: q.warningCount })]
+      : q.requiredVerificationCount > 0
+        ? [fmt('reasonVerificationCount', { count: q.requiredVerificationCount })]
+        : [t('summaryNoQualityIssues')];
   return [
-    { label: t('summaryFiles'), value: String(s.sessionFileCount || impact.files.length || 0) },
-    { label: t('summaryDocs'), value: String(impact.docs) },
-    { label: t('summaryQuality'), value: quality },
-    { label: t('summaryArchitecture'), value: impact.architectureText }
+    { label: t('summaryFiles'), value: String(s.sessionFileCount || impact.files.length || 0), evidence: fileEvidence },
+    { label: t('summaryDocs'), value: String(impact.docsFiles.length), evidence: impact.docsFiles.length ? impact.docsFiles.slice(0, 2).map(f => basename(f)) : [t('summaryNoDocs')] },
+    { label: t('summaryQuality'), value: quality, evidence: qualityEvidence },
+    { label: t('summaryArchitecture'), value: impact.architectureText, evidence: impactEvidence(impact) }
   ];
 }
 
@@ -1198,7 +1294,8 @@ function render(s) {
 
   const summaryCard = '<div class="card"><div class="card-title">' + esc(t('sessionSummaryTitle')) + '</div>' +
     '<div class="summary-grid">' + sessionSummaryItems(s).map(item =>
-      '<div class="summary-item"><div class="summary-value">' + esc(item.value) + '</div><div class="summary-label">' + esc(item.label) + '</div></div>'
+      '<div class="summary-item"><div class="summary-value">' + esc(item.value) + '</div><div class="summary-label">' + esc(item.label) + '</div>' +
+      '<div class="summary-evidence">' + (item.evidence || []).map(line => '<div>' + esc(line) + '</div>').join('') + '</div></div>'
     ).join('') + '</div></div>';
 
   /* Next action card */

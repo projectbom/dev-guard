@@ -211,7 +211,7 @@ The UI follows the browser language automatically and includes an English/Korean
 
 It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not monitoring the project, it tells the user to run `dev-guard watch`.
 
-The dashboard is the normal user workflow: it recommends the next actions with reasons, helps you open the Quality Report, shows session impact, and provides Review Complete when review is done. The CLI remains available for automation, terminal-only workflows, and recovery.
+The dashboard is the normal user workflow: it recommends the next action based on quality state and session changes, shows the evidence behind each recommendation, and provides Review Complete when review is done. The CLI remains available for automation, terminal-only workflows, and recovery.
 
 Advanced terminal-only mode:
 
