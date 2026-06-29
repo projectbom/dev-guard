@@ -853,6 +853,63 @@ langBtns.forEach(b => b.addEventListener('click', () => setLang(b.dataset.lang))
 
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
 
+function normalizeDashboardState(s) {
+  const reports = s?.reports || {};
+  const knowledge = s?.knowledge || {};
+  const todayStats = s?.todayStats || {};
+  return {
+    status: s?.status || 'idle',
+    watchingSince: s?.watchingSince || '',
+    elapsed: s?.elapsed || '',
+    lastActivity: s?.lastActivity || '',
+    idleCountdown: s?.idleCountdown || null,
+    changeCount: Number.isFinite(s?.changeCount) ? s.changeCount : 0,
+    recentFiles: Array.isArray(s?.recentFiles) ? s.recentFiles : [],
+    sessionFiles: Array.isArray(s?.sessionFiles) ? s.sessionFiles : [],
+    moreFileCount: Number.isFinite(s?.moreFileCount) ? s.moreFileCount : 0,
+    sessionFileCount: Number.isFinite(s?.sessionFileCount) ? s.sessionFileCount : 0,
+    watchRunning: Boolean(s?.watchRunning),
+    initialized: Boolean(s?.initialized),
+    empty: Boolean(s?.empty),
+    message: s?.message,
+    qualityVerdict: s?.qualityVerdict,
+    lastProcessedAt: s?.lastProcessedAt,
+    sessions: Array.isArray(s?.sessions) ? s.sessions : [],
+    todayStats: {
+      sessions: Number.isFinite(todayStats.sessions) ? todayStats.sessions : 0,
+      filesChanged: Number.isFinite(todayStats.filesChanged) ? todayStats.filesChanged : 0,
+      reportsGenerated: Number.isFinite(todayStats.reportsGenerated) ? todayStats.reportsGenerated : 0,
+      lastUpdate: todayStats.lastUpdate || ''
+    },
+    qualityTrend: Array.isArray(s?.qualityTrend) ? s.qualityTrend : [],
+    timeline: Array.isArray(s?.timeline) ? s.timeline : [],
+    reports: {
+      handoffExists: Boolean(reports.handoffExists),
+      qualityReportExists: Boolean(reports.qualityReportExists),
+      agentContextExists: Boolean(reports.agentContextExists),
+      nextClaudePromptExists: Boolean(reports.nextClaudePromptExists),
+      nextCodexPromptExists: Boolean(reports.nextCodexPromptExists),
+      handoffUpdatedAt: reports.handoffUpdatedAt,
+      qualityReportUpdatedAt: reports.qualityReportUpdatedAt,
+      agentContextUpdatedAt: reports.agentContextUpdatedAt,
+      nextClaudePromptUpdatedAt: reports.nextClaudePromptUpdatedAt,
+      nextCodexPromptUpdatedAt: reports.nextCodexPromptUpdatedAt,
+      handoffPreview: reports.handoffPreview,
+      qualityReportPreview: reports.qualityReportPreview,
+      agentContextPreview: reports.agentContextPreview,
+      qualitySummary: reports.qualitySummary || { warningCount: 0, blockedCount: 0, requiredVerificationCount: 0 }
+    },
+    knowledge: {
+      exists: Boolean(knowledge.exists),
+      updatedAt: knowledge.updatedAt,
+      filesIndexed: Number.isFinite(knowledge.filesIndexed) ? knowledge.filesIndexed : 0,
+      architectureModules: Number.isFinite(knowledge.architectureModules) ? knowledge.architectureModules : 0,
+      framework: knowledge.framework
+    },
+    setup: s?.setup
+  };
+}
+
 /* ─ Status view ─ */
 function statusView(s) {
   if (s.setup?.active) return { icon:'🔵', cls:'setup', title:t('setupTitle'), body:t('setupBody'), activity:t('activityInit'), next:t('nextStartWatch') };
@@ -996,11 +1053,11 @@ function shortFileList(files, max = 3) {
 
 function sessionImpact(s) {
   const files = s.sessionFiles || s.recentFiles || [];
-  const docsFiles = files.filter(f => /(^|\/)(README[^/]*|docs\/)|\.(md|mdx)$/i.test(f));
-  const apiFiles = files.filter(f => /(^|\/)(app|src\/app|pages|src\/pages)\/api\/|(^|\/)api\/.*\.[tj]s$|(^|\/)routes\/.*\.[tj]s$|\/route\.[tj]s$/i.test(f));
-  const dashboardFiles = files.filter(f => /(^|\/)packages\/cli\/src\/dashboard(?:-[^/]*)?\.[tj]s$|(^|\/)packages\/cli\/src\/dashboard\//i.test(f));
-  const configFiles = files.filter(f => /(^|\/)(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|tsconfig[^/]*\.json|vite\.config\.[tj]s|next\.config\.[tj]s|eslint\.config\.[tj]s|\.env[^/]*)$/i.test(f) || /(^|\/)config\//i.test(f));
-  const cliFiles = files.filter(f => /^packages\/cli\/src\/.+\.[tj]s$/i.test(f) && !dashboardFiles.includes(f));
+  const docsFiles = files.filter(f => /(^|\\/)(README[^\\/]*|docs\\/)|\\.(md|mdx)$/i.test(f));
+  const apiFiles = files.filter(f => /(^|\\/)(app|src\\/app|pages|src\\/pages)\\/api\\/|(^|\\/)api\\/.*\\.[tj]s$|(^|\\/)routes\\/.*\\.[tj]s$|\\/route\\.[tj]s$/i.test(f));
+  const dashboardFiles = files.filter(f => /(^|\\/)packages\\/cli\\/src\\/dashboard(?:-[^\\/]*)?\\.[tj]s$|(^|\\/)packages\\/cli\\/src\\/dashboard\\//i.test(f));
+  const configFiles = files.filter(f => /(^|\\/)(package\\.json|pnpm-lock\\.yaml|package-lock\\.json|yarn\\.lock|tsconfig[^\\/]*\\.json|vite\\.config\\.[tj]s|next\\.config\\.[tj]s|eslint\\.config\\.[tj]s|\\.env[^\\/]*)$/i.test(f) || /(^|\\/)config\\//i.test(f));
+  const cliFiles = files.filter(f => /^packages\\/cli\\/src\\/.+\\.[tj]s$/i.test(f) && !dashboardFiles.includes(f));
   const primary =
     apiFiles.length > 0 ? { key: 'api', label: t('architectureApiChanged'), files: apiFiles } :
     cliFiles.length > 0 ? { key: 'cli', label: t('architectureCliChanged'), files: cliFiles } :
@@ -1173,6 +1230,7 @@ function tlLabel(type) { return type==='session' ? t('timelineSession') : type==
 
 /* ─ Main render ─ */
 function render(s) {
+  s = normalizeDashboardState(s);
   last = s;
   const v = statusView(s);
 

@@ -2,7 +2,7 @@ import { access } from "node:fs/promises";
 import { fromRoot } from "./fs.js";
 import { ensureInitialProjectFiles } from "./init.js";
 import { ensureAgentInstructions } from "./install-agent-instructions.js";
-import { generateProjectKnowledge } from "./knowledge.js";
+import { generateProjectKnowledge, getProjectKnowledgeRefreshStatus } from "./knowledge.js";
 import { installHooks } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
 import { readRuntimeState, writeRuntimeState, type SetupStatus, type SetupStatusStep } from "./runtime-state.js";
@@ -21,7 +21,10 @@ const setupSteps: SetupStatusStep[] = [
   { key: "dashboard", label: "Dashboard", status: "pending" }
 ];
 
-export async function prepareWatchProject(root: string, options: { dashboardEnabled: boolean; dashboardReady: boolean }): Promise<PrepareResult> {
+export async function prepareWatchProject(
+  root: string,
+  options: { dashboardEnabled: boolean; dashboardReady: boolean; onProgress?: (line: string) => void }
+): Promise<PrepareResult> {
   const steps: PrepareResult["steps"] = [];
   const warnings: string[] = [];
   const startedAt = new Date().toISOString();
@@ -79,11 +82,24 @@ export async function prepareWatchProject(root: string, options: { dashboardEnab
   await markStep(root, startedAt, "hooks", hookWarning ? "warning" : "done", hookWarning);
 
   await markStep(root, startedAt, "knowledge", "running");
-  const knowledgeExists = await fileExists(fromRoot(root, devguardPaths.projectKnowledge));
+  const knowledgeStatus = await getProjectKnowledgeRefreshStatus(root);
   let knowledgeChanged = false;
   let knowledgeWarning: string | undefined;
-  if (!knowledgeExists) {
+  if (knowledgeStatus.shouldGenerate) {
     try {
+      options.onProgress?.("Learning project...");
+      options.onProgress?.(`Detected: ${knowledgeStatus.detected.packageManager}`);
+      options.onProgress?.(`Detected: ${knowledgeStatus.detected.framework}`);
+      if (knowledgeStatus.detected.buildCommand !== "Unknown") {
+        options.onProgress?.(`Detected: ${knowledgeStatus.detected.buildCommand}`);
+      }
+      if (knowledgeStatus.detected.testCommand !== "Unknown") {
+        options.onProgress?.(`Detected: ${knowledgeStatus.detected.testCommand}`);
+      }
+      if (knowledgeStatus.detected.typecheckCommand !== "Unknown") {
+        options.onProgress?.(`Detected: ${knowledgeStatus.detected.typecheckCommand}`);
+      }
+      options.onProgress?.("Generating Project Knowledge...");
       await generateProjectKnowledge(root);
       knowledgeChanged = true;
       didWork = true;
@@ -95,9 +111,9 @@ export async function prepareWatchProject(root: string, options: { dashboardEnab
   steps.push({
     key: "knowledge",
     label: "Generated Project Knowledge",
-    status: knowledgeWarning ? "warning" : knowledgeExists ? "skipped" : "done",
+    status: knowledgeWarning ? "warning" : knowledgeStatus.shouldGenerate ? "done" : "skipped",
     changed: knowledgeChanged,
-    detail: knowledgeWarning
+    detail: knowledgeWarning ?? knowledgeDetail(knowledgeStatus)
   });
   await markStep(root, startedAt, "knowledge", knowledgeWarning ? "warning" : "done", knowledgeWarning);
 
@@ -126,6 +142,13 @@ export async function prepareWatchProject(root: string, options: { dashboardEnab
   });
 
   return { didWork, warnings, steps };
+}
+
+function knowledgeDetail(status: Awaited<ReturnType<typeof getProjectKnowledgeRefreshStatus>>): string | undefined {
+  if (status.reason === "fresh") return undefined;
+  if (status.reason === "missing") return `${status.detected.packageManager}; ${status.detected.framework}`;
+  if (status.staleFiles.length > 0) return `Refreshed after config change: ${status.staleFiles.slice(0, 3).join(", ")}${status.staleFiles.length > 3 ? ", ..." : ""}`;
+  return undefined;
 }
 
 async function markStep(root: string, startedAt: string, key: SetupStatusStep["key"], status: SetupStatusStep["status"], detail?: string): Promise<void> {

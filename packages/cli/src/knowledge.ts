@@ -1,4 +1,4 @@
-import { access, readdir } from "node:fs/promises";
+import { access, readdir, stat } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { readJsonFile, readTextFile, writeTextFile, fromRoot } from "./fs.js";
 import { devguardPaths } from "./paths.js";
@@ -39,6 +39,24 @@ interface PackageJson {
   devDependencies?: Record<string, string>;
 }
 
+export interface ProjectKnowledgeRefreshStatus {
+  exists: boolean;
+  shouldGenerate: boolean;
+  reason: "missing" | "stale" | "fresh";
+  staleFiles: string[];
+  detected: {
+    packageManager: string;
+    framework: string;
+    buildCommand: string;
+    testCommand: string;
+    typecheckCommand: string;
+    packageScripts: string[];
+    entryPoints: string[];
+    sourceRoots: string[];
+    configFiles: string[];
+  };
+}
+
 const ignoredDirectories = new Set([
   ".git",
   ".devguard",
@@ -54,6 +72,30 @@ const ignoredDirectories = new Set([
 
 const sourceExtensions = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".mdx", ".sql"]);
 const maxFiles = 2_000;
+
+const knowledgeRefreshCandidates = [
+  "package.json",
+  "pnpm-lock.yaml",
+  "package-lock.json",
+  "yarn.lock",
+  "bun.lockb",
+  "tsconfig.json",
+  "tsconfig.base.json",
+  "next.config.js",
+  "next.config.mjs",
+  "next.config.ts",
+  "vite.config.js",
+  "vite.config.mjs",
+  "vite.config.ts",
+  "astro.config.js",
+  "astro.config.mjs",
+  "astro.config.ts",
+  "nuxt.config.js",
+  "nuxt.config.mjs",
+  "nuxt.config.ts",
+  "svelte.config.js",
+  "svelte.config.ts"
+];
 
 export async function runKnowledge(root: string): Promise<void> {
   const knowledge = await generateProjectKnowledge(root);
@@ -109,9 +151,103 @@ export async function generateProjectKnowledge(root: string): Promise<ProjectKno
   return knowledge;
 }
 
+export async function getProjectKnowledgeRefreshStatus(root: string): Promise<ProjectKnowledgeRefreshStatus> {
+  const knowledgePath = fromRoot(root, devguardPaths.projectKnowledge);
+  const [knowledgeInfo, detected] = await Promise.all([statOptional(knowledgePath), detectProjectBasics(root)]);
+  if (!knowledgeInfo) {
+    return { exists: false, shouldGenerate: true, reason: "missing", staleFiles: [], detected };
+  }
+
+  const staleFiles: string[] = [];
+  for (const file of knowledgeRefreshCandidates) {
+    const info = await statOptional(fromRoot(root, file));
+    if (info && info.mtimeMs > knowledgeInfo.mtimeMs) {
+      staleFiles.push(file);
+    }
+  }
+
+  return {
+    exists: true,
+    shouldGenerate: staleFiles.length > 0,
+    reason: staleFiles.length > 0 ? "stale" : "fresh",
+    staleFiles,
+    detected
+  };
+}
+
 export async function readProjectKnowledge(root: string): Promise<ProjectKnowledge | undefined> {
   try {
     return await readJsonFile<ProjectKnowledge>(fromRoot(root, devguardPaths.projectKnowledge), undefined as unknown as ProjectKnowledge);
+  } catch {
+    return undefined;
+  }
+}
+
+async function detectProjectBasics(root: string): Promise<ProjectKnowledgeRefreshStatus["detected"]> {
+  const rootPackage = await readJsonFile<PackageJson>(fromRoot(root, "package.json"), {});
+  const packageScripts = Object.keys(rootPackage.scripts ?? {}).sort();
+  const configFiles = (
+    await Promise.all(
+      knowledgeRefreshCandidates.map(async (file) => ((await exists(join(root, file))) ? file : undefined))
+    )
+  ).filter((file): file is string => Boolean(file));
+  const entryPointCandidates = ["README.md", "package.json", "packages/cli/src/index.ts", "src/index.ts", "app/page.tsx", "pages/index.tsx"];
+  const sourceRootCandidates = ["app", "pages", "src", "packages", "components", "lib", "server", "supabase", "prisma", "docs"];
+  const [entryPoints, sourceRoots] = await Promise.all([
+    filterExisting(root, entryPointCandidates),
+    filterExisting(root, sourceRootCandidates)
+  ]);
+  const packageManager = await detectPackageManager(root, rootPackage);
+  return {
+    packageManager,
+    framework: await detectFrameworkLight(root, rootPackage),
+    buildCommand: scriptCommand(packageManager, rootPackage, ["build"]),
+    testCommand: scriptCommand(packageManager, rootPackage, ["test", "test:unit", "vitest"]),
+    typecheckCommand: scriptCommand(packageManager, rootPackage, ["typecheck", "type-check", "check"]),
+    packageScripts,
+    entryPoints,
+    sourceRoots,
+    configFiles
+  };
+}
+
+async function detectFrameworkLight(root: string, packageJson: PackageJson): Promise<string> {
+  const deps = { ...packageJson.dependencies, ...packageJson.devDependencies };
+  if (deps.next || (await exists(join(root, "next.config.js"))) || (await exists(join(root, "next.config.mjs"))) || (await exists(join(root, "next.config.ts")))) return "Next.js";
+  if (deps.astro || (await exists(join(root, "astro.config.js"))) || (await exists(join(root, "astro.config.mjs"))) || (await exists(join(root, "astro.config.ts")))) return "Astro";
+  if (deps.nuxt || (await exists(join(root, "nuxt.config.js"))) || (await exists(join(root, "nuxt.config.mjs"))) || (await exists(join(root, "nuxt.config.ts")))) return "Nuxt";
+  if (deps["@vitejs/plugin-react"] || deps.vite || (await exists(join(root, "vite.config.js"))) || (await exists(join(root, "vite.config.mjs"))) || (await exists(join(root, "vite.config.ts")))) return "Vite";
+  if (deps.express) return "Express";
+  if (deps.react) return "React";
+  if (deps.typescript || (await exists(join(root, "tsconfig.json")))) return "Node.js / TypeScript";
+  return "Unknown";
+}
+
+function scriptCommand(packageManager: string, packageJson: PackageJson, names: string[]): string {
+  const scripts = packageJson.scripts ?? {};
+  const found = names.find((name) => scripts[name]);
+  return found ? `${packageManagerCommand(packageManager)} ${found}` : "Unknown";
+}
+
+function packageManagerCommand(packageManager: string): string {
+  const manager = packageManager.split("@")[0];
+  if (manager === "yarn") return "yarn";
+  if (manager === "bun") return "bun run";
+  if (manager === "npm") return "npm run";
+  return "pnpm";
+}
+
+async function filterExisting(root: string, paths: string[]): Promise<string[]> {
+  const result: string[] = [];
+  for (const path of paths) {
+    if (await exists(join(root, path))) result.push(path);
+  }
+  return result;
+}
+
+async function statOptional(path: string): Promise<{ mtimeMs: number } | undefined> {
+  try {
+    return await stat(path);
   } catch {
     return undefined;
   }

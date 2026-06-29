@@ -51,12 +51,31 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     }
   }
 
+  let preparationStreamStarted = false;
   const prepareResult = await prepareWatchProject(root, {
     dashboardEnabled: options.dashboard,
-    dashboardReady: Boolean(dashboard)
+    dashboardReady: Boolean(dashboard),
+    onProgress: (line) => {
+      if (!preparationStreamStarted) {
+        console.log("DevGuard");
+        console.log("");
+        console.log("Preparing project...");
+        console.log("");
+        preparationStreamStarted = true;
+      }
+      console.log(line);
+    }
   });
   const showPreparation = prepareResult.didWork || prepareResult.warnings.length > 0;
-  printStartup({ prepareResult, showPreparation, dashboard, dashboardOpenFailed, dashboardWarning, dashboardEnabled: options.dashboard });
+  printStartup({
+    prepareResult,
+    showPreparation,
+    preparationStreamStarted,
+    dashboard,
+    dashboardOpenFailed,
+    dashboardWarning,
+    dashboardEnabled: options.dashboard
+  });
 
   await ensureDevguardWorkspace(root);
   const strategyReport = await getAgentStrategyReport(root);
@@ -326,15 +345,18 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 function printStartup(input: {
   prepareResult: Awaited<ReturnType<typeof prepareWatchProject>>;
   showPreparation: boolean;
+  preparationStreamStarted: boolean;
   dashboard?: DashboardServerHandle;
   dashboardOpenFailed: boolean;
   dashboardWarning?: string;
   dashboardEnabled: boolean;
 }): void {
-  console.log("DevGuard");
-  console.log("");
+  if (!input.preparationStreamStarted) {
+    console.log("DevGuard");
+    console.log("");
+  }
 
-  if (input.showPreparation) {
+  if (input.showPreparation && !input.preparationStreamStarted) {
     console.log("Preparing project...");
     console.log("");
     for (const step of input.prepareResult.steps) {
@@ -346,6 +368,14 @@ function printStartup(input: {
       if (step.detail) {
         console.log(`  ${step.detail}`);
       }
+    }
+    if (input.dashboardWarning) {
+      console.log(`! Dashboard warning: ${input.dashboardWarning}`);
+    }
+    console.log("");
+  } else if (input.preparationStreamStarted) {
+    for (const warning of input.prepareResult.warnings) {
+      console.log(`! ${warning}`);
     }
     if (input.dashboardWarning) {
       console.log(`! Dashboard warning: ${input.dashboardWarning}`);
