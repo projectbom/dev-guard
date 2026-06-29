@@ -625,6 +625,7 @@ function renderPage(): string {
     .banner.offline { background: var(--surface); border-color: var(--line2); }
     .banner-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
     .banner-text { flex: 1; min-width: 0; }
+    .section-label { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: 6px; }
     .banner-title { font-size: 18px; font-weight: 700; line-height: 1.25; letter-spacing: -.2px; }
     .banner-body { color: var(--ink2); margin-top: 3px; font-size: 14px; }
     .banner-cmd { display: inline-block; margin-top: 8px; font: 13px/1.4 var(--mono); background: rgba(0,0,0,.06); border-radius: 5px; padding: 4px 9px; }
@@ -1237,7 +1238,7 @@ function render(s) {
   /* Status banner */
   const banner = '<div class="banner ' + esc(v.cls) + '">' +
     '<div class="banner-icon" aria-hidden="true">' + v.icon + '</div>' +
-    '<div class="banner-text"><div class="banner-title">' + esc(v.title) + '</div>' +
+    '<div class="banner-text"><div class="section-label">' + esc(t('statusSectionTitle')) + '</div><div class="banner-title">' + esc(v.title) + '</div>' +
     '<div class="banner-body">' + esc(v.body) + '</div>' +
     (v.cmd ? '<code class="banner-cmd">' + esc(v.cmd) + '</code>' : '') +
     '</div></div>';
@@ -1368,6 +1369,7 @@ function render(s) {
       '</div><div id="reviewMessage" class="review-message" aria-live="polite"></div>'
     : '';
   const nextCard = '<div class="next-card ' + esc(na.cls) + '">' +
+    '<div class="section-label">' + esc(t('nextActionTitle')) + '</div>' +
     '<div class="next-top"><div class="next-icon" aria-hidden="true">' + esc(na.icon) + '</div><div>' +
     '<div class="next-title">' + esc(na.title) + '</div>' +
     '<div class="next-body">' + esc(na.body) + '</div>' +

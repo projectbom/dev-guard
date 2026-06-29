@@ -10,6 +10,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     refresh: "Refresh",
 
     // Status card
+    statusSectionTitle: "Status",
     notInitializedTitle: "Setup required",
     notInitializedBody: "Run dev-guard watch to prepare and monitor this project.",
     watchNotRunningTitle: "Not monitoring",
@@ -224,6 +225,7 @@ export const dashboardTranslations: Record<DashboardLanguage, Record<string, str
     refresh: "새로고침",
 
     // Status card
+    statusSectionTitle: "상태",
     notInitializedTitle: "초기 설정이 필요합니다",
     notInitializedBody: "dev-guard watch를 실행하면 프로젝트 준비와 모니터링이 시작됩니다.",
     watchNotRunningTitle: "모니터링이 꺼져 있습니다",

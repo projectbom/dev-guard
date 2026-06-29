@@ -455,7 +455,8 @@ function parseWatchOptions(args: string[], config: WatchConfig): WatchOptions {
 
 async function createWatcher(root: string, onChange: (path: string) => Promise<void> | void, options: WatchOptions): Promise<unknown> {
   const existingRoots = watchRoots.map((path) => join(root, path)).filter((path) => existsSync(path));
-  const paths = existingRoots.length > 0 ? existingRoots : [root];
+  const rootWatchPath = join(root, ".");
+  const paths = existingRoots.includes(rootWatchPath) ? [rootWatchPath] : existingRoots.length > 0 ? existingRoots : [root];
   const chokidar = await loadChokidar();
   if (chokidar?.watch) {
     const watcher = chokidar.watch(paths, {
