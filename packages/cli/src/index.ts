@@ -21,7 +21,7 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
-import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, resetRuntimeState } from "./runtime-state.js";
+import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
@@ -326,13 +326,49 @@ Advanced / recovery:
 `);
 }
 
+function cliCopy(locale: string): {
+  changedFiles: string;
+  detectedAreas: string;
+  judgments: string;
+  generated: string;
+  newSession: string;
+  nextTask: string;
+  resumePrompt: string;
+  idleState: string;
+} {
+  if (locale === "ko-KR") {
+    return {
+      changedFiles: "변경 파일:",
+      detectedAreas: "감지된 영역:",
+      judgments: "판단:",
+      generated: "생성됨:",
+      newSession: "새 세션 시작 시:",
+      nextTask: "다음 작업:",
+      resumePrompt: "새 세션 재개 프롬프트:",
+      idleState: "State: 대기 중"
+    };
+  }
+  return {
+    changedFiles: "Changed files:",
+    detectedAreas: "Detected areas:",
+    judgments: "Judgments:",
+    generated: "Generated:",
+    newSession: "When starting a new session:",
+    nextTask: "Next task:",
+    resumePrompt: "Resume prompt for new session:",
+    idleState: "State: idle"
+  };
+}
+
 async function runDone(root: string): Promise<void> {
   try {
+    const locale = await refreshRuntimeLocale(root);
+    const copy = cliCopy(locale);
     const result = await processDoneEvent(root);
     console.log("dev-guard done (manual finalization)");
     console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");
-    console.log("변경 파일:");
+    console.log(copy.changedFiles);
     for (const file of result.changedFiles.slice(0, 20)) {
       console.log(`- ${file}`);
     }
@@ -340,17 +376,17 @@ async function runDone(root: string): Promise<void> {
       console.log(`- ... +${result.changedFiles.length - 20} files`);
     }
     console.log("");
-    console.log("감지된 영역:");
+    console.log(copy.detectedAreas);
     for (const area of result.areas) {
       console.log(`- ${area}`);
     }
     console.log("");
-    console.log("판단:");
+    console.log(copy.judgments);
     for (const judgment of result.judgments) {
       console.log(`- ${judgment}`);
     }
     console.log("");
-    console.log("생성됨:");
+    console.log(copy.generated);
     console.log(`- ${result.reportPath}`);
     console.log(`- ${result.promptPath}`);
     console.log(`- ${result.historySummaryPath}`);
@@ -363,11 +399,11 @@ async function runDone(root: string): Promise<void> {
     console.log("");
     console.log(`Quality: ${result.qualityVerdict}`);
     console.log("");
-    console.log("새 세션 시작 시:");
+    console.log(copy.newSession);
     console.log(`  Read ${result.agentContextPath} and continue.`);
     console.log("");
-    console.log("다음 작업:");
-    console.log(`${result.promptPath} 확인 후 필요한 수정 진행`);
+    console.log(copy.nextTask);
+    console.log(locale === "ko-KR" ? `${result.promptPath} 확인 후 필요한 수정 진행` : `Review ${result.promptPath} and continue with the required fixes.`);
   } catch (error) {
     console.error(`dev-guard done failed: ${errorMessage(error)}`);
     console.error("recovery: run dev-guard status, then dev-guard reset if the pending buffer is wrong");
@@ -377,6 +413,8 @@ async function runDone(root: string): Promise<void> {
 
 async function runHandoff(root: string): Promise<void> {
   try {
+    const locale = await refreshRuntimeLocale(root);
+    const copy = cliCopy(locale);
     const [handoffPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
       generateProjectHandoff(root),
       generateAgentContext(root),
@@ -388,7 +426,7 @@ async function runHandoff(root: string): Promise<void> {
     console.log(`- ${agentContextPath}`);
     console.log(`- ${nextClaudePromptPath}`);
     console.log("");
-    console.log("Resume prompt for new session:");
+    console.log(copy.resumePrompt);
     console.log(`  Read ${devguardPaths.agentContext} and continue.`);
   } catch (error) {
     console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
@@ -398,6 +436,8 @@ async function runHandoff(root: string): Promise<void> {
 
 async function runStatus(root: string): Promise<void> {
   console.log("dev-guard status");
+  const locale = await refreshRuntimeLocale(root);
+  const copy = cliCopy(locale);
   const initialized = await isDevGuardInitialized(root);
   const [runtime, state, history, hookStatus] = await Promise.all([
     readRuntimeState(root),
@@ -408,6 +448,7 @@ async function runStatus(root: string): Promise<void> {
   const strategyReport = await getAgentStrategyReport(root);
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   await writeHookStatusReport(root);
+  console.log(`Locale: ${locale}`);
   console.log(`Pending files: ${runtime.pendingChangedFiles.length}`);
   for (const file of runtime.pendingChangedFiles.slice(0, 12)) {
     console.log(`- ${file}`);
@@ -418,7 +459,7 @@ async function runStatus(root: string): Promise<void> {
   console.log(`Runtime status: ${runtime.lastStatus ?? "idle"}`);
   printWatchRuntimeExplanation(runtime, runtimeVerified);
   if (runtime.pendingChangedFiles.length === 0) {
-    console.log("State: 대기 중");
+    console.log(copy.idleState);
   }
   console.log(`Last changed: ${runtime.lastChangedAt ?? "none"}`);
   console.log(`Last processed: ${state.lastProcessedAt ?? "none"}`);
@@ -476,7 +517,7 @@ async function runStatus(root: string): Promise<void> {
   console.log("Agent Context:");
   console.log(devguardPaths.agentContext);
   console.log("");
-  console.log("Resume prompt for new session:");
+  console.log(copy.resumePrompt);
   console.log(`  Read ${devguardPaths.agentContext} and continue.`);
   if (!initialized) {
     console.log("");

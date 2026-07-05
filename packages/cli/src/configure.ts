@@ -17,6 +17,7 @@ export async function runConfigure(root: string, args: string[]): Promise<void> 
       throw new Error(
         "Usage: dev-guard config set <key> <value>\n" +
         "AI keys:    provider  model  temperature  maxTokens  reasoningEffort  baseURL\n" +
+        "Locale key: locale\n" +
         "Watch keys: watch.dashboard  watch.autoComplete  watch.autoCompleteDelay\n" +
         "            watch.stableAfter  watch.poll  watch.depth  watch.compact  watch.includeLockfiles"
       );
@@ -25,7 +26,9 @@ export async function runConfigure(root: string, args: string[]): Promise<void> 
     console.log("dev-guard config set");
     console.log(`- ${key}: ${value}`);
     console.log("- wrote: .devguard/config.json");
-    if (key.startsWith("watch.")) {
+    if (key === "locale") {
+      console.log(`- locale: ${next.locale ?? value}`);
+    } else if (key.startsWith("watch.")) {
       const watch = next.watch ?? {};
       console.log(`- watch.autoComplete: ${watch.autoComplete ?? true}`);
       console.log(`- watch.autoCompleteDelay: ${watch.autoCompleteDelay ?? 8}s`);

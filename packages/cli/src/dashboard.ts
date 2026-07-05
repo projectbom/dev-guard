@@ -8,6 +8,7 @@ import { readProjectKnowledge } from "./knowledge.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
+import { writeConfigValue } from "./config.js";
 
 const DEFAULT_PORT = 3737;
 const HOST = "127.0.0.1";
@@ -187,6 +188,22 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
     }
     return;
   }
+  if (request.method === "POST" && url.pathname === "/api/locale") {
+    try {
+      const body = await readJsonBody<{ locale?: string }>(request);
+      const locale = body.locale === "ko" ? "ko-KR" : body.locale === "en" ? "en-US" : body.locale;
+      if (locale !== "ko-KR" && locale !== "en-US") {
+        sendJson(response, { ok: false, error: "Unsupported locale" }, 400);
+        return;
+      }
+      await writeConfigValue(root, "locale", locale);
+      const resolved = await refreshRuntimeLocale(root);
+      sendJson(response, { ok: true, locale: resolved });
+    } catch (error) {
+      sendJson(response, { ok: false, error: errorMessage(error) }, 500);
+    }
+    return;
+  }
   if (request.method !== "GET") {
     sendText(response, 405, "Method not allowed");
     return;
@@ -229,6 +246,16 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
     return;
   }
   sendText(response, 404, "Not found");
+}
+
+async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const text = Buffer.concat(chunks).toString("utf8").trim();
+  if (!text) return {} as T;
+  return JSON.parse(text) as T;
 }
 
 async function getDashboardState(root: string): Promise<DashboardState> {
@@ -837,6 +864,7 @@ const langBtns = [...document.querySelectorAll('[data-lang]')];
 let lang = initLang();
 let last = null;
 let reviewCompleteUntil = 0;
+let applyingServerLang = false;
 
 function initLang() {
   const saved = localStorage.getItem('dg.lang');
@@ -845,7 +873,10 @@ function initLang() {
   return ls.some(l => String(l).toLowerCase().startsWith('ko')) ? 'ko' : 'en';
 }
 function t(k) { return STRINGS[lang]?.[k] || STRINGS.en[k] || k; }
-function setLang(l) {
+function localeToLang(locale) {
+  return String(locale || '').toLowerCase().startsWith('ko') ? 'ko' : String(locale || '').toLowerCase().startsWith('en') ? 'en' : null;
+}
+function setLang(l, opts = {}) {
   if (!STRINGS[l]) return;
   lang = l;
   localStorage.setItem('dg.lang', l);
@@ -854,6 +885,29 @@ function setLang(l) {
   brandSub.textContent = t('appSubtitle');
   refreshBtn.textContent = t('refresh');
   if (last) render(last); else root.textContent = t('loading');
+  if (!opts.skipPersist) persistLocale(l);
+}
+async function persistLocale(l) {
+  if (applyingServerLang) return;
+  try {
+    await fetch('/api/locale', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ locale: l === 'ko' ? 'ko-KR' : 'en-US' })
+    });
+  } catch {
+    // The dashboard language still changes locally; config sync will retry on the next user change.
+  }
+}
+function applyServerLocale(locale) {
+  const next = localeToLang(locale);
+  if (!next || next === lang) return;
+  applyingServerLang = true;
+  try {
+    setLang(next, { skipPersist: true });
+  } finally {
+    applyingServerLang = false;
+  }
 }
 langBtns.forEach(b => b.addEventListener('click', () => setLang(b.dataset.lang)));
 
@@ -1238,6 +1292,7 @@ function tlLabel(type) { return type==='session' ? t('timelineSession') : type==
 /* ─ Main render ─ */
 function render(s) {
   s = normalizeDashboardState(s);
+  applyServerLocale(s.locale);
   last = s;
   const v = statusView(s);
 
