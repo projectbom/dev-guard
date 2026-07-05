@@ -1352,11 +1352,20 @@ function buildQualityNextAction(input: {
 }
 
 function qualityImpactSummary(changedFiles: string[], areas: string[]): string {
+  if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
+    return "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.";
+  }
+  if (changedFiles.some((file) => /locale|dashboard-i18n/i.test(file)) || changedFiles.some((file) => /dashboard/i.test(file) && /config|locale/i.test(changedFiles.join("\n")))) {
+    return "This change affects whether Dashboard language choices are reflected in generated reports and handoff files.";
+  }
   if (changedFiles.some((file) => /dashboard/i.test(file))) {
-    return "The change can affect what users see in the Dashboard.";
+    return "This change affects what users see or do in the Dashboard.";
+  }
+  if (changedFiles.some((file) => /auth|oauth|login|session/i.test(file)) || areas.includes("auth")) {
+    return "This change affects the authentication or login flow, so the end-to-end sign-in behavior needs review.";
   }
   if (changedFiles.some((file) => /runtime-state|handoff|prompt|quality/i.test(file))) {
-    return "The change can affect generated reports, handoff files, or next-session context.";
+    return "This change affects generated reports, handoff files, or next-session context.";
   }
   if (changedFiles.some((file) => /config|configure|\.devguard|package\.json|tsconfig/i.test(file)) || areas.includes("config")) {
     return "The change can affect configuration or runtime behavior.";
@@ -1398,13 +1407,16 @@ function userFacingReason(item: QualityCheckItem, changedFiles: string[], areas:
     return `Watch behavior changed. Verify polling, depth handling, and settle/finalize output with a small file-change scenario.${fileText}`;
   }
   if (item.label === "state/history verification") {
+    if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
+      return `Quality Report or handoff generation changed. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names.${fileText}`;
+    }
     return `State, history, prompt, or report generation changed. Confirm done/status/handoff regenerate the expected files without stale state.${fileText}`;
   }
   if (item.label === "docs update candidate") {
     return `Source files changed without documentation changes. If user-facing behavior changed, update the relevant README or docs page.${fileText}`;
   }
   if (item.label === "drift clarity") {
-    return `The changed files may include work outside the current request. Confirm each changed file supports the same task before finishing.${fileText}`;
+    return `The changed files should be checked against the current task, not against a generic rule. Confirm the diff is only improving the Quality Report review experience.${fileText}`;
   }
   return `${item.detail}${fileText}`;
 }
@@ -1444,6 +1456,14 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
     };
   }
   if (item.label === "state/history verification") {
+    if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
+      return {
+        title: "Quality Report output review",
+        body: ["Regenerate the Quality Report and confirm the first screen tells the user what changed, what to do now, and why it matters."],
+        files,
+        checks: ["pnpm cli done", "Read .devguard/reports/quality-report.md", "Confirm no internal rule names appear in the main sections."]
+      };
+    }
     return {
       title: "Report and handoff regeneration",
       body: ["Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly."],
@@ -1470,7 +1490,7 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
   if (item.label === "drift clarity") {
     return {
       title: "Change scope check",
-      body: ["Confirm the changed files all support the current request and remove or split unrelated work before finishing."],
+      body: ["Confirm the diff is focused on Quality Report intelligence and does not change unrelated watch, hook, dashboard, or release behavior."],
       files,
       checks: ["Review git diff by file.", "Keep only changes required for the current task."]
     };
@@ -1680,11 +1700,11 @@ function formatActionSteps(report: QualityReport, items: QualityReviewItem[], lo
   if (primary.files.length > 0) {
     steps.push(`2. ${locale === "ko-KR" ? "관련 파일 확인" : "Check related files"}: ${compactFileList(primary.files, 3)}`);
   }
-  const command = report.requiredVerification[0];
-  if (command) {
-    steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "검증 실행" : "Run verification"}: ${command}`);
+  const primaryCheck = primary.checks.find((check) => /^pnpm|^npm|^yarn/.test(check)) ?? report.requiredVerification[0];
+  if (primaryCheck) {
+    steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "검증 실행" : "Run verification"}: ${primaryCheck}`);
   }
-  steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "보고서와 인수인계가 의도대로 재생성됐는지 확인" : "Confirm the report and handoff regenerated as expected"}`);
+  steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "보고서 첫 화면이 변경 의미와 다음 행동을 바로 안내하는지 확인" : "Confirm the report starts with the change meaning and next action"}`);
   return steps;
 }
 
@@ -1697,14 +1717,16 @@ function reviewQuestion(item: QualityReviewItem, locale: DevGuardLocale): string
   const title = localizeReviewTitle(item.title, locale);
   const fileText = item.files.length > 0 ? ` (${compactFileList(item.files, 3)})` : "";
   if (locale === "ko-KR") {
+    if (item.title === "Quality Report output review") return `Quality Report가 첫 화면에서 변경 의미와 다음 행동을 바로 알려주는가?${fileText}`;
     if (item.title === "Report and handoff regeneration") return `done/status/handoff 실행 후 사용자용 보고서가 최신 상태로 재생성되는가?${fileText}`;
-    if (item.title === "Change scope check") return `이번 변경 파일이 모두 현재 Quality Report UX 개선 작업에 필요한가?${fileText}`;
+    if (item.title === "Change scope check") return `이번 변경이 Quality Report intelligence 개선에만 집중되어 있는가?${fileText}`;
     if (item.title === "Documentation update need") return `사용자-facing 동작이 바뀌었다면 README 또는 docs 설명도 맞게 갱신되었는가?${fileText}`;
     if (item.title === "CLI command and help consistency") return `CLI help/status 출력이 문서와 일치하는가?${fileText}`;
     return `${title}을 확인했는가?${fileText}`;
   }
   if (item.title === "Report and handoff regeneration") return `Do done/status/handoff regenerate the latest user-facing reports?${fileText}`;
-  if (item.title === "Change scope check") return `Do all changed files belong to this Quality Report UX task?${fileText}`;
+  if (item.title === "Quality Report output review") return `Does the Quality Report immediately tell the user what changed and what to do next?${fileText}`;
+  if (item.title === "Change scope check") return `Is this diff focused only on Quality Report intelligence?${fileText}`;
   if (item.title === "Documentation update need") return `If user-facing behavior changed, do README/docs match it?${fileText}`;
   if (item.title === "CLI command and help consistency") return `Do CLI help/status output and docs still match?${fileText}`;
   return `Has ${title} been checked?${fileText}`;
@@ -1720,7 +1742,7 @@ function formatRelatedFiles(files: string[], reviewItems: QualityReviewItem[], l
 
 function relatedFileRole(file: string, reviewItems: QualityReviewItem[], locale: DevGuardLocale): string {
   if (/runtime-state\.ts$/.test(file)) {
-    return locale === "ko-KR" ? "Quality Report 생성과 handoff 파싱 로직" : "Quality Report generation and handoff parsing logic";
+    return locale === "ko-KR" ? "Quality Report 판단 문장, 실행 안내, handoff 파싱 로직" : "Quality Report review copy, action guidance, and handoff parsing logic";
   }
   if (/dashboard/i.test(file)) {
     return locale === "ko-KR" ? "Dashboard 표시와 사용자 상호작용" : "Dashboard display and user interaction";
@@ -1772,6 +1794,7 @@ function localizeReviewTitle(value: string, locale: DevGuardLocale): string {
     "CLI command and help consistency": "CLI 명령과 도움말 일치 여부",
     "Watch behavior check": "watch 동작 확인",
     "Report and handoff regeneration": "보고서와 인수인계 재생성 확인",
+    "Quality Report output review": "Quality Report 출력 검토",
     "Runtime-sensitive behavior": "런타임 영향 확인",
     "Documentation update need": "문서 업데이트 필요 여부",
     "Change scope check": "변경 범위 확인",
@@ -1868,6 +1891,11 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Use the review items below to confirm the behavior before committing or publishing.": "커밋 또는 배포 전에 아래 검토 항목으로 실제 동작을 확인하세요.",
     "The change can affect what users see in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보는 내용에 영향을 줄 수 있습니다.",
     "The change can affect generated reports, handoff files, or next-session context.": "이번 변경은 생성 보고서, 인수인계 파일, 다음 세션 컨텍스트에 영향을 줄 수 있습니다.",
+    "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.": "이번 변경은 DevGuard가 로컬 점검 결과를 사용자용 Quality Report와 인수인계 안내로 바꾸는 방식에 영향을 줍니다.",
+    "This change affects whether Dashboard language choices are reflected in generated reports and handoff files.": "이번 변경은 Dashboard 언어 선택이 생성 보고서와 인수인계 파일에 반영되는 흐름에 영향을 줍니다.",
+    "This change affects what users see or do in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보고 실행하는 흐름에 영향을 줍니다.",
+    "This change affects the authentication or login flow, so the end-to-end sign-in behavior needs review.": "이번 변경은 인증 또는 로그인 흐름에 영향을 주므로 실제 로그인 동작 검토가 필요합니다.",
+    "This change affects generated reports, handoff files, or next-session context.": "이번 변경은 생성 보고서, 인수인계 파일, 다음 세션 컨텍스트에 영향을 줍니다.",
     "The change can affect configuration or runtime behavior.": "이번 변경은 설정 또는 런타임 동작에 영향을 줄 수 있습니다.",
     "The change affects documentation or user-facing guidance.": "이번 변경은 문서 또는 사용자 안내에 영향을 줍니다.",
     "The change can affect API behavior or external callers.": "이번 변경은 API 동작 또는 외부 호출자에 영향을 줄 수 있습니다.",
@@ -1878,6 +1906,11 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Confirm changed CLI routing or output still matches README/docs and the commands users will run.": "변경된 CLI 라우팅 또는 출력이 README/docs와 사용자가 실행할 명령과 일치하는지 확인하세요.",
     "Confirm watch still tracks real project changes and ignores DevGuard internal files.": "watch가 실제 프로젝트 변경만 추적하고 DevGuard 내부 파일은 무시하는지 확인하세요.",
     "Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly.": "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요.",
+    "Regenerate the Quality Report and confirm the first screen tells the user what changed, what to do now, and why it matters.": "Quality Report를 재생성한 뒤 첫 화면에서 무엇이 바뀌었고 지금 무엇을 해야 하며 왜 중요한지 바로 보이는지 확인하세요.",
+    "Quality Report or handoff generation changed. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names.": "Quality Report 또는 인수인계 생성 흐름이 바뀌었습니다. 재생성된 보고서가 사용자가 먼저 할 일을 알려주고, 관련 파일의 역할을 설명하며, 내부 규칙 이름을 노출하지 않는지 확인하세요.",
+    "The changed files should be checked against the current task, not against a generic rule. Confirm the diff is only improving the Quality Report review experience.": "변경 파일은 일반 규칙이 아니라 현재 작업 목표를 기준으로 확인해야 합니다. diff가 Quality Report 리뷰 경험 개선에만 집중되어 있는지 확인하세요.",
+    "Confirm the diff is focused on Quality Report intelligence and does not change unrelated watch, hook, dashboard, or release behavior.": "diff가 Quality Report intelligence 개선에 집중되어 있고 관련 없는 watch, hook, Dashboard, release 동작을 바꾸지 않는지 확인하세요.",
+    "Confirm no internal rule names appear in the main sections.": "주요 섹션에 내부 규칙 이름이 그대로 노출되지 않는지 확인하세요.",
     "Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read.": "변경된 소스 동작이 명령어, Dashboard 문구, 설정, hook, 보고서, 사용자가 읽는 생성 파일에 영향을 주는지 확인하세요.",
     "Confirm the changed files all support the current request and remove or split unrelated work before finishing.": "변경된 파일이 모두 현재 요청을 뒷받침하는지 확인하고, 관련 없는 작업은 제거하거나 분리하세요.",
     "Review the changed files once and confirm the implementation still matches the user request.": "변경 파일을 한 번 검토하고 구현이 여전히 사용자 요청과 일치하는지 확인하세요.",
@@ -1899,6 +1932,8 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     .replace(/^Confirm the (.+) area\(s\) still behave as intended in the actual workflow\.$/, "$1 영역이 실제 워크플로우에서 의도대로 동작하는지 확인하세요.")
     .replace(/^State, history, prompt, or report generation changed\. Confirm done\/status\/handoff regenerate the expected files without stale state\./, "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff가 오래된 상태 없이 필요한 파일을 재생성하는지 확인하세요.")
     .replace(/^The changed files may include work outside the current request\. Confirm each changed file supports the same task before finishing\./, "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.")
+    .replace(/^Quality Report or handoff generation changed\. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names\./, "Quality Report 또는 인수인계 생성 흐름이 바뀌었습니다. 재생성된 보고서가 사용자가 먼저 할 일을 알려주고, 관련 파일의 역할을 설명하며, 내부 규칙 이름을 노출하지 않는지 확인하세요.")
+    .replace(/^The changed files should be checked against the current task, not against a generic rule\. Confirm the diff is only improving the Quality Report review experience\./, "변경 파일은 일반 규칙이 아니라 현재 작업 목표를 기준으로 확인해야 합니다. diff가 Quality Report 리뷰 경험 개선에만 집중되어 있는지 확인하세요.")
     .replace(/^Confirm done\/status\/handoff read the latest runtime state and regenerate user-facing reports correctly\. Focus on (.+)\. Then run the required verification commands\.$/, "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요. 관련 파일: $1. 그런 다음 필요한 검증 명령을 실행하세요.")
     .replace(/^(.+) Focus on (.+)\. Then run the required verification commands\.$/, "$1 관련 파일: $2. 그런 다음 필요한 검증 명령을 실행하세요.")
     .replace(/ Related file\(s\): /g, " 관련 파일: ")
