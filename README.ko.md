@@ -83,11 +83,18 @@ npm 설치/업데이트 후 초기세팅, GPT 설정, `AGENTS.md`/`CLAUDE.md` �
 
 ## OpenAI GPT 설정
 
-대부분의 세션 연속성 명령은 API key 없이 동작합니다: `init`, `watch`, `done`, `status`, `handoff`, 로컬 휴리스틱 검사.
+대부분의 세션 연속성 명령은 API key 없이 동작합니다: `init`, `watch`, `done`, `status`, `handoff`, 로컬 휴리스틱 검사. Key가 없으면 Quality Report는 로컬 품질 규칙으로 생성됩니다. Key가 있으면 `done`이 OpenAI 기반 품질 요약을 보강할 수 있습니다.
 
-OpenAI가 필요한 AI 보조 명령(`review`, `task-ai`)을 사용할 때만 환경 변수로 API key를 설정합니다. DevGuard는 API key를 환경 변수에서만 읽습니다.
+DevGuard는 OpenAI API key를 다음 순서로 읽습니다.
+
+1. `.devguard/config.json` (`dev-guard config set openaiApiKey <key>` 또는 Dashboard 설정)
+2. `DEV_GUARD_OPENAI_API_KEY`
+3. `OPENAI_API_KEY`
+4. 없음, 로컬 규칙 기반 fallback
 
 ```bash
+dev-guard config set openaiApiKey "your_api_key_here"
+# 또는:
 export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
 # 또는:
 export OPENAI_API_KEY="your_api_key_here"
@@ -100,7 +107,7 @@ dev-guard configure ai --provider openai --model gpt-4o-mini
 dev-guard doctor
 ```
 
-API key는 git에 넣지 않습니다. `.env`, secret이 들어간 `.devguard/config.json`, 로컬 secret 파일을 커밋하지 마세요.
+DevGuard는 key 값을 출력하거나 Dashboard API 응답에 포함하지 않습니다. `.devguard/config.json`에 key를 저장했다면 해당 파일을 git에 커밋하지 마세요.
 
 ## 핵심 명령어
 

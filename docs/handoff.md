@@ -49,7 +49,7 @@ If a project doc is empty or still contains TODO-only content, the prompt says `
 - The prompt is generated only when `done` runs.
 - It does not grant permission to rewrite unrelated files.
 - It includes generated file paths as `Do Not Change`.
-- It never stores API keys.
+- It never includes API keys in generated handoff or prompt text.
 - It is ignored by git by default.
 
 ## Typical Use

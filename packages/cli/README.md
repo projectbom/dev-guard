@@ -27,9 +27,11 @@ On first launch, `watch` automatically creates default `.devguard/` configuratio
 
 ## GPT Setup
 
-The default `watch`, `done`, `status`, and `handoff` workflow does not require GPT/API setup. Configure an OpenAI provider only for AI-assisted commands such as `review` and `task-ai`.
+The default `watch`, `done`, `status`, and `handoff` workflow does not require GPT/API setup. Without a key, `done` generates rule-based Quality Reports. With a key, DevGuard can add OpenAI-assisted Quality Report summaries and run AI-backed commands such as `review` and `task-ai`.
 
 ```bash
+dev-guard config set openaiApiKey "your_api_key"
+# or:
 export DEV_GUARD_OPENAI_API_KEY="your_api_key"
 # or:
 export OPENAI_API_KEY="your_api_key"
@@ -37,7 +39,7 @@ dev-guard configure ai --provider openai --model gpt-4o-mini
 dev-guard doctor
 ```
 
-Do not store API keys in project files, `.env`, markdown, or git-tracked secret files.
+DevGuard checks `.devguard/config.json`, then `DEV_GUARD_OPENAI_API_KEY`, then `OPENAI_API_KEY`. It never prints the key or returns it from the dashboard API. If you store the key in `.devguard/config.json`, keep that file out of git.
 
 ## Agent Instruction Files
 

@@ -33,6 +33,7 @@ export const defaultWatchConfig: Required<WatchConfig> = {
 
 // Internal: config.json may have both DevGuardConfig fields and a `watch` section.
 type ConfigFileShape = DevGuardConfig & { watch?: WatchConfig; locale?: string };
+export type OpenAIKeySource = "config" | "DEV_GUARD_OPENAI_API_KEY" | "OPENAI_API_KEY" | "none";
 
 export interface ResolvedConfig {
   config: DevGuardConfig;
@@ -45,7 +46,7 @@ export interface ResolvedConfig {
 export interface EnvResolution {
   apiKey: {
     checked: Array<{ name: "DEV_GUARD_OPENAI_API_KEY" | "OPENAI_API_KEY"; found: boolean }>;
-    selectedKey?: "DEV_GUARD_OPENAI_API_KEY" | "OPENAI_API_KEY";
+    selectedKey?: OpenAIKeySource;
     found: boolean;
   };
 }
@@ -57,13 +58,17 @@ export async function loadConfig(root: string, cliAI: Partial<AIConfig> = {}): P
   const local = await loadLocalConfig(root, warnings);
   const envResolution = resolveOpenAIEnv();
   const env = envConfig(envResolution);
+  const keyResolution = resolveConfiguredOpenAIKey(local.config, envResolution);
   const merged = mergeDevGuardConfig(defaultConfig, env, local.config, { ai: cliAI });
-  if (envResolution.apiKey.found) {
+  if (keyResolution.found) {
     merged.ai = {
       ...(merged.ai ?? {}),
       provider: "openai",
       model: merged.ai?.model ?? defaultConfig.ai.model
     };
+    if (keyResolution.source === "config" && keyResolution.apiKey) {
+      merged.ai.apiKey = keyResolution.apiKey;
+    }
   }
 
   return {
@@ -71,7 +76,13 @@ export async function loadConfig(root: string, cliAI: Partial<AIConfig> = {}): P
     watchConfig: local.watchConfig,
     source: sourceLabel(local.source, env),
     warnings,
-    env: envResolution
+    env: {
+      apiKey: {
+        checked: envResolution.apiKey.checked,
+        selectedKey: keyResolution.source === "none" ? undefined : keyResolution.source,
+        found: keyResolution.found
+      }
+    }
   };
 }
 
@@ -84,6 +95,22 @@ export async function writeConfigValue(root: string, key: string, value: string)
   const configPath = fromRoot(root, ".devguard/config.json");
   const current = await readJsonFile<ConfigFileShape>(configPath, defaultConfig);
   const next = applyConfigValue(current, key, value);
+  await writeTextFile(configPath, `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
+export async function writeOpenAIApiKey(root: string, apiKey: string | undefined): Promise<ConfigFileShape> {
+  const configPath = fromRoot(root, ".devguard/config.json");
+  const current = await readJsonFile<ConfigFileShape>(configPath, defaultConfig);
+  const ai = { ...(current.ai ?? {}) };
+  if (apiKey?.trim()) {
+    ai.apiKey = apiKey.trim();
+    ai.provider = "openai";
+    ai.model = ai.model ?? defaultConfig.ai.model;
+  } else {
+    delete ai.apiKey;
+  }
+  const next: ConfigFileShape = { ...current, ai };
   await writeTextFile(configPath, `${JSON.stringify(next, null, 2)}\n`);
   return next;
 }
@@ -103,6 +130,7 @@ export function printConfigSummary(label: string, resolved: ResolvedConfig): voi
   if (ai.baseURL) {
     console.log(`- baseURL: ${ai.baseURL}`);
   }
+  console.log(`- OpenAI API key: ${resolved.env.apiKey.found ? "configured" : "not configured"}`);
   console.log("Watch:");
   console.log(`- dashboard: ${watch.dashboard ?? defaultWatchConfig.dashboard}`);
   console.log(`- autoComplete: ${watch.autoComplete ?? defaultWatchConfig.autoComplete}`);
@@ -197,6 +225,46 @@ export function readOpenAIApiKey(env: NodeJS.ProcessEnv = process.env): string |
   return openAIKey || undefined;
 }
 
+export async function resolveOpenAIApiKey(root: string, env: NodeJS.ProcessEnv = process.env): Promise<{
+  apiKey?: string;
+  source: OpenAIKeySource;
+  configured: boolean;
+}> {
+  const local = await readJsonFile<ConfigFileShape>(fromRoot(root, ".devguard/config.json"), {});
+  const configKey = local.ai?.apiKey?.trim();
+  if (configKey) {
+    return { apiKey: configKey, source: "config", configured: true };
+  }
+  const devGuardKey = env.DEV_GUARD_OPENAI_API_KEY?.trim();
+  if (devGuardKey) {
+    return { apiKey: devGuardKey, source: "DEV_GUARD_OPENAI_API_KEY", configured: true };
+  }
+  const openAIKey = env.OPENAI_API_KEY?.trim();
+  if (openAIKey) {
+    return { apiKey: openAIKey, source: "OPENAI_API_KEY", configured: true };
+  }
+  return { source: "none", configured: false };
+}
+
+export async function readOpenAIApiKeyForRoot(root: string, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
+  return (await resolveOpenAIApiKey(root, env)).apiKey;
+}
+
+function resolveConfiguredOpenAIKey(config: DevGuardConfig, envResolution: EnvResolution): {
+  apiKey?: string;
+  source: OpenAIKeySource;
+  found: boolean;
+} {
+  const configKey = config.ai?.apiKey?.trim();
+  if (configKey) {
+    return { apiKey: configKey, source: "config", found: true };
+  }
+  if (envResolution.apiKey.selectedKey) {
+    return { source: envResolution.apiKey.selectedKey, found: true };
+  }
+  return { source: "none", found: false };
+}
+
 function hasNonEmptyEnv(value: string | undefined): boolean {
   return Boolean(value?.trim());
 }
@@ -259,9 +327,17 @@ function applyConfigValue(config: ConfigFileShape, key: string, value: string): 
     ai.reasoningEffort = value;
   } else if (key === "baseURL") {
     ai.baseURL = value;
+  } else if (key === "openaiApiKey" || key === "openai.apiKey" || key === "ai.apiKey") {
+    if (!value.trim() || value === "none" || value === "unset") {
+      delete ai.apiKey;
+    } else {
+      ai.apiKey = value.trim();
+      ai.provider = "openai";
+      ai.model = ai.model ?? defaultConfig.ai.model;
+    }
   } else {
     throw new Error(
-      "지원하는 config key: provider, model, temperature, maxTokens, reasoningEffort, baseURL, locale, " +
+      "지원하는 config key: provider, model, temperature, maxTokens, reasoningEffort, baseURL, openaiApiKey, openai.apiKey, locale, " +
       "watch.dashboard, watch.autoComplete, watch.autoCompleteDelay, watch.stableAfter, " +
       "watch.poll, watch.depth, watch.compact, watch.includeLockfiles"
     );

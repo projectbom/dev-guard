@@ -28,7 +28,7 @@ import {
 import { buildAIContextPreamble, writeAIContext } from "./ai-context.js";
 import { copyTextToClipboard } from "./clipboard.js";
 import { filterCommandTargetCandidates, inferCommandTargetFiles, mergeCommandTargetCandidates } from "./command-targets.js";
-import { loadConfig, readOpenAIApiKey } from "./config.js";
+import { loadConfig, readOpenAIApiKeyForRoot } from "./config.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges, getProjectFiles } from "./git.js";
 import {
@@ -63,7 +63,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
   const config = resolvedConfig.config;
   const providerName = config.ai?.provider ?? defaultConfig.ai.provider ?? "none";
   const model = config.ai?.model ?? defaultConfig.ai.model ?? "gpt-4o-mini";
-  const openAIApiKey = readOpenAIApiKey();
+  const openAIApiKey = await readOpenAIApiKeyForRoot(root);
   const currentIdentity = await loadCurrentProjectIdentity(root).catch(() => undefined);
 
   const [gitChanges, projectMemory, rulesMarkdown, mistakesMarkdown, projectStateMarkdown, decisionsMarkdown] = await Promise.all([
@@ -155,7 +155,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
   }
 
   if (providerName === "openai" && !openAIApiKey) {
-    throw new Error("OpenAI API key 환경변수가 없습니다. API key는 config에 저장하지 말고 `DEV_GUARD_OPENAI_API_KEY` 또는 `OPENAI_API_KEY`로 설정해 주세요.");
+    throw new Error("OpenAI API key가 설정되어 있지 않습니다. `dev-guard config set openaiApiKey <key>`, `DEV_GUARD_OPENAI_API_KEY`, 또는 `OPENAI_API_KEY`를 사용하세요.");
   }
 
   const provider =

@@ -8,7 +8,7 @@ import { readProjectKnowledge } from "./knowledge.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
-import { writeConfigValue } from "./config.js";
+import { resolveOpenAIApiKey, writeConfigValue, writeOpenAIApiKey, type OpenAIKeySource } from "./config.js";
 
 const DEFAULT_PORT = 3737;
 const HOST = "127.0.0.1";
@@ -107,6 +107,10 @@ interface DashboardState {
     framework?: string;
   };
   setup?: RuntimeState["setupStatus"];
+  openAI: {
+    configured: boolean;
+    source: OpenAIKeySource;
+  };
 }
 
 export async function runDashboard(root: string, args: string[]): Promise<void> {
@@ -204,6 +208,26 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
     }
     return;
   }
+  if (request.method === "POST" && url.pathname === "/api/openai-key") {
+    try {
+      const body = await readJsonBody<{ apiKey?: string; action?: string }>(request);
+      if (body.action === "remove") {
+        await writeOpenAIApiKey(root, undefined);
+        sendJson(response, { ok: true, configured: false, source: "none" });
+        return;
+      }
+      const apiKey = body.apiKey?.trim();
+      if (!apiKey) {
+        sendJson(response, { ok: false, error: "Missing API key" }, 400);
+        return;
+      }
+      await writeOpenAIApiKey(root, apiKey);
+      sendJson(response, { ok: true, configured: true, source: "config" });
+    } catch (error) {
+      sendJson(response, { ok: false, error: errorMessage(error) }, 500);
+    }
+    return;
+  }
   if (request.method !== "GET") {
     sendText(response, 405, "Method not allowed");
     return;
@@ -260,13 +284,14 @@ async function readJsonBody<T>(request: IncomingMessage): Promise<T> {
 
 async function getDashboardState(root: string): Promise<DashboardState> {
   const initialized = await isDevGuardInitialized(root);
-  const [runtime, strategyReport, reports, projectState, history, knowledge] = await Promise.all([
+  const [runtime, strategyReport, reports, projectState, history, knowledge, openAI] = await Promise.all([
     readRuntimeState(root),
     getAgentStrategyReport(root),
     readReportState(root),
     readProjectState(root),
     readHistoryRecords(root, 20),
-    readKnowledgeState(root)
+    readKnowledgeState(root),
+    resolveOpenAIApiKey(root)
   ]);
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoMode = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
@@ -309,7 +334,11 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     timeline,
     reports,
     knowledge,
-    setup: runtime.setupStatus
+    setup: runtime.setupStatus,
+    openAI: {
+      configured: openAI.configured,
+      source: openAI.source
+    }
   };
 }
 
@@ -684,6 +713,11 @@ function renderPage(): string {
     .ac-btn-secondary { background: var(--surface2); border: 1px solid var(--line2); color: var(--ink2); }
     .ac-btn-secondary:hover { background: var(--line); color: var(--ink); }
     .ac-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .setting-help { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .setting-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .mini-btn { border: 1px solid var(--line2); background: var(--ink); color: #fff; border-radius: var(--r-sm); padding: 7px 11px; font: 12px/1 var(--sans); font-weight: 700; cursor: pointer; }
+    .mini-btn.ghost { background: var(--surface); color: var(--ink2); }
+    .mini-btn:hover { filter: brightness(.96); }
 
     /* ── Assistant prompt / summary ── */
     .prompt-list { display: grid; gap: 7px; margin-top: 10px; }
@@ -899,6 +933,32 @@ async function persistLocale(l) {
     // The dashboard language still changes locally; config sync will retry on the next user change.
   }
 }
+async function setOpenAIKey(btn) {
+  const key = window.prompt(t('openAIKeyPrompt'));
+  if (!key) return;
+  await saveOpenAIKey({ apiKey: key }, btn);
+}
+async function removeOpenAIKey(btn) {
+  if (!window.confirm(t('openAIKeyRemoveConfirm'))) return;
+  await saveOpenAIKey({ action: 'remove' }, btn);
+}
+async function saveOpenAIKey(body, btn) {
+  const original = btn ? btn.textContent : '';
+  if (btn) btn.textContent = t('saving');
+  try {
+    const res = await fetch('/api/openai-key', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await tick();
+  } catch {
+    window.alert(t('openAIKeySaveFailed'));
+  } finally {
+    if (btn) btn.textContent = original;
+  }
+}
 function applyServerLocale(locale) {
   const next = localeToLang(locale);
   if (!next || next === lang) return;
@@ -967,7 +1027,11 @@ function normalizeDashboardState(s) {
       architectureModules: Number.isFinite(knowledge.architectureModules) ? knowledge.architectureModules : 0,
       framework: knowledge.framework
     },
-    setup: s?.setup
+    setup: s?.setup,
+    openAI: {
+      configured: Boolean(s?.openAI?.configured),
+      source: s?.openAI?.source || 'none'
+    }
   };
 }
 
@@ -1343,6 +1407,16 @@ function render(s) {
     actions.map((action, index) => recommendedActionCard(action, index)).join('') +
     '</div></div>';
 
+  const openAISettings = '<div class="card openai-card">' +
+    '<div class="card-title">' + esc(t('openAIKeyTitle')) + '</div>' +
+    '<div class="activity-row"><span class="activity-label">' + esc(t('openAIKeyStatus')) + '</span><span class="activity-value">' +
+    esc(s.openAI.configured ? t('openAIKeyConfigured') : t('openAIKeyNotConfigured')) + '</span></div>' +
+    '<div class="setting-help">' + esc(s.openAI.configured ? t('openAIKeyConfiguredHelp') : t('openAIKeyMissingHelp')) + '</div>' +
+    '<div class="setting-actions">' +
+    '<button class="mini-btn" onclick="setOpenAIKey(this)">' + esc(s.openAI.configured ? t('openAIKeyUpdate') : t('openAIKeySet')) + '</button>' +
+    (s.openAI.configured && s.openAI.source === 'config' ? '<button class="mini-btn ghost" onclick="removeOpenAIKey(this)">' + esc(t('openAIKeyRemove')) + '</button>' : '') +
+    '</div></div>';
+
   /* Activity card */
   const actRows = [
     s.watchingSince ? '<div class="activity-row"><span class="activity-label">' + esc(t('sessionStarted')) + '</span><span class="activity-value">' + esc(s.watchingSince) + '</span></div>' : '',
@@ -1464,7 +1538,7 @@ function render(s) {
     '</div></div></details></div>';
 
   root.innerHTML =
-    nextCard + banner + setupList + actionCenter +
+    nextCard + banner + setupList + actionCenter + openAISettings +
     '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
     '<div class="gap g2w" style="margin-top:12px">' + summaryCard + sessionsCard + '</div>' +
     '<div class="gap g2" style="margin-top:12px">' + healthCard + timelineCard + '</div>' +

@@ -39,6 +39,7 @@ export function mergeConfig(config?: DevGuardConfig): Required<DevGuardConfig> {
     ai: {
       provider: config?.ai?.provider ?? defaultConfig.ai.provider,
       model: config?.ai?.model ?? defaultConfig.ai.model,
+      apiKey: config?.ai?.apiKey,
       temperature: config?.ai?.temperature ?? defaultConfig.ai.temperature,
       maxTokens: config?.ai?.maxTokens ?? defaultConfig.ai.maxTokens,
       reasoningEffort: config?.ai?.reasoningEffort ?? defaultConfig.ai.reasoningEffort,

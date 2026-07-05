@@ -58,4 +58,13 @@ If a project wants to share rules with its team, it can explicitly unignore or c
 
 ## API Keys
 
-Do not store API keys in `.devguard/config.json`, markdown files, or run logs. Use environment variables such as `OPENAI_API_KEY`.
+DevGuard works without an OpenAI API key. When no key is configured, Quality Reports use local rule-based guidance and commands still succeed.
+
+OpenAI API key resolution order:
+
+1. `.devguard/config.json` via `dev-guard config set openaiApiKey <key>` or the dashboard setting
+2. `DEV_GUARD_OPENAI_API_KEY`
+3. `OPENAI_API_KEY`
+4. no key, local rule-based fallback
+
+DevGuard never prints the key and the dashboard API only reports whether a key is configured. If you store a key in `.devguard/config.json`, treat that file as a local secret and keep it out of git.

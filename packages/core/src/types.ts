@@ -22,6 +22,7 @@ export type AIProviderName = "none" | "openai";
 
 export interface AIConfig {
   provider?: AIProviderName;
+  apiKey?: string;
   model?: string;
   temperature?: number;
   maxTokens?: number;

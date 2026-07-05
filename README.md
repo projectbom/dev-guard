@@ -82,11 +82,18 @@ For npm install/update, initial setup, GPT setup, `AGENTS.md` / `CLAUDE.md` text
 
 ## OpenAI GPT Setup
 
-Most DevGuard session-continuity commands work without an API key: `init`, `watch`, `done`, `status`, `handoff`, and local heuristic checks.
+Most DevGuard session-continuity commands work without an API key: `init`, `watch`, `done`, `status`, `handoff`, and local heuristic checks. Without a key, Quality Reports use local rule-based guidance. With a key, `done` can add an OpenAI-assisted Quality Report summary.
 
-AI-backed commands such as `review` and `task-ai` can use OpenAI. DevGuard reads API keys from environment variables only:
+DevGuard reads OpenAI API keys in this order:
+
+1. `.devguard/config.json` (`dev-guard config set openaiApiKey <key>` or Dashboard settings)
+2. `DEV_GUARD_OPENAI_API_KEY`
+3. `OPENAI_API_KEY`
+4. no key, local rule-based fallback
 
 ```bash
+dev-guard config set openaiApiKey "your_api_key_here"
+# or:
 export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
 # or:
 export OPENAI_API_KEY="your_api_key_here"
@@ -99,7 +106,7 @@ dev-guard configure ai --provider openai --model gpt-4o-mini
 dev-guard doctor
 ```
 
-Keep API keys out of git. Do not commit `.env`, `.devguard/config.json` with secrets, or local secret files.
+DevGuard does not print the key or return it from the dashboard API. If you store the key in `.devguard/config.json`, keep that file out of git.
 
 ## Recommended Workflow
 
@@ -460,7 +467,7 @@ Read more in [docs/quality.md](./docs/quality.md).
 - `decisions.md` is not modified automatically; decision candidates are written to a report.
 - `update` is preview-only; `update --write` is the only docs-write command and only touches managed blocks.
 - API providers are optional. Local heuristic mode works without an API key.
-- API keys must stay in environment variables, not config or markdown files.
+- API keys are never printed. If stored in `.devguard/config.json`, that file must stay out of git.
 
 ## Watch Notes
 
@@ -475,14 +482,16 @@ Watch excludes common heavy/generated paths such as `node_modules`, `.git`, `.ne
 
 ## AI Provider Setup
 
-The event-based workflow works without an AI provider. Configure one only for advanced task/review flows:
+The event-based workflow works without an AI provider. Configure one only for OpenAI-assisted Quality Report summaries or advanced task/review flows:
 
 ```bash
 dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard config set openaiApiKey "your_api_key"
+# or:
 export OPENAI_API_KEY="your_api_key"
 ```
 
-Do not store API keys in project files.
+If you store a key in `.devguard/config.json`, keep that file out of git.
 
 ## Alpha Status
 

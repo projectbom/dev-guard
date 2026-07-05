@@ -78,7 +78,7 @@ dev-guard config set model gpt-5
 dev-guard config show
 ```
 
-Do not store API keys in `.devguard/config.json`, `.env`, markdown files, or git-tracked files. Pass them through runtime environment variables.
+OpenAI API keys are optional. DevGuard checks `.devguard/config.json`, `DEV_GUARD_OPENAI_API_KEY`, then `OPENAI_API_KEY`. Environment variables are recommended for shared machines; if you store a key with `dev-guard config set openaiApiKey <key>`, keep `.devguard/config.json` out of git.
 
 To disable the AI provider and use local heuristics only:
 

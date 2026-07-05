@@ -10,6 +10,7 @@ import {
   formatInferredDiffIntentClusters,
   generateUpdateSuggestions,
   inferDiffIntentClusters,
+  OpenAIProvider,
   type ChangeFile,
   type CodeGraphEntry,
   type DevGuardConfig
@@ -20,6 +21,7 @@ import { migrateLegacyDevguardDir } from "./migration.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { generateProjectKnowledge } from "./knowledge.js";
 import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
+import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -108,6 +110,11 @@ interface QualityReport {
   reviewItems: QualityReviewItem[];
   beforeCommit: string[];
   nextRecommendedAction: string;
+  aiSummary?: {
+    status: "generated" | "fallback";
+    reason: string;
+    source: "openai" | "rule-based";
+  };
 }
 
 interface QualityReviewItem {
@@ -402,13 +409,24 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const decisionCandidates = inferDecisionCandidates({ areas, changedFiles, judgments, summary });
   const riskDetails = buildRiskDetails({ judgments, changedFiles, areas });
   const nextTask = chooseNextTask({ drift, judgments, areas, changedFiles, testCandidates });
-  const qualityReport = await assessCompletionQuality(root, {
+  let qualityReport = await assessCompletionQuality(root, {
     changedFiles,
     rawChangedFiles,
     areas,
     judgments,
     testCandidates,
     nextTaskTitle: nextTask.title
+  });
+  qualityReport = await enhanceQualityReportWithAI(root, {
+    locale,
+    report: qualityReport,
+    changedFiles,
+    areas,
+    judgments,
+    summary,
+    nextTaskTitle: nextTask.title,
+    projectContext,
+    previousHistory
   });
   historyRecord.qualityVerdict = qualityReport.verdict;
   const reportMarkdown = renderLastRunReport({
@@ -1269,6 +1287,243 @@ async function assessCompletionQuality(
   };
 }
 
+async function enhanceQualityReportWithAI(
+  root: string,
+  input: {
+    locale: DevGuardLocale;
+    report: QualityReport;
+    changedFiles: string[];
+    areas: string[];
+    judgments: string[];
+    summary: string;
+    nextTaskTitle: string;
+    projectContext: ProjectContextSummary;
+    previousHistory: HistoryRecord[];
+  }
+): Promise<QualityReport> {
+  const key = await resolveOpenAIApiKey(root);
+  if (!key.apiKey) {
+    return markQualityReportAIFallback(input.report, "missing_key");
+  }
+
+  try {
+    const [resolvedConfig, previousHandoff, projectKnowledge] = await Promise.all([
+      loadConfig(root),
+      readTextFile(fromRoot(root, devguardPaths.projectHandoff)),
+      readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+    ]);
+    const ai = resolvedConfig.config.ai ?? defaultConfig.ai;
+    const model = ai.model ?? defaultConfig.ai.model ?? "gpt-4o-mini";
+    const provider = new OpenAIProvider({
+      apiKey: key.apiKey,
+      model,
+      temperature: ai.temperature ?? 0.2,
+      maxTokens: Math.min(ai.maxTokens ?? 1400, 1800),
+      reasoningEffort: ai.reasoningEffort,
+      baseURL: ai.baseURL
+    });
+    const text = await withTimeout(provider.generateText({
+      model,
+      temperature: ai.temperature ?? 0.2,
+      maxTokens: Math.min(ai.maxTokens ?? 1400, 1800),
+      system: qualityAISystemPrompt(input.locale),
+      prompt: qualityAIUserPrompt({
+        ...input,
+        previousHandoff,
+        projectKnowledge: projectKnowledge.slice(0, 5000)
+      })
+    }), 12000);
+    const generated = parseAIQualityReview(text);
+    if (!generated) {
+      return markQualityReportAIFallback(input.report, "invalid_response");
+    }
+    return {
+      ...input.report,
+      summary: generated.summary.length > 0 ? generated.summary : input.report.summary,
+      why: generated.why.length > 0 ? generated.why : input.report.why,
+      reviewItems: mergeAIReviewItems(input.report.reviewItems, generated.reviewItems),
+      nextRecommendedAction: generated.nextAction || input.report.nextRecommendedAction,
+      aiSummary: {
+        status: "generated",
+        reason: "openai_quality_review",
+        source: "openai"
+      }
+    };
+  } catch {
+    return markQualityReportAIFallback(input.report, "request_failed");
+  }
+}
+
+function markQualityReportAIFallback(report: QualityReport, reason: "missing_key" | "request_failed" | "invalid_response"): QualityReport {
+  return {
+    ...report,
+    aiSummary: {
+      status: "fallback",
+      reason,
+      source: "rule-based"
+    }
+  };
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("OpenAI quality review timed out")), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function qualityAISystemPrompt(locale: DevGuardLocale): string {
+  return [
+    "You are a senior software engineer reviewing the current DevGuard session.",
+    "Improve the Quality Report content only. Do not invent problems.",
+    "Write as a concise action guide for the user, not as a rule-engine explanation.",
+    "Do not expose internal rule names such as scope drift, docs update candidate, runtime candidate, review candidate, or heuristic candidate.",
+    "If something is uncertain, say it needs confirmation.",
+    `Write user-facing text in ${locale === "ko-KR" ? "natural Korean" : "natural English"}.`,
+    "Return strict JSON only with keys: summary, why, nextAction, reviewItems.",
+    "summary and why are arrays of short strings.",
+    "reviewItems is an array of { title, body, files, checks } where body/files/checks are arrays."
+  ].join("\n");
+}
+
+function qualityAIUserPrompt(input: {
+  locale: DevGuardLocale;
+  report: QualityReport;
+  changedFiles: string[];
+  areas: string[];
+  judgments: string[];
+  summary: string;
+  nextTaskTitle: string;
+  projectContext: ProjectContextSummary;
+  previousHistory: HistoryRecord[];
+  previousHandoff: string;
+  projectKnowledge: string;
+}): string {
+  const recent = input.previousHistory.slice(-5).map((record) => ({
+    timestamp: record.timestamp,
+    files: record.changedFiles.slice(0, 8),
+    quality: record.qualityVerdict,
+    summary: record.inferredSummary
+  }));
+  const checklist = input.report.checklist.map((item) => ({
+    label: userFacingQualityLabel(item.label),
+    status: item.status,
+    detail: item.detail
+  }));
+  return JSON.stringify({
+    locale: input.locale,
+    sessionGoal: input.nextTaskTitle || "Needs confirmation",
+    effectiveTask: input.summary || "Needs confirmation",
+    changedFiles: input.changedFiles.map((file) => ({ path: file, purpose: fileRoleDescription(file, input.locale) })),
+    areas: input.areas,
+    qualityVerdict: input.report.verdict,
+    qualityChecklist: checklist,
+    verificationCommands: input.report.requiredVerification,
+    currentRuleBasedSummary: input.report.summary,
+    currentRuleBasedReasons: input.report.why,
+    projectContext: input.projectContext,
+    projectKnowledge: input.projectKnowledge,
+    handoffSummary: input.previousHandoff.slice(0, 2500),
+    recentSessionContext: recent,
+    constraints: [
+      "Focus only on this change.",
+      "Explain what matters, what the user should do now, and why.",
+      "Do not copy generic verification commands as the main next action unless they are directly relevant.",
+      "Do not list files without explaining their role."
+    ]
+  }, null, 2);
+}
+
+interface AIQualityReview {
+  summary: string[];
+  why: string[];
+  nextAction: string;
+  reviewItems: QualityReviewItem[];
+}
+
+function parseAIQualityReview(text: string): AIQualityReview | null {
+  const trimmed = text.trim();
+  const jsonText = trimmed.startsWith("{") ? trimmed : trimmed.match(/\{[\s\S]*\}/)?.[0];
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText) as Partial<AIQualityReview>;
+    return {
+      summary: stringArray(parsed.summary).slice(0, 4),
+      why: stringArray(parsed.why).slice(0, 5),
+      nextAction: typeof parsed.nextAction === "string" ? parsed.nextAction.trim() : "",
+      reviewItems: Array.isArray(parsed.reviewItems)
+        ? parsed.reviewItems.map(normalizeAIReviewItem).filter(Boolean).slice(0, 4) as QualityReviewItem[]
+        : []
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAIReviewItem(item: unknown): QualityReviewItem | null {
+  if (!item || typeof item !== "object") return null;
+  const record = item as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title.trim() : "";
+  if (!title) return null;
+  return {
+    title,
+    body: stringArray(record.body).slice(0, 3),
+    files: stringArray(record.files).slice(0, 6),
+    checks: stringArray(record.checks).slice(0, 4)
+  };
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0).map((entry) => entry.trim());
+}
+
+function mergeAIReviewItems(existing: QualityReviewItem[], generated: QualityReviewItem[]): QualityReviewItem[] {
+  if (generated.length === 0) return existing;
+  return dedupeReviewItems([...generated, ...existing]).slice(0, 5);
+}
+
+function userFacingQualityLabel(label: string): string {
+  if (label === "generated/runtime files") return "Generated runtime files in source changes";
+  if (label === "package lock consistency") return "Package and lockfile consistency";
+  if (label === "package manifest changed") return "Package manifest changed";
+  if (label === "build verification candidate") return "Build verification availability";
+  if (label === "change breadth") return "Change breadth";
+  if (label === "risky areas") return "Runtime-sensitive area changed";
+  if (label === "CLI router/help verification") return "CLI command and help verification";
+  if (label === "watch verification") return "Watch behavior verification";
+  if (label === "state/history verification") return "Report, history, and handoff generation verification";
+  if (label === "docs update candidate") return "Documentation update need";
+  if (label === "drift clarity") return "Change scope clarity";
+  return label;
+}
+
+function fileRoleDescription(file: string, locale: DevGuardLocale): string {
+  const role = inferFileRole(file);
+  if (locale !== "ko-KR") return role;
+  if (role === "script/dependency config") return "스크립트 또는 의존성 설정";
+  if (role === "lockfile/dependency snapshot") return "의존성 잠금 파일";
+  if (role === "generated artifacts exclusion") return "생성 산출물 제외 설정";
+  if (role === "CLI command router / entrypoint") return "CLI 명령 라우터 또는 진입점";
+  if (role === "watch command / file watcher") return "watch 명령 또는 파일 감시";
+  if (role === "runtime state / history persistence") return "런타임 상태와 히스토리 저장";
+  if (role === "review command / drift analysis") return "리뷰 명령 또는 변경 범위 분석";
+  if (role === "docs update preview/write logic") return "문서 업데이트 미리보기 또는 쓰기 로직";
+  if (role === "documentation") return "사용자 문서";
+  if (role === "test file") return "테스트 파일";
+  if (role === "API/server route") return "API 또는 서버 라우트";
+  if (role === "UI/component surface") return "UI 또는 컴포넌트 영역";
+  if (role === "build/runtime config") return "빌드 또는 런타임 설정";
+  return "소스 파일";
+}
+
 function buildQualitySummary(input: {
   verdict: QualityVerdict;
   changedFiles: string[];
@@ -1479,6 +1734,14 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
       checks: requiredVerification.slice(0, 4)
     };
   }
+  if (item.label === "change breadth") {
+    return {
+      title: "Change breadth review",
+      body: ["Confirm the changed files still belong to one coherent task and split unrelated work if needed."],
+      files,
+      checks: requiredVerification.slice(0, 3)
+    };
+  }
   if (item.label === "docs update candidate") {
     return {
       title: "Documentation update need",
@@ -1546,6 +1809,7 @@ const reportCopy = {
     why: "Why Review Is Needed",
     relatedFiles: "Related Files",
     requiredVerification: "Required Verification",
+    aiSummary: "AI Summary",
     blockedItems: "Blocked Items",
     warnings: "Additional Checks",
     riskChecklist: "Risk Checklist",
@@ -1562,6 +1826,7 @@ const reportCopy = {
     why: "왜 검토가 필요한가",
     relatedFiles: "관련 파일",
     requiredVerification: "필요한 검증",
+    aiSummary: "AI 요약",
     blockedItems: "먼저 해결해야 할 항목",
     warnings: "추가로 검토하면 좋은 점",
     riskChecklist: "위험 점검표",
@@ -1614,6 +1879,7 @@ function renderQualityReport(report: QualityReport, locale: DevGuardLocale): str
 
 function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale): string {
   const copy = reportCopy[locale];
+  const aiNote = formatAIQualityNote(report, locale);
   return [
     `# ${copy.title}`,
     "",
@@ -1626,6 +1892,7 @@ function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale):
     locale === "ko-KR" ? "필수 품질 검사를 통과했습니다." : "Required quality checks passed.",
     "",
     locale === "ko-KR" ? "추가 작업은 필요하지 않습니다." : "No additional action is required.",
+    ...(aiNote.length > 0 ? ["", `## ${copy.aiSummary}`, "", ...aiNote] : []),
     "",
     `## ${locale === "ko-KR" ? "실행할 검증" : "Verification To Run"}`,
     "",
@@ -1643,6 +1910,7 @@ function renderNeedsReviewQualityReport(report: QualityReport, locale: DevGuardL
     "",
     `## ${copy.verdict}`,
     `- ${report.verdict}`,
+    ...formatAIQualityNote(report, locale),
     "",
     `## ${copy.important}`,
     ...formatLocalizedBullets(report.summary, locale),
@@ -1674,6 +1942,7 @@ function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocal
     "",
     `## ${copy.verdict}`,
     `- ${report.verdict}`,
+    ...formatAIQualityNote(report, locale),
     "",
     `## ${copy.blockedItems}`,
     ...formatReviewItems(blockedReviewItems, locale),
@@ -1690,6 +1959,29 @@ function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocal
     `## ${copy.warnings}`,
     ...formatReviewQuestions(warningReviewItems, locale),
   ].join("\n") + "\n";
+}
+
+function formatAIQualityNote(report: QualityReport, locale: DevGuardLocale): string[] {
+  if (!report.aiSummary) return [];
+  if (report.aiSummary.status === "generated") {
+    return [
+      locale === "ko-KR"
+        ? "- OpenAI 기반 검토 요약을 반영했습니다."
+        : "- OpenAI-assisted review summary was applied."
+    ];
+  }
+  if (report.aiSummary.reason === "missing_key") {
+    return [
+      locale === "ko-KR"
+        ? "- AI 기반 요약은 생성하지 않았습니다. OpenAI API Key가 설정되어 있지 않아 기본 품질 규칙으로 보고서를 생성했습니다."
+        : "- AI summary was not generated. No OpenAI API key is configured, so this report was created with local quality rules."
+    ];
+  }
+  return [
+    locale === "ko-KR"
+      ? "- AI 기반 요약을 사용할 수 없어 기본 품질 규칙으로 보고서를 생성했습니다."
+      : "- AI summary was unavailable, so this report was created with local quality rules."
+  ];
 }
 
 function formatActionSteps(report: QualityReport, items: QualityReviewItem[], locale: DevGuardLocale): string[] {
@@ -1720,6 +2012,8 @@ function reviewQuestion(item: QualityReviewItem, locale: DevGuardLocale): string
     if (item.title === "Quality Report output review") return `Quality Report가 첫 화면에서 변경 의미와 다음 행동을 바로 알려주는가?${fileText}`;
     if (item.title === "Report and handoff regeneration") return `done/status/handoff 실행 후 사용자용 보고서가 최신 상태로 재생성되는가?${fileText}`;
     if (item.title === "Change scope check") return `이번 변경이 Quality Report intelligence 개선에만 집중되어 있는가?${fileText}`;
+    if (item.title === "Change breadth review") return `변경 파일이 하나의 작업 목표로 설명되는가?${fileText}`;
+    if (item.title === "Runtime-sensitive behavior") return `설정과 런타임 흐름이 실제 사용 방식과 일치하는가?${fileText}`;
     if (item.title === "Documentation update need") return `사용자-facing 동작이 바뀌었다면 README 또는 docs 설명도 맞게 갱신되었는가?${fileText}`;
     if (item.title === "CLI command and help consistency") return `CLI help/status 출력이 문서와 일치하는가?${fileText}`;
     return `${title}을 확인했는가?${fileText}`;
@@ -1727,6 +2021,8 @@ function reviewQuestion(item: QualityReviewItem, locale: DevGuardLocale): string
   if (item.title === "Report and handoff regeneration") return `Do done/status/handoff regenerate the latest user-facing reports?${fileText}`;
   if (item.title === "Quality Report output review") return `Does the Quality Report immediately tell the user what changed and what to do next?${fileText}`;
   if (item.title === "Change scope check") return `Is this diff focused only on Quality Report intelligence?${fileText}`;
+  if (item.title === "Change breadth review") return `Do the changed files still belong to one coherent task?${fileText}`;
+  if (item.title === "Runtime-sensitive behavior") return `Does the configuration and runtime flow still match actual use?${fileText}`;
   if (item.title === "Documentation update need") return `If user-facing behavior changed, do README/docs match it?${fileText}`;
   if (item.title === "CLI command and help consistency") return `Do CLI help/status output and docs still match?${fileText}`;
   return `Has ${title} been checked?${fileText}`;
@@ -1796,6 +2092,7 @@ function localizeReviewTitle(value: string, locale: DevGuardLocale): string {
     "Report and handoff regeneration": "보고서와 인수인계 재생성 확인",
     "Quality Report output review": "Quality Report 출력 검토",
     "Runtime-sensitive behavior": "런타임 영향 확인",
+    "Change breadth review": "변경 범위 확인",
     "Documentation update need": "문서 업데이트 필요 여부",
     "Change scope check": "변경 범위 확인",
     "Final behavior check": "최종 동작 확인"
@@ -1904,6 +2201,7 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Confirm DevGuard runtime artifacts are not included as source changes.": "DevGuard 런타임 산출물이 소스 변경으로 포함되지 않았는지 확인하세요.",
     "Confirm package scripts, dependencies, versions, and lockfile state match the intended release impact.": "package scripts, dependencies, version, lockfile 상태가 의도한 배포 영향과 맞는지 확인하세요.",
     "Confirm changed CLI routing or output still matches README/docs and the commands users will run.": "변경된 CLI 라우팅 또는 출력이 README/docs와 사용자가 실행할 명령과 일치하는지 확인하세요.",
+    "CLI routing or help output changed. Verify that documented commands, help text, and status output still match the implementation.": "CLI 라우팅 또는 도움말 출력이 바뀌었습니다. 문서의 명령 설명과 실제 help/status 출력이 일치하는지 확인하세요.",
     "Confirm watch still tracks real project changes and ignores DevGuard internal files.": "watch가 실제 프로젝트 변경만 추적하고 DevGuard 내부 파일은 무시하는지 확인하세요.",
     "Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly.": "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요.",
     "Regenerate the Quality Report and confirm the first screen tells the user what changed, what to do now, and why it matters.": "Quality Report를 재생성한 뒤 첫 화면에서 무엇이 바뀌었고 지금 무엇을 해야 하며 왜 중요한지 바로 보이는지 확인하세요.",
@@ -1913,6 +2211,7 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Confirm no internal rule names appear in the main sections.": "주요 섹션에 내부 규칙 이름이 그대로 노출되지 않는지 확인하세요.",
     "Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read.": "변경된 소스 동작이 명령어, Dashboard 문구, 설정, hook, 보고서, 사용자가 읽는 생성 파일에 영향을 주는지 확인하세요.",
     "Confirm the changed files all support the current request and remove or split unrelated work before finishing.": "변경된 파일이 모두 현재 요청을 뒷받침하는지 확인하고, 관련 없는 작업은 제거하거나 분리하세요.",
+    "Confirm the changed files still belong to one coherent task and split unrelated work if needed.": "변경 파일이 하나의 작업 목표에 속하는지 확인하고, 관련 없는 작업은 필요하면 분리하세요.",
     "Review the changed files once and confirm the implementation still matches the user request.": "변경 파일을 한 번 검토하고 구현이 여전히 사용자 요청과 일치하는지 확인하세요.",
     "Run git status and keep .devguard runtime outputs out of the commit.": "git status를 실행하고 .devguard 런타임 산출물이 커밋에 포함되지 않게 하세요.",
     "Review git diff by file.": "파일별 git diff를 검토하세요.",
@@ -1927,8 +2226,9 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     .replace(/^Review is recommended because (\d+) check item\(s\) need confirmation\.$/, "확인이 필요한 항목이 $1개 있어 검토를 권장합니다.")
     .replace(/^Completion is blocked because (\d+) check item\(s\) need confirmation\.$/, "확인이 필요한 항목이 $1개 있어 완료가 차단되었습니다.")
     .replace(/^(\d+) changed file\(s\) are ready for final review after the listed verification commands\.$/, "$1개 변경 파일은 나열된 검증 명령 실행 후 최종 검토할 수 있습니다.")
-    .replace(/^This session changed (\d+) file\(s\), so review whether the work still belongs to one coherent task\.$/, "이번 세션에서 $1개 파일이 변경되었습니다. 변경 범위가 하나의 작업 목표로 설명되는지 확인하세요.")
-    .replace(/^The change touches (.+) area\(s\)\. Confirm the runtime behavior still matches the intended workflow\.$/, "이번 변경은 $1 영역에 닿아 있습니다. 런타임 동작이 의도한 흐름과 일치하는지 확인하세요.")
+    .replace(/^This session changed (\d+) file\(s\), so review whether the work still belongs to one coherent task\./, "이번 세션에서 $1개 파일이 변경되었습니다. 변경 범위가 하나의 작업 목표로 설명되는지 확인하세요.")
+    .replace(/^The change touches (.+) area\(s\)\. Confirm the runtime behavior still matches the intended workflow\./, "이번 변경은 $1 영역에 닿아 있습니다. 런타임 동작이 의도한 흐름과 일치하는지 확인하세요.")
+    .replace(/^CLI routing or help output changed\. Verify that documented commands, help text, and status output still match the implementation\./, "CLI 라우팅 또는 도움말 출력이 바뀌었습니다. 문서의 명령 설명과 실제 help/status 출력이 일치하는지 확인하세요.")
     .replace(/^Confirm the (.+) area\(s\) still behave as intended in the actual workflow\.$/, "$1 영역이 실제 워크플로우에서 의도대로 동작하는지 확인하세요.")
     .replace(/^State, history, prompt, or report generation changed\. Confirm done\/status\/handoff regenerate the expected files without stale state\./, "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff가 오래된 상태 없이 필요한 파일을 재생성하는지 확인하세요.")
     .replace(/^The changed files may include work outside the current request\. Confirm each changed file supports the same task before finishing\./, "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.")

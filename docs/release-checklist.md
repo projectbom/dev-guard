@@ -20,7 +20,7 @@ git status --short
 - Git baseline exists or initial-commit noise is understood.
 - README, Korean README, docs, and wiki links are consistent.
 - npm install/update usage is covered in `docs/npm-setup.md`, `docs/npm-setup.ko.md`, and `packages/cli/README.md`.
-- Provider setup is optional and API keys are documented as environment variables.
+- Provider setup is optional and API key resolution is documented for config plus environment variables.
 - `.devguard/` runtime files are ignored.
 - `update` is preview-only unless `--write` is passed.
 - `watch` does not edit source or docs by default.

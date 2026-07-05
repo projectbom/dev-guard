@@ -241,6 +241,7 @@ Configuration file: .devguard/config.json
     dev-guard config set watch.dashboard false
     dev-guard config set watch.autoCompleteDelay 15
     dev-guard config set watch.stableAfter 30
+    dev-guard config set openaiApiKey <key>
     dev-guard config show
 
 Watch options (all have config file equivalents):

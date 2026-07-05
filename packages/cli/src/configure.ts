@@ -16,7 +16,7 @@ export async function runConfigure(root: string, args: string[]): Promise<void> 
     if (!key || value === undefined) {
       throw new Error(
         "Usage: dev-guard config set <key> <value>\n" +
-        "AI keys:    provider  model  temperature  maxTokens  reasoningEffort  baseURL\n" +
+        "AI keys:    provider  model  temperature  maxTokens  reasoningEffort  baseURL  openaiApiKey\n" +
         "Locale key: locale\n" +
         "Watch keys: watch.dashboard  watch.autoComplete  watch.autoCompleteDelay\n" +
         "            watch.stableAfter  watch.poll  watch.depth  watch.compact  watch.includeLockfiles"
@@ -24,7 +24,11 @@ export async function runConfigure(root: string, args: string[]): Promise<void> 
     }
     const next = await writeConfigValue(root, key, value);
     console.log("dev-guard config set");
-    console.log(`- ${key}: ${value}`);
+    if (key === "openaiApiKey" || key === "openai.apiKey" || key === "ai.apiKey") {
+      console.log(`- ${key}: ${next.ai?.apiKey ? "configured" : "not configured"}`);
+    } else {
+      console.log(`- ${key}: ${value}`);
+    }
     console.log("- wrote: .devguard/config.json");
     if (key === "locale") {
       console.log(`- locale: ${next.locale ?? value}`);
@@ -79,7 +83,7 @@ export async function runConfigure(root: string, args: string[]): Promise<void> 
   console.log(`- config source: ${resolved.source}`);
   console.log("");
   console.log("Note:");
-  console.log("- API key is not stored. It is read from environment at runtime.");
+  console.log("- API key values are never printed. DevGuard checks .devguard/config.json, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.");
 }
 
 function parseConfigureAIOptions(args: string[]): ConfigureAIOptions {
