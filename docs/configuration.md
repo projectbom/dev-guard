@@ -48,7 +48,7 @@ Example config shape:
 }
 ```
 
-`locale` is optional. Supported values are `en-US` and `ko-KR`. If it is missing, DevGuard uses OS locale variables (`LC_ALL`, `LC_MESSAGES`, `LANG`) and then falls back to `en-US`. User-facing outputs follow this locale; AI-facing prompts and internal state stay in English.
+`locale` is optional. Supported values are `en-US` and `ko-KR`. If it is missing, DevGuard uses OS locale variables (`LC_ALL`, `LC_MESSAGES`, `LANG`) and then falls back to `en-US`. User-facing outputs follow this locale; AI-facing prompts and internal state stay in English. Changing language in the dashboard updates the same `.devguard/config.json` locale.
 
 ## Rules And Mistakes
 

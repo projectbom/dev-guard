@@ -178,7 +178,7 @@ dev-guard config set locale ko-KR
 dev-guard config set locale en-US
 ```
 
-The dashboard, quality report, and project handoff follow this locale. AI-facing prompts such as `.devguard/prompts/next-codex-prompt.md` stay in English.
+The dashboard, quality report, and project handoff follow this locale. The dashboard language toggle persists the same setting. AI-facing prompts such as `.devguard/prompts/next-codex-prompt.md` stay in English.
 
 ## Development Helpers
 

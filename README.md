@@ -165,7 +165,7 @@ After finalization, DevGuard writes quality and handoff artifacts:
 - `.devguard/reports/project-handoff.md`
 - `.devguard/prompts/next-codex-prompt.md`
 
-User-facing artifacts such as the dashboard, quality report, and project handoff follow the detected locale. DevGuard checks `.devguard/config.json` `locale`, then OS locale (`LANG`, `LC_ALL`, `LC_MESSAGES`), then falls back to `en-US`. AI-facing artifacts such as `next-codex-prompt.md` stay in English.
+User-facing artifacts such as the dashboard, quality report, and project handoff follow the detected locale. DevGuard checks `.devguard/config.json` `locale`, then OS locale (`LANG`, `LC_ALL`, `LC_MESSAGES`), then falls back to `en-US`. The dashboard language toggle writes the same project locale setting. AI-facing artifacts such as `next-codex-prompt.md` stay in English.
 
 Use those files to continue in the next session without rediscovering the repository.
 
