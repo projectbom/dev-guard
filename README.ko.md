@@ -175,6 +175,8 @@ dev-guard dashboard [--port 3737]
 `next-codex-prompt.md`는 다음 Claude/Codex에 바로 전달할 수 있는 인수인계 문서입니다.
 `project-handoff.md`는 context window 초과 후 새 Claude/Codex 스레드에서 바로 이어가기 위한 압축 인수인계 문서입니다.
 
+Dashboard, 품질 보고서, 프로젝트 인수인계처럼 사용자가 직접 읽는 산출물은 locale을 따릅니다. DevGuard는 `.devguard/config.json`의 `locale`, OS locale(`LANG`, `LC_ALL`, `LC_MESSAGES`), 기본값 `en-US` 순서로 결정합니다. `next-codex-prompt.md` 같은 AI 전용 산출물은 영어를 유지합니다.
+
 자세한 내용은 [docs/handoff.md](./docs/handoff.md)를 참고하세요.
 
 ## Project Knowledge

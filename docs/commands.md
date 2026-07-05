@@ -171,6 +171,15 @@ These commands remain available but are no longer the main onboarding path:
 - `dev-guard configure ai`: configure provider/model.
 - `dev-guard config set`: update config values.
 
+Locale can be pinned for user-facing output:
+
+```bash
+dev-guard config set locale ko-KR
+dev-guard config set locale en-US
+```
+
+The dashboard, quality report, and project handoff follow this locale. AI-facing prompts such as `.devguard/prompts/next-codex-prompt.md` stay in English.
+
 ## Development Helpers
 
 These are mostly for developing dev-guard itself:

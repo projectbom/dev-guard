@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { access, stat } from "node:fs/promises";
 import { fromRoot, readTextFile } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
+import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
 import { readProjectKnowledge } from "./knowledge.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
@@ -77,6 +77,7 @@ interface DashboardState {
   message?: string;
   qualityVerdict?: string;
   lastProcessedAt?: string;
+  locale?: string;
   sessions: SessionSummary[];
   todayStats: TodayStats;
   qualityTrend: Array<{ verdict: string; timestamp: string }>;
@@ -110,8 +111,11 @@ interface DashboardState {
 export async function runDashboard(root: string, args: string[]): Promise<void> {
   const port = readPort(args);
   const shouldOpenBrowser = !args.includes("--no-open");
+  const locale = await refreshRuntimeLocale(root);
   const dashboard = await startDashboardServer(root, { port });
   console.log(dashboard.started ? "DevGuard dashboard running" : "DevGuard dashboard already running");
+  console.log("");
+  console.log(`Locale: ${locale}`);
   console.log("");
   console.log("URL:");
   console.log(dashboard.url);
@@ -271,6 +275,7 @@ async function getDashboardState(root: string): Promise<DashboardState> {
     message: initialized ? (watchRunning ? undefined : "Watch is not running.") : "DevGuard is not initialized.",
     qualityVerdict: projectState.lastQualityVerdict ?? undefined,
     lastProcessedAt: projectState.lastProcessedAt ?? undefined,
+    locale: runtime.locale,
     sessions,
     todayStats,
     qualityTrend,
@@ -875,6 +880,7 @@ function normalizeDashboardState(s) {
     message: s?.message,
     qualityVerdict: s?.qualityVerdict,
     lastProcessedAt: s?.lastProcessedAt,
+    locale: s?.locale,
     sessions: Array.isArray(s?.sessions) ? s.sessions : [],
     todayStats: {
       sessions: Number.isFinite(todayStats.sessions) ? todayStats.sessions : 0,

@@ -19,6 +19,7 @@ import { getDiffForChangeFiles, getGitChanges, type GitChanges } from "./git.js"
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { generateProjectKnowledge } from "./knowledge.js";
+import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +41,7 @@ export interface RuntimeState {
   hookActive?: boolean;
   revision?: number;
   updatedAt?: string;
+  locale?: DevGuardLocale;
   setupStatus?: SetupStatus;
 }
 
@@ -186,6 +188,15 @@ export async function writeRuntimeState(root: string, state: RuntimeState): Prom
   }
 }
 
+export async function refreshRuntimeLocale(root: string): Promise<DevGuardLocale> {
+  const locale = await resolveDevGuardLocale(root);
+  const current = await readRuntimeState(root);
+  if (current.locale !== locale) {
+    await writeRuntimeState(root, { ...current, locale });
+  }
+  return locale;
+}
+
 export async function resetRuntimeState(root: string): Promise<void> {
   await writeRuntimeState(root, { ...defaultRuntime, idleSinceAt: new Date().toISOString() });
 }
@@ -313,6 +324,7 @@ async function writeAtomicTextFile(path: string, content: string): Promise<void>
 
 export async function processDoneEvent(root: string): Promise<DoneProcessingResult> {
   await ensureDevguardWorkspace(root);
+  const locale = await refreshRuntimeLocale(root);
   const runtime = await readRuntimeState(root);
   const gitChanges = await loadChangesWithFallback(root, runtime);
   const changeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
@@ -408,7 +420,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     candidates: decisionCandidates,
     changedFiles
   });
-  const qualityReportMarkdown = renderQualityReport(qualityReport);
+  const qualityReportMarkdown = renderQualityReport(qualityReport, locale);
   const promptMarkdown = renderNextPrompt({
     projectContext,
     summary,
@@ -471,6 +483,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
 
 export async function generateProjectHandoff(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
+  const locale = await refreshRuntimeLocale(root);
   const [project, architecture, decisions, tasks, history, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state, projectKnowledge] = await Promise.all([
     readRequiredText(root, devguardPaths.project),
     readRequiredText(root, devguardPaths.architecture),
@@ -500,7 +513,8 @@ export async function generateProjectHandoff(root: string): Promise<string> {
     nextPrompt,
     hookStatus,
     state,
-    projectKnowledge
+    projectKnowledge,
+    locale
   });
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
   return projectHandoffPath;
@@ -873,7 +887,7 @@ function outstandingIssuesFromQuality(report: QualityReport, riskHints: string[]
 
 function compactOutstanding(items: string[], verdict: string): string[] {
   if (verdict === "PASS") return ["none"];
-  return items.filter((item) => item !== "none").slice(0, verdict === "BLOCKED" ? 5 : 3);
+  return items.filter((item) => item !== "none" && item !== "없음").slice(0, verdict === "BLOCKED" ? 5 : 3);
 }
 
 function executableNextSteps(report: QualityReport, nextTask: NextTaskPlan): string[] {
@@ -900,7 +914,24 @@ function executableNextSteps(report: QualityReport, nextTask: NextTaskPlan): str
   ];
 }
 
-function executableNextStepsFromParsedQuality(quality: { verdict: string; requiredVerification: string[] }, nextTask: string): string[] {
+function executableNextStepsFromParsedQuality(quality: { verdict: string; requiredVerification: string[] }, nextTask: string, locale: DevGuardLocale = "en-US"): string[] {
+  if (locale === "ko-KR") {
+    if (quality.verdict === "BLOCKED") {
+      return [
+        "- 품질 보고서의 차단 항목을 먼저 확인하세요.",
+        "- 차단 항목 해결에 필요한 파일만 수정하세요.",
+        `- 실행: ${compactCommandList(quality.requiredVerification)}`
+      ];
+    }
+    if (quality.verdict === "NEEDS_REVIEW") {
+      return [
+        `- 계속 진행: ${localizeSentence(nextTask, locale)}`,
+        `- 실행: ${compactCommandList(quality.requiredVerification)}`,
+        `- 확인: ${devguardPaths.qualityReport}`
+      ];
+    }
+    return [`- 계속 진행: ${localizeSentence(nextTask, locale)}`, `- 실행: ${compactCommandList(quality.requiredVerification)}`];
+  }
   if (quality.verdict === "BLOCKED") {
     return [
       "- Review BLOCKED items in the quality report.",
@@ -941,9 +972,10 @@ function compactProjectContextLine(projectContext: ProjectContextSummary): strin
   return parts.length > 0 ? parts.join("; ") : `see ${devguardPaths.projectKnowledge}`;
 }
 
-function compactQualityLine(quality: { verdict: string; why: string[]; requiredVerification: string[] }): string {
+function compactQualityLine(quality: { verdict: string; why: string[]; requiredVerification: string[] }, locale: DevGuardLocale = "en-US"): string {
   const why = quality.why.filter((item) => item !== "확인 필요").slice(0, 2).join(" / ");
   const verify = compactCommandList(quality.requiredVerification);
+  if (locale === "ko-KR") return `${quality.verdict}${why ? ` - ${why}` : ""}; 검증: ${verify}`;
   return `${quality.verdict}${why ? ` - ${why}` : ""}; verify: ${verify}`;
 }
 
@@ -1232,36 +1264,177 @@ async function assessCompletionQuality(
   };
 }
 
-function renderQualityReport(report: QualityReport): string {
+const reportCopy = {
+  "en-US": {
+    title: "Completion Quality Report",
+    verdict: "Verdict",
+    why: "Why",
+    requiredVerification: "Required Verification",
+    blockedItems: "Blocked Items",
+    warnings: "Warnings",
+    riskChecklist: "Risk Checklist",
+    beforeCommit: "Before Commit",
+    nextRecommendedAction: "Next Recommended Action",
+    noItems: "none"
+  },
+  "ko-KR": {
+    title: "완료 품질 보고서",
+    verdict: "판정",
+    why: "판단 이유",
+    requiredVerification: "필요한 검증",
+    blockedItems: "먼저 해결해야 할 항목",
+    warnings: "검토 권장 항목",
+    riskChecklist: "위험 점검표",
+    beforeCommit: "커밋 전 확인",
+    nextRecommendedAction: "다음으로 진행하면 좋은 작업",
+    noItems: "없음"
+  }
+} as const;
+
+const handoffCopy = {
+  "en-US": {
+    title: "Project Handoff",
+    Goal: "Goal",
+    Next: "Next",
+    Outstanding: "Outstanding",
+    Quality: "Quality",
+    Changed: "Changed",
+    History: "History",
+    Project: "Project",
+    Decisions: "Decisions",
+    Workflow: "Workflow",
+    Missing: "Missing",
+    HandoffQuality: "Handoff Quality",
+    ResumePrompt: "Resume Prompt",
+    resumePrompt: "Read this file, then continue from Next and Outstanding. Verify with current files before changing code."
+  },
+  "ko-KR": {
+    title: "프로젝트 인수인계",
+    Goal: "현재 목표",
+    Next: "다음으로 진행하면 좋은 작업",
+    Outstanding: "남아 있는 검토 항목",
+    Quality: "품질 상태",
+    Changed: "이번 세션에서 달라진 점",
+    History: "최근 작업 흐름",
+    Project: "프로젝트 정보",
+    Decisions: "중요한 결정",
+    Workflow: "작업 방식",
+    Missing: "확인이 필요한 입력",
+    HandoffQuality: "인수인계 품질",
+    ResumePrompt: "재개 프롬프트",
+    resumePrompt: "이 파일을 먼저 읽고, 다음 작업과 남아 있는 검토 항목을 기준으로 이어서 진행하세요. 변경 전에는 현재 파일 상태를 확인하세요."
+  }
+} as const;
+
+function renderQualityReport(report: QualityReport, locale: DevGuardLocale): string {
+  const copy = reportCopy[locale];
   const blocked = report.checklist.filter((item) => item.status === "BLOCKED");
   const warnings = report.checklist.filter((item) => item.status === "WARN");
   return [
-    "# Completion Quality Report",
+    `# ${copy.title}`,
     "",
-    "## Verdict",
+    `## ${copy.verdict}`,
     `- ${report.verdict}`,
     "",
-    "## Why",
-    ...formatBullets(report.why),
+    `## ${copy.why}`,
+    ...formatLocalizedBullets(report.why, locale),
     "",
-    "## Required Verification",
-    ...formatBullets(report.requiredVerification),
+    `## ${copy.requiredVerification}`,
+    ...formatLocalizedBullets(report.requiredVerification, locale),
     "",
-    "## Blocked Items",
-    ...formatBullets(blocked.map((item) => `${item.label} - ${item.detail}`)),
+    `## ${copy.blockedItems}`,
+    ...formatLocalizedBullets(blocked.map((item) => formatQualityItem(item, locale)), locale),
     "",
-    "## Warnings",
-    ...formatBullets(warnings.map((item) => `${item.label} - ${item.detail}`)),
+    `## ${copy.warnings}`,
+    ...formatLocalizedBullets(warnings.map((item) => formatQualityItem(item, locale)), locale),
     "",
-    "## Risk Checklist",
-    ...report.checklist.map((item) => `- ${item.status}: ${item.label} - ${item.detail}`),
+    `## ${copy.riskChecklist}`,
+    ...report.checklist.map((item) => `- ${item.status}: ${formatQualityItem(item, locale)}`),
     "",
-    "## Before Commit",
-    ...formatBullets(report.beforeCommit),
+    `## ${copy.beforeCommit}`,
+    ...formatLocalizedBullets(report.beforeCommit, locale),
     "",
-    "## Next Recommended Action",
-    `- ${report.nextRecommendedAction}`
+    `## ${copy.nextRecommendedAction}`,
+    `- ${localizeSentence(report.nextRecommendedAction, locale)}`
   ].join("\n") + "\n";
+}
+
+function formatLocalizedBullets(items: string[], locale: DevGuardLocale): string[] {
+  const filtered = items.filter((item) => item && item !== "none" && item !== "확인 필요");
+  if (filtered.length === 0) return [`- ${reportCopy[locale].noItems}`];
+  return filtered.map((item) => `- ${localizeSentence(item, locale)}`);
+}
+
+function formatQualityItem(item: QualityCheckItem, locale: DevGuardLocale): string {
+  if (locale === "en-US") return `${item.label} - ${item.detail}`;
+  return `${localizeQualityLabel(item.label)} - ${localizeSentence(item.detail, locale)}`;
+}
+
+function localizeQualityLabel(label: string): string {
+  const labels: Record<string, string> = {
+    "generated/runtime files": "생성 파일 포함 여부",
+    "package lock consistency": "패키지 잠금 파일 일치 여부",
+    "package manifest changed": "패키지 설정 변경",
+    "build verification candidate": "빌드 검증 후보",
+    "change breadth": "변경 범위",
+    "risky areas": "주의가 필요한 영역",
+    "CLI router/help verification": "CLI 라우터와 도움말 검증",
+    "watch verification": "watch 동작 검증",
+    "state/history verification": "상태와 히스토리 생성 검증",
+    "docs update candidate": "문서 업데이트 후보",
+    "drift clarity": "작업 범위 명확성"
+  };
+  return labels[label] ?? label;
+}
+
+function localizeSentence(value: string, locale: DevGuardLocale): string {
+  if (locale === "en-US") return value;
+  const exact: Record<string, string> = {
+    "none": "없음",
+    "no generated runtime files in git changes": "git 변경 목록에 DevGuard 생성 파일이 포함되지 않았습니다.",
+    "package/lockfile state does not look inconsistent": "package 파일과 lockfile 상태가 어긋나 보이지 않습니다.",
+    "package.json not changed": "package.json은 변경되지 않았습니다.",
+    "build verification candidate found": "빌드 검증 명령을 찾았습니다.",
+    "no auth/database/api/config area detected": "인증, 데이터베이스, API, 설정 영역 변경은 감지되지 않았습니다.",
+    "CLI router not changed": "CLI 라우터는 변경되지 않았습니다.",
+    "watch implementation not changed": "watch 구현은 변경되지 않았습니다.",
+    "state/history generation not changed": "상태와 히스토리 생성 로직은 변경되지 않았습니다.",
+    "docs/source balance does not require warning": "문서와 소스 변경의 균형에 추가 경고는 필요하지 않습니다.",
+    "no drift candidate": "작업 범위 이탈 후보는 없습니다.",
+    "change scope is small, verification exists, and no blocking local quality rule fired": "변경 범위가 작고 검증 후보가 있으며, 차단 수준의 로컬 품질 규칙은 감지되지 않았습니다.",
+    "ready for final review or commit": "최종 검토 또는 커밋을 진행할 수 있습니다.",
+    "fix BLOCKED items before commit": "커밋 전에 차단 항목을 먼저 해결하세요.",
+    "Coverage: Complete": "포함 범위: 충분함",
+    "Redundancy: Low": "중복도: 낮음",
+    "Redundancy: Medium": "중복도: 보통",
+    "Readability: High": "가독성: 높음",
+    "Readability: Medium": "가독성: 보통"
+  };
+  if (exact[value]) return exact[value];
+  return value
+    .replace(/^run /, "실행: ")
+    .replace(/^review /, "확인: ")
+    .replace(/^Continue: /, "계속 진행: ")
+    .replace(/^Run: /, "실행: ")
+    .replace(/^Review: /, "확인: ")
+    .replace(/^BLOCKED: /, "차단: ")
+    .replace(/^WARN: /, "검토 권장: ")
+    .replace(/risky areas -/g, "주의가 필요한 영역 -")
+    .replace(/watch verification -/g, "watch 동작 검증 -")
+    .replace(/state\/history verification -/g, "상태와 히스토리 생성 검증 -")
+    .replace(/drift clarity -/g, "작업 범위 명확성 -")
+    .replace(/package manifest changed -/g, "패키지 설정 변경 -")
+    .replace(/package lock consistency -/g, "패키지 잠금 파일 일치 여부 -")
+    .replace(/, then review /g, " 실행 후 확인: ")
+    .replace(/; verify: /g, "; 검증: ")
+    .replace(/package\.json changed but no lockfile change detected/g, "package.json은 변경되었지만 lockfile 변경이 감지되지 않았습니다")
+    .replace(/package\.json changed; verify scripts\/dependencies and publish impact/g, "package.json이 변경되었습니다. scripts, dependencies, 배포 영향을 확인하세요")
+    .replace(/risky area\(s\): ([\w, ]+)/g, "주의가 필요한 영역: $1")
+    .replace(/watch changed; verify --poll and --depth behavior/g, "watch가 변경되었습니다. --poll 및 --depth 동작을 확인하세요")
+    .replace(/state\/history\/prompt generation changed; verify done\/status output/g, "상태, 히스토리, 프롬프트 생성이 변경되었습니다. done/status 출력을 확인하세요")
+    .replace(/source changed without docs changes; recorded as doc update candidate only/g, "소스 변경이 있지만 문서 변경은 없습니다. 문서 업데이트 후보로만 기록합니다")
+    .replace(/drift candidate present; next task=/g, "작업 범위 이탈 후보가 있습니다. 다음 작업: ")
+    .replace(/changed file\(s\)/g, "개 파일 변경");
 }
 
 interface RequiredText {
@@ -1283,7 +1456,9 @@ function renderProjectHandoff(input: {
   hookStatus: RequiredText;
   state: string;
   projectKnowledge: RequiredText;
+  locale: DevGuardLocale;
 }): string {
+  const copy = handoffCopy[input.locale];
   const quality = parseQuality(input.qualityReport.content);
   const nextTask = extractNextTask(input.nextPrompt.content, input.tasks.content, input.state);
   const decisions = importantDecisions(input.decisions.content, input.decisionCandidates.content);
@@ -1296,9 +1471,9 @@ function renderProjectHandoff(input: {
   const missing = missingInputs([input.project, input.architecture, input.tasks, input.qualityReport, input.projectKnowledge, input.historySummary]);
   const sections = new Map<string, string[]>([
     ["Goal", [`- ${nextTask}`, `- status: ${completionStatus(quality.verdict, state.lastDrift)}`]],
-    ["Next", executableNextStepsFromParsedQuality(quality, nextTask)],
+    ["Next", executableNextStepsFromParsedQuality(quality, nextTask, input.locale)],
     ["Outstanding", formatBullets(risks)],
-    ["Quality", [`- ${compactQualityLine(quality)}`]],
+    ["Quality", [`- ${compactQualityLine(quality, input.locale)}`]],
     ["Changed", [...semanticChanges.slice(0, 3).map((item) => `- ${item}`), `- files: ${compactFileList(changedFiles)}`]],
     ["History", recentSessions.slice(0, 3).map((item) => `- ${item}`)],
     ["Project", [`- ${compactKnowledgeLine(input.projectKnowledge.content)}`]],
@@ -1310,25 +1485,67 @@ function renderProjectHandoff(input: {
   ]);
   if (missing.length > 0) sections.set("Missing", missing);
   const order = handoffSectionOrder(quality.verdict);
-  const body: string[] = ["# Project Handoff", ""];
+  const body: string[] = [`# ${copy.title}`, ""];
   for (const title of order) {
     const lines = sections.get(title)?.filter(Boolean) ?? [];
     if (lines.length === 0) continue;
-    body.push(`## ${title}`, ...lines, "");
+    body.push(`## ${copy[title as keyof typeof copy] ?? title}`, ...localizeHandoffLines(lines, input.locale), "");
   }
   const score = handoffQualityScore({
     missingCount: missing.length,
-    outstandingCount: risks.filter((item) => item !== "none").length,
+    outstandingCount: risks.filter((item) => item !== "none" && item !== "없음").length,
     lineCountEstimate: body.length + 8
   });
   body.push(
-    "## Handoff Quality",
-    ...formatBullets(score),
+    `## ${copy.HandoffQuality}`,
+    ...formatLocalizedBullets(score, input.locale),
     "",
-    "## Resume Prompt",
-    "Read this file, then continue from Next and Outstanding. Verify with current files before changing code."
+    `## ${copy.ResumePrompt}`,
+    copy.resumePrompt
   );
   return body.join("\n") + "\n";
+}
+
+function localizeHandoffLines(lines: string[], locale: DevGuardLocale): string[] {
+  if (locale === "en-US") return lines;
+  return lines.map((line) => {
+    if (!line.startsWith("- ")) return line;
+    return `- ${localizeSentence(localizeHandoffSentence(line.slice(2)), locale)}`;
+  });
+}
+
+function localizeHandoffSentence(value: string): string {
+  return value
+    .replace(/^status: completed$/, "상태: 완료")
+    .replace(/^status: blocked$/, "상태: 차단됨")
+    .replace(/^status: partially completed$/, "상태: 일부 완료")
+    .replace(/^files: none$/, "변경 파일: 없음")
+    .replace(/^files: /, "변경 파일: ")
+    .replace(/^Last session:/, "마지막 세션:")
+    .replace(/^Previous:/, "이전 세션:")
+    .replace(/^Earlier:/, "그 이전 세션:")
+    .replace(/^project:/, "프로젝트:")
+    .replace(/^framework:/, "프레임워크:")
+    .replace(/^language:/, "언어:")
+    .replace(/^package manager:/, "패키지 매니저:")
+    .replace(/^files indexed:/, "색인된 파일:")
+    .replace(/^architecture modules:/, "아키텍처 모듈:")
+    .replace(/^known commands\/apis:/, "알려진 명령/API:")
+    .replace(/^Coverage: Complete$/, "포함 범위: 충분함")
+    .replace(/^Redundancy: Low$/, "중복도: 낮음")
+    .replace(/^Redundancy: Medium$/, "중복도: 보통")
+    .replace(/^Readability: High$/, "가독성: 높음")
+    .replace(/^Readability: Medium$/, "가독성: 보통")
+    .replace("Dashboard UX and assistant guidance changed.", "Dashboard UX와 작업 안내가 변경되었습니다.")
+    .replace("Session continuity and handoff generation changed.", "세션 연속성과 인수인계 생성 흐름이 변경되었습니다.")
+    .replace("Project Knowledge generation or usage changed.", "Project Knowledge 생성 또는 사용 방식이 변경되었습니다.")
+    .replace("Documentation updated to match the current workflow.", "현재 워크플로우에 맞게 문서가 업데이트되었습니다.")
+    .replace("Configuration or dependency setup changed.", "설정 또는 의존성 구성이 변경되었습니다.")
+    .replace("CLI behavior changed.", "CLI 동작이 변경되었습니다.")
+    .replace("Hook status needs verification in the actual Claude/Codex environment.", "실제 Claude/Codex 환경에서 Hook 상태 확인이 필요합니다.")
+    .replace("Codex Stop Hook format is configured; actual Codex runtime trust/execution still needs environment verification.", "Codex Stop Hook 형식은 설정되어 있지만, 실제 Codex 런타임 trust/execution 확인이 필요합니다.")
+    .replace("Do not add polling completion, LLM API calls, git commits, or unrelated UX changes.", "polling 기반 완료 감지, LLM API 호출, git commit, 관련 없는 UX 변경은 추가하지 마세요.")
+    .replace("`dev-guard watch` is the normal entry point; `done` writes reports, prompts, handoff, context, and project knowledge.", "`dev-guard watch`가 기본 시작점입니다. `done`은 보고서, 프롬프트, 인수인계, 컨텍스트, Project Knowledge를 생성합니다.");
 }
 
 async function readRequiredText(root: string, path: string): Promise<RequiredText> {
@@ -1358,9 +1575,9 @@ function parseHistoryRecords(text: string): HistoryRecord[] {
 
 function parseQuality(markdown: string): { verdict: string; why: string[]; requiredVerification: string[] } {
   return {
-    verdict: firstSectionBullet(markdown, "Verdict") ?? "확인 필요",
-    why: extractSectionBullets(markdown, "Why", 4),
-    requiredVerification: extractSectionBullets(markdown, "Required Verification", 5)
+    verdict: firstSectionBulletAny(markdown, ["Verdict", "판정"]) ?? "확인 필요",
+    why: extractSectionBulletsAny(markdown, ["Why", "판단 이유"], 4),
+    requiredVerification: extractSectionBulletsAny(markdown, ["Required Verification", "필요한 검증"], 5)
   };
 }
 
@@ -1390,8 +1607,11 @@ function openRisks(input: {
   nextPrompt: RequiredText;
 }): string[] {
   const risks = new Set<string>();
-  for (const item of [...extractSectionBullets(input.qualityReport.content, "Blocked Items", 5), ...extractSectionBullets(input.qualityReport.content, "Warnings", 5)]) {
-    if (item !== "none" && item !== "확인 필요") risks.add(item);
+  for (const item of [
+    ...extractSectionBulletsAny(input.qualityReport.content, ["Blocked Items", "먼저 해결해야 할 항목"], 5),
+    ...extractSectionBulletsAny(input.qualityReport.content, ["Warnings", "검토 권장 항목"], 5)
+  ]) {
+    if (item !== "none" && item !== "확인 필요" && item !== "없음") risks.add(item);
   }
   if (/NOT_INSTALLED|unknown|no/i.test(input.hookStatus.content)) risks.add("Hook status needs verification in the actual Claude/Codex environment.");
   if (/Codex CLI: INSTALLED/.test(input.hookStatus.content)) risks.add("Codex Stop Hook format is configured; actual Codex runtime trust/execution still needs environment verification.");
@@ -1446,7 +1666,11 @@ function summarizeFromState(stateJson: string, key: keyof ProjectState): string 
 }
 
 function extractSectionBullets(markdown: string, heading: string, limit: number): string[] {
-  const bullets = sectionLines(markdown, heading)
+  return extractSectionBulletsAny(markdown, [heading], limit);
+}
+
+function extractSectionBulletsAny(markdown: string, headings: string[], limit: number): string[] {
+  const bullets = sectionLinesAny(markdown, headings)
     .map((line) => line.trim())
     .filter((line) => /^[-*]\s+/.test(line))
     .map((line) => line.replace(/^[-*]\s+/, "").trim())
@@ -1565,14 +1789,23 @@ function summarizeProjectContext(input: { projectMarkdown: string; architectureM
 }
 
 function firstSectionBullet(markdown: string, heading: string): string | undefined {
-  const lines = sectionLines(markdown, heading);
+  return firstSectionBulletAny(markdown, [heading]);
+}
+
+function firstSectionBulletAny(markdown: string, headings: string[]): string | undefined {
+  const lines = sectionLinesAny(markdown, headings);
   const bullet = lines.map((line) => line.trim()).find((line) => /^[-*]\s+/.test(line) && !/TODO|확인 필요/i.test(line));
   return bullet?.replace(/^[-*]\s+/, "").trim();
 }
 
 function sectionLines(markdown: string, heading: string): string[] {
+  return sectionLinesAny(markdown, [heading]);
+}
+
+function sectionLinesAny(markdown: string, headings: string[]): string[] {
   const lines = markdown.split(/\r?\n/);
-  const start = lines.findIndex((line) => line.replace(/^#+\s*/, "").trim() === heading);
+  const headingSet = new Set(headings);
+  const start = lines.findIndex((line) => headingSet.has(line.replace(/^#+\s*/, "").trim()));
   if (start < 0) return [];
   const result: string[] = [];
   for (const line of lines.slice(start + 1)) {

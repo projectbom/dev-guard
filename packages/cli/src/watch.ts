@@ -11,6 +11,7 @@ import {
   readRuntimeState,
   recordRuntimeChange,
   resetRuntimeState,
+  refreshRuntimeLocale,
   writeRuntimeState
 } from "./runtime-state.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
@@ -39,6 +40,7 @@ const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   const watchConfig = await loadWatchConfig(root);
   const options = parseWatchOptions(args, watchConfig);
+  const locale = await refreshRuntimeLocale(root);
   let dashboard: DashboardServerHandle | undefined;
   let dashboardOpenFailed = false;
   let dashboardWarning: string | undefined;
@@ -71,6 +73,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     prepareResult,
     showPreparation,
     preparationStreamStarted,
+    locale,
     dashboard,
     dashboardOpenFailed,
     dashboardWarning,
@@ -346,6 +349,7 @@ function printStartup(input: {
   prepareResult: Awaited<ReturnType<typeof prepareWatchProject>>;
   showPreparation: boolean;
   preparationStreamStarted: boolean;
+  locale: string;
   dashboard?: DashboardServerHandle;
   dashboardOpenFailed: boolean;
   dashboardWarning?: string;
@@ -384,6 +388,7 @@ function printStartup(input: {
   }
 
   console.log("Watching project...");
+  console.log(`Locale: ${input.locale}`);
 
   if (input.dashboardWarning) {
     console.log("");

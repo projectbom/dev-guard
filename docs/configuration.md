@@ -40,12 +40,15 @@ Example config shape:
 
 ```json
 {
+  "locale": "ko-KR",
   "ai": {
     "provider": "none",
     "model": "gpt-4o-mini"
   }
 }
 ```
+
+`locale` is optional. Supported values are `en-US` and `ko-KR`. If it is missing, DevGuard uses OS locale variables (`LC_ALL`, `LC_MESSAGES`, `LANG`) and then falls back to `en-US`. User-facing outputs follow this locale; AI-facing prompts and internal state stay in English.
 
 ## Rules And Mistakes
 

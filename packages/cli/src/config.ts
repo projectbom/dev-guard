@@ -1,5 +1,6 @@
 import { defaultConfig, type AIConfig, type AIProviderName, type DevGuardConfig } from "@dev-guard/core";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
+import { normalizeLocale } from "./locale.js";
 
 interface PackageJsonConfig {
   devGuard?: DevGuardConfig;
@@ -31,7 +32,7 @@ export const defaultWatchConfig: Required<WatchConfig> = {
 };
 
 // Internal: config.json may have both DevGuardConfig fields and a `watch` section.
-type ConfigFileShape = DevGuardConfig & { watch?: WatchConfig };
+type ConfigFileShape = DevGuardConfig & { watch?: WatchConfig; locale?: string };
 
 export interface ResolvedConfig {
   config: DevGuardConfig;
@@ -111,6 +112,7 @@ export function printConfigSummary(label: string, resolved: ResolvedConfig): voi
   console.log(`- depth: ${watch.depth ?? defaultWatchConfig.depth}`);
   console.log(`- compact: ${watch.compact ?? defaultWatchConfig.compact}`);
   console.log(`- includeLockfiles: ${watch.includeLockfiles ?? defaultWatchConfig.includeLockfiles}`);
+  console.log(`- locale: ${(resolved.config as ConfigFileShape).locale ?? "auto"}`);
   console.log("Source:");
   console.log(`- config source: ${resolved.source}`);
   console.log(`- env DEV_GUARD_OPENAI_API_KEY: ${resolved.env.apiKey.checked[0]?.found ? "found" : "missing"}`);
@@ -224,6 +226,14 @@ function applyConfigValue(config: ConfigFileShape, key: string, value: string): 
     return applyWatchConfigValue(config, watchKey, value);
   }
 
+  if (key === "locale") {
+    const locale = normalizeLocale(value);
+    if (!locale) {
+      throw new Error("locale 값은 en-US 또는 ko-KR만 지원합니다.");
+    }
+    return { ...config, locale };
+  }
+
   // Handle AI keys (legacy flat keys for backward compatibility)
   const ai = { ...(config.ai ?? {}) };
   if (key === "provider") {
@@ -251,7 +261,7 @@ function applyConfigValue(config: ConfigFileShape, key: string, value: string): 
     ai.baseURL = value;
   } else {
     throw new Error(
-      "지원하는 config key: provider, model, temperature, maxTokens, reasoningEffort, baseURL, " +
+      "지원하는 config key: provider, model, temperature, maxTokens, reasoningEffort, baseURL, locale, " +
       "watch.dashboard, watch.autoComplete, watch.autoCompleteDelay, watch.stableAfter, " +
       "watch.poll, watch.depth, watch.compact, watch.includeLockfiles"
     );
