@@ -100,11 +100,21 @@ interface QualityCheckItem {
 
 interface QualityReport {
   verdict: QualityVerdict;
+  summary: string[];
   why: string[];
+  relatedFiles: string[];
   requiredVerification: string[];
   checklist: QualityCheckItem[];
+  reviewItems: QualityReviewItem[];
   beforeCommit: string[];
   nextRecommendedAction: string;
+}
+
+interface QualityReviewItem {
+  title: string;
+  body: string[];
+  files: string[];
+  checks: string[];
 }
 
 export interface HistoryRecord {
@@ -1240,38 +1250,282 @@ async function assessCompletionQuality(
   const warns = verdictItems.filter((item) => item.status === "WARN");
   const verdict: QualityVerdict = blocked.length > 0 ? "BLOCKED" : warns.length > 0 ? "NEEDS_REVIEW" : "PASS";
   const requiredVerification = input.testCandidates.length > 0 ? input.testCandidates : ["확인 필요: package.json scripts에서 검증 명령을 찾지 못함"];
+  const issueItems = [...blocked, ...warns];
   const beforeCommit = [
     ...requiredVerification.map((command) => `run ${command}`),
     `review ${devguardPaths.qualityReport}`,
     `review ${devguardPaths.nextCodexPrompt}`
   ];
-  const nextRecommendedAction =
-    verdict === "BLOCKED"
-      ? "fix BLOCKED items before commit"
-      : verdict === "NEEDS_REVIEW"
-        ? `run ${requiredVerification[0]}, then review ${devguardPaths.qualityReport}`
-        : "ready for final review or commit";
   return {
     verdict,
-    why:
-      verdict === "PASS"
-        ? ["change scope is small, verification exists, and no blocking local quality rule fired"]
-        : [...blocked, ...warns].map((item) => `${item.status}: ${item.label} - ${item.detail}`),
+    summary: buildQualitySummary({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification }),
+    why: buildQualityReasons({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems }),
+    relatedFiles: relatedQualityFiles(input.changedFiles, issueItems),
     requiredVerification,
     checklist,
+    reviewItems: buildQualityReviewItems({ changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification }),
     beforeCommit,
-    nextRecommendedAction
+    nextRecommendedAction: buildQualityNextAction({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification })
   };
+}
+
+function buildQualitySummary(input: {
+  verdict: QualityVerdict;
+  changedFiles: string[];
+  areas: string[];
+  issueItems: QualityCheckItem[];
+  requiredVerification: string[];
+}): string[] {
+  if (input.verdict === "PASS") {
+    return [
+      "No blocking quality issues were detected.",
+      input.changedFiles.length > 0
+        ? `${input.changedFiles.length} changed file(s) are ready for final review after the listed verification commands.`
+        : "No source changes are currently pending."
+    ];
+  }
+  const impact = qualityImpactSummary(input.changedFiles, input.areas);
+  const issueCount = input.issueItems.length;
+  return [
+    `${input.verdict === "BLOCKED" ? "Completion is blocked" : "Review is recommended"} because ${issueCount} check item(s) need confirmation.`,
+    impact,
+    "Use the review items below to confirm the behavior before committing or publishing."
+  ];
+}
+
+function buildQualityReasons(input: {
+  verdict: QualityVerdict;
+  changedFiles: string[];
+  areas: string[];
+  issueItems: QualityCheckItem[];
+}): string[] {
+  if (input.verdict === "PASS") {
+    return ["The change scope is small, verification commands are available, and no blocking local quality rule fired."];
+  }
+  const reasons = new Set<string>();
+  for (const item of input.issueItems) {
+    reasons.add(userFacingReason(item, input.changedFiles, input.areas));
+  }
+  return [...reasons].slice(0, 6);
+}
+
+function buildQualityReviewItems(input: {
+  changedFiles: string[];
+  areas: string[];
+  issueItems: QualityCheckItem[];
+  requiredVerification: string[];
+}): QualityReviewItem[] {
+  const items: QualityReviewItem[] = [];
+  for (const issue of input.issueItems) {
+    items.push(reviewItemForQualityCheck(issue, input.changedFiles, input.areas, input.requiredVerification));
+  }
+  if (items.length === 0 && input.changedFiles.length > 0) {
+    items.push({
+      title: "Final behavior check",
+      body: ["Review the changed files once and confirm the implementation still matches the user request."],
+      files: input.changedFiles.slice(0, 6),
+      checks: input.requiredVerification.slice(0, 3)
+    });
+  }
+  return dedupeReviewItems(items).slice(0, 5);
+}
+
+function buildQualityNextAction(input: {
+  verdict: QualityVerdict;
+  changedFiles: string[];
+  areas: string[];
+  issueItems: QualityCheckItem[];
+  requiredVerification: string[];
+}): string {
+  if (input.verdict === "PASS") {
+    return input.changedFiles.length > 0
+      ? "Run the listed verification commands, then proceed with final review or commit."
+      : "No project changes need review right now.";
+  }
+  const firstIssue = input.issueItems[0];
+  if (firstIssue) {
+    const review = reviewItemForQualityCheck(firstIssue, input.changedFiles, input.areas, input.requiredVerification);
+    const fileText = review.files.length > 0 ? ` Focus on ${compactFileList(review.files, 3)}.` : "";
+    return `${review.body[0]}${fileText} Then run the required verification commands.`;
+  }
+  return `Run ${input.requiredVerification[0] ?? "the required verification command"}, then review ${devguardPaths.qualityReport}.`;
+}
+
+function qualityImpactSummary(changedFiles: string[], areas: string[]): string {
+  if (changedFiles.some((file) => /dashboard/i.test(file))) {
+    return "The change can affect what users see in the Dashboard.";
+  }
+  if (changedFiles.some((file) => /runtime-state|handoff|prompt|quality/i.test(file))) {
+    return "The change can affect generated reports, handoff files, or next-session context.";
+  }
+  if (changedFiles.some((file) => /config|configure|\.devguard|package\.json|tsconfig/i.test(file)) || areas.includes("config")) {
+    return "The change can affect configuration or runtime behavior.";
+  }
+  if (areas.includes("docs")) {
+    return "The change affects documentation or user-facing guidance.";
+  }
+  if (areas.includes("api")) {
+    return "The change can affect API behavior or external callers.";
+  }
+  return "The change should be reviewed against the current user request.";
+}
+
+function userFacingReason(item: QualityCheckItem, changedFiles: string[], areas: string[]): string {
+  const files = relatedFilesForQualityCheck(item, changedFiles);
+  const fileText = files.length > 0 ? ` Related file(s): ${compactFileList(files, 4)}.` : "";
+  if (item.label === "generated/runtime files") {
+    return `DevGuard-generated files appear in the project diff and should not be committed as source changes.${fileText}`;
+  }
+  if (item.label === "package lock consistency") {
+    return `Package metadata changed without a matching lockfile update, so install/publish behavior may be inconsistent.${fileText}`;
+  }
+  if (item.label === "package manifest changed") {
+    return `Package metadata changed. Confirm scripts, dependencies, version, and publish impact before release.${fileText}`;
+  }
+  if (item.label === "build verification candidate") {
+    return `The project has a build script, but the quality flow could not find a build verification command. Add or run the appropriate build check before finishing.${fileText}`;
+  }
+  if (item.label === "change breadth") {
+    return `This session changed ${changedFiles.length} file(s), so review whether the work still belongs to one coherent task.${fileText}`;
+  }
+  if (item.label === "risky areas") {
+    return `The change touches ${areas.join(", ") || "runtime-sensitive"} area(s). Confirm the runtime behavior still matches the intended workflow.${fileText}`;
+  }
+  if (item.label === "CLI router/help verification") {
+    return `CLI routing or help output changed. Verify that documented commands, help text, and status output still match the implementation.${fileText}`;
+  }
+  if (item.label === "watch verification") {
+    return `Watch behavior changed. Verify polling, depth handling, and settle/finalize output with a small file-change scenario.${fileText}`;
+  }
+  if (item.label === "state/history verification") {
+    return `State, history, prompt, or report generation changed. Confirm done/status/handoff regenerate the expected files without stale state.${fileText}`;
+  }
+  if (item.label === "docs update candidate") {
+    return `Source files changed without documentation changes. If user-facing behavior changed, update the relevant README or docs page.${fileText}`;
+  }
+  if (item.label === "drift clarity") {
+    return `The changed files may include work outside the current request. Confirm each changed file supports the same task before finishing.${fileText}`;
+  }
+  return `${item.detail}${fileText}`;
+}
+
+function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[], areas: string[], requiredVerification: string[]): QualityReviewItem {
+  const files = relatedFilesForQualityCheck(item, changedFiles);
+  if (item.label === "generated/runtime files") {
+    return {
+      title: "Generated file commit check",
+      body: ["Confirm DevGuard runtime artifacts are not included as source changes."],
+      files,
+      checks: ["Run git status and keep .devguard runtime outputs out of the commit."]
+    };
+  }
+  if (item.label === "package lock consistency" || item.label === "package manifest changed") {
+    return {
+      title: "Package and release impact",
+      body: ["Confirm package scripts, dependencies, versions, and lockfile state match the intended release impact."],
+      files,
+      checks: requiredVerification.slice(0, 3)
+    };
+  }
+  if (item.label === "CLI router/help verification") {
+    return {
+      title: "CLI command and help consistency",
+      body: ["Confirm changed CLI routing or output still matches README/docs and the commands users will run."],
+      files,
+      checks: ["pnpm cli --help", "pnpm cli help advanced", "pnpm cli status"]
+    };
+  }
+  if (item.label === "watch verification") {
+    return {
+      title: "Watch behavior check",
+      body: ["Confirm watch still tracks real project changes and ignores DevGuard internal files."],
+      files,
+      checks: ["pnpm cli watch --stable-after 1 --compact", "pnpm cli done", "pnpm cli status"]
+    };
+  }
+  if (item.label === "state/history verification") {
+    return {
+      title: "Report and handoff regeneration",
+      body: ["Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly."],
+      files,
+      checks: ["pnpm cli done", "pnpm cli status", "pnpm cli handoff"]
+    };
+  }
+  if (item.label === "risky areas") {
+    return {
+      title: "Runtime-sensitive behavior",
+      body: [`Confirm the ${areas.join(", ") || "changed"} area(s) still behave as intended in the actual workflow.`],
+      files,
+      checks: requiredVerification.slice(0, 4)
+    };
+  }
+  if (item.label === "docs update candidate") {
+    return {
+      title: "Documentation update need",
+      body: ["Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read."],
+      files,
+      checks: ["If behavior changed, update README.md, README.ko.md, docs/commands.md, or docs/configuration.md as appropriate."]
+    };
+  }
+  if (item.label === "drift clarity") {
+    return {
+      title: "Change scope check",
+      body: ["Confirm the changed files all support the current request and remove or split unrelated work before finishing."],
+      files,
+      checks: ["Review git diff by file.", "Keep only changes required for the current task."]
+    };
+  }
+  return {
+    title: item.label,
+    body: [item.detail],
+    files,
+    checks: requiredVerification.slice(0, 3)
+  };
+}
+
+function relatedQualityFiles(changedFiles: string[], issueItems: QualityCheckItem[]): string[] {
+  const files = new Set<string>();
+  for (const item of issueItems) {
+    for (const file of relatedFilesForQualityCheck(item, changedFiles)) files.add(file);
+  }
+  if (files.size === 0) for (const file of changedFiles.slice(0, 8)) files.add(file);
+  return [...files].slice(0, 10);
+}
+
+function relatedFilesForQualityCheck(item: QualityCheckItem, changedFiles: string[]): string[] {
+  if (item.label === "generated/runtime files") return changedFiles.filter(isGeneratedRuntimePath);
+  if (item.label === "package lock consistency" || item.label === "package manifest changed") {
+    return changedFiles.filter((file) => /(^|\/)(package\.json|pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?)$/.test(file));
+  }
+  if (item.label === "CLI router/help verification") return changedFiles.filter((file) => /packages\/cli\/src\/index\.tsx?$|docs\/commands|README/i.test(file));
+  if (item.label === "watch verification") return changedFiles.filter((file) => /watch\.[tj]sx?$|docs\/watch|README/i.test(file));
+  if (item.label === "state/history verification") return changedFiles.filter((file) => /(runtime-state|history|state|prompt)\.[tj]sx?$|handoff|quality|README|docs\//i.test(file));
+  if (item.label === "risky areas") return changedFiles.filter((file) => /config|configure|\.devguard|package\.json|tsconfig|api|auth|database/i.test(file)).slice(0, 8);
+  if (item.label === "docs update candidate") return changedFiles.filter((file) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file)).slice(0, 8);
+  if (item.label === "drift clarity") return changedFiles.slice(0, 8);
+  return changedFiles.slice(0, 6);
+}
+
+function dedupeReviewItems(items: QualityReviewItem[]): QualityReviewItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = item.title;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 const reportCopy = {
   "en-US": {
     title: "Completion Quality Report",
     verdict: "Verdict",
+    summary: "Summary",
     why: "Why",
+    relatedFiles: "Related Files",
     requiredVerification: "Required Verification",
     blockedItems: "Blocked Items",
-    warnings: "Warnings",
+    warnings: "Review Items",
     riskChecklist: "Risk Checklist",
     beforeCommit: "Before Commit",
     nextRecommendedAction: "Next Recommended Action",
@@ -1280,7 +1534,9 @@ const reportCopy = {
   "ko-KR": {
     title: "완료 품질 보고서",
     verdict: "판정",
+    summary: "요약",
     why: "판단 이유",
+    relatedFiles: "관련 파일",
     requiredVerification: "필요한 검증",
     blockedItems: "먼저 해결해야 할 항목",
     warnings: "검토 권장 항목",
@@ -1329,24 +1585,31 @@ const handoffCopy = {
 function renderQualityReport(report: QualityReport, locale: DevGuardLocale): string {
   const copy = reportCopy[locale];
   const blocked = report.checklist.filter((item) => item.status === "BLOCKED");
-  const warnings = report.checklist.filter((item) => item.status === "WARN");
+  const blockedReviewItems = report.reviewItems.filter((item) => blocked.some((blockedItem) => reviewItemMatchesQualityItem(item, blockedItem)));
+  const warningReviewItems = report.reviewItems.filter((item) => !blockedReviewItems.includes(item));
   return [
     `# ${copy.title}`,
     "",
     `## ${copy.verdict}`,
     `- ${report.verdict}`,
     "",
+    `## ${copy.summary}`,
+    ...formatLocalizedBullets(report.summary, locale),
+    "",
     `## ${copy.why}`,
     ...formatLocalizedBullets(report.why, locale),
     "",
+    `## ${copy.relatedFiles}`,
+    ...formatLocalizedBullets(report.relatedFiles, locale),
+    "",
     `## ${copy.requiredVerification}`,
-    ...formatLocalizedBullets(report.requiredVerification, locale),
+    ...report.requiredVerification.map((command) => `- ${command}`),
     "",
     `## ${copy.blockedItems}`,
-    ...formatLocalizedBullets(blocked.map((item) => formatQualityItem(item, locale)), locale),
+    ...formatReviewItems(blockedReviewItems, locale),
     "",
     `## ${copy.warnings}`,
-    ...formatLocalizedBullets(warnings.map((item) => formatQualityItem(item, locale)), locale),
+    ...formatReviewItems(warningReviewItems, locale),
     "",
     `## ${copy.riskChecklist}`,
     ...report.checklist.map((item) => `- ${item.status}: ${formatQualityItem(item, locale)}`),
@@ -1359,6 +1622,51 @@ function renderQualityReport(report: QualityReport, locale: DevGuardLocale): str
   ].join("\n") + "\n";
 }
 
+function reviewItemMatchesQualityItem(reviewItem: QualityReviewItem, item: QualityCheckItem): boolean {
+  const title = reviewItem.title.toLowerCase();
+  if (item.label === "generated/runtime files") return title.includes("generated") || title.includes("생성");
+  if (item.label === "package lock consistency" || item.label === "package manifest changed") return title.includes("package") || title.includes("패키지");
+  if (item.label === "CLI router/help verification") return title.includes("cli");
+  if (item.label === "watch verification") return title.includes("watch");
+  if (item.label === "state/history verification") return title.includes("report") || title.includes("handoff") || title.includes("보고서") || title.includes("인수");
+  if (item.label === "risky areas") return title.includes("runtime") || title.includes("런타임");
+  if (item.label === "docs update candidate") return title.includes("documentation") || title.includes("문서");
+  if (item.label === "drift clarity") return title.includes("scope") || title.includes("범위");
+  return false;
+}
+
+function formatReviewItems(items: QualityReviewItem[], locale: DevGuardLocale): string[] {
+  if (items.length === 0) return [`- ${reportCopy[locale].noItems}`];
+  const lines: string[] = [];
+  for (const item of items) {
+    lines.push(`- ${localizeReviewTitle(item.title, locale)}`);
+    for (const body of item.body) lines.push(`  - ${localizeSentence(body, locale)}`);
+    if (item.files.length > 0) {
+      lines.push(`  - ${locale === "ko-KR" ? "관련 파일" : "Related files"}: ${compactFileList(item.files, 5)}`);
+    }
+    if (item.checks.length > 0) {
+      lines.push(`  - ${locale === "ko-KR" ? "확인 기준" : "Check"}: ${item.checks.slice(0, 4).map((check) => localizeSentence(check, locale)).join("; ")}`);
+    }
+  }
+  return lines;
+}
+
+function localizeReviewTitle(value: string, locale: DevGuardLocale): string {
+  if (locale === "en-US") return value;
+  const titles: Record<string, string> = {
+    "Generated file commit check": "생성 파일 커밋 여부 확인",
+    "Package and release impact": "패키지와 배포 영향 확인",
+    "CLI command and help consistency": "CLI 명령과 도움말 일치 여부",
+    "Watch behavior check": "watch 동작 확인",
+    "Report and handoff regeneration": "보고서와 인수인계 재생성 확인",
+    "Runtime-sensitive behavior": "런타임 영향 확인",
+    "Documentation update need": "문서 업데이트 필요 여부",
+    "Change scope check": "변경 범위 확인",
+    "Final behavior check": "최종 동작 확인"
+  };
+  return titles[value] ?? value;
+}
+
 function formatLocalizedBullets(items: string[], locale: DevGuardLocale): string[] {
   const filtered = items.filter((item) => item && item !== "none" && item !== "확인 필요");
   if (filtered.length === 0) return [`- ${reportCopy[locale].noItems}`];
@@ -1366,25 +1674,58 @@ function formatLocalizedBullets(items: string[], locale: DevGuardLocale): string
 }
 
 function formatQualityItem(item: QualityCheckItem, locale: DevGuardLocale): string {
-  if (locale === "en-US") return `${item.label} - ${item.detail}`;
-  return `${localizeQualityLabel(item.label)} - ${localizeSentence(item.detail, locale)}`;
+  return `${qualityLabel(item.label, locale)} - ${qualityDetail(item, locale)}`;
 }
 
-function localizeQualityLabel(label: string): string {
-  const labels: Record<string, string> = {
-    "generated/runtime files": "생성 파일 포함 여부",
-    "package lock consistency": "패키지 잠금 파일 일치 여부",
-    "package manifest changed": "패키지 설정 변경",
-    "build verification candidate": "빌드 검증 후보",
-    "change breadth": "변경 범위",
-    "risky areas": "주의가 필요한 영역",
-    "CLI router/help verification": "CLI 라우터와 도움말 검증",
-    "watch verification": "watch 동작 검증",
-    "state/history verification": "상태와 히스토리 생성 검증",
-    "docs update candidate": "문서 업데이트 후보",
-    "drift clarity": "작업 범위 명확성"
+function qualityLabel(label: string, locale: DevGuardLocale): string {
+  const labels: Record<string, { en: string; ko: string }> = {
+    "generated/runtime files": { en: "Generated files", ko: "생성 파일 포함 여부" },
+    "package lock consistency": { en: "Package lock consistency", ko: "패키지 잠금 파일 일치 여부" },
+    "package manifest changed": { en: "Package metadata", ko: "패키지 설정 변경" },
+    "build verification candidate": { en: "Build verification", ko: "빌드 검증 후보" },
+    "change breadth": { en: "Change breadth", ko: "변경 범위" },
+    "risky areas": { en: "Runtime-sensitive areas", ko: "주의가 필요한 영역" },
+    "CLI router/help verification": { en: "CLI command and help consistency", ko: "CLI 라우터와 도움말 검증" },
+    "watch verification": { en: "Watch behavior", ko: "watch 동작 검증" },
+    "state/history verification": { en: "Report and state generation", ko: "상태와 히스토리 생성 검증" },
+    "docs update candidate": { en: "Documentation update need", ko: "문서 업데이트 후보" },
+    "drift clarity": { en: "Change scope clarity", ko: "작업 범위 명확성" }
   };
-  return labels[label] ?? label;
+  const entry = labels[label];
+  if (!entry) return label;
+  return locale === "ko-KR" ? entry.ko : entry.en;
+}
+
+function qualityDetail(item: QualityCheckItem, locale: DevGuardLocale): string {
+  const detail = item.detail;
+  if (item.label === "drift clarity" && /drift candidate present/i.test(detail)) {
+    return locale === "ko-KR"
+      ? "변경 범위 이탈 가능성이 있습니다. 관련 파일이 모두 같은 작업 목표에 속하는지 확인하세요."
+      : "A scope mismatch is possible. Confirm the changed files all belong to the same user request.";
+  }
+  if (item.label === "CLI router/help verification" && item.status !== "PASS" && /changed/i.test(detail)) {
+    return locale === "ko-KR"
+      ? "CLI 라우팅 또는 도움말 출력이 바뀌었습니다. README/docs와 실제 help/status 출력이 일치하는지 확인하세요."
+      : "CLI routing or help output changed. Confirm README/docs match the actual help and status output.";
+  }
+  if (item.label === "docs update candidate" && /source changed without docs/i.test(detail)) {
+    return locale === "ko-KR"
+      ? "소스 변경이 사용자 동작에 영향을 준다면 관련 문서 업데이트가 필요합니다."
+      : "If the source change affects user-facing behavior, update the relevant docs.";
+  }
+  if (item.label === "state/history verification" && item.status !== "PASS" && /changed/i.test(detail)) {
+    return locale === "ko-KR"
+      ? "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff 출력과 생성 파일을 확인하세요."
+      : "State, history, prompt, or report generation changed. Confirm done/status/handoff output and generated files.";
+  }
+  return locale === "ko-KR" ? localizeSentence(detail, locale) : humanizeInternalSentence(detail);
+}
+
+function humanizeInternalSentence(value: string): string {
+  return value
+    .replace(/risky area\(s\): /g, "runtime-sensitive area(s): ")
+    .replace(/drift candidate present; next task=.*/gi, "scope mismatch needs review")
+    .replace(/source changed without docs changes; recorded as doc update candidate only/gi, "source changed; confirm whether docs need an update");
 }
 
 function localizeSentence(value: string, locale: DevGuardLocale): string {
@@ -1408,10 +1749,46 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Redundancy: Low": "중복도: 낮음",
     "Redundancy: Medium": "중복도: 보통",
     "Readability: High": "가독성: 높음",
-    "Readability: Medium": "가독성: 보통"
+    "Readability: Medium": "가독성: 보통",
+    "No blocking quality issues were detected.": "차단 수준의 품질 문제는 감지되지 않았습니다.",
+    "No source changes are currently pending.": "현재 대기 중인 소스 변경은 없습니다.",
+    "Use the review items below to confirm the behavior before committing or publishing.": "커밋 또는 배포 전에 아래 검토 항목으로 실제 동작을 확인하세요.",
+    "The change can affect what users see in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보는 내용에 영향을 줄 수 있습니다.",
+    "The change can affect generated reports, handoff files, or next-session context.": "이번 변경은 생성 보고서, 인수인계 파일, 다음 세션 컨텍스트에 영향을 줄 수 있습니다.",
+    "The change can affect configuration or runtime behavior.": "이번 변경은 설정 또는 런타임 동작에 영향을 줄 수 있습니다.",
+    "The change affects documentation or user-facing guidance.": "이번 변경은 문서 또는 사용자 안내에 영향을 줍니다.",
+    "The change can affect API behavior or external callers.": "이번 변경은 API 동작 또는 외부 호출자에 영향을 줄 수 있습니다.",
+    "The change should be reviewed against the current user request.": "이번 변경이 현재 사용자 요청과 맞는지 확인해야 합니다.",
+    "The change scope is small, verification commands are available, and no blocking local quality rule fired.": "변경 범위가 작고 검증 명령이 있으며, 차단 수준의 로컬 품질 규칙은 감지되지 않았습니다.",
+    "Confirm DevGuard runtime artifacts are not included as source changes.": "DevGuard 런타임 산출물이 소스 변경으로 포함되지 않았는지 확인하세요.",
+    "Confirm package scripts, dependencies, versions, and lockfile state match the intended release impact.": "package scripts, dependencies, version, lockfile 상태가 의도한 배포 영향과 맞는지 확인하세요.",
+    "Confirm changed CLI routing or output still matches README/docs and the commands users will run.": "변경된 CLI 라우팅 또는 출력이 README/docs와 사용자가 실행할 명령과 일치하는지 확인하세요.",
+    "Confirm watch still tracks real project changes and ignores DevGuard internal files.": "watch가 실제 프로젝트 변경만 추적하고 DevGuard 내부 파일은 무시하는지 확인하세요.",
+    "Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly.": "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요.",
+    "Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read.": "변경된 소스 동작이 명령어, Dashboard 문구, 설정, hook, 보고서, 사용자가 읽는 생성 파일에 영향을 주는지 확인하세요.",
+    "Confirm the changed files all support the current request and remove or split unrelated work before finishing.": "변경된 파일이 모두 현재 요청을 뒷받침하는지 확인하고, 관련 없는 작업은 제거하거나 분리하세요.",
+    "Review the changed files once and confirm the implementation still matches the user request.": "변경 파일을 한 번 검토하고 구현이 여전히 사용자 요청과 일치하는지 확인하세요.",
+    "Run git status and keep .devguard runtime outputs out of the commit.": "git status를 실행하고 .devguard 런타임 산출물이 커밋에 포함되지 않게 하세요.",
+    "Review git diff by file.": "파일별 git diff를 검토하세요.",
+    "Keep only changes required for the current task.": "현재 작업에 필요한 변경만 남기세요.",
+    "Run the listed verification commands, then proceed with final review or commit.": "나열된 검증 명령을 실행한 뒤 최종 검토 또는 커밋을 진행하세요.",
+    "No project changes need review right now.": "지금 검토할 프로젝트 변경은 없습니다.",
+    "State, history, prompt, or report generation changed. Confirm done/status/handoff regenerate the expected files without stale state.": "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff가 오래된 상태 없이 필요한 파일을 재생성하는지 확인하세요.",
+    "The changed files may include work outside the current request. Confirm each changed file supports the same task before finishing.": "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요."
   };
   if (exact[value]) return exact[value];
   return value
+    .replace(/^Review is recommended because (\d+) check item\(s\) need confirmation\.$/, "확인이 필요한 항목이 $1개 있어 검토를 권장합니다.")
+    .replace(/^Completion is blocked because (\d+) check item\(s\) need confirmation\.$/, "확인이 필요한 항목이 $1개 있어 완료가 차단되었습니다.")
+    .replace(/^(\d+) changed file\(s\) are ready for final review after the listed verification commands\.$/, "$1개 변경 파일은 나열된 검증 명령 실행 후 최종 검토할 수 있습니다.")
+    .replace(/^This session changed (\d+) file\(s\), so review whether the work still belongs to one coherent task\.$/, "이번 세션에서 $1개 파일이 변경되었습니다. 변경 범위가 하나의 작업 목표로 설명되는지 확인하세요.")
+    .replace(/^The change touches (.+) area\(s\)\. Confirm the runtime behavior still matches the intended workflow\.$/, "이번 변경은 $1 영역에 닿아 있습니다. 런타임 동작이 의도한 흐름과 일치하는지 확인하세요.")
+    .replace(/^Confirm the (.+) area\(s\) still behave as intended in the actual workflow\.$/, "$1 영역이 실제 워크플로우에서 의도대로 동작하는지 확인하세요.")
+    .replace(/^State, history, prompt, or report generation changed\. Confirm done\/status\/handoff regenerate the expected files without stale state\./, "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff가 오래된 상태 없이 필요한 파일을 재생성하는지 확인하세요.")
+    .replace(/^The changed files may include work outside the current request\. Confirm each changed file supports the same task before finishing\./, "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.")
+    .replace(/^Confirm done\/status\/handoff read the latest runtime state and regenerate user-facing reports correctly\. Focus on (.+)\. Then run the required verification commands\.$/, "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요. 관련 파일: $1. 그런 다음 필요한 검증 명령을 실행하세요.")
+    .replace(/^(.+) Focus on (.+)\. Then run the required verification commands\.$/, "$1 관련 파일: $2. 그런 다음 필요한 검증 명령을 실행하세요.")
+    .replace(/ Related file\(s\): /g, " 관련 파일: ")
     .replace(/^run /, "실행: ")
     .replace(/^review /, "확인: ")
     .replace(/^Continue: /, "계속 진행: ")
@@ -1609,7 +1986,7 @@ function openRisks(input: {
   const risks = new Set<string>();
   for (const item of [
     ...extractSectionBulletsAny(input.qualityReport.content, ["Blocked Items", "먼저 해결해야 할 항목"], 5),
-    ...extractSectionBulletsAny(input.qualityReport.content, ["Warnings", "검토 권장 항목"], 5)
+    ...extractSectionBulletsAny(input.qualityReport.content, ["Warnings", "Review Items", "검토 권장 항목"], 5)
   ]) {
     if (item !== "none" && item !== "확인 필요" && item !== "없음") risks.add(item);
   }
