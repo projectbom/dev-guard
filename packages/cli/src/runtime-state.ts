@@ -1287,8 +1287,8 @@ function buildQualitySummary(input: {
   const impact = qualityImpactSummary(input.changedFiles, input.areas);
   const issueCount = input.issueItems.length;
   return [
-    `${input.verdict === "BLOCKED" ? "Completion is blocked" : "Review is recommended"} because ${issueCount} check item(s) need confirmation.`,
     impact,
+    `${input.verdict === "BLOCKED" ? "Completion is blocked" : "Review is recommended"} because ${issueCount} check item(s) need confirmation.`,
     "Use the review items below to confirm the behavior before committing or publishing."
   ];
 }
@@ -1520,12 +1520,14 @@ const reportCopy = {
   "en-US": {
     title: "Completion Quality Report",
     verdict: "Verdict",
-    summary: "Summary",
-    why: "Why",
+    result: "Result",
+    important: "What Matters In This Change",
+    actionNow: "What To Do Now",
+    why: "Why Review Is Needed",
     relatedFiles: "Related Files",
     requiredVerification: "Required Verification",
     blockedItems: "Blocked Items",
-    warnings: "Review Items",
+    warnings: "Additional Checks",
     riskChecklist: "Risk Checklist",
     beforeCommit: "Before Commit",
     nextRecommendedAction: "Next Recommended Action",
@@ -1534,12 +1536,14 @@ const reportCopy = {
   "ko-KR": {
     title: "완료 품질 보고서",
     verdict: "판정",
-    summary: "요약",
-    why: "판단 이유",
+    result: "결과",
+    important: "이번 변경에서 중요한 점",
+    actionNow: "지금 해야 하는 작업",
+    why: "왜 검토가 필요한가",
     relatedFiles: "관련 파일",
     requiredVerification: "필요한 검증",
     blockedItems: "먼저 해결해야 할 항목",
-    warnings: "검토 권장 항목",
+    warnings: "추가로 검토하면 좋은 점",
     riskChecklist: "위험 점검표",
     beforeCommit: "커밋 전 확인",
     nextRecommendedAction: "다음으로 진행하면 좋은 작업",
@@ -1583,6 +1587,33 @@ const handoffCopy = {
 } as const;
 
 function renderQualityReport(report: QualityReport, locale: DevGuardLocale): string {
+  if (report.verdict === "PASS") return renderPassQualityReport(report, locale);
+  if (report.verdict === "BLOCKED") return renderBlockedQualityReport(report, locale);
+  return renderNeedsReviewQualityReport(report, locale);
+}
+
+function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale): string {
+  const copy = reportCopy[locale];
+  return [
+    `# ${copy.title}`,
+    "",
+    `## ${copy.verdict}`,
+    "",
+    report.verdict,
+    "",
+    `## ${copy.result}`,
+    "",
+    locale === "ko-KR" ? "필수 품질 검사를 통과했습니다." : "Required quality checks passed.",
+    "",
+    locale === "ko-KR" ? "추가 작업은 필요하지 않습니다." : "No additional action is required.",
+    "",
+    `## ${locale === "ko-KR" ? "실행할 검증" : "Verification To Run"}`,
+    "",
+    ...report.requiredVerification.slice(0, 4).map((command) => `- ${command}`)
+  ].join("\n") + "\n";
+}
+
+function renderNeedsReviewQualityReport(report: QualityReport, locale: DevGuardLocale): string {
   const copy = reportCopy[locale];
   const blocked = report.checklist.filter((item) => item.status === "BLOCKED");
   const blockedReviewItems = report.reviewItems.filter((item) => blocked.some((blockedItem) => reviewItemMatchesQualityItem(item, blockedItem)));
@@ -1593,33 +1624,115 @@ function renderQualityReport(report: QualityReport, locale: DevGuardLocale): str
     `## ${copy.verdict}`,
     `- ${report.verdict}`,
     "",
-    `## ${copy.summary}`,
+    `## ${copy.important}`,
     ...formatLocalizedBullets(report.summary, locale),
+    "",
+    `## ${copy.actionNow}`,
+    ...formatActionSteps(report, warningReviewItems, locale),
     "",
     `## ${copy.why}`,
     ...formatLocalizedBullets(report.why, locale),
     "",
     `## ${copy.relatedFiles}`,
-    ...formatLocalizedBullets(report.relatedFiles, locale),
+    ...formatRelatedFiles(report.relatedFiles, report.reviewItems, locale),
     "",
     `## ${copy.requiredVerification}`,
     ...report.requiredVerification.map((command) => `- ${command}`),
     "",
+    `## ${copy.warnings}`,
+    ...formatReviewQuestions(warningReviewItems, locale),
+  ].join("\n") + "\n";
+}
+
+function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocale): string {
+  const copy = reportCopy[locale];
+  const blocked = report.checklist.filter((item) => item.status === "BLOCKED");
+  const blockedReviewItems = report.reviewItems.filter((item) => blocked.some((blockedItem) => reviewItemMatchesQualityItem(item, blockedItem)));
+  const warningReviewItems = report.reviewItems.filter((item) => !blockedReviewItems.includes(item));
+  return [
+    `# ${copy.title}`,
+    "",
+    `## ${copy.verdict}`,
+    `- ${report.verdict}`,
+    "",
     `## ${copy.blockedItems}`,
     ...formatReviewItems(blockedReviewItems, locale),
     "",
+    `## ${copy.why}`,
+    ...formatLocalizedBullets(report.why, locale),
+    "",
+    `## ${copy.relatedFiles}`,
+    ...formatRelatedFiles(report.relatedFiles, report.reviewItems, locale),
+    "",
+    `## ${copy.requiredVerification}`,
+    ...report.requiredVerification.map((command) => `- ${command}`),
+    "",
     `## ${copy.warnings}`,
-    ...formatReviewItems(warningReviewItems, locale),
-    "",
-    `## ${copy.riskChecklist}`,
-    ...report.checklist.map((item) => `- ${item.status}: ${formatQualityItem(item, locale)}`),
-    "",
-    `## ${copy.beforeCommit}`,
-    ...formatLocalizedBullets(report.beforeCommit, locale),
-    "",
-    `## ${copy.nextRecommendedAction}`,
-    `- ${localizeSentence(report.nextRecommendedAction, locale)}`
+    ...formatReviewQuestions(warningReviewItems, locale),
   ].join("\n") + "\n";
+}
+
+function formatActionSteps(report: QualityReport, items: QualityReviewItem[], locale: DevGuardLocale): string[] {
+  const primary = items[0];
+  if (!primary) return [`1. ${localizeSentence(report.nextRecommendedAction, locale)}`];
+  const steps: string[] = [];
+  steps.push(`1. ${localizeReviewTitle(primary.title, locale)}`);
+  if (primary.files.length > 0) {
+    steps.push(`2. ${locale === "ko-KR" ? "관련 파일 확인" : "Check related files"}: ${compactFileList(primary.files, 3)}`);
+  }
+  const command = report.requiredVerification[0];
+  if (command) {
+    steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "검증 실행" : "Run verification"}: ${command}`);
+  }
+  steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "보고서와 인수인계가 의도대로 재생성됐는지 확인" : "Confirm the report and handoff regenerated as expected"}`);
+  return steps;
+}
+
+function formatReviewQuestions(items: QualityReviewItem[], locale: DevGuardLocale): string[] {
+  if (items.length === 0) return [`- ${reportCopy[locale].noItems}`];
+  return items.map((item) => `- ${reviewQuestion(item, locale)}`);
+}
+
+function reviewQuestion(item: QualityReviewItem, locale: DevGuardLocale): string {
+  const title = localizeReviewTitle(item.title, locale);
+  const fileText = item.files.length > 0 ? ` (${compactFileList(item.files, 3)})` : "";
+  if (locale === "ko-KR") {
+    if (item.title === "Report and handoff regeneration") return `done/status/handoff 실행 후 사용자용 보고서가 최신 상태로 재생성되는가?${fileText}`;
+    if (item.title === "Change scope check") return `이번 변경 파일이 모두 현재 Quality Report UX 개선 작업에 필요한가?${fileText}`;
+    if (item.title === "Documentation update need") return `사용자-facing 동작이 바뀌었다면 README 또는 docs 설명도 맞게 갱신되었는가?${fileText}`;
+    if (item.title === "CLI command and help consistency") return `CLI help/status 출력이 문서와 일치하는가?${fileText}`;
+    return `${title}을 확인했는가?${fileText}`;
+  }
+  if (item.title === "Report and handoff regeneration") return `Do done/status/handoff regenerate the latest user-facing reports?${fileText}`;
+  if (item.title === "Change scope check") return `Do all changed files belong to this Quality Report UX task?${fileText}`;
+  if (item.title === "Documentation update need") return `If user-facing behavior changed, do README/docs match it?${fileText}`;
+  if (item.title === "CLI command and help consistency") return `Do CLI help/status output and docs still match?${fileText}`;
+  return `Has ${title} been checked?${fileText}`;
+}
+
+function formatRelatedFiles(files: string[], reviewItems: QualityReviewItem[], locale: DevGuardLocale): string[] {
+  if (files.length === 0) return [`- ${reportCopy[locale].noItems}`];
+  return files.slice(0, 10).map((file) => {
+    const role = relatedFileRole(file, reviewItems, locale);
+    return `- ${file}${role ? ` ${locale === "ko-KR" ? "→" : "-"} ${role}` : ""}`;
+  });
+}
+
+function relatedFileRole(file: string, reviewItems: QualityReviewItem[], locale: DevGuardLocale): string {
+  if (/runtime-state\.ts$/.test(file)) {
+    return locale === "ko-KR" ? "Quality Report 생성과 handoff 파싱 로직" : "Quality Report generation and handoff parsing logic";
+  }
+  if (/dashboard/i.test(file)) {
+    return locale === "ko-KR" ? "Dashboard 표시와 사용자 상호작용" : "Dashboard display and user interaction";
+  }
+  if (/configure|config/i.test(file)) {
+    return locale === "ko-KR" ? "설정 저장과 CLI 설정 흐름" : "Configuration persistence and CLI config flow";
+  }
+  if (/README|docs\//i.test(file)) {
+    return locale === "ko-KR" ? "사용자 문서와 명령 설명" : "User documentation and command guidance";
+  }
+  const item = reviewItems.find((reviewItem) => reviewItem.files.includes(file));
+  return item ? localizeReviewTitle(item.title, locale) : "";
 }
 
 function reviewItemMatchesQualityItem(reviewItem: QualityReviewItem, item: QualityCheckItem): boolean {
