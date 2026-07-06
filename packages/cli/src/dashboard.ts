@@ -719,12 +719,12 @@ function renderPage(): string {
     .mini-btn.ghost { background: var(--surface); color: var(--ink2); }
     .mini-btn:hover { filter: brightness(.96); }
     .quick-bar { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px; margin-bottom: 10px; }
-    .quick-title { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 9px; }
+    .quick-title { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 12px; }
     .quick-actions { display: flex; gap: 7px; flex-wrap: wrap; }
     .quick-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 30px; border-radius: var(--r-sm); border: 1px solid var(--line2); background: var(--surface2); color: var(--ink); padding: 6px 10px; font: 12px/1 var(--sans); font-weight: 700; cursor: pointer; text-decoration: none; white-space: nowrap; }
     .quick-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
     .quick-btn:disabled { opacity: .55; cursor: not-allowed; }
-    .settings-panel { margin: -2px 0 10px; }
+    .settings-panel { margin: 16px 0 10px; }
     .settings-panel details { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
     .settings-panel summary { padding: 10px 12px; font-size: 11px; }
     .settings-body { padding: 0 12px 12px; display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -909,6 +909,8 @@ let lang = initLang();
 let last = null;
 let reviewCompleteUntil = 0;
 let applyingServerLang = false;
+let settingsOpen = false;
+let advancedOpen = false;
 
 function initLang() {
   const saved = localStorage.getItem('dg.lang');
@@ -1282,8 +1284,14 @@ function quickActionButton(label, key, opts = {}) {
 }
 
 function toggleSettings() {
+  settingsOpen = !settingsOpen;
   const panel = document.getElementById('settingsPanel');
-  if (panel) panel.open = !panel.open;
+  if (panel) panel.open = settingsOpen;
+}
+
+function rememberDetails(name, open) {
+  if (name === 'settings') settingsOpen = open;
+  if (name === 'advanced') advancedOpen = open;
 }
 
 function assistantPromptLines(s) {
@@ -1352,7 +1360,7 @@ function nextActionView(s, v) {
       cls: 'pass',
       icon: '✓',
       title: t('monitoringReadyTitle'),
-      body: t('monitoringReadyBody'),
+      body: '',
       steps: [t('reviewStepContinue')]
     };
   }
@@ -1435,7 +1443,7 @@ function render(s) {
     quickActionButton(t('settingsTitle'), '', { available: true, settings: true }) +
     '</div></div>';
 
-  const openAISettings = '<div class="settings-panel"><details id="settingsPanel"><summary>' + esc(t('settingsTitle')) + '</summary><div class="settings-body">' +
+  const openAISettings = '<div class="settings-panel"><details id="settingsPanel"' + (settingsOpen ? ' open' : '') + ' ontoggle="rememberDetails(\\'settings\\', this.open)"><summary>' + esc(t('settingsTitle')) + '</summary><div class="settings-body">' +
     '<div class="card openai-card"><div class="card-title">' + esc(t('openAIKeyTitle')) + '</div>' +
     '<div class="activity-row"><span class="activity-label">' + esc(t('openAIKeyStatus')) + '</span><span class="activity-value">' +
     esc(s.openAI.configured ? t('openAIKeyConfigured') : t('openAIKeyNotConfigured')) + '</span></div>' +
@@ -1539,7 +1547,7 @@ function render(s) {
     '<div class="section-label">' + esc(t('nextActionTitle')) + '</div>' +
     '<div class="next-top"><div class="next-icon" aria-hidden="true">' + esc(na.icon) + '</div><div>' +
     '<div class="next-title">' + esc(na.title) + '</div>' +
-    '<div class="next-body">' + esc(na.body) + '</div>' +
+    (na.body ? '<div class="next-body">' + esc(na.body) + '</div>' : '') +
     reviewSteps + nextButtons +
     '</div></div></div>';
 
@@ -1558,7 +1566,7 @@ function render(s) {
     { label: t('internalStatus'), value: s.status || '—' },
     { label: t('idleCountdown'), value: s.idleCountdown || t('noCountdown') }
   ];
-  const advanced = '<div class="adv-wrap"><details>' +
+  const advanced = '<div class="adv-wrap"><details id="advancedDetails"' + (advancedOpen ? ' open' : '') + ' ontoggle="rememberDetails(\\'advanced\\', this.open)">' +
     '<summary>' + esc(t('advancedTitle')) + '</summary>' +
     '<div class="adv-body">' +
     '<div class="adv-grid">' + advItems.map(i => '<div class="adv-item"><div class="adv-label">' + esc(i.label) + '</div><div class="adv-value">' + esc(i.value) + '</div></div>').join('') + '</div>' +
