@@ -402,7 +402,7 @@ async function runDone(root: string): Promise<void> {
     console.log(`Quality: ${result.qualityVerdict}`);
     console.log("");
     console.log(copy.newSession);
-    console.log(`  Read ${result.agentContextPath} and continue.`);
+    console.log(`  Read ${result.workingContextPath}, ${result.projectHandoffPath}, and ${result.qualityReportPath}; then continue.`);
     console.log("");
     console.log(copy.nextTask);
     console.log(locale === "ko-KR" ? `${result.promptPath} 확인 후 필요한 수정 진행` : `Review ${result.promptPath} and continue with the required fixes.`);
@@ -431,7 +431,7 @@ async function runHandoff(root: string): Promise<void> {
     console.log(`- ${nextClaudePromptPath}`);
     console.log("");
     console.log(copy.resumePrompt);
-    console.log(`  Read ${devguardPaths.agentContext} and continue.`);
+    console.log(`  Read ${devguardPaths.workingContext}, ${devguardPaths.projectHandoff}, and ${devguardPaths.qualityReport}; then continue.`);
   } catch (error) {
     console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
     process.exitCode = 1;

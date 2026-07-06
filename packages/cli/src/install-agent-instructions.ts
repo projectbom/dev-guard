@@ -21,11 +21,12 @@ function sharedDevGuardInstructions(agentName: "Codex" | "Claude"): string[] {
     "",
     "Before changing code:",
     "",
-    `1. Read \`${devguardPaths.projectKnowledge}\` before broad repository exploration.`,
-    `2. Read \`${devguardPaths.agentContext}\``,
-    `3. Read \`${devguardPaths.projectHandoff}\``,
-    `4. Read \`${devguardPaths.qualityReport}\``,
-    "5. Run `dev-guard status` when the current state is unclear.",
+    `1. Read \`${devguardPaths.workingContext}\` — code structure map for the current work area.`,
+    `2. Read \`${devguardPaths.projectHandoff}\` — next-session work instructions.`,
+    `3. Read \`${devguardPaths.qualityReport}\` — QA result and remaining verification.`,
+    `4. Read \`${devguardPaths.projectKnowledge}\` before broad repository exploration.`,
+    `5. Read \`${devguardPaths.agentContext}\` when agent-specific rules or current state are needed.`,
+    "6. Run `dev-guard status` when the current state is unclear.",
     "",
     "Common commands:",
     "",
@@ -44,14 +45,17 @@ function sharedDevGuardInstructions(agentName: "Codex" | "Claude"): string[] {
     "",
     "Session workflow:",
     "",
-    "- Start: read the DevGuard Project Knowledge file and context files above, then inspect only the files needed for the task.",
+    "- Start: read the Working Context entry files first, then inspect only the files needed for the task.",
     "- During work: keep `dev-guard watch` running in another terminal when continuous change tracking is wanted.",
     "- Finish: run the relevant project checks, then run `dev-guard done` and `dev-guard status` so handoff/status files are current.",
-    `- Next ${agentName} session: use \`${devguardPaths.agentContext}\`, \`${devguardPaths.projectHandoff}\`, or \`${nextPrompt}\` to resume without rediscovering the repo.`,
+    `- Next ${agentName} session: use \`${devguardPaths.workingContext}\`, \`${devguardPaths.projectHandoff}\`, \`${devguardPaths.agentContext}\`, or \`${nextPrompt}\` to resume without rediscovering the repo.`,
     "",
     "Rules:",
     "",
     "- Use DevGuard artifacts as the primary source of current project state.",
+    `- Start from the entry files and excluded areas in \`${devguardPaths.workingContext}\`; do not scan the full repository first.`,
+    `- Use \`${devguardPaths.projectHandoff}\` as the next work instruction.`,
+    `- Use \`${devguardPaths.qualityReport}\` only for QA results and verification status.`,
     `- Treat \`${devguardPaths.projectKnowledge}\` as the primary source of project structure before broad repository exploration.`,
     "- Do not perform repository-wide scans before reading the current DevGuard context.",
     "- Do not make broad unrelated changes.",
@@ -160,7 +164,7 @@ export async function runInstallAgentInstructions(root: string, args: string[]):
   console.log("  before exploring the repository. They are guidance, not enforced rules.");
   console.log("");
   console.log("Resume prompt for new sessions:");
-  console.log(`  Read ${devguardPaths.agentContext} and continue.`);
+  console.log(`  Read ${devguardPaths.workingContext}, ${devguardPaths.projectHandoff}, and ${devguardPaths.qualityReport}; then continue.`);
 }
 
 export async function ensureAgentInstructions(root: string): Promise<AgentInstructionInstallSummary> {

@@ -97,12 +97,13 @@ dev-guard configure ai --provider none --model gpt-4o-mini
 
 Before doing any work:
 
-1. Read `.devguard/context/agent-context.md`
+1. Read `.devguard/reports/working-context.md`
 2. Read `.devguard/reports/project-handoff.md`
 3. Read `.devguard/reports/quality-report.md`
 
 Use dev-guard artifacts as the primary source of project context.
 Do not perform repository-wide scans before reading them.
+Start from the entry files and excluded areas in Working Context.
 Only open additional files when required for the current task.
 Continue from the latest dev-guard state.
 
@@ -129,10 +130,12 @@ Always read the latest dev-guard context before exploring the repository.
 Required reading:
 
 * `.devguard/context/agent-context.md`
+* `.devguard/reports/working-context.md`
 * `.devguard/reports/project-handoff.md`
 * `.devguard/reports/quality-report.md`
 
 Avoid repository-wide scans unless the dev-guard context is insufficient.
+Start from the Working Context entry files and excluded areas.
 Prefer continuing from dev-guard context rather than rediscovering project state.
 
 <!-- dev-guard-section-end -->

@@ -418,6 +418,7 @@ For a full compressed resume, also read `.devguard/reports/project-handoff.md`.
 
 `dev-guard done` and `dev-guard handoff` produce:
 
+- `.devguard/reports/working-context.md` — code structure map for AI agents to start from the right files
 - `.devguard/context/agent-context.md` — single-entry context document for new sessions
 - `.devguard/prompts/next-claude-prompt.md` — structured startup prompt for Claude sessions
 - `.devguard/prompts/next-codex-prompt.md` — compact execution prompt for Codex sessions
@@ -438,7 +439,7 @@ These files are project-level guidance for:
 - Codex (reads `AGENTS.md`)
 - Other agents that honor project-level instruction files
 
-The files contain suggestions, not enforced rules. They recommend reading dev-guard artifacts to avoid repository-wide scans and reduce context rebuild cost when starting a new session. Existing content is preserved; dev-guard only appends or updates its own section (marked with HTML comment markers).
+The files contain suggestions, not enforced rules. They recommend reading Working Context, Handoff, and Quality Report before repository-wide scans so agents can start from the right entry files and avoid rebuilding context. Existing content is preserved; dev-guard only appends or updates its own section (marked with HTML comment markers).
 
 ## Quality Flow
 

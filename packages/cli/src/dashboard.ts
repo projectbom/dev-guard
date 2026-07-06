@@ -17,6 +17,7 @@ const HOST = "127.0.0.1";
 const FILE_KEYS: Record<string, string> = {
   handoff: devguardPaths.projectHandoff,
   quality: devguardPaths.qualityReport,
+  working: devguardPaths.workingContext,
   context: devguardPaths.agentContext,
   nextclaude: devguardPaths.nextClaudePrompt,
   nextcodex: devguardPaths.nextCodexPrompt,
@@ -87,16 +88,19 @@ interface DashboardState {
     handoffExists: boolean;
     qualityReportExists: boolean;
     agentContextExists: boolean;
+    workingContextExists: boolean;
     nextClaudePromptExists: boolean;
     nextCodexPromptExists: boolean;
     handoffUpdatedAt?: string;
     qualityReportUpdatedAt?: string;
     agentContextUpdatedAt?: string;
+    workingContextUpdatedAt?: string;
     nextClaudePromptUpdatedAt?: string;
     nextCodexPromptUpdatedAt?: string;
     handoffPreview?: string;
     qualityReportPreview?: string;
     agentContextPreview?: string;
+    workingContextPreview?: string;
     qualitySummary: QualitySummary;
   };
   knowledge: {
@@ -428,9 +432,10 @@ function buildTimeline(history: HistoryRecord[], runtime: RuntimeState): Timelin
 }
 
 async function readReportState(root: string): Promise<DashboardState["reports"]> {
-  const [handoff, quality, context, nextClaude, nextCodex] = await Promise.all([
+  const [handoff, quality, working, context, nextClaude, nextCodex] = await Promise.all([
     readKnownPreview(root, devguardPaths.projectHandoff),
     readKnownPreview(root, devguardPaths.qualityReport),
+    readKnownPreview(root, devguardPaths.workingContext),
     readKnownPreview(root, devguardPaths.agentContext),
     checkFileInfo(root, devguardPaths.nextClaudePrompt),
     checkFileInfo(root, devguardPaths.nextCodexPrompt)
@@ -438,16 +443,19 @@ async function readReportState(root: string): Promise<DashboardState["reports"]>
   return {
     handoffExists: handoff.exists,
     qualityReportExists: quality.exists,
+    workingContextExists: working.exists,
     agentContextExists: context.exists,
     nextClaudePromptExists: nextClaude.exists,
     nextCodexPromptExists: nextCodex.exists,
     handoffUpdatedAt: handoff.updatedAt,
     qualityReportUpdatedAt: quality.updatedAt,
+    workingContextUpdatedAt: working.updatedAt,
     agentContextUpdatedAt: context.updatedAt,
     nextClaudePromptUpdatedAt: nextClaude.updatedAt,
     nextCodexPromptUpdatedAt: nextCodex.updatedAt,
     handoffPreview: handoff.preview,
     qualityReportPreview: quality.preview,
+    workingContextPreview: working.preview,
     agentContextPreview: context.preview,
     qualitySummary: summarizeQualityReport(quality.text ?? quality.preview ?? "")
   };
@@ -853,7 +861,8 @@ function renderPage(): string {
     .adv-value { font: 13px/1.3 var(--mono); color: var(--ink); word-break: break-all; }
     .rpt-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
     .rpt-card { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 12px; }
-    .rpt-name { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+    .rpt-name { font-size: 13px; font-weight: 760; margin-bottom: 3px; }
+    .rpt-desc { font-size: 12px; line-height: 1.35; color: var(--muted); margin-bottom: 8px; }
     .rpt-meta { font-size: 12px; color: var(--muted); display: grid; gap: 3px; }
     .rpt-prev details { border: none; border-radius: 0; overflow: visible; }
     .rpt-prev { margin-top: 8px; border-top: 1px solid var(--line); padding-top: 8px; }
@@ -911,6 +920,7 @@ let reviewCompleteUntil = 0;
 let applyingServerLang = false;
 let settingsOpen = false;
 let advancedOpen = false;
+const previewOpen = {};
 
 function initLang() {
   const saved = localStorage.getItem('dg.lang');
@@ -1019,16 +1029,19 @@ function normalizeDashboardState(s) {
     reports: {
       handoffExists: Boolean(reports.handoffExists),
       qualityReportExists: Boolean(reports.qualityReportExists),
+      workingContextExists: Boolean(reports.workingContextExists),
       agentContextExists: Boolean(reports.agentContextExists),
       nextClaudePromptExists: Boolean(reports.nextClaudePromptExists),
       nextCodexPromptExists: Boolean(reports.nextCodexPromptExists),
       handoffUpdatedAt: reports.handoffUpdatedAt,
       qualityReportUpdatedAt: reports.qualityReportUpdatedAt,
+      workingContextUpdatedAt: reports.workingContextUpdatedAt,
       agentContextUpdatedAt: reports.agentContextUpdatedAt,
       nextClaudePromptUpdatedAt: reports.nextClaudePromptUpdatedAt,
       nextCodexPromptUpdatedAt: reports.nextCodexPromptUpdatedAt,
       handoffPreview: reports.handoffPreview,
       qualityReportPreview: reports.qualityReportPreview,
+      workingContextPreview: reports.workingContextPreview,
       agentContextPreview: reports.agentContextPreview,
       qualitySummary: reports.qualitySummary || { warningCount: 0, blockedCount: 0, requiredVerificationCount: 0 }
     },
@@ -1120,7 +1133,7 @@ function boolHealth(exists) {
   return exists ? { cls:'good', icon:'✓', label:t('healthGood') } : { cls:'missing', icon:'○', label:t('healthMissing') };
 }
 function reportsHealth(s) {
-  if (!s.reports.handoffExists && !s.reports.qualityReportExists) return { cls:'missing', icon:'○', label:t('reportsNeverUpdated') };
+  if (!s.reports.handoffExists && !s.reports.qualityReportExists && !s.reports.workingContextExists) return { cls:'missing', icon:'○', label:t('reportsNeverUpdated') };
   const stamp = s.reports.qualityReportUpdatedAt || s.reports.handoffUpdatedAt;
   return { cls:'good', icon:'✓', label: t('reportsUpdated') + (stamp ? ' ' + shortTime(stamp) : '') };
 }
@@ -1292,6 +1305,7 @@ function toggleSettings() {
 function rememberDetails(name, open) {
   if (name === 'settings') settingsOpen = open;
   if (name === 'advanced') advancedOpen = open;
+  if (name.startsWith('preview:')) previewOpen[name.slice(8)] = open;
 }
 
 function assistantPromptLines(s) {
@@ -1373,13 +1387,15 @@ function nextActionView(s, v) {
 }
 
 /* ─ Advanced report block ─ */
-function rptBlock(name, exists, updatedAt, preview) {
+function rptBlock(key, name, description, exists, updatedAt, preview) {
   const ds = updatedAt ? new Date(updatedAt).toLocaleString(lang==='ko'?'ko-KR':'en-US', { dateStyle:'short', timeStyle:'short' }) : t('notCreated');
+  const openAttr = previewOpen[key] ? ' open' : '';
   return '<div class="rpt-card">' +
     '<div class="rpt-name">' + esc(name) + '</div>' +
+    '<div class="rpt-desc">' + esc(description) + '</div>' +
     '<div class="rpt-meta"><div>' + esc(t('availability')) + ': ' + esc(exists ? t('ready') : t('notCreated')) + '</div>' +
     '<div>' + esc(t('lastUpdated')) + ': ' + esc(ds) + '</div></div>' +
-    (exists && preview ? '<details class="rpt-prev"><summary>' + esc(t('preview')) + '</summary><pre>' + esc(preview) + '</pre></details>' : '') +
+    (exists && preview ? '<details class="rpt-prev"' + openAttr + ' ontoggle="rememberDetails(\\'preview:' + esc(key) + '\\', this.open)"><summary>' + esc(t('preview')) + '</summary><pre>' + esc(preview) + '</pre></details>' : '') +
     '</div>';
 }
 
@@ -1439,6 +1455,8 @@ function render(s) {
     '<div class="quick-actions">' +
     quickActionButton(t('actionQualityTitle'), 'quality', { available: s.reports.qualityReportExists, primary: s.qualityVerdict === 'NEEDS_REVIEW' || s.qualityVerdict === 'BLOCKED' }) +
     quickActionButton(t('actionHandoffTitle'), 'handoff', { available: s.reports.handoffExists }) +
+    quickActionButton(t('actionWorkingTitle'), 'working', { available: s.reports.workingContextExists }) +
+    quickActionButton(t('actionContextTitle'), 'context', { available: s.reports.agentContextExists }) +
     quickActionButton(t('knowledgeTitle'), 'knowledge', { available: s.knowledge.exists }) +
     quickActionButton(t('settingsTitle'), '', { available: true, settings: true }) +
     '</div></div>';
@@ -1571,9 +1589,10 @@ function render(s) {
     '<div class="adv-body">' +
     '<div class="adv-grid">' + advItems.map(i => '<div class="adv-item"><div class="adv-label">' + esc(i.label) + '</div><div class="adv-value">' + esc(i.value) + '</div></div>').join('') + '</div>' +
     '<div class="rpt-grid">' +
-    rptBlock(t('reportHandoff'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
-    rptBlock(t('reportQuality'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
-    rptBlock(t('reportContext'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
+    rptBlock('quality', t('reportQuality'), t('reportQualityDesc'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
+    rptBlock('handoff', t('reportHandoff'), t('reportHandoffDesc'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
+    rptBlock('working', t('reportWorking'), t('reportWorkingDesc'), s.reports.workingContextExists, s.reports.workingContextUpdatedAt, s.reports.workingContextPreview) +
+    rptBlock('context', t('reportContext'), t('reportContextDesc'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
     '</div>' +
     '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
     '<div class="gap g2w" style="margin-top:12px">' + sessionsCard + progressCard + '</div>' +

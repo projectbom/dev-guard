@@ -196,7 +196,7 @@ DevGuard는 AI 세션이 레포지토리를 넓게 탐색하기 전에 읽을 �
 dev-guard knowledge
 ```
 
-생성되는 `AGENTS.md`와 `CLAUDE.md` 안내문은 agent가 source file을 넓게 열기 전에 project knowledge를 먼저 읽도록 안내합니다.
+생성되는 `AGENTS.md`와 `CLAUDE.md` 안내문은 agent가 source file을 넓게 열기 전에 Working Context, Handoff, Quality Report를 먼저 읽고 필요한 진입 파일부터 확인하도록 안내합니다.
 
 ## 에이전트별 완료 전략
 
