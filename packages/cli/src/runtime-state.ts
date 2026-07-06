@@ -45,6 +45,18 @@ export interface RuntimeState {
   updatedAt?: string;
   locale?: DevGuardLocale;
   setupStatus?: SetupStatus;
+  qaResults?: Record<string, QAExecutionResult>;
+}
+
+export interface QAExecutionResult {
+  name: string;
+  status: "PASS" | "FAIL";
+  command: string;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+  summary?: string;
+  reason?: string;
 }
 
 export interface SetupStatus {
@@ -110,6 +122,7 @@ interface QualityReport {
   reviewItems: QualityReviewItem[];
   beforeCommit: string[];
   nextRecommendedAction: string;
+  qaResults?: Record<string, QAExecutionResult>;
   aiSummary?: {
     status: "generated" | "fallback";
     reason: string;
@@ -213,6 +226,12 @@ export async function writeRuntimeState(root: string, state: RuntimeState): Prom
   }
 }
 
+export async function recordQAExecutionResult(root: string, result: QAExecutionResult): Promise<void> {
+  const current = await readRuntimeState(root);
+  const qaResults = { ...(current.qaResults ?? {}), [result.name]: result };
+  await writeRuntimeState(root, { ...current, qaResults });
+}
+
 export async function refreshRuntimeLocale(root: string): Promise<DevGuardLocale> {
   const locale = await resolveDevGuardLocale(root);
   const current = await readRuntimeState(root);
@@ -222,8 +241,13 @@ export async function refreshRuntimeLocale(root: string): Promise<DevGuardLocale
   return locale;
 }
 
-export async function resetRuntimeState(root: string): Promise<void> {
-  await writeRuntimeState(root, { ...defaultRuntime, idleSinceAt: new Date().toISOString() });
+export async function resetRuntimeState(root: string, options: { preserveQaResults?: boolean } = {}): Promise<void> {
+  const current = options.preserveQaResults ? await readRuntimeState(root) : undefined;
+  await writeRuntimeState(root, {
+    ...defaultRuntime,
+    idleSinceAt: new Date().toISOString(),
+    ...(options.preserveQaResults && current?.qaResults ? { qaResults: current.qaResults } : {})
+  });
 }
 
 export async function readProjectState(root: string): Promise<ProjectState> {
@@ -423,7 +447,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     areas,
     judgments,
     testCandidates,
-    nextTaskTitle: nextTask.title
+    nextTaskTitle: nextTask.title,
+    qaResults: runtime.qaResults
   });
   qualityReport = await enhanceQualityReportWithAI(root, {
     locale,
@@ -490,7 +515,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
       lastPromptPath: promptPath,
       lastHandoffPath: projectHandoffPath
     }),
-    resetRuntimeState(root)
+    resetRuntimeState(root, { preserveQaResults: true })
   ]);
   await Promise.all([
     generateProjectHandoff(root),
@@ -1185,6 +1210,7 @@ async function assessCompletionQuality(
     judgments: string[];
     testCandidates: string[];
     nextTaskTitle: string;
+    qaResults?: Record<string, QAExecutionResult>;
   }
 ): Promise<QualityReport> {
   const [rootPackage, cliPackage] = await Promise.all([
@@ -1292,7 +1318,8 @@ async function assessCompletionQuality(
     checklist,
     reviewItems,
     beforeCommit,
-    nextRecommendedAction: buildQualityNextAction({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification })
+    nextRecommendedAction: buildQualityNextAction({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification }),
+    qaResults: input.qaResults
   };
 }
 
@@ -1932,8 +1959,9 @@ const reportCopy = {
     changed: "5. What Changed",
     qaResult: "6. QA Checklist",
     regressionRisk: "7. Regression Risk",
-    why: "8. Why This Verdict",
-    nextQa: "9. Next QA",
+    qaConfidence: "8. QA Confidence",
+    why: "9. Why This Verdict",
+    nextQa: "10. Next QA",
     aiSummary: "AI Summary",
     riskChecklist: "Risk Checklist",
     beforeCommit: "Before Commit",
@@ -1949,8 +1977,9 @@ const reportCopy = {
     changed: "5. 이번 변경 내용",
     qaResult: "6. QA Checklist",
     regressionRisk: "7. 잠재 회귀 위험",
-    why: "8. 왜 이 판정이 나왔는가",
-    nextQa: "9. 다음 QA",
+    qaConfidence: "8. QA Confidence",
+    why: "9. 왜 이 판정이 나왔는가",
+    nextQa: "10. 다음 QA",
     aiSummary: "AI 요약",
     riskChecklist: "위험 점검표",
     beforeCommit: "커밋 전 확인",
@@ -2034,6 +2063,10 @@ function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale):
     "",
     ...formatRegressionRisk(report, locale),
     "",
+    `## ${copy.qaConfidence}`,
+    "",
+    ...formatQAConfidence(report, locale),
+    "",
     `## ${copy.why}`,
     "",
     ...formatQualityVerdictReasons(report, locale),
@@ -2080,6 +2113,10 @@ function renderNeedsReviewQualityReport(report: QualityReport, locale: DevGuardL
     `## ${copy.regressionRisk}`,
     "",
     ...formatRegressionRisk(report, locale),
+    "",
+    `## ${copy.qaConfidence}`,
+    "",
+    ...formatQAConfidence(report, locale),
     "",
     `## ${copy.why}`,
     "",
@@ -2128,6 +2165,10 @@ function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocal
     "",
     ...formatRegressionRisk(report, locale),
     "",
+    `## ${copy.qaConfidence}`,
+    "",
+    ...formatQAConfidence(report, locale),
+    "",
     `## ${copy.why}`,
     "",
     ...formatQualityVerdictReasons(report, locale),
@@ -2165,14 +2206,28 @@ function formatQASnapshot(report: QualityReport, locale: DevGuardLocale): string
 }
 
 function qaCommandStatus(report: QualityReport, pattern: RegExp, locale: DevGuardLocale): string {
+  const result = pattern.source.includes("build") ? report.qaResults?.build : pattern.source.includes("self-check") ? report.qaResults?.["self-check"] : undefined;
+  if (result) return formatQAStatus(result, locale);
   const command = report.requiredVerification.find((item) => pattern.test(item));
-  if (!command) return locale === "ko-KR" ? "미기록" : "Not recorded";
-  return locale === "ko-KR" ? `미기록 (${command})` : `Not recorded (${command})`;
+  if (!command) return locale === "ko-KR" ? "최근 실행 결과 없음" : "No recent result";
+  return locale === "ko-KR" ? `최근 실행 결과 없음 (${command})` : `No recent result (${command})`;
 }
 
 function manualQAStatus(report: QualityReport, locale: DevGuardLocale): string {
   if (report.verdict === "PASS") return locale === "ko-KR" ? "현재 규칙상 추가 요구 없음" : "Not required by current rules";
   return locale === "ko-KR" ? "대기" : "Pending";
+}
+
+function formatQAStatus(result: QAExecutionResult, locale: DevGuardLocale): string {
+  const icon = result.status === "PASS" ? "✅" : "❌";
+  const seconds = Math.max(0, Math.round(result.durationMs / 1000));
+  const time = new Date(result.completedAt).toLocaleString(locale === "ko-KR" ? "ko-KR" : "en-US", {
+    dateStyle: "short",
+    timeStyle: "short"
+  });
+  return locale === "ko-KR"
+    ? `${icon} ${result.status} (${seconds}s, ${time})`
+    : `${icon} ${result.status} (${seconds}s, ${time})`;
 }
 
 function formatFinalVerdict(report: QualityReport, locale: DevGuardLocale): string[] {
@@ -2214,6 +2269,7 @@ function formatQualityImpact(report: QualityReport, locale: DevGuardLocale): str
     notAffected.add("Watch");
   }
   if ([...files].some((file) => /dashboard/i.test(file))) affected.add("Dashboard");
+  if ([...files].some((file) => /packages\/cli\/src\/self\.ts$/.test(file))) affected.add("Self Check");
   if ([...files].some((file) => /locale|dashboard-i18n/i.test(file))) affected.add("Locale");
   if ([...files].some((file) => /handoff|prompt/i.test(file))) affected.add("Handoff");
   if ([...files].some((file) => /index\.tsx?$|configure|config/i.test(file))) affected.add("CLI");
@@ -2248,6 +2304,11 @@ function qualityFileChangeDescription(file: string, locale: DevGuardLocale): str
       ? "Quality Report의 판정, QA 요약, 변경 파일 설명, 다음 QA 문구를 생성하는 흐름을 조정합니다."
       : "Adjusts the flow that generates Quality Report verdicts, QA summaries, file explanations, and next-QA guidance.";
   }
+  if (/packages\/cli\/src\/self\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "self-check가 실행한 build, local check, heuristic review, doctor 결과를 runtime state에 기록합니다."
+      : "Records build, local check, heuristic review, and doctor results from self-check into runtime state.";
+  }
   if (/dashboard\.ts$/.test(file)) {
     return locale === "ko-KR"
       ? "Dashboard 표시나 사용자 상호작용 동작을 조정합니다."
@@ -2267,6 +2328,11 @@ function qualityFileReason(file: string, report: QualityReport, locale: DevGuard
       ? "생성되는 Quality Report가 단순 체크리스트가 아니라 이번 변경의 QA 결과를 설명하도록 하기 위해 변경되었습니다."
       : "Changed so generated Quality Reports explain the QA result for this session instead of acting like a generic checklist.";
   }
+  if (/packages\/cli\/src\/self\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "Quality Report가 실제 자동 검증 결과를 사용할 수 있도록 self-check 실행 결과를 저장하기 위해 변경되었습니다."
+      : "Changed so Quality Report can use actual automatic verification results recorded by self-check.";
+  }
   const item = report.reviewItems.find((reviewItem) => reviewItem.files.includes(file));
   if (item?.body[0]) return localizeSentence(sanitizeQualitySentence(item.body[0]), locale);
   if (report.verdict === "NEEDS_REVIEW") return locale === "ko-KR" ? "이 파일이 현재 검토 대상에 포함되어 있어 실제 영향 확인이 필요합니다." : "This file is part of the current review surface and needs impact verification.";
@@ -2279,21 +2345,55 @@ function formatQAResults(report: QualityReport, locale: DevGuardLocale): string[
   const warnings = report.checklist.filter((item) => item.status === "WARN");
   const lines: string[] = [];
   lines.push(locale === "ko-KR" ? "✅ 확인 완료" : "✅ Completed");
+  for (const result of orderedQAResults(report)) {
+    if (result.status === "PASS") lines.push(`- ${qaResultLine(result, locale)}`);
+  }
   if (passed.length > 0) {
     for (const item of passed.slice(0, 5)) lines.push(`- ${qualityCheckOutcome(item, locale)}`);
-  } else {
+  } else if (!orderedQAResults(report).some((result) => result.status === "PASS")) {
     lines.push(locale === "ko-KR" ? "- 완료로 기록된 품질 항목이 없습니다." : "- No quality item is recorded as completed.");
   }
   lines.push("");
   lines.push(locale === "ko-KR" ? "⚠ 추가 확인 필요" : "⚠ Needs Additional QA");
   const pending = [...blocked, ...warnings];
+  for (const result of orderedQAResults(report)) {
+    if (result.status === "FAIL") lines.push(`- ${qaResultLine(result, locale)}`);
+  }
   if (pending.length > 0) {
     for (const item of pending.slice(0, 6)) lines.push(`- ${qualityCheckOutcome(item, locale)}`);
   } else {
     lines.push(locale === "ko-KR" ? "- 추가 확인이 필요한 품질 항목은 없습니다." : "- No additional quality item needs review.");
   }
-  lines.push(...unrecordedVerificationLines(report.requiredVerification, locale));
+  lines.push(...unrecordedVerificationLines(report, locale));
   return lines;
+}
+
+function orderedQAResults(report: QualityReport): QAExecutionResult[] {
+  const results = report.qaResults ?? {};
+  return ["build", "self-check", "check-local", "review-heuristic", "doctor"]
+    .map((key) => results[key])
+    .filter((result): result is QAExecutionResult => Boolean(result));
+}
+
+function qaResultLine(result: QAExecutionResult, locale: DevGuardLocale): string {
+  const label = qaResultLabel(result.name, locale);
+  const seconds = Math.max(0, Math.round(result.durationMs / 1000));
+  const detail = result.status === "PASS"
+    ? (locale === "ko-KR" ? `${seconds}s 동안 실행되어 통과했습니다.` : `passed in ${seconds}s.`)
+    : (locale === "ko-KR" ? `${seconds}s 후 실패했습니다${result.reason ? `: ${result.reason}` : "."}` : `failed after ${seconds}s${result.reason ? `: ${result.reason}` : "."}`);
+  return `${label}: ${result.status} - ${detail}`;
+}
+
+function qaResultLabel(name: string, locale: DevGuardLocale): string {
+  const labels: Record<string, { ko: string; en: string }> = {
+    build: { ko: "Build", en: "Build" },
+    "self-check": { ko: "Self Check", en: "Self Check" },
+    "check-local": { ko: "Local Check", en: "Local Check" },
+    "review-heuristic": { ko: "Heuristic Review", en: "Heuristic Review" },
+    doctor: { ko: "Doctor", en: "Doctor" }
+  };
+  const label = labels[name];
+  return label ? (locale === "ko-KR" ? label.ko : label.en) : name;
 }
 
 function qualityCheckOutcome(item: QualityCheckItem, locale: DevGuardLocale): string {
@@ -2309,13 +2409,23 @@ function qualityCheckOutcome(item: QualityCheckItem, locale: DevGuardLocale): st
   return `${label}: needs additional QA. ${detail}`;
 }
 
-function unrecordedVerificationLines(commands: string[], locale: DevGuardLocale): string[] {
+function unrecordedVerificationLines(report: QualityReport, locale: DevGuardLocale): string[] {
+  const commands = report.requiredVerification;
   if (commands.length === 0) return [];
-  return commands.slice(0, 5).map((command) =>
+  return commands.filter((command) => !hasRecordedCommand(report, command)).slice(0, 5).map((command) =>
     locale === "ko-KR"
       ? `- 실행 결과 미기록: \`${command}\`는 Quality Report 생성 시점에 통과 여부가 기록되어 있지 않습니다.`
       : `- Not recorded: \`${command}\` has no pass/fail result recorded at Quality Report generation time.`
   );
+}
+
+function hasRecordedCommand(report: QualityReport, command: string): boolean {
+  if (/\bbuild\b/i.test(command) && report.qaResults?.build) return true;
+  if (/self-check/i.test(command) && report.qaResults?.["self-check"]) return true;
+  if (/check --local/i.test(command) && report.qaResults?.["check-local"]) return true;
+  if (/review --heuristic/i.test(command) && report.qaResults?.["review-heuristic"]) return true;
+  if (/doctor/i.test(command) && report.qaResults?.doctor) return true;
+  return false;
 }
 
 function formatRegressionRisk(report: QualityReport, locale: DevGuardLocale): string[] {
@@ -2341,6 +2451,31 @@ function regressionRiskLevel(report: QualityReport, locale: DevGuardLocale): str
   if (warnings.some((item) => /risky areas|package|CLI|watch/i.test(item.label))) return "Medium";
   if (warnings.length > 0) return "Low";
   return "None";
+}
+
+function formatQAConfidence(report: QualityReport, locale: DevGuardLocale): string[] {
+  const build = report.qaResults?.build;
+  const selfCheck = report.qaResults?.["self-check"];
+  const automaticPassed = build?.status === "PASS" && selfCheck?.status === "PASS";
+  const anyFailed = build?.status === "FAIL" || selfCheck?.status === "FAIL";
+  if (anyFailed) {
+    return locale === "ko-KR"
+      ? ["Low", "", "Build 또는 Self Check 실패가 기록되어 QA 신뢰도가 낮습니다."]
+      : ["Low", "", "Build or Self Check failed, so QA confidence is low."];
+  }
+  if (automaticPassed && report.verdict === "PASS") {
+    return locale === "ko-KR"
+      ? ["High", "", "Build와 Self Check가 통과했고 현재 품질 규칙에서 추가 QA 요구가 없습니다."]
+      : ["High", "", "Build and Self Check passed, and current quality rules do not require more QA."];
+  }
+  if (automaticPassed) {
+    return locale === "ko-KR"
+      ? ["Medium", "", "Build와 Self Check는 통과했지만 Manual QA 또는 생성물 직접 확인이 남아 있습니다."]
+      : ["Medium", "", "Build and Self Check passed, but manual QA or generated output review remains."];
+  }
+  return locale === "ko-KR"
+    ? ["Low", "", "Build 또는 Self Check의 최근 실행 결과가 기록되어 있지 않습니다."]
+    : ["Low", "", "No recent Build or Self Check result is recorded."];
 }
 
 function formatQualityVerdictReasons(report: QualityReport, locale: DevGuardLocale): string[] {

@@ -20,6 +20,7 @@ import { runCheck } from "./check.js";
 import { runDoctor } from "./doctor.js";
 import { runReview } from "./review.js";
 import { runTaskAI } from "./task-ai.js";
+import { recordQAExecutionResult } from "./runtime-state.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -61,6 +62,7 @@ export async function runSelf(root: string, args: string | string[]): Promise<vo
 
 export async function runSelfCheck(root: string): Promise<void> {
   const results: Array<{ name: string; ok: boolean; reason?: string; output: string[] }> = [];
+  const selfStartedAt = new Date();
   for (const step of [
     { name: "pnpm run build", run: () => execFileAsync("pnpm", ["run", "build"], { cwd: root }) },
     { name: "dev-guard check --local", run: () => runCheck(root, { includeContextFiles: false, local: true }) },
@@ -68,16 +70,37 @@ export async function runSelfCheck(root: string): Promise<void> {
     { name: "dev-guard doctor", run: () => runDoctor(root) }
   ]) {
     console.log(`dev-guard self-check: running ${step.name}`);
+    const startedAt = new Date();
     try {
       const output = await captureConsole(step.run);
+      const completedAt = new Date();
       results.push({ name: step.name, ok: true, output });
+      await recordQAExecutionResult(root, {
+        name: qaResultName(step.name),
+        command: step.name,
+        status: "PASS",
+        startedAt: startedAt.toISOString(),
+        completedAt: completedAt.toISOString(),
+        durationMs: completedAt.getTime() - startedAt.getTime(),
+        summary: summarizeSelfCheckStep(step.name, output).join("; ")
+      });
       for (const line of summarizeSelfCheckStep(step.name, output)) {
         console.log(`  ${line}`);
       }
     } catch (error) {
+      const completedAt = new Date();
       const reason = errorMessage(error);
       console.log(`dev-guard self-check: ${step.name} failed (${reason})`);
       results.push({ name: step.name, ok: false, reason, output: [] });
+      await recordQAExecutionResult(root, {
+        name: qaResultName(step.name),
+        command: step.name,
+        status: "FAIL",
+        startedAt: startedAt.toISOString(),
+        completedAt: completedAt.toISOString(),
+        durationMs: completedAt.getTime() - startedAt.getTime(),
+        reason
+      });
     }
   }
 
@@ -85,9 +108,29 @@ export async function runSelfCheck(root: string): Promise<void> {
   for (const result of results) {
     console.log(`- ${result.ok ? "pass" : "fail"}: ${result.name}${result.reason ? ` (${result.reason})` : ""}`);
   }
+  const selfCompletedAt = new Date();
+  const failed = results.find((result) => !result.ok);
+  await recordQAExecutionResult(root, {
+    name: "self-check",
+    command: "pnpm cli self-check",
+    status: failed ? "FAIL" : "PASS",
+    startedAt: selfStartedAt.toISOString(),
+    completedAt: selfCompletedAt.toISOString(),
+    durationMs: selfCompletedAt.getTime() - selfStartedAt.getTime(),
+    summary: results.map((result) => `${result.ok ? "pass" : "fail"}: ${result.name}`).join("; "),
+    reason: failed?.reason
+  });
   if (results.some((result) => !result.ok)) {
     process.exitCode = 1;
   }
+}
+
+function qaResultName(command: string): string {
+  if (command === "pnpm run build") return "build";
+  if (command === "dev-guard check --local") return "check-local";
+  if (command === "dev-guard review --heuristic") return "review-heuristic";
+  if (command === "dev-guard doctor") return "doctor";
+  return command;
 }
 
 async function runLocalSelfTask(root: string, options: SelfOptions): Promise<void> {
