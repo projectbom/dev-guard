@@ -95,6 +95,7 @@ export interface DoneProcessingResult {
   decisionCandidatesPath: string;
   qualityReportPath: string;
   projectHandoffPath: string;
+  workingContextPath: string;
   agentContextPath: string;
   nextClaudePromptPath: string;
   projectKnowledgePath: string;
@@ -200,6 +201,7 @@ const historySummaryPath = devguardPaths.historySummary;
 const decisionCandidatesPath = devguardPaths.decisionCandidates;
 const qualityReportPath = devguardPaths.qualityReport;
 const projectHandoffPath = devguardPaths.projectHandoff;
+const workingContextPath = devguardPaths.workingContext;
 const hookStatusPath = devguardPaths.hookStatus;
 
 const defaultRuntime: RuntimeState = {
@@ -519,6 +521,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   ]);
   await Promise.all([
     generateProjectHandoff(root),
+    generateWorkingContext(root),
     generateAgentContext(root),
     generateNextClaudePrompt(root),
     generateProjectKnowledge(root)
@@ -533,6 +536,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     decisionCandidatesPath,
     qualityReportPath,
     projectHandoffPath,
+    workingContextPath,
     agentContextPath: devguardPaths.agentContext,
     nextClaudePromptPath: devguardPaths.nextClaudePrompt,
     projectKnowledgePath: devguardPaths.projectKnowledge,
@@ -579,6 +583,19 @@ export async function generateProjectHandoff(root: string): Promise<string> {
   });
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
   return projectHandoffPath;
+}
+
+export async function generateWorkingContext(root: string): Promise<string> {
+  await ensureDevguardWorkspace(root);
+  const [state, historyRecords, projectKnowledge] = await Promise.all([
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readHistoryRecords(root, 5),
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+  ]);
+  const files = workingContextFiles(state, historyRecords);
+  const context = renderWorkingContext({ files, state, historyRecords, projectKnowledge });
+  await writeTextFile(fromRoot(root, workingContextPath), context);
+  return workingContextPath;
 }
 
 export async function generateAgentContext(root: string): Promise<string> {
@@ -632,6 +649,288 @@ export async function generateNextClaudePrompt(root: string): Promise<string> {
   return devguardPaths.nextClaudePrompt;
 }
 
+function workingContextFiles(state: ProjectState, records: HistoryRecord[]): string[] {
+  const files = state.lastChangedFiles?.length ? state.lastChangedFiles : lastHistoryFiles(records);
+  return [...new Set(files.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)))].sort();
+}
+
+function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string }): string {
+  const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
+  const domains = inferWorkingDomains(input.files);
+  const changedAreas = input.files.length > 0 ? input.files : ["확인 필요"];
+  const entryFiles = workingEntryFiles(input.files, profile);
+  const componentTree = workingComponentTree(domains);
+  const nextAreas = workingNextAreas(domains);
+  const excludedAreas = workingExcludedAreas(domains);
+  const currentWork = workingCurrentWork(input.state, domains);
+  const structure = workingCurrentStructure(domains);
+  const tips = workingTips(domains);
+  const resume = workingResumeStart(entryFiles, nextAreas);
+
+  return [
+    "# Working Context",
+    "",
+    "> AI-readable workspace map. Use this before opening broad repository files.",
+    "",
+    "## 현재 작업",
+    `- ${currentWork}`,
+    "",
+    "## 작업 범위",
+    "",
+    "수정 대상",
+    ...formatBullets(workingTargets(domains)),
+    "",
+    "수정 제외",
+    ...formatBullets(excludedAreas),
+    "",
+    "## 진입 파일",
+    ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
+    "",
+    "## 컴포넌트 관계",
+    ...componentTree,
+    "",
+    "## 이번 세션에서 수정한 영역",
+    ...changedAreas.slice(0, 12).map((file) => workingChangedFileLine(file, domains)),
+    ...(changedAreas.length > 12 ? [`- ... +${changedAreas.length - 12} files`] : []),
+    "",
+    "## 다음 작업에서 수정해야 하는 영역",
+    ...formatBullets(nextAreas),
+    "",
+    "## 수정하지 말아야 하는 영역",
+    ...formatBullets(excludedAreas),
+    "",
+    "## 현재 구조",
+    ...structure,
+    "",
+    "## AI 작업 팁",
+    ...formatBullets(tips),
+    "",
+    "## 재개 시작점",
+    ...resume.map((line) => `- ${line}`)
+  ].join("\n") + "\n";
+}
+
+function parseWorkingProjectKnowledge(content: string): { entryPoints: string[]; architecture: Array<{ name: string; files: string[] }> } {
+  try {
+    const parsed = JSON.parse(content) as {
+      summary?: { entryPoints?: string[] };
+      architecture?: { modules?: Array<{ name?: string; files?: string[] }> };
+    };
+    return {
+      entryPoints: parsed.summary?.entryPoints ?? [],
+      architecture: (parsed.architecture?.modules ?? []).map((module) => ({
+        name: module.name ?? "Unknown",
+        files: module.files ?? []
+      }))
+    };
+  } catch {
+    return { entryPoints: [], architecture: [] };
+  }
+}
+
+function inferWorkingDomains(files: string[]): Set<string> {
+  const domains = new Set<string>();
+  for (const file of files) {
+    if (/packages\/cli\/src\/dashboard/i.test(file)) domains.add("dashboard");
+    if (/packages\/cli\/src\/(runtime-state|self|report|review|quality)/i.test(file)) domains.add("reports");
+    if (/packages\/cli\/src\/(index|configure|config|paths|init|prepare)/i.test(file)) domains.add("cli");
+    if (/packages\/cli\/src\/(watch|watch-format)/i.test(file)) domains.add("watch");
+    if (/packages\/cli\/src\/(hooks|agent-strategies)/i.test(file)) domains.add("hooks");
+    if (/packages\/cli\/src\/knowledge/i.test(file)) domains.add("knowledge");
+    if (/docs\/|README|\.md$/i.test(file)) domains.add("docs");
+    if (/packages\/core\//i.test(file)) domains.add("core");
+    if (/package\.json|pnpm-lock|tsconfig|\.npmrc/i.test(file)) domains.add("config");
+  }
+  if (domains.size === 0) domains.add("general");
+  return domains;
+}
+
+function workingCurrentWork(state: ProjectState, domains: Set<string>): string {
+  if (domains.has("reports")) return "Quality Report / Working Context 생성 흐름 개선";
+  if (domains.has("dashboard")) return "Dashboard UX 또는 상태 렌더링 조정";
+  if (domains.has("watch")) return "watch 런타임 상태 추적 조정";
+  if (domains.has("hooks")) return "agent hook/notify 자동 완료 흐름 조정";
+  if (domains.has("knowledge")) return "Project Knowledge 생성 및 활용 조정";
+  return state.lastSummary && state.lastSummary !== "확인 필요" ? state.lastSummary : "현재 작업 목표 확인 필요";
+}
+
+function workingTargets(domains: Set<string>): string[] {
+  const targets: string[] = [];
+  if (domains.has("reports")) targets.push("Generated report pipeline", "Quality Report rendering", "Working Context structure map", "runtime QA metadata");
+  if (domains.has("dashboard")) targets.push("Dashboard rendering", "Dashboard i18n copy", "Dashboard API state mapping");
+  if (domains.has("cli")) targets.push("CLI command routing", "generated artifact output list", "configuration paths");
+  if (domains.has("watch")) targets.push("watch runtime state", "pending file tracking", "dashboard refresh state");
+  if (domains.has("hooks")) targets.push("Claude/Codex completion triggers", "hook script status", "agent strategy verification");
+  if (domains.has("knowledge")) targets.push("Project Knowledge extraction", "first-run project understanding");
+  if (domains.has("docs")) targets.push("README/docs user-facing guidance");
+  if (domains.has("config")) targets.push("package/config metadata");
+  return targets.length > 0 ? [...new Set(targets)] : ["변경 파일 기준 작업 범위 확인 필요"];
+}
+
+function workingExcludedAreas(domains: Set<string>): string[] {
+  const exclusions = new Set(["large refactors", "automatic git commit/publish", "unrelated package release flow"]);
+  if (!domains.has("dashboard")) exclusions.add("Dashboard UI");
+  if (!domains.has("watch")) exclusions.add("watch completion behavior");
+  if (!domains.has("hooks")) exclusions.add("Claude/Codex hook runtime");
+  if (!domains.has("core")) exclusions.add("core analysis engine");
+  if (!domains.has("knowledge")) exclusions.add("Project Knowledge extraction");
+  if (!domains.has("docs")) exclusions.add("README/docs wording");
+  exclusions.add("auth / database / routing unless directly changed");
+  return [...exclusions];
+}
+
+function workingEntryFiles(files: string[], profile: { entryPoints: string[]; architecture: Array<{ name: string; files: string[] }> }): string[] {
+  const priority = [
+    "packages/cli/src/runtime-state.ts",
+    "packages/cli/src/self.ts",
+    "packages/cli/src/index.ts",
+    "packages/cli/src/paths.ts",
+    "packages/cli/src/dashboard.ts",
+    "packages/cli/src/dashboard-i18n.ts",
+    "packages/cli/src/watch.ts",
+    "packages/cli/src/knowledge.ts"
+  ];
+  const scopedFiles = files.filter((file) => /\.(ts|tsx|js|jsx|md|json)$/i.test(file));
+  const candidates =
+    scopedFiles.length > 0
+      ? [...priority.filter((file) => scopedFiles.includes(file)), ...scopedFiles]
+      : [...profile.entryPoints, ...profile.architecture.flatMap((module) => module.files.slice(0, 2))];
+  return [...new Set(candidates)].slice(0, 8);
+}
+
+function workingComponentTree(domains: Set<string>): string[] {
+  if (domains.has("reports")) {
+    return [
+      "dev-guard done",
+      "├── processDoneEvent",
+      "│   ├── assessCompletionQuality",
+      "│   ├── renderQualityReport",
+      "│   ├── generateProjectHandoff",
+      "│   ├── generateWorkingContext",
+      "│   ├── generateAgentContext",
+      "│   └── generateNextClaudePrompt",
+      "└── writes generated artifacts under `.devguard/reports`, `.devguard/context`, `.devguard/prompts`",
+      "",
+      "dev-guard self-check",
+      "├── runs validation steps",
+      "└── recordQAExecutionResult → runtime QA metadata"
+    ];
+  }
+  if (domains.has("dashboard")) {
+    return [
+      "Dashboard",
+      "├── Status",
+      "├── Next Action",
+      "├── Quick Actions",
+      "├── Session Summary",
+      "├── Settings",
+      "└── Advanced Details"
+    ];
+  }
+  if (domains.has("watch")) {
+    return [
+      "dev-guard watch",
+      "├── file change filter",
+      "├── runtime state writer",
+      "├── dashboard server",
+      "└── external done/status refresh observer"
+    ];
+  }
+  return ["CLI", "├── packages/cli/src/index.ts", "├── command implementation files", "└── generated `.devguard` artifacts"];
+}
+
+function workingChangedFileLine(file: string, domains: Set<string>): string {
+  const reason = workingFileReason(file, domains);
+  return `- \`${file}\`\n  - 변경 이유: ${reason.reason}\n  - 주요 변경: ${reason.change}\n  - 확인 필요: ${reason.check}`;
+}
+
+function workingFileReason(file: string, domains: Set<string>): { reason: string; change: string; check: string } {
+  if (/runtime-state\.ts$/.test(file)) {
+    return {
+      reason: "done 실행 시 생성되는 DevGuard 산출물과 런타임 상태를 조정",
+      change: "Quality Report / Handoff / Agent Context / Working Context 생성 흐름",
+      check: "생성된 `.devguard/reports/*` 산출물이 서로 역할을 침범하지 않는지 확인"
+    };
+  }
+  if (/self\.ts$/.test(file)) {
+    return {
+      reason: "self-check 실행 결과를 QA 산출물에서 재사용하기 위한 흐름",
+      change: "검증 단계 결과 기록",
+      check: "실패한 검증을 PASS로 기록하지 않는지 확인"
+    };
+  }
+  if (/index\.ts$/.test(file)) {
+    return {
+      reason: "CLI 명령 출력 또는 생성 산출물 연결",
+      change: "사용자에게 표시되는 command result",
+      check: "help/command 출력이 실제 생성 파일과 일치하는지 확인"
+    };
+  }
+  if (/paths\.ts$/.test(file)) {
+    return {
+      reason: "DevGuard 내부 산출물 경로 추가",
+      change: "`.devguard` 경로 상수",
+      check: "새 경로가 하드코딩 없이 상수로 사용되는지 확인"
+    };
+  }
+  if (domains.has("dashboard") && /dashboard/.test(file)) {
+    return {
+      reason: "Dashboard 화면 또는 문구 조정",
+      change: "Dashboard client/rendering/i18n",
+      check: "PASS / NEEDS_REVIEW / BLOCKED 상태가 모두 렌더링되는지 확인"
+    };
+  }
+  return {
+    reason: "이번 세션 변경 범위에 포함된 파일",
+    change: "파일별 diff 확인 필요",
+    check: "변경 목적이 현재 작업 목표와 일치하는지 확인"
+  };
+}
+
+function workingNextAreas(domains: Set<string>): string[] {
+  if (domains.has("reports")) return ["Working Context generated output", "Quality Report role separation", "done / handoff command generated file list"];
+  if (domains.has("dashboard")) return ["Status card", "Next Action steps", "Settings / Advanced Details interaction"];
+  if (domains.has("watch")) return ["runtime/state refresh", "pending file filtering", "external done synchronization"];
+  return ["current changed files", "generated artifact output", "build/self-check validation"];
+}
+
+function workingCurrentStructure(domains: Set<string>): string[] {
+  if (domains.has("reports")) {
+    return [
+      "CLI command",
+      "↓",
+      "`processDoneEvent`",
+      "↓",
+      "quality assessment + runtime QA metadata",
+      "↓",
+      "generated reports/prompts/context files"
+    ];
+  }
+  if (domains.has("dashboard")) {
+    return ["Dashboard API state", "↓", "normalized dashboard state", "↓", "compact home cards", "↓", "advanced details"];
+  }
+  return ["CLI entry", "↓", "command handler", "↓", "runtime state", "↓", "generated `.devguard` artifacts"];
+}
+
+function workingTips(domains: Set<string>): string[] {
+  const tips = ["Start with the entry files above before opening adjacent modules.", "Do not scan `.devguard/**`; it is generated runtime state."];
+  if (domains.has("reports")) tips.push("For generated report behavior, start in `packages/cli/src/runtime-state.ts`.", "For QA result capture, start in `packages/cli/src/self.ts`.");
+  if (!domains.has("dashboard")) tips.push("Dashboard UI is not part of the current edit unless a dashboard file appears in changed files.");
+  if (!domains.has("hooks")) tips.push("Hook runtime is not part of the current edit.");
+  if (!domains.has("watch")) tips.push("watch auto-finalization behavior is not part of the current edit.");
+  return tips;
+}
+
+function workingResumeStart(entryFiles: string[], nextAreas: string[]): string[] {
+  const firstFile = entryFiles[0] ?? "확인 필요";
+  const firstArea = nextAreas[0] ?? "확인 필요";
+  return [
+    `먼저 \`${firstFile}\`를 열고 현재 변경 지점을 확인한다.`,
+    `${firstArea} 범위 안에서만 수정한다.`,
+    "`pnpm run build`, `pnpm cli self-check`, `pnpm cli done` 순서로 검증하고 Working Context가 갱신되는지 확인한다."
+  ];
+}
+
 function renderAgentContext(input: {
   projectPurpose: string;
   currentGoal: string;
@@ -679,6 +978,7 @@ function renderAgentContext(input: {
     "",
     "## Additional Context",
     `- project knowledge: \`${devguardPaths.projectKnowledge}\``,
+    `- working context: \`${devguardPaths.workingContext}\``,
     `- full handoff: \`${devguardPaths.projectHandoff}\``,
     `- architecture: \`${devguardPaths.architecture}\``,
     `- decisions: \`${devguardPaths.decisions}\``,
@@ -695,8 +995,9 @@ function renderNextClaudePrompt(input: { qualityVerdict: string; nextBestTask: s
     "",
     `1. \`${devguardPaths.agentContext}\` — current state, quality status, next task`,
     `2. \`${devguardPaths.projectKnowledge}\` — static project structure for AI sessions`,
-    `3. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
-    `4. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
+    `3. \`${devguardPaths.workingContext}\` — code structure map for the current work area`,
+    `4. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
+    `5. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
     "",
     "Use dev-guard context as the primary source of project state.",
     "Do not perform repository-wide scans before reading them.",

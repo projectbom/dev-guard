@@ -33,6 +33,7 @@ export const devguardPaths = {
   decisionCandidates: `${DEVGUARD_DIR}/reports/decision-candidates.md`,
   qualityReport: `${DEVGUARD_DIR}/reports/quality-report.md`,
   projectHandoff: `${DEVGUARD_DIR}/reports/project-handoff.md`,
+  workingContext: `${DEVGUARD_DIR}/reports/working-context.md`,
   nextCodexPrompt: `${DEVGUARD_DIR}/prompts/next-codex-prompt.md`,
   nextClaudePrompt: `${DEVGUARD_DIR}/prompts/next-claude-prompt.md`,
   agentContext: `${DEVGUARD_DIR}/context/agent-context.md`,

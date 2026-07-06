@@ -21,7 +21,7 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
-import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
+import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, generateWorkingContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
@@ -394,6 +394,7 @@ async function runDone(root: string): Promise<void> {
     console.log(`- ${result.decisionCandidatesPath}`);
     console.log(`- ${result.qualityReportPath}`);
     console.log(`- ${result.projectHandoffPath}`);
+    console.log(`- ${result.workingContextPath}`);
     console.log(`- ${result.agentContextPath}`);
     console.log(`- ${result.nextClaudePromptPath}`);
     console.log(`- ${result.projectKnowledgePath}`);
@@ -416,14 +417,16 @@ async function runHandoff(root: string): Promise<void> {
   try {
     const locale = await refreshRuntimeLocale(root);
     const copy = cliCopy(locale);
-    const [handoffPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
+    const [handoffPath, workingContextPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
       generateProjectHandoff(root),
+      generateWorkingContext(root),
       generateAgentContext(root),
       generateNextClaudePrompt(root)
     ]);
     console.log("dev-guard handoff");
     console.log("generated:");
     console.log(`- ${handoffPath}`);
+    console.log(`- ${workingContextPath}`);
     console.log(`- ${agentContextPath}`);
     console.log(`- ${nextClaudePromptPath}`);
     console.log("");
