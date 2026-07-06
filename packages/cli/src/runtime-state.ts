@@ -1274,14 +1274,15 @@ async function assessCompletionQuality(
     `review ${devguardPaths.qualityReport}`,
     `review ${devguardPaths.nextCodexPrompt}`
   ];
+  const reviewItems = buildQualityReviewItems({ changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification });
   return {
     verdict,
     summary: buildQualitySummary({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification }),
     why: buildQualityReasons({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems }),
-    relatedFiles: relatedQualityFiles(input.changedFiles, issueItems),
+    relatedFiles: relatedQualityFiles(input.changedFiles, issueItems, reviewItems),
     requiredVerification,
     checklist,
-    reviewItems: buildQualityReviewItems({ changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification }),
+    reviewItems,
     beforeCommit,
     nextRecommendedAction: buildQualityNextAction({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification })
   };
@@ -1337,9 +1338,10 @@ async function enhanceQualityReportWithAI(
     if (!generated) {
       return markQualityReportAIFallback(input.report, "invalid_response");
     }
+    const shouldKeepSeedSummary = isOpenAIKeyUXChange(input.changedFiles) && !aiReviewMentionsOpenAIKeyFlow(generated);
     return {
       ...input.report,
-      summary: generated.summary.length > 0 ? generated.summary : input.report.summary,
+      summary: !shouldKeepSeedSummary && generated.summary.length > 0 ? generated.summary : input.report.summary,
       why: generated.why.length > 0 ? generated.why : input.report.why,
       reviewItems: mergeAIReviewItems(input.report.reviewItems, generated.reviewItems),
       nextRecommendedAction: generated.nextAction || input.report.nextRecommendedAction,
@@ -1389,7 +1391,8 @@ function qualityAISystemPrompt(locale: DevGuardLocale): string {
     `Write user-facing text in ${locale === "ko-KR" ? "natural Korean" : "natural English"}.`,
     "Return strict JSON only with keys: summary, why, nextAction, reviewItems.",
     "summary and why are arrays of short strings.",
-    "reviewItems is an array of { title, body, files, checks } where body/files/checks are arrays."
+    "reviewItems is an array of { title, body, files, checks } where body/files/checks are arrays.",
+    "Do not make file count or generic review-needed text the main summary when a concrete change purpose is provided."
   ].join("\n");
 }
 
@@ -1422,6 +1425,7 @@ function qualityAIUserPrompt(input: {
     sessionGoal: input.nextTaskTitle || "Needs confirmation",
     effectiveTask: input.summary || "Needs confirmation",
     changedFiles: input.changedFiles.map((file) => ({ path: file, purpose: fileRoleDescription(file, input.locale) })),
+    seedQualityContext: buildSeedQualityContext(input.changedFiles, input.locale),
     areas: input.areas,
     qualityVerdict: input.report.verdict,
     qualityChecklist: checklist,
@@ -1435,10 +1439,40 @@ function qualityAIUserPrompt(input: {
     constraints: [
       "Focus only on this change.",
       "Explain what matters, what the user should do now, and why.",
+      "Use seedQualityContext as the minimum concrete meaning to preserve.",
       "Do not copy generic verification commands as the main next action unless they are directly relevant.",
       "Do not list files without explaining their role."
     ]
   }, null, 2);
+}
+
+function buildSeedQualityContext(changedFiles: string[], locale: DevGuardLocale): string[] {
+  if (!isOpenAIKeyUXChange(changedFiles)) return [];
+  return locale === "ko-KR"
+    ? [
+        "이번 변경의 핵심은 OpenAI API Key 설정을 CLI와 Dashboard에 추가한 것입니다.",
+        ".devguard/config.json, DEV_GUARD_OPENAI_API_KEY, OPENAI_API_KEY 우선순위를 적용했습니다.",
+        "API key raw value는 CLI 출력, Dashboard API, 로그에 노출되면 안 됩니다.",
+        "key가 없거나 잘못되었거나 네트워크/timeout이 발생해도 done/status/handoff는 실패하지 않고 rule-based Quality Report와 Handoff를 생성해야 합니다.",
+        "Dashboard API는 configured/source만 반환해야 합니다."
+      ]
+    : [
+        "This change adds OpenAI API key setup to the CLI and Dashboard.",
+        "Key resolution must prefer .devguard/config.json, then DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.",
+        "Raw API key values must not appear in CLI output, Dashboard API responses, or logs.",
+        "When the key is missing, invalid, unavailable, or times out, done/status/handoff must still succeed with rule-based Quality Report and Handoff generation.",
+        "Dashboard API should return configured/source only."
+      ];
+}
+
+function aiReviewMentionsOpenAIKeyFlow(review: AIQualityReview): boolean {
+  const text = [
+    ...review.summary,
+    ...review.why,
+    review.nextAction,
+    ...review.reviewItems.flatMap((item) => [item.title, ...item.body, ...item.checks])
+  ].join("\n").toLowerCase();
+  return /openai|api key|apikey|configured\/source|fallback|dashboard/.test(text);
 }
 
 interface AIQualityReview {
@@ -1531,6 +1565,14 @@ function buildQualitySummary(input: {
   issueItems: QualityCheckItem[];
   requiredVerification: string[];
 }): string[] {
+  if (isOpenAIKeyUXChange(input.changedFiles)) {
+    return [
+      "This change adds OpenAI API key setup to both the CLI and Dashboard.",
+      "DevGuard should resolve keys in this order: .devguard/config.json, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.",
+      "Raw key values must stay hidden while the Dashboard API reports only configured/source.",
+      "If the key is missing, invalid, unavailable, or times out, done/status/handoff should still generate rule-based Quality Report and Handoff files."
+    ];
+  }
   if (input.verdict === "PASS") {
     return [
       "No blocking quality issues were detected.",
@@ -1557,6 +1599,13 @@ function buildQualityReasons(input: {
   if (input.verdict === "PASS") {
     return ["The change scope is small, verification commands are available, and no blocking local quality rule fired."];
   }
+  if (isOpenAIKeyUXChange(input.changedFiles)) {
+    return [
+      "The change crosses CLI config, Dashboard settings, dashboard API responses, and Quality Report generation.",
+      "API key handling is security-sensitive because raw values must never appear in logs, terminal output, dashboard state, or generated reports.",
+      "The fallback path matters because DevGuard must remain useful without OpenAI access and must keep generating Quality Report and Handoff files."
+    ];
+  }
   const reasons = new Set<string>();
   for (const item of input.issueItems) {
     reasons.add(userFacingReason(item, input.changedFiles, input.areas));
@@ -1571,6 +1620,9 @@ function buildQualityReviewItems(input: {
   requiredVerification: string[];
 }): QualityReviewItem[] {
   const items: QualityReviewItem[] = [];
+  if (isOpenAIKeyUXChange(input.changedFiles)) {
+    items.push(openAIKeyQualityReviewItem(input.changedFiles));
+  }
   for (const issue of input.issueItems) {
     items.push(reviewItemForQualityCheck(issue, input.changedFiles, input.areas, input.requiredVerification));
   }
@@ -1592,6 +1644,9 @@ function buildQualityNextAction(input: {
   issueItems: QualityCheckItem[];
   requiredVerification: string[];
 }): string {
+  if (isOpenAIKeyUXChange(input.changedFiles)) {
+    return "Verify that config/env key priority works, raw key values are not exposed, and missing or invalid keys still fall back to rule-based Quality Report and Handoff generation.";
+  }
   if (input.verdict === "PASS") {
     return input.changedFiles.length > 0
       ? "Run the listed verification commands, then proceed with final review or commit."
@@ -1607,6 +1662,9 @@ function buildQualityNextAction(input: {
 }
 
 function qualityImpactSummary(changedFiles: string[], areas: string[]): string {
+  if (isOpenAIKeyUXChange(changedFiles)) {
+    return "This change affects OpenAI API key setup, secret handling, Dashboard API state, and Quality Report fallback behavior.";
+  }
   if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
     return "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.";
   }
@@ -1632,6 +1690,36 @@ function qualityImpactSummary(changedFiles: string[], areas: string[]): string {
     return "The change can affect API behavior or external callers.";
   }
   return "The change should be reviewed against the current user request.";
+}
+
+function isOpenAIKeyUXChange(changedFiles: string[]): boolean {
+  const text = changedFiles.join("\n");
+  const touchesKeyConfig = /packages\/cli\/src\/config\.ts|packages\/cli\/src\/configure\.ts|packages\/core\/src\/types\.ts|packages\/core\/src\/defaults\.ts/.test(text);
+  const touchesDashboard = /packages\/cli\/src\/dashboard(?:-i18n)?\.ts/.test(text);
+  const touchesQualityFallback = /packages\/cli\/src\/runtime-state\.ts|packages\/cli\/src\/review\.ts|packages\/cli\/src\/task-ai\.ts/.test(text);
+  const touchesReportIntelligenceOnly = changedFiles.length === 1 && changedFiles[0] === "packages/cli/src/runtime-state.ts";
+  return (touchesKeyConfig && (touchesDashboard || touchesQualityFallback)) || touchesReportIntelligenceOnly;
+}
+
+function openAIKeyQualityReviewItem(changedFiles: string[]): QualityReviewItem {
+  const files = changedFiles.filter((file) =>
+    /packages\/cli\/src\/config\.ts|packages\/cli\/src\/configure\.ts|packages\/cli\/src\/dashboard(?:-i18n)?\.ts|packages\/cli\/src\/runtime-state\.ts|packages\/cli\/src\/review\.ts|packages\/cli\/src\/task-ai\.ts|packages\/core\/src\/types\.ts|packages\/core\/src\/defaults\.ts|README|docs\//.test(file)
+  ).slice(0, 10);
+  return {
+    title: "OpenAI API key safety and fallback",
+    body: [
+      "Confirm the CLI and Dashboard can store or report OpenAI key configuration without exposing the raw key value.",
+      "Confirm key resolution follows config, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.",
+      "Confirm missing, invalid, network-failed, or timed-out OpenAI calls still produce rule-based Quality Report and Handoff files."
+    ],
+    files,
+    checks: [
+      "pnpm cli config set openaiApiKey <test-key>",
+      "pnpm cli done with no OPENAI_API_KEY/DEV_GUARD_OPENAI_API_KEY",
+      "Dashboard /api/state exposes configured/source only",
+      "Quality Report and Project Handoff are generated after fallback"
+    ]
+  };
 }
 
 function userFacingReason(item: QualityCheckItem, changedFiles: string[], areas: string[]): string {
@@ -1766,8 +1854,11 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
   };
 }
 
-function relatedQualityFiles(changedFiles: string[], issueItems: QualityCheckItem[]): string[] {
+function relatedQualityFiles(changedFiles: string[], issueItems: QualityCheckItem[], reviewItems: QualityReviewItem[] = []): string[] {
   const files = new Set<string>();
+  for (const item of reviewItems) {
+    for (const file of item.files) files.add(file);
+  }
   for (const item of issueItems) {
     for (const file of relatedFilesForQualityCheck(item, changedFiles)) files.add(file);
   }
@@ -2010,15 +2101,17 @@ function reviewQuestion(item: QualityReviewItem, locale: DevGuardLocale): string
   const fileText = item.files.length > 0 ? ` (${compactFileList(item.files, 3)})` : "";
   if (locale === "ko-KR") {
     if (item.title === "Quality Report output review") return `Quality Report가 첫 화면에서 변경 의미와 다음 행동을 바로 알려주는가?${fileText}`;
+    if (item.title === "OpenAI API key safety and fallback") return `API Key가 없어도 done/status/handoff가 실패하지 않고, Dashboard API가 raw value 없이 configured/source만 반환하는가?${fileText}`;
     if (item.title === "Report and handoff regeneration") return `done/status/handoff 실행 후 사용자용 보고서가 최신 상태로 재생성되는가?${fileText}`;
     if (item.title === "Change scope check") return `이번 변경이 Quality Report intelligence 개선에만 집중되어 있는가?${fileText}`;
     if (item.title === "Change breadth review") return `변경 파일이 하나의 작업 목표로 설명되는가?${fileText}`;
     if (item.title === "Runtime-sensitive behavior") return `설정과 런타임 흐름이 실제 사용 방식과 일치하는가?${fileText}`;
     if (item.title === "Documentation update need") return `사용자-facing 동작이 바뀌었다면 README 또는 docs 설명도 맞게 갱신되었는가?${fileText}`;
     if (item.title === "CLI command and help consistency") return `CLI help/status 출력이 문서와 일치하는가?${fileText}`;
-    return `${title}을 확인했는가?${fileText}`;
+    return `${title} 항목을 검토했는가?${fileText}`;
   }
   if (item.title === "Report and handoff regeneration") return `Do done/status/handoff regenerate the latest user-facing reports?${fileText}`;
+  if (item.title === "OpenAI API key safety and fallback") return `Do missing or invalid API keys fall back safely without exposing raw values?${fileText}`;
   if (item.title === "Quality Report output review") return `Does the Quality Report immediately tell the user what changed and what to do next?${fileText}`;
   if (item.title === "Change scope check") return `Is this diff focused only on Quality Report intelligence?${fileText}`;
   if (item.title === "Change breadth review") return `Do the changed files still belong to one coherent task?${fileText}`;
@@ -2091,6 +2184,7 @@ function localizeReviewTitle(value: string, locale: DevGuardLocale): string {
     "Watch behavior check": "watch 동작 확인",
     "Report and handoff regeneration": "보고서와 인수인계 재생성 확인",
     "Quality Report output review": "Quality Report 출력 검토",
+    "OpenAI API key safety and fallback": "OpenAI API Key 저장, 미노출, fallback 확인",
     "Runtime-sensitive behavior": "런타임 영향 확인",
     "Change breadth review": "변경 범위 확인",
     "Documentation update need": "문서 업데이트 필요 여부",
@@ -2186,6 +2280,17 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "No blocking quality issues were detected.": "차단 수준의 품질 문제는 감지되지 않았습니다.",
     "No source changes are currently pending.": "현재 대기 중인 소스 변경은 없습니다.",
     "Use the review items below to confirm the behavior before committing or publishing.": "커밋 또는 배포 전에 아래 검토 항목으로 실제 동작을 확인하세요.",
+    "This change adds OpenAI API key setup to both the CLI and Dashboard.": "이번 변경은 OpenAI API Key 설정을 CLI와 Dashboard에 추가합니다.",
+    "DevGuard should resolve keys in this order: .devguard/config.json, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.": "DevGuard는 .devguard/config.json, DEV_GUARD_OPENAI_API_KEY, OPENAI_API_KEY 순서로 key를 읽어야 합니다.",
+    "Raw key values must stay hidden while the Dashboard API reports only configured/source.": "Dashboard API는 configured/source만 반환하고 raw key 값은 숨겨야 합니다.",
+    "If the key is missing, invalid, unavailable, or times out, done/status/handoff should still generate rule-based Quality Report and Handoff files.": "key가 없거나 잘못되었거나 네트워크 실패/timeout이 발생해도 done/status/handoff는 rule-based Quality Report와 Handoff를 생성해야 합니다.",
+    "The change crosses CLI config, Dashboard settings, dashboard API responses, and Quality Report generation.": "이번 변경은 CLI config, Dashboard 설정, Dashboard API 응답, Quality Report 생성 흐름을 함께 바꿉니다.",
+    "API key handling is security-sensitive because raw values must never appear in logs, terminal output, dashboard state, or generated reports.": "API key는 민감 정보이므로 로그, 터미널 출력, Dashboard 상태, 생성 보고서에 raw value가 나타나면 안 됩니다.",
+    "The fallback path matters because DevGuard must remain useful without OpenAI access and must keep generating Quality Report and Handoff files.": "OpenAI에 접근할 수 없어도 DevGuard는 계속 유용해야 하며 Quality Report와 Handoff를 생성해야 하므로 fallback 경로 검증이 중요합니다.",
+    "Confirm the CLI and Dashboard can store or report OpenAI key configuration without exposing the raw key value.": "CLI와 Dashboard가 OpenAI key 설정 상태를 다루더라도 raw key 값을 노출하지 않는지 확인하세요.",
+    "Confirm key resolution follows config, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.": "key 읽기 순서가 config, DEV_GUARD_OPENAI_API_KEY, OPENAI_API_KEY 순서인지 확인하세요.",
+    "Confirm missing, invalid, network-failed, or timed-out OpenAI calls still produce rule-based Quality Report and Handoff files.": "key 없음, 잘못된 key, 네트워크 실패, timeout 상황에서도 rule-based Quality Report와 Handoff가 생성되는지 확인하세요.",
+    "Verify that config/env key priority works, raw key values are not exposed, and missing or invalid keys still fall back to rule-based Quality Report and Handoff generation.": "config/env key 우선순위, raw key 미노출, key 없음/오류 시 rule-based Quality Report와 Handoff fallback이 모두 동작하는지 확인하세요.",
     "The change can affect what users see in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보는 내용에 영향을 줄 수 있습니다.",
     "The change can affect generated reports, handoff files, or next-session context.": "이번 변경은 생성 보고서, 인수인계 파일, 다음 세션 컨텍스트에 영향을 줄 수 있습니다.",
     "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.": "이번 변경은 DevGuard가 로컬 점검 결과를 사용자용 Quality Report와 인수인계 안내로 바꾸는 방식에 영향을 줍니다.",
