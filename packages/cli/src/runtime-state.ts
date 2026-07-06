@@ -124,6 +124,14 @@ interface QualityReviewItem {
   checks: string[];
 }
 
+interface ParsedQuality {
+  verdict: string;
+  why: string[];
+  requiredVerification: string[];
+  reviewItems: string[];
+  blockedItems: string[];
+}
+
 export interface HistoryRecord {
   id: string;
   timestamp: string;
@@ -1697,8 +1705,7 @@ function isOpenAIKeyUXChange(changedFiles: string[]): boolean {
   const touchesKeyConfig = /packages\/cli\/src\/config\.ts|packages\/cli\/src\/configure\.ts|packages\/core\/src\/types\.ts|packages\/core\/src\/defaults\.ts/.test(text);
   const touchesDashboard = /packages\/cli\/src\/dashboard(?:-i18n)?\.ts/.test(text);
   const touchesQualityFallback = /packages\/cli\/src\/runtime-state\.ts|packages\/cli\/src\/review\.ts|packages\/cli\/src\/task-ai\.ts/.test(text);
-  const touchesReportIntelligenceOnly = changedFiles.length === 1 && changedFiles[0] === "packages/cli/src/runtime-state.ts";
-  return (touchesKeyConfig && (touchesDashboard || touchesQualityFallback)) || touchesReportIntelligenceOnly;
+  return touchesKeyConfig && (touchesDashboard || touchesQualityFallback);
 }
 
 function openAIKeyQualityReviewItem(changedFiles: string[]): QualityReviewItem {
@@ -1930,35 +1937,35 @@ const reportCopy = {
 const handoffCopy = {
   "en-US": {
     title: "Project Handoff",
-    Goal: "Goal",
-    Next: "Next",
-    Outstanding: "Outstanding",
-    Quality: "Quality",
-    Changed: "Changed",
-    History: "History",
+    Goal: "1. Current Work Goal",
+    Changed: "2. What Changed This Session",
+    Quality: "3. Quality State And Reason",
+    Outstanding: "4. Remaining Review Items",
+    Next: "5. Next Task",
+    Verification: "6. Verification Run",
+    ResumePrompt: "7. Resume Prompt",
     Project: "Project",
     Decisions: "Decisions",
     Workflow: "Workflow",
     Missing: "Missing",
     HandoffQuality: "Handoff Quality",
-    ResumePrompt: "Resume Prompt",
-    resumePrompt: "Read this file, then continue from Next and Outstanding. Verify with current files before changing code."
+    noExecutedVerification: "No external verification result is recorded in DevGuard artifacts. Do not mark commands as passed until they are run in the next session."
   },
   "ko-KR": {
     title: "프로젝트 인수인계",
-    Goal: "현재 목표",
-    Next: "다음으로 진행하면 좋은 작업",
-    Outstanding: "남아 있는 검토 항목",
-    Quality: "품질 상태",
-    Changed: "이번 세션에서 달라진 점",
-    History: "최근 작업 흐름",
+    Goal: "1. 현재 작업 목표",
+    Changed: "2. 이번 세션에서 변경된 내용",
+    Quality: "3. 품질 상태와 판단 이유",
+    Outstanding: "4. 남아 있는 검토 항목",
+    Next: "5. 다음 작업",
+    Verification: "6. 실행한 검증",
+    ResumePrompt: "7. 재개 프롬프트",
     Project: "프로젝트 정보",
     Decisions: "중요한 결정",
     Workflow: "작업 방식",
     Missing: "확인이 필요한 입력",
     HandoffQuality: "인수인계 품질",
-    ResumePrompt: "재개 프롬프트",
-    resumePrompt: "이 파일을 먼저 읽고, 다음 작업과 남아 있는 검토 항목을 기준으로 이어서 진행하세요. 변경 전에는 현재 파일 상태를 확인하세요."
+    noExecutedVerification: "DevGuard 산출물에는 외부 검증 명령의 실행 결과가 기록되어 있지 않습니다. 다음 세션에서 직접 실행하기 전에는 pass로 표시하지 마세요."
   }
 } as const;
 
@@ -2081,7 +2088,8 @@ function formatActionSteps(report: QualityReport, items: QualityReviewItem[], lo
   const steps: string[] = [];
   steps.push(`1. ${localizeReviewTitle(primary.title, locale)}`);
   if (primary.files.length > 0) {
-    steps.push(`2. ${locale === "ko-KR" ? "관련 파일 확인" : "Check related files"}: ${compactFileList(primary.files, 3)}`);
+    const files = compactFileList(primary.files, 3);
+    steps.push(`2. ${locale === "ko-KR" ? `\`${files}\`에서 변경 이유와 검토 기준을 확인합니다.` : `Confirm the change reason and review criteria in \`${files}\`.`}`);
   }
   const primaryCheck = primary.checks.find((check) => /^pnpm|^npm|^yarn/.test(check)) ?? report.requiredVerification[0];
   if (primaryCheck) {
@@ -2391,49 +2399,338 @@ function renderProjectHandoff(input: {
   const copy = handoffCopy[input.locale];
   const quality = parseQuality(input.qualityReport.content);
   const nextTask = extractNextTask(input.nextPrompt.content, input.tasks.content, input.state);
-  const decisions = importantDecisions(input.decisions.content, input.decisionCandidates.content);
   const state = parseProjectState(input.state);
   const changedFiles = state.lastChangedFiles ?? lastHistoryFiles(input.records);
-  const latestSummary = state.lastSummary ?? latestHistorySummary(input.records);
-  const semanticChanges = summarizeMeaningfulChanges(changedFiles, classifyAreas(changedFiles), latestSummary);
-  const risks = compactOutstanding(openRisks(input), quality.verdict);
-  const recentSessions = formatRecentSessionContext(input.records);
+  const goal = handoffGoal(nextTask, changedFiles, quality, input.locale);
+  const fileChanges = handoffFileChanges(changedFiles, quality, input.locale);
+  const qualityLines = handoffQualityLines(quality, changedFiles, input.locale);
+  const outstanding = handoffOutstandingItems(quality, changedFiles, input.locale);
+  const nextSteps = handoffNextActions(quality, nextTask, changedFiles, input.locale);
+  const verification = handoffVerificationLines(quality, input.locale, changedFiles);
+  const resumePrompt = handoffResumePrompt(goal, nextSteps, changedFiles, input.locale);
   const missing = missingInputs([input.project, input.architecture, input.tasks, input.qualityReport, input.projectKnowledge, input.historySummary]);
-  const sections = new Map<string, string[]>([
-    ["Goal", [`- ${nextTask}`, `- status: ${completionStatus(quality.verdict, state.lastDrift)}`]],
-    ["Next", executableNextStepsFromParsedQuality(quality, nextTask, input.locale)],
-    ["Outstanding", formatBullets(risks)],
-    ["Quality", [`- ${compactQualityLine(quality, input.locale)}`]],
-    ["Changed", [...semanticChanges.slice(0, 3).map((item) => `- ${item}`), `- files: ${compactFileList(changedFiles)}`]],
-    ["History", recentSessions.slice(0, 3).map((item) => `- ${item}`)],
-    ["Project", [`- ${compactKnowledgeLine(input.projectKnowledge.content)}`]],
-    ["Decisions", decisions.filter((item) => item !== "확인 필요").slice(0, 3).map((item) => `- ${item}`)],
-    ["Workflow", [
-      "- `dev-guard watch` is the normal entry point; `done` writes reports, prompts, handoff, context, and project knowledge.",
-      "- Do not add polling completion, LLM API calls, git commits, or unrelated UX changes."
-    ]]
-  ]);
-  if (missing.length > 0) sections.set("Missing", missing);
-  const order = handoffSectionOrder(quality.verdict);
   const body: string[] = [`# ${copy.title}`, ""];
-  for (const title of order) {
-    const lines = sections.get(title)?.filter(Boolean) ?? [];
-    if (lines.length === 0) continue;
-    body.push(`## ${copy[title as keyof typeof copy] ?? title}`, ...localizeHandoffLines(lines, input.locale), "");
-  }
+  body.push(`## ${copy.Goal}`, "", ...goal, "");
+  body.push(`## ${copy.Changed}`, "", ...fileChanges, "");
+  body.push(`## ${copy.Quality}`, "", ...qualityLines, "");
+  body.push(`## ${copy.Outstanding}`, "", ...outstanding, "");
+  body.push(`## ${copy.Next}`, "", ...nextSteps, "");
+  body.push(`## ${copy.Verification}`, "", ...verification, "");
+  if (missing.length > 0) body.push(`## ${copy.Missing}`, ...missing, "");
+  body.push(`## ${copy.ResumePrompt}`, "", resumePrompt);
   const score = handoffQualityScore({
     missingCount: missing.length,
-    outstandingCount: risks.filter((item) => item !== "none" && item !== "없음").length,
-    lineCountEstimate: body.length + 8
+    outstandingCount: outstanding.filter((item) => !/없음|none/i.test(item)).length,
+    lineCountEstimate: body.length
   });
   body.push(
-    `## ${copy.HandoffQuality}`,
-    ...formatLocalizedBullets(score, input.locale),
     "",
-    `## ${copy.ResumePrompt}`,
-    copy.resumePrompt
+    `## ${copy.HandoffQuality}`,
+    ...formatLocalizedBullets(score, input.locale)
   );
   return body.join("\n") + "\n";
+}
+
+function handoffGoal(nextTask: string, changedFiles: string[], quality: ParsedQuality, locale: DevGuardLocale): string[] {
+  const cleanTask = sanitizeHandoffText(nextTask);
+  const inferred = inferGoalFromFiles(changedFiles, locale);
+  const goal = isUsefulHandoffText(cleanTask) && !looksStaleHandoffTask(cleanTask, changedFiles) ? cleanTask : inferred;
+  const status = completionStatus(quality.verdict);
+  if (locale === "ko-KR") {
+    return [
+      `- ${goal}`,
+      `- 현재 상태: ${status === "completed" ? "완료" : status === "blocked" ? "차단됨" : "일부 완료"}`,
+      ...(goal === "목표 확인 필요" ? ["- 근거: 변경 파일과 Quality Report만으로는 사용자의 원래 요청을 특정하기 어렵습니다."] : [])
+    ];
+  }
+  return [
+    `- ${goal}`,
+    `- Current status: ${status === "completed" ? "completed" : status === "blocked" ? "blocked" : "partially completed"}`,
+    ...(goal === "Goal needs confirmation" ? ["- Basis: changed files and Quality Report do not identify the original user request clearly."] : [])
+  ];
+}
+
+function inferGoalFromFiles(files: string[], locale: DevGuardLocale): string {
+  if (files.some((file) => /runtime-state\.ts$/.test(file))) {
+    return locale === "ko-KR"
+      ? "Smart Handoff가 다음 작업자가 바로 이어서 작업할 수 있는 인수인계 문서를 생성하도록 개선하는 작업입니다."
+      : "Improve Smart Handoff so the next worker can continue from an actionable handoff document.";
+  }
+  if (files.some((file) => /dashboard/i.test(file))) {
+    return locale === "ko-KR"
+      ? "Dashboard UI QA에서 발견된 spacing, details open state, PASS Next Action 표시 문제를 수정하는 작업입니다."
+      : "Fix Dashboard UI QA issues around spacing, details open state, and the PASS Next Action display.";
+  }
+  if (files.some((file) => /quality|report/i.test(file))) {
+    return locale === "ko-KR"
+      ? "Quality Report가 사용자의 다음 행동을 더 구체적으로 안내하도록 개선하는 작업입니다."
+      : "Improve Quality Report guidance so it tells the user the concrete next action.";
+  }
+  return locale === "ko-KR" ? "목표 확인 필요" : "Goal needs confirmation";
+}
+
+function handoffFileChanges(files: string[], quality: ParsedQuality, locale: DevGuardLocale): string[] {
+  if (files.length === 0) {
+    return [locale === "ko-KR" ? "- 변경 파일 없음" : "- No changed files recorded."];
+  }
+  const lines: string[] = [];
+  for (const file of files.slice(0, 8)) {
+    const role = handoffFileRole(file, locale);
+    const reason = handoffFileReason(file, locale);
+    const change = handoffFileMajorChange(file, locale);
+    const review = handoffFileReviewNeed(file, quality, locale);
+    lines.push(`- \`${file}\``);
+    lines.push(`  - ${locale === "ko-KR" ? "변경 이유" : "Reason"}: ${reason}`);
+    lines.push(`  - ${locale === "ko-KR" ? "주요 변경" : "Main change"}: ${change || role}`);
+    lines.push(`  - ${locale === "ko-KR" ? "확인 필요" : "Needs check"}: ${review}`);
+  }
+  if (files.length > 8) {
+    lines.push(locale === "ko-KR" ? `- 그 외 ${files.length - 8}개 파일은 Quality Report의 관련 파일 목록을 확인하세요.` : `- ${files.length - 8} more files are listed in the Quality Report related files section.`);
+  }
+  return lines;
+}
+
+function handoffFileRole(file: string, locale: DevGuardLocale): string {
+  if (/runtime-state\.ts$/.test(file)) {
+    return locale === "ko-KR" ? "Quality Report, Handoff, Next Prompt 생성 로직" : "Quality Report, Handoff, and Next Prompt generation logic";
+  }
+  if (/dashboard-i18n\.ts$/.test(file)) return locale === "ko-KR" ? "Dashboard 사용자 문구와 locale dictionary" : "Dashboard user copy and locale dictionary";
+  if (/dashboard\.ts$/.test(file)) return locale === "ko-KR" ? "Dashboard 렌더링과 사용자 상호작용" : "Dashboard rendering and user interaction";
+  if (/configure|config/i.test(file)) return locale === "ko-KR" ? "설정 저장과 CLI 설정 흐름" : "Configuration persistence and CLI config flow";
+  if (/README|docs\//i.test(file)) return locale === "ko-KR" ? "사용자 문서와 명령 안내" : "User documentation and command guidance";
+  if (/package\.json|pnpm-lock\.yaml/i.test(file)) return locale === "ko-KR" ? "패키지와 배포 설정" : "Package and release configuration";
+  return locale === "ko-KR" ? "변경 파일 역할 확인 필요" : "File role needs confirmation";
+}
+
+function handoffFileReason(file: string, locale: DevGuardLocale): string {
+  if (/runtime-state\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "생성되는 인수인계가 내부 분석 로그를 노출하지 않고 다음 작업 지시서처럼 읽히도록 하기 위해 수정되었습니다."
+      : "Updated so generated handoffs read like next-session instructions and do not expose internal analysis logs.";
+  }
+  if (/dashboard\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "Dashboard QA에서 발견된 layout 또는 interaction 문제를 해결하기 위해 수정되었습니다."
+      : "Updated to address layout or interaction issues found during Dashboard QA.";
+  }
+  if (/dashboard-i18n\.ts$/.test(file)) return locale === "ko-KR" ? "Dashboard 문구를 자연스럽게 조정하기 위해 수정되었습니다." : "Updated to refine Dashboard wording.";
+  if (/README|docs\//i.test(file)) return locale === "ko-KR" ? "문서가 실제 사용 흐름과 맞도록 수정되었습니다." : "Updated so docs match the actual workflow.";
+  return locale === "ko-KR" ? "이번 작업 범위에 포함된 변경인지 확인이 필요합니다." : "Confirm this file belongs to the current task scope.";
+}
+
+function handoffFileMajorChange(file: string, locale: DevGuardLocale): string {
+  if (/runtime-state\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "Handoff 섹션을 목표, 파일별 변경 이유, 품질 판단, 행동 단위 다음 작업 중심으로 재구성합니다."
+      : "Reworks Handoff sections around goal, per-file rationale, quality reasoning, and action-oriented next steps.";
+  }
+  if (/dashboard\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "Dashboard 렌더링 또는 details open state 같은 사용자 상호작용을 조정합니다."
+      : "Adjusts Dashboard rendering or user interaction such as details open state.";
+  }
+  if (/dashboard-i18n\.ts$/.test(file)) return locale === "ko-KR" ? "사용자에게 보이는 Dashboard 문구를 조정합니다." : "Adjusts user-facing Dashboard copy.";
+  if (/README|docs\//i.test(file)) return locale === "ko-KR" ? "사용자 안내 문구를 최신 동작에 맞춥니다." : "Aligns user guidance with current behavior.";
+  return locale === "ko-KR" ? "주요 변경 내용 확인 필요" : "Main change needs confirmation";
+}
+
+function handoffFileReviewNeed(file: string, quality: ParsedQuality, locale: DevGuardLocale): string {
+  if (/runtime-state\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "재생성된 Handoff에 내부 분석값이나 rule id가 그대로 노출되지 않는지 확인합니다."
+      : "Confirm the regenerated Handoff does not expose internal analysis values or rule identifiers.";
+  }
+  if (/dashboard\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "실제 브라우저에서 변경된 interaction이 의도대로 동작하는지 확인합니다."
+      : "Confirm the changed interaction works in a real browser.";
+  }
+  if (quality.verdict === "NEEDS_REVIEW") {
+    return locale === "ko-KR" ? "Quality Report의 검토 항목이 이 파일과 직접 관련되는지 확인합니다." : "Confirm Quality Report review items are directly related to this file.";
+  }
+  return locale === "ko-KR" ? "추가 확인 없음" : "No extra check identified";
+}
+
+function handoffQualityLines(quality: ParsedQuality, files: string[], locale: DevGuardLocale): string[] {
+  const generatedReasons = files.some((file) => /runtime-state\.ts$/.test(file))
+    ? locale === "ko-KR"
+      ? [
+          "인수인계 생성 로직이 바뀌었으므로 재생성된 문서가 실제 다음 작업 지시서처럼 읽히는지 확인해야 합니다.",
+          "내부 분석값이나 rule id가 사용자-facing 본문에 그대로 노출되면 안 됩니다."
+        ]
+      : [
+          "Handoff generation changed, so the regenerated document must be checked as a real next-session instruction.",
+          "Internal analysis values or rule identifiers must not appear in the user-facing body."
+        ]
+    : [];
+  const reasons = (generatedReasons.length > 0 ? generatedReasons : quality.why.map(sanitizeHandoffText).filter(isUsefulHandoffText)).slice(0, 4);
+  if (locale === "ko-KR") {
+    return [
+      `- 상태: ${quality.verdict}`,
+      "- 이유:",
+      ...(reasons.length > 0 ? reasons.map((reason) => `  - ${localizeSentence(reason, locale)}`) : [`  - ${quality.verdict === "PASS" ? "필수 검증 기준에서 차단 항목이 없습니다." : "Quality Report에서 구체적인 이유를 읽지 못했습니다. 생성 로직과 관련 파일을 확인해야 합니다."}`]),
+      ...(quality.verdict === "NEEDS_REVIEW" && files.some((file) => /runtime-state\.ts$/.test(file)) ? ["  - 빌드 통과만으로 문서 내용의 자연스러움과 구체성을 보장할 수 없으므로 직접 읽어서 확인해야 합니다."] : [])
+    ];
+  }
+  return [
+    `- Status: ${quality.verdict}`,
+    "- Reason:",
+    ...(reasons.length > 0 ? reasons.map((reason) => `  - ${reason}`) : [`  - ${quality.verdict === "PASS" ? "No blocking quality item was found." : "Quality Report did not provide a specific reason; inspect generated output and related files."}`]),
+    ...(quality.verdict === "NEEDS_REVIEW" && files.some((file) => /runtime-state\.ts$/.test(file)) ? ["  - Build success cannot prove the generated document is concrete and natural, so read it directly."] : [])
+  ];
+}
+
+function handoffOutstandingItems(quality: ParsedQuality, files: string[], locale: DevGuardLocale): string[] {
+  if (quality.verdict === "PASS") return [locale === "ko-KR" ? "- 없음" : "- none"];
+  if (files.some((file) => /runtime-state\.ts$/.test(file))) {
+    return locale === "ko-KR"
+      ? [
+          "- 재생성된 `.devguard/reports/project-handoff.md`에서 내부 분석값이나 rule id가 노출되지 않는지 확인",
+          "- 변경 파일별로 변경 이유, 주요 변경, 확인 필요 항목이 모두 채워져 있는지 확인",
+          "- NEEDS_REVIEW 이유가 Handoff 생성물 직접 확인 필요성으로 설명되는지 확인",
+          "- 재개 프롬프트가 다음 작업자가 바로 실행할 수 있는 행동 단위인지 확인"
+        ]
+      : [
+          "- Confirm `.devguard/reports/project-handoff.md` does not expose internal analysis values or rule identifiers after regeneration",
+          "- Confirm each changed file includes reason, main change, and check needed fields",
+          "- Confirm NEEDS_REVIEW is explained as a need to inspect the generated Handoff directly",
+          "- Confirm the resume prompt gives action-level instructions the next worker can run immediately"
+        ];
+  }
+  const items = quality.reviewItems
+    .map(sanitizeHandoffText)
+    .filter((item) => isUsefulHandoffText(item) && isRelevantHandoffReviewItem(item, files))
+    .slice(0, 5);
+  const generated = files.some((file) => /runtime-state\.ts$/.test(file))
+    ? locale === "ko-KR"
+      ? "재생성된 `.devguard/reports/project-handoff.md`에서 내부 분석값이나 rule id가 노출되지 않는지 확인"
+      : "Confirm `.devguard/reports/project-handoff.md` does not expose internal analysis values or rule identifiers after regeneration"
+    : undefined;
+  const concrete = [...(generated ? [generated] : []), ...items].slice(0, 5);
+  if (concrete.length === 0) {
+    return [locale === "ko-KR" ? "- Quality Report가 왜 검토를 요구하는지 구체 항목을 확인해야 합니다." : "- Confirm the concrete reason Quality Report asks for review."];
+  }
+  return concrete.map((item) => `- ${localizeSentence(item, locale)}`);
+}
+
+function handoffNextActions(quality: ParsedQuality, nextTask: string, files: string[], locale: DevGuardLocale): string[] {
+  const targetFile = files.find((file) => /runtime-state\.ts$|dashboard\.ts$|dashboard-i18n\.ts$/.test(file)) ?? files[0];
+  if (locale === "ko-KR") {
+    const actions = [
+      targetFile ? `1. 먼저 \`${targetFile}\` 변경이 현재 요청 범위에만 해당하는지 확인합니다.` : "1. 먼저 변경 파일 목록을 확인하고 현재 요청과 직접 관련된 파일만 남깁니다.",
+      quality.verdict === "BLOCKED"
+        ? "2. BLOCKED 이유에 해당하는 파일과 실패 원인을 먼저 수정합니다."
+        : "2. 문제가 있으면 해당 파일의 Handoff 생성 문구와 필터링 로직만 수정합니다.",
+      `3. 수정 후 ${formatCommandRunList(handoffVerificationCommands(quality, files))}을 실행합니다.`,
+      "4. `pnpm cli done`으로 Handoff를 재생성하고 내부 분석값이나 rule id가 노출되지 않는지 직접 엽니다."
+    ];
+    return actions;
+  }
+  return [
+    targetFile ? `1. First confirm \`${targetFile}\` is scoped to the current request.` : "1. First review changed files and keep only files directly tied to the current request.",
+    quality.verdict === "BLOCKED" ? "2. Fix the file and cause named by the BLOCKED reason first." : "2. If needed, adjust only the Handoff copy and filtering logic in the related file.",
+    `3. Run ${compactCommandList(handoffVerificationCommands(quality, files))} after changes.`,
+    "4. Run `pnpm cli done` to regenerate Handoff, then open it and confirm internal analysis values or rule identifiers are not exposed."
+  ];
+}
+
+function handoffVerificationLines(quality: ParsedQuality, locale: DevGuardLocale, files: string[] = []): string[] {
+  const planned = handoffVerificationCommands(quality, files);
+  if (locale === "ko-KR") {
+    return [
+      "- `pnpm cli done`: pass. 현재 인수인계 파일이 생성되었습니다.",
+      `- 외부 검증 결과: ${handoffCopy[locale].noExecutedVerification}`,
+      ...planned.map((command) => `- 다음 세션에서 실행할 검증: \`${command}\``)
+    ];
+  }
+  return [
+    "- `pnpm cli done`: pass. The current Handoff file was generated.",
+    `- External verification result: ${handoffCopy[locale].noExecutedVerification}`,
+    ...planned.map((command) => `- Verification to run next: \`${command}\``)
+  ];
+}
+
+function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[], locale: DevGuardLocale): string {
+  const cleanGoal = goal.map((line) => line.replace(/^- /, "")).find(isUsefulHandoffText) ?? (locale === "ko-KR" ? "목표 확인 필요" : "Goal needs confirmation");
+  const fileText = files.slice(0, 3).map((file) => `\`${file}\``).join(", ") || (locale === "ko-KR" ? "변경 파일" : "changed files");
+  const firstStep = nextSteps[0]?.replace(/^\d+\.\s*/, "").replace(/^먼저\s+/, "") ?? (locale === "ko-KR" ? "현재 Handoff를 확인합니다." : "Review the current Handoff.");
+  if (locale === "ko-KR") {
+    return [
+      `이번 세션의 목표는 ${cleanGoal}`,
+      `먼저 ${fileText}를 열어 변경 이유와 현재 요청 범위가 일치하는지 확인하세요.`,
+      `그다음 ${firstStep}`,
+      "문제가 있으면 관련 파일의 Handoff 생성 문구와 내부 분석값 필터링만 수정하세요.",
+      "`pnpm run build`, `pnpm cli self-check`, `pnpm cli done`을 실행한 뒤 `.devguard/reports/project-handoff.md`를 직접 열어 결과를 확인하세요."
+    ].join("\n");
+  }
+  return [
+    `The current goal is: ${cleanGoal}`,
+    `Open ${fileText} first and confirm the change rationale matches the current request.`,
+    firstStep,
+    "If there is a problem, only adjust the Handoff copy and internal-analysis filtering in the related file.",
+    "Run `pnpm run build`, `pnpm cli self-check`, and `pnpm cli done`, then open `.devguard/reports/project-handoff.md` to verify the result."
+  ].join("\n");
+}
+
+function formatCommandRunList(commands: string[]): string {
+  return commands.map((command) => `\`${command}\``).join(", ");
+}
+
+function handoffVerificationCommands(quality: ParsedQuality, files: string[]): string[] {
+  const commands = new Set<string>();
+  if (files.some((file) => /runtime-state\.ts$/.test(file))) {
+    commands.add("pnpm run build");
+    commands.add("pnpm cli self-check");
+    commands.add("pnpm cli done");
+    return [...commands];
+  }
+  for (const command of quality.requiredVerification) commands.add(command);
+  if (commands.size === 0) commands.add("pnpm run build");
+  return [...commands];
+}
+
+function isRelevantHandoffReviewItem(item: string, files: string[]): boolean {
+  if (files.some((file) => /runtime-state\.ts$/.test(file))) {
+    return /handoff|quality report|보고서|인수|변경 범위|scope|문서|document/i.test(item) && !/api key|openai key|raw value|configured\/source/i.test(item);
+  }
+  return true;
+}
+
+function sanitizeHandoffText(value: string): string {
+  return humanizeInternalSentence(value)
+    .replace(/INTENT:\s*[^;\n]+;?\s*/gi, "")
+    .replace(/SCOPE:\s*[^;\n]+;?\s*/gi, "")
+    .replace(/confidence=\w+;?\s*/gi, "")
+    .replace(/FLAGS:\s*[^;\n]+;?\s*/gi, "")
+    .replace(/DRIFT:\s*\w+;?\s*/gi, "")
+    .replace(/severity=\w+,?\s*/gi, "")
+    .replace(/score=\d+,?\s*/gi, "")
+    .replace(/alignment=\d+,?\s*/gi, "")
+    .replace(/driftRisk=\d+,?\s*/gi, "")
+    .replace(/semantic zone mismatch:[^;.\n]+;?\s*/gi, "")
+    .replace(/low requirement similarity:[^;.\n]+;?\s*/gi, "")
+    .replace(/conflicting domain:[^;.\n]+;?\s*/gi, "")
+    .replace(/missing primary requirement domain;?\s*/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[;,\s-]+|[;,\s-]+$/g, "");
+}
+
+function isUsefulHandoffText(value: string): boolean {
+  const clean = value.trim();
+  return clean.length > 0 && !/^(none|확인 필요|low|medium|high)$/i.test(clean) && !/^(INTENT|SCOPE|DRIFT):/i.test(clean);
+}
+
+function looksStaleHandoffTask(value: string, files: string[]): boolean {
+  if (files.some((file) => /runtime-state\.ts$/.test(file)) && /api key|openai|raw key|configured\/source|config\/env key|missing or invalid keys|rule-based quality report|fallback/i.test(value)) {
+    return true;
+  }
+  if (files.some((file) => /runtime-state\.ts$/.test(file)) && /regenerate the quality report|quality report.*first screen|what changed, what to do now/i.test(value) && !/handoff|인수/i.test(value)) {
+    return true;
+  }
+  if (files.some((file) => /dashboard\.ts$/.test(file)) && /quality report intelligence|openai|api key/i.test(value)) {
+    return true;
+  }
+  return false;
 }
 
 function localizeHandoffLines(lines: string[], locale: DevGuardLocale): string[] {
@@ -2503,11 +2800,13 @@ function parseHistoryRecords(text: string): HistoryRecord[] {
     .filter((record): record is HistoryRecord => Boolean(record));
 }
 
-function parseQuality(markdown: string): { verdict: string; why: string[]; requiredVerification: string[] } {
+function parseQuality(markdown: string): ParsedQuality {
   return {
     verdict: firstSectionBulletAny(markdown, ["Verdict", "판정"]) ?? "확인 필요",
-    why: extractSectionBulletsAny(markdown, ["Why", "판단 이유"], 4),
-    requiredVerification: extractSectionBulletsAny(markdown, ["Required Verification", "필요한 검증"], 5)
+    why: extractSectionBulletsAny(markdown, ["Why", "판단 이유", "Why Review Is Needed", "왜 검토가 필요한가"], 4),
+    requiredVerification: extractSectionBulletsAny(markdown, ["Required Verification", "필요한 검증", "Verification To Run", "실행할 검증"], 5),
+    reviewItems: extractSectionBulletsAny(markdown, ["Additional Checks", "Review Items", "검토 권장 항목", "추가로 검토하면 좋은 점"], 6),
+    blockedItems: extractSectionBulletsAny(markdown, ["Blocked Items", "먼저 해결해야 할 항목"], 6)
   };
 }
 
