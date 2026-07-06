@@ -1573,6 +1573,14 @@ function buildQualitySummary(input: {
   issueItems: QualityCheckItem[];
   requiredVerification: string[];
 }): string[] {
+  if (isQualityReportGenerationChange(input.changedFiles)) {
+    return [
+      "This change turns the generated Quality Report into a QA result document instead of a generic checklist.",
+      "The report should explain the verdict, summarize the change, describe what changed per file, and separate completed QA from missing QA.",
+      "Because the report generation logic changed, the regenerated markdown must be read directly after `pnpm cli done`.",
+      "Build success alone cannot prove the generated QA wording is specific, natural, and free of internal rule labels."
+    ];
+  }
   if (isOpenAIKeyUXChange(input.changedFiles)) {
     return [
       "This change adds OpenAI API key setup to both the CLI and Dashboard.",
@@ -1606,6 +1614,13 @@ function buildQualityReasons(input: {
 }): string[] {
   if (input.verdict === "PASS") {
     return ["The change scope is small, verification commands are available, and no blocking local quality rule fired."];
+  }
+  if (isQualityReportGenerationChange(input.changedFiles)) {
+    return [
+      "Quality Report generation changed, so the generated markdown itself is the behavior under test.",
+      "The report must show what changed, why the verdict was chosen, what QA is complete, and what QA remains.",
+      "The implementation should not expose internal analysis labels or replace QA reasoning with generic commands."
+    ];
   }
   if (isOpenAIKeyUXChange(input.changedFiles)) {
     return [
@@ -1652,6 +1667,9 @@ function buildQualityNextAction(input: {
   issueItems: QualityCheckItem[];
   requiredVerification: string[];
 }): string {
+  if (isQualityReportGenerationChange(input.changedFiles)) {
+    return "Regenerate the Quality Report, read the generated markdown, and confirm it explains the QA result, changed files, risks, and next QA without generic review wording.";
+  }
   if (isOpenAIKeyUXChange(input.changedFiles)) {
     return "Verify that config/env key priority works, raw key values are not exposed, and missing or invalid keys still fall back to rule-based Quality Report and Handoff generation.";
   }
@@ -1670,6 +1688,9 @@ function buildQualityNextAction(input: {
 }
 
 function qualityImpactSummary(changedFiles: string[], areas: string[]): string {
+  if (isQualityReportGenerationChange(changedFiles)) {
+    return "This change affects how DevGuard explains the current session's QA result in the generated Quality Report.";
+  }
   if (isOpenAIKeyUXChange(changedFiles)) {
     return "This change affects OpenAI API key setup, secret handling, Dashboard API state, and Quality Report fallback behavior.";
   }
@@ -1706,6 +1727,10 @@ function isOpenAIKeyUXChange(changedFiles: string[]): boolean {
   const touchesDashboard = /packages\/cli\/src\/dashboard(?:-i18n)?\.ts/.test(text);
   const touchesQualityFallback = /packages\/cli\/src\/runtime-state\.ts|packages\/cli\/src\/review\.ts|packages\/cli\/src\/task-ai\.ts/.test(text);
   return touchesKeyConfig && (touchesDashboard || touchesQualityFallback);
+}
+
+function isQualityReportGenerationChange(changedFiles: string[]): boolean {
+  return changedFiles.some((file) => /packages\/cli\/src\/runtime-state\.ts$/.test(file));
 }
 
 function openAIKeyQualityReviewItem(changedFiles: string[]): QualityReviewItem {
@@ -1758,7 +1783,7 @@ function userFacingReason(item: QualityCheckItem, changedFiles: string[], areas:
   }
   if (item.label === "state/history verification") {
     if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
-      return `Quality Report or handoff generation changed. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names.${fileText}`;
+      return `Quality Report generation changed. Confirm the regenerated report reads like a QA result, explains each relevant file role, and does not expose internal rule names.${fileText}`;
     }
     return `State, history, prompt, or report generation changed. Confirm done/status/handoff regenerate the expected files without stale state.${fileText}`;
   }
@@ -1766,7 +1791,7 @@ function userFacingReason(item: QualityCheckItem, changedFiles: string[], areas:
     return `Source files changed without documentation changes. If user-facing behavior changed, update the relevant README or docs page.${fileText}`;
   }
   if (item.label === "drift clarity") {
-    return `The changed files should be checked against the current task, not against a generic rule. Confirm the diff is only improving the Quality Report review experience.${fileText}`;
+    return `The changed files should be checked against the current task. Confirm the diff is limited to Quality Report QA wording and generation behavior.${fileText}`;
   }
   return `${item.detail}${fileText}`;
 }
@@ -1809,9 +1834,9 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
     if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
       return {
         title: "Quality Report output review",
-        body: ["Regenerate the Quality Report and confirm the first screen tells the user what changed, what to do now, and why it matters."],
+        body: ["Regenerate the Quality Report and confirm it reads like a QA result: verdict, change summary, file-level changes, completed QA, missing QA, risks, and next QA."],
         files,
-        checks: ["pnpm cli done", "Read .devguard/reports/quality-report.md", "Confirm no internal rule names appear in the main sections."]
+        checks: ["pnpm cli done", "Read .devguard/reports/quality-report.md", "Confirm no internal rule names or generic review-only phrases appear in the main sections."]
       };
     }
     return {
@@ -1848,7 +1873,7 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
   if (item.label === "drift clarity") {
     return {
       title: "Change scope check",
-      body: ["Confirm the diff is focused on Quality Report intelligence and does not change unrelated watch, hook, dashboard, or release behavior."],
+      body: ["Confirm the diff is focused on Quality Report QA wording and generation behavior without changing Dashboard, Handoff, watch, hook, or release behavior."],
       files,
       checks: ["Review git diff by file.", "Keep only changes required for the current task."]
     };
@@ -1900,16 +1925,14 @@ function dedupeReviewItems(items: QualityReviewItem[]): QualityReviewItem[] {
 const reportCopy = {
   "en-US": {
     title: "Completion Quality Report",
-    verdict: "Verdict",
-    result: "Result",
-    important: "What Matters In This Change",
-    actionNow: "What To Do Now",
-    why: "Why Review Is Needed",
-    relatedFiles: "Related Files",
-    requiredVerification: "Required Verification",
+    finalVerdict: "1. Final Verdict",
+    qaSummary: "2. QA Summary",
+    changed: "3. What Changed",
+    qaResult: "4. QA Result",
+    risks: "5. Risks Found",
+    why: "6. Why This Verdict",
+    nextQa: "7. Next QA",
     aiSummary: "AI Summary",
-    blockedItems: "Blocked Items",
-    warnings: "Additional Checks",
     riskChecklist: "Risk Checklist",
     beforeCommit: "Before Commit",
     nextRecommendedAction: "Next Recommended Action",
@@ -1917,16 +1940,14 @@ const reportCopy = {
   },
   "ko-KR": {
     title: "완료 품질 보고서",
-    verdict: "판정",
-    result: "결과",
-    important: "이번 변경에서 중요한 점",
-    actionNow: "지금 해야 하는 작업",
-    why: "왜 검토가 필요한가",
-    relatedFiles: "관련 파일",
-    requiredVerification: "필요한 검증",
+    finalVerdict: "1. 최종 판정",
+    qaSummary: "2. QA 요약",
+    changed: "3. 이번 변경 내용",
+    qaResult: "4. QA 결과",
+    risks: "5. 발견된 위험 요소",
+    why: "6. 왜 이 판정이 나왔는가",
+    nextQa: "7. 다음 QA",
     aiSummary: "AI 요약",
-    blockedItems: "먼저 해결해야 할 항목",
-    warnings: "추가로 검토하면 좋은 점",
     riskChecklist: "위험 점검표",
     beforeCommit: "커밋 전 확인",
     nextRecommendedAction: "다음으로 진행하면 좋은 작업",
@@ -1981,20 +2002,34 @@ function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale):
   return [
     `# ${copy.title}`,
     "",
-    `## ${copy.verdict}`,
+    `## ${copy.finalVerdict}`,
     "",
-    report.verdict,
+    ...formatFinalVerdict(report, locale),
     "",
-    `## ${copy.result}`,
+    `## ${copy.qaSummary}`,
     "",
-    locale === "ko-KR" ? "필수 품질 검사를 통과했습니다." : "Required quality checks passed.",
+    ...formatQASummary(report, locale),
     "",
-    locale === "ko-KR" ? "추가 작업은 필요하지 않습니다." : "No additional action is required.",
-    ...(aiNote.length > 0 ? ["", `## ${copy.aiSummary}`, "", ...aiNote] : []),
+    `## ${copy.changed}`,
     "",
-    `## ${locale === "ko-KR" ? "실행할 검증" : "Verification To Run"}`,
+    ...formatQualityChangedFiles(report, locale),
     "",
-    ...report.requiredVerification.slice(0, 4).map((command) => `- ${command}`)
+    `## ${copy.qaResult}`,
+    "",
+    ...formatQAResults(report, locale),
+    "",
+    `## ${copy.risks}`,
+    "",
+    ...formatQARisks(report, locale),
+    "",
+    `## ${copy.why}`,
+    "",
+    ...formatQualityVerdictReasons(report, locale),
+    "",
+    `## ${copy.nextQa}`,
+    "",
+    ...formatNextQAActions(report, [], locale),
+    ...(aiNote.length > 0 ? ["", `## ${copy.aiSummary}`, "", ...aiNote] : [])
   ].join("\n") + "\n";
 }
 
@@ -2006,27 +2041,34 @@ function renderNeedsReviewQualityReport(report: QualityReport, locale: DevGuardL
   return [
     `# ${copy.title}`,
     "",
-    `## ${copy.verdict}`,
-    `- ${report.verdict}`,
-    ...formatAIQualityNote(report, locale),
+    `## ${copy.finalVerdict}`,
     "",
-    `## ${copy.important}`,
-    ...formatLocalizedBullets(report.summary, locale),
+    ...formatFinalVerdict(report, locale),
     "",
-    `## ${copy.actionNow}`,
-    ...formatActionSteps(report, warningReviewItems, locale),
+    `## ${copy.qaSummary}`,
+    "",
+    ...formatQASummary(report, locale),
+    "",
+    `## ${copy.changed}`,
+    "",
+    ...formatQualityChangedFiles(report, locale),
+    "",
+    `## ${copy.qaResult}`,
+    "",
+    ...formatQAResults(report, locale),
+    "",
+    `## ${copy.risks}`,
+    "",
+    ...formatQARisks(report, locale),
     "",
     `## ${copy.why}`,
-    ...formatLocalizedBullets(report.why, locale),
     "",
-    `## ${copy.relatedFiles}`,
-    ...formatRelatedFiles(report.relatedFiles, report.reviewItems, locale),
+    ...formatQualityVerdictReasons(report, locale),
     "",
-    `## ${copy.requiredVerification}`,
-    ...report.requiredVerification.map((command) => `- ${command}`),
+    `## ${copy.nextQa}`,
     "",
-    `## ${copy.warnings}`,
-    ...formatReviewQuestions(warningReviewItems, locale),
+    ...formatNextQAActions(report, warningReviewItems, locale),
+    ...formatAIQualitySection(report, locale),
   ].join("\n") + "\n";
 }
 
@@ -2038,25 +2080,228 @@ function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocal
   return [
     `# ${copy.title}`,
     "",
-    `## ${copy.verdict}`,
-    `- ${report.verdict}`,
-    ...formatAIQualityNote(report, locale),
+    `## ${copy.finalVerdict}`,
     "",
-    `## ${copy.blockedItems}`,
-    ...formatReviewItems(blockedReviewItems, locale),
+    ...formatFinalVerdict(report, locale),
+    "",
+    `## ${copy.qaSummary}`,
+    "",
+    ...formatQASummary(report, locale),
+    "",
+    `## ${copy.changed}`,
+    "",
+    ...formatQualityChangedFiles(report, locale),
+    "",
+    `## ${copy.qaResult}`,
+    "",
+    ...formatQAResults(report, locale),
+    "",
+    `## ${copy.risks}`,
+    "",
+    ...formatQARisks(report, locale),
     "",
     `## ${copy.why}`,
-    ...formatLocalizedBullets(report.why, locale),
     "",
-    `## ${copy.relatedFiles}`,
-    ...formatRelatedFiles(report.relatedFiles, report.reviewItems, locale),
+    ...formatQualityVerdictReasons(report, locale),
     "",
-    `## ${copy.requiredVerification}`,
-    ...report.requiredVerification.map((command) => `- ${command}`),
+    `## ${copy.nextQa}`,
     "",
-    `## ${copy.warnings}`,
-    ...formatReviewQuestions(warningReviewItems, locale),
+    ...formatNextQAActions(report, [...blockedReviewItems, ...warningReviewItems], locale),
+    ...formatAIQualitySection(report, locale),
   ].join("\n") + "\n";
+}
+
+function formatAIQualitySection(report: QualityReport, locale: DevGuardLocale): string[] {
+  const note = formatAIQualityNote(report, locale);
+  return note.length > 0 ? ["", `## ${reportCopy[locale].aiSummary}`, "", ...note] : [];
+}
+
+function formatFinalVerdict(report: QualityReport, locale: DevGuardLocale): string[] {
+  const icon = report.verdict === "PASS" ? "🟢" : report.verdict === "BLOCKED" ? "🔴" : "🟡";
+  const summary = verdictOneLine(report, locale);
+  return [`${icon} ${report.verdict}`, "", summary];
+}
+
+function verdictOneLine(report: QualityReport, locale: DevGuardLocale): string {
+  if (locale === "ko-KR") {
+    if (report.verdict === "PASS") return "현재 품질 규칙에서 차단 항목이 발견되지 않았습니다.";
+    if (report.verdict === "BLOCKED") return "완료를 막는 항목이 있어 먼저 수정이 필요합니다.";
+    return "기본 검사는 진행됐지만 생성물이나 실제 동작 확인이 남아 있습니다.";
+  }
+  if (report.verdict === "PASS") return "No blocking item was found by the current quality rules.";
+  if (report.verdict === "BLOCKED") return "A blocking item must be fixed before this can be considered complete.";
+  return "Local checks ran, but generated output or runtime behavior still needs direct QA.";
+}
+
+function formatQASummary(report: QualityReport, locale: DevGuardLocale): string[] {
+  const lines = report.summary.map(sanitizeQualitySentence).filter(isUsefulQualityLine).slice(0, 5);
+  if (lines.length === 0) {
+    return locale === "ko-KR"
+      ? ["이번 변경의 의미를 자동으로 충분히 요약하지 못했습니다.", "아래 변경 파일과 QA 결과를 기준으로 실제 동작을 확인해야 합니다."]
+      : ["DevGuard could not produce a detailed change summary automatically.", "Use the changed files and QA result sections below to verify behavior."];
+  }
+  return lines.map((line) => localizeSentence(line, locale));
+}
+
+function formatQualityChangedFiles(report: QualityReport, locale: DevGuardLocale): string[] {
+  const files = report.relatedFiles.length > 0 ? report.relatedFiles : report.reviewItems.flatMap((item) => item.files);
+  const unique = [...new Set(files)].slice(0, 10);
+  if (unique.length === 0) {
+    return [locale === "ko-KR" ? "- 변경 파일 없음" : "- No changed files recorded."];
+  }
+  const lines: string[] = [];
+  for (const file of unique) {
+    lines.push(`- \`${file}\``);
+    lines.push(`  - ${locale === "ko-KR" ? "무엇을 변경했는가" : "What changed"}: ${qualityFileChangeDescription(file, locale)}`);
+    lines.push(`  - ${locale === "ko-KR" ? "왜 변경했는가" : "Why it changed"}: ${qualityFileReason(file, report, locale)}`);
+  }
+  return lines;
+}
+
+function qualityFileChangeDescription(file: string, locale: DevGuardLocale): string {
+  if (/runtime-state\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "Quality Report의 판정, QA 요약, 변경 파일 설명, 다음 QA 문구를 생성하는 흐름을 조정합니다."
+      : "Adjusts the flow that generates Quality Report verdicts, QA summaries, file explanations, and next-QA guidance.";
+  }
+  if (/dashboard\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "Dashboard 표시나 사용자 상호작용 동작을 조정합니다."
+      : "Adjusts Dashboard display or user interaction behavior.";
+  }
+  if (/dashboard-i18n\.ts$/.test(file)) {
+    return locale === "ko-KR" ? "Dashboard의 사용자-facing 문구와 번역을 조정합니다." : "Adjusts Dashboard user-facing copy and translations.";
+  }
+  if (/README|docs\//i.test(file)) return locale === "ko-KR" ? "사용자 문서와 명령 안내를 조정합니다." : "Adjusts user documentation and command guidance.";
+  if (/package\.json|pnpm-lock\.yaml/i.test(file)) return locale === "ko-KR" ? "패키지 설정이나 의존성 상태를 조정합니다." : "Adjusts package metadata or dependency state.";
+  return locale === "ko-KR" ? "변경 내용 확인 필요" : "Change detail needs confirmation";
+}
+
+function qualityFileReason(file: string, report: QualityReport, locale: DevGuardLocale): string {
+  if (/runtime-state\.ts$/.test(file)) {
+    return locale === "ko-KR"
+      ? "생성되는 Quality Report가 단순 체크리스트가 아니라 이번 변경의 QA 결과를 설명하도록 하기 위해 변경되었습니다."
+      : "Changed so generated Quality Reports explain the QA result for this session instead of acting like a generic checklist.";
+  }
+  const item = report.reviewItems.find((reviewItem) => reviewItem.files.includes(file));
+  if (item?.body[0]) return localizeSentence(sanitizeQualitySentence(item.body[0]), locale);
+  if (report.verdict === "NEEDS_REVIEW") return locale === "ko-KR" ? "이 파일이 현재 검토 대상에 포함되어 있어 실제 영향 확인이 필요합니다." : "This file is part of the current review surface and needs impact verification.";
+  return locale === "ko-KR" ? "현재 변경 범위에 포함된 파일입니다." : "This file is part of the current change scope.";
+}
+
+function formatQAResults(report: QualityReport, locale: DevGuardLocale): string[] {
+  const passed = report.checklist.filter((item) => item.status === "PASS" && item.affectsVerdict !== false);
+  const blocked = report.checklist.filter((item) => item.status === "BLOCKED");
+  const warnings = report.checklist.filter((item) => item.status === "WARN");
+  const lines: string[] = [];
+  lines.push(locale === "ko-KR" ? "✅ 확인 완료" : "✅ Completed");
+  if (passed.length > 0) {
+    for (const item of passed.slice(0, 5)) lines.push(`- ${qualityCheckOutcome(item, locale)}`);
+  } else {
+    lines.push(locale === "ko-KR" ? "- 완료로 기록된 품질 항목이 없습니다." : "- No quality item is recorded as completed.");
+  }
+  lines.push("");
+  lines.push(locale === "ko-KR" ? "⚠ 추가 확인 필요" : "⚠ Needs Additional QA");
+  const pending = [...blocked, ...warnings];
+  if (pending.length > 0) {
+    for (const item of pending.slice(0, 6)) lines.push(`- ${qualityCheckOutcome(item, locale)}`);
+  } else {
+    lines.push(locale === "ko-KR" ? "- 추가 확인이 필요한 품질 항목은 없습니다." : "- No additional quality item needs review.");
+  }
+  lines.push(...unrecordedVerificationLines(report.requiredVerification, locale));
+  return lines;
+}
+
+function qualityCheckOutcome(item: QualityCheckItem, locale: DevGuardLocale): string {
+  const label = qualityLabel(item.label, locale);
+  const detail = qualityDetail(item, locale);
+  if (locale === "ko-KR") {
+    if (item.status === "PASS") return `${label}: ${detail}`;
+    if (item.status === "BLOCKED") return `${label}: 완료를 막는 항목입니다. ${detail}`;
+    return `${label}: 추가 확인이 필요합니다. ${detail}`;
+  }
+  if (item.status === "PASS") return `${label}: ${detail}`;
+  if (item.status === "BLOCKED") return `${label}: blocking item. ${detail}`;
+  return `${label}: needs additional QA. ${detail}`;
+}
+
+function unrecordedVerificationLines(commands: string[], locale: DevGuardLocale): string[] {
+  if (commands.length === 0) return [];
+  return commands.slice(0, 5).map((command) =>
+    locale === "ko-KR"
+      ? `- 실행 결과 미기록: \`${command}\`는 Quality Report 생성 시점에 통과 여부가 기록되어 있지 않습니다.`
+      : `- Not recorded: \`${command}\` has no pass/fail result recorded at Quality Report generation time.`
+  );
+}
+
+function formatQARisks(report: QualityReport, locale: DevGuardLocale): string[] {
+  const risks = report.checklist.filter((item) => item.status !== "PASS" && item.affectsVerdict !== false);
+  if (risks.length === 0) {
+    return [locale === "ko-KR" ? "특별한 위험 요소는 발견되지 않았습니다." : "No specific risk was found."];
+  }
+  return risks.slice(0, 6).map((item) => {
+    const reason = userFacingReason(item, report.relatedFiles, []);
+    return `- ${localizeSentence(sanitizeQualitySentence(reason), locale)}`;
+  });
+}
+
+function formatQualityVerdictReasons(report: QualityReport, locale: DevGuardLocale): string[] {
+  const reasons = report.why.map(sanitizeQualitySentence).filter(isUsefulQualityLine).slice(0, 5);
+  if (reasons.length > 0) return reasons.map((reason) => `- ${localizeSentence(reason, locale)}`);
+  if (report.verdict === "PASS") {
+    return [locale === "ko-KR" ? "- 차단 항목이 없고 현재 품질 규칙에서 추가 QA가 요구되지 않습니다." : "- No blocking item was found and the current quality rules do not require more QA."];
+  }
+  if (report.verdict === "BLOCKED") {
+    return [locale === "ko-KR" ? "- 완료를 막는 항목이 있어 먼저 수정해야 합니다." : "- A blocking item exists and must be fixed first."];
+  }
+  return [locale === "ko-KR" ? "- 자동 점검만으로 충분하지 않아 실제 생성물 또는 동작 확인이 필요합니다." : "- Automated checks are not enough; generated output or runtime behavior needs direct QA."];
+}
+
+function formatNextQAActions(report: QualityReport, items: QualityReviewItem[], locale: DevGuardLocale): string[] {
+  const primaryItems = items.length > 0 ? items : report.reviewItems;
+  const actions: string[] = [];
+  const first = primaryItems[0];
+  if (first) {
+    actions.push(`1. ${localizeReviewTitle(first.title, locale)}: ${localizeSentence(sanitizeQualitySentence(first.body[0] ?? report.nextRecommendedAction), locale)}`);
+    const files = first.files.length > 0 ? first.files : report.relatedFiles;
+    if (files.length > 0) {
+      actions.push(`2. ${locale === "ko-KR" ? `${compactFileList(files, 3)}에서 위 QA 기준이 실제 변경과 맞는지 확인합니다.` : `Check ${compactFileList(files, 3)} against the QA criterion above.`}`);
+    }
+  } else {
+    actions.push(`1. ${localizeSentence(sanitizeQualitySentence(report.nextRecommendedAction), locale)}`);
+  }
+  const commands = report.requiredVerification.slice(0, 4);
+  const start = actions.length + 1;
+  commands.forEach((command, index) => {
+    actions.push(`${start + index}. ${locale === "ko-KR" ? `${formatCommandObject(command)} 실행 결과를 이 보고서의 QA 상태와 비교합니다.` : `Run \`${command}\` and compare the result with this QA status.`}`);
+  });
+  if (report.verdict !== "PASS") {
+    actions.push(`${actions.length + 1}. ${locale === "ko-KR" ? "필요한 QA가 끝나면 `pnpm cli done`으로 보고서를 다시 생성해 판정이 바뀌는지 확인합니다." : "After QA is complete, run `pnpm cli done` again and confirm whether the verdict changes."}`);
+  }
+  return actions.slice(0, 7);
+}
+
+function sanitizeQualitySentence(value: string): string {
+  return humanizeInternalSentence(value)
+    .replace(/INTENT:\s*[^;\n]+;?\s*/gi, "")
+    .replace(/SCOPE:\s*[^;\n]+;?\s*/gi, "")
+    .replace(/confidence=\w+;?\s*/gi, "")
+    .replace(/FLAGS:\s*[^;\n]+;?\s*/gi, "")
+    .replace(/DRIFT:\s*\w+;?\s*/gi, "")
+    .replace(/scope drift|docs update candidate|runtime candidate|review candidate|heuristic candidate/gi, "")
+    .replace(/related file\(s\):/gi, "관련 파일:")
+    .replace(/files:/gi, "관련 파일:")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[;,\s-]+|[;,\s-]+$/g, "");
+}
+
+function formatCommandObject(command: string): string {
+  return `\`${command}\``;
+}
+
+function isUsefulQualityLine(value: string): boolean {
+  const clean = value.trim();
+  return clean.length > 0 && !/^(none|없음|확인 필요)$/i.test(clean) && !/^(INTENT|SCOPE|DRIFT):/i.test(clean);
 }
 
 function formatAIQualityNote(report: QualityReport, locale: DevGuardLocale): string[] {
@@ -2217,7 +2462,7 @@ function qualityLabel(label: string, locale: DevGuardLocale): string {
     "generated/runtime files": { en: "Generated files", ko: "생성 파일 포함 여부" },
     "package lock consistency": { en: "Package lock consistency", ko: "패키지 잠금 파일 일치 여부" },
     "package manifest changed": { en: "Package metadata", ko: "패키지 설정 변경" },
-    "build verification candidate": { en: "Build verification", ko: "빌드 검증 후보" },
+    "build verification candidate": { en: "Build verification", ko: "빌드 검증 명령" },
     "change breadth": { en: "Change breadth", ko: "변경 범위" },
     "risky areas": { en: "Runtime-sensitive areas", ko: "주의가 필요한 영역" },
     "CLI router/help verification": { en: "CLI command and help consistency", ko: "CLI 라우터와 도움말 검증" },
@@ -2302,6 +2547,15 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "The change can affect what users see in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보는 내용에 영향을 줄 수 있습니다.",
     "The change can affect generated reports, handoff files, or next-session context.": "이번 변경은 생성 보고서, 인수인계 파일, 다음 세션 컨텍스트에 영향을 줄 수 있습니다.",
     "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.": "이번 변경은 DevGuard가 로컬 점검 결과를 사용자용 Quality Report와 인수인계 안내로 바꾸는 방식에 영향을 줍니다.",
+    "This change turns the generated Quality Report into a QA result document instead of a generic checklist.": "이번 변경은 생성되는 Quality Report를 일반 체크리스트가 아니라 QA 결과 보고서로 바꾸는 작업입니다.",
+    "The report should explain the verdict, summarize the change, describe what changed per file, and separate completed QA from missing QA.": "보고서는 판정 이유, 변경 요약, 파일별 변경 내용, 완료된 QA와 남은 QA를 구분해서 설명해야 합니다.",
+    "Because the report generation logic changed, the regenerated markdown must be read directly after `pnpm cli done`.": "보고서 생성 로직이 바뀌었으므로 `pnpm cli done` 후 재생성된 markdown을 직접 읽어야 합니다.",
+    "Build success alone cannot prove the generated QA wording is specific, natural, and free of internal rule labels.": "빌드 통과만으로는 생성된 QA 문구가 구체적이고 자연스러우며 내부 rule label을 노출하지 않는지 보장할 수 없습니다.",
+    "Quality Report generation changed, so the generated markdown itself is the behavior under test.": "Quality Report 생성 로직이 바뀌었으므로 생성된 markdown 자체가 이번 QA 대상입니다.",
+    "The report must show what changed, why the verdict was chosen, what QA is complete, and what QA remains.": "보고서는 무엇이 바뀌었는지, 왜 이 판정이 나왔는지, 어떤 QA가 끝났고 무엇이 남았는지 보여줘야 합니다.",
+    "The implementation should not expose internal analysis labels or replace QA reasoning with generic commands.": "구현은 내부 분석 label을 노출하거나 QA 이유를 일반 명령 목록으로 대체하면 안 됩니다.",
+    "Regenerate the Quality Report, read the generated markdown, and confirm it explains the QA result, changed files, risks, and next QA without generic review wording.": "Quality Report를 재생성한 뒤 markdown을 직접 읽고, 일반적인 검토 문구 없이 QA 결과, 변경 파일, 위험 요소, 다음 QA를 설명하는지 확인하세요.",
+    "This change affects how DevGuard explains the current session's QA result in the generated Quality Report.": "이번 변경은 DevGuard가 현재 세션의 QA 결과를 생성된 Quality Report에서 설명하는 방식에 영향을 줍니다.",
     "This change affects whether Dashboard language choices are reflected in generated reports and handoff files.": "이번 변경은 Dashboard 언어 선택이 생성 보고서와 인수인계 파일에 반영되는 흐름에 영향을 줍니다.",
     "This change affects what users see or do in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보고 실행하는 흐름에 영향을 줍니다.",
     "This change affects the authentication or login flow, so the end-to-end sign-in behavior needs review.": "이번 변경은 인증 또는 로그인 흐름에 영향을 주므로 실제 로그인 동작 검토가 필요합니다.",
@@ -2321,6 +2575,10 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Quality Report or handoff generation changed. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names.": "Quality Report 또는 인수인계 생성 흐름이 바뀌었습니다. 재생성된 보고서가 사용자가 먼저 할 일을 알려주고, 관련 파일의 역할을 설명하며, 내부 규칙 이름을 노출하지 않는지 확인하세요.",
     "The changed files should be checked against the current task, not against a generic rule. Confirm the diff is only improving the Quality Report review experience.": "변경 파일은 일반 규칙이 아니라 현재 작업 목표를 기준으로 확인해야 합니다. diff가 Quality Report 리뷰 경험 개선에만 집중되어 있는지 확인하세요.",
     "Confirm the diff is focused on Quality Report intelligence and does not change unrelated watch, hook, dashboard, or release behavior.": "diff가 Quality Report intelligence 개선에 집중되어 있고 관련 없는 watch, hook, Dashboard, release 동작을 바꾸지 않는지 확인하세요.",
+    "Quality Report generation changed. Confirm the regenerated report reads like a QA result, explains each relevant file role, and does not expose internal rule names.": "Quality Report 생성 흐름이 바뀌었습니다. 재생성된 보고서가 QA 결과처럼 읽히고, 관련 파일의 역할을 설명하며, 내부 rule 이름을 노출하지 않는지 확인하세요.",
+    "The changed files should be checked against the current task. Confirm the diff is limited to Quality Report QA wording and generation behavior.": "변경 파일을 현재 작업 기준으로 확인해야 합니다. diff가 Quality Report QA 문구와 생성 동작에만 한정되는지 확인하세요.",
+    "Regenerate the Quality Report and confirm it reads like a QA result: verdict, change summary, file-level changes, completed QA, missing QA, risks, and next QA.": "Quality Report를 재생성하고 판정, 변경 요약, 파일별 변경, 완료된 QA, 남은 QA, 위험 요소, 다음 QA를 설명하는 QA 결과 보고서처럼 읽히는지 확인하세요.",
+    "Confirm the diff is focused on Quality Report QA wording and generation behavior without changing Dashboard, Handoff, watch, hook, or release behavior.": "diff가 Dashboard, Handoff, watch, hook, release 동작을 바꾸지 않고 Quality Report QA 문구와 생성 동작에만 집중되어 있는지 확인하세요.",
     "Confirm no internal rule names appear in the main sections.": "주요 섹션에 내부 규칙 이름이 그대로 노출되지 않는지 확인하세요.",
     "Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read.": "변경된 소스 동작이 명령어, Dashboard 문구, 설정, hook, 보고서, 사용자가 읽는 생성 파일에 영향을 주는지 확인하세요.",
     "Confirm the changed files all support the current request and remove or split unrelated work before finishing.": "변경된 파일이 모두 현재 요청을 뒷받침하는지 확인하고, 관련 없는 작업은 제거하거나 분리하세요.",
@@ -2336,6 +2594,7 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
   };
   if (exact[value]) return exact[value];
   return value
+    .replace(/^(\d+) changed file\(s\)$/, "$1개 파일 변경")
     .replace(/^Review is recommended because (\d+) check item\(s\) need confirmation\.$/, "확인이 필요한 항목이 $1개 있어 검토를 권장합니다.")
     .replace(/^Completion is blocked because (\d+) check item\(s\) need confirmation\.$/, "확인이 필요한 항목이 $1개 있어 완료가 차단되었습니다.")
     .replace(/^(\d+) changed file\(s\) are ready for final review after the listed verification commands\.$/, "$1개 변경 파일은 나열된 검증 명령 실행 후 최종 검토할 수 있습니다.")
@@ -2347,6 +2606,8 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     .replace(/^The changed files may include work outside the current request\. Confirm each changed file supports the same task before finishing\./, "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.")
     .replace(/^Quality Report or handoff generation changed\. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names\./, "Quality Report 또는 인수인계 생성 흐름이 바뀌었습니다. 재생성된 보고서가 사용자가 먼저 할 일을 알려주고, 관련 파일의 역할을 설명하며, 내부 규칙 이름을 노출하지 않는지 확인하세요.")
     .replace(/^The changed files should be checked against the current task, not against a generic rule\. Confirm the diff is only improving the Quality Report review experience\./, "변경 파일은 일반 규칙이 아니라 현재 작업 목표를 기준으로 확인해야 합니다. diff가 Quality Report 리뷰 경험 개선에만 집중되어 있는지 확인하세요.")
+    .replace(/^Quality Report generation changed\. Confirm the regenerated report reads like a QA result, explains each relevant file role, and does not expose internal rule names\./, "Quality Report 생성 흐름이 바뀌었습니다. 재생성된 보고서가 QA 결과처럼 읽히고, 관련 파일의 역할을 설명하며, 내부 rule 이름을 노출하지 않는지 확인하세요.")
+    .replace(/^The changed files should be checked against the current task\. Confirm the diff is limited to Quality Report QA wording and generation behavior\./, "변경 파일을 현재 작업 기준으로 확인해야 합니다. diff가 Quality Report QA 문구와 생성 동작에만 한정되는지 확인하세요.")
     .replace(/^Confirm done\/status\/handoff read the latest runtime state and regenerate user-facing reports correctly\. Focus on (.+)\. Then run the required verification commands\.$/, "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요. 관련 파일: $1. 그런 다음 필요한 검증 명령을 실행하세요.")
     .replace(/^(.+) Focus on (.+)\. Then run the required verification commands\.$/, "$1 관련 파일: $2. 그런 다음 필요한 검증 명령을 실행하세요.")
     .replace(/ Related file\(s\): /g, " 관련 파일: ")
@@ -2802,9 +3063,9 @@ function parseHistoryRecords(text: string): HistoryRecord[] {
 
 function parseQuality(markdown: string): ParsedQuality {
   return {
-    verdict: firstSectionBulletAny(markdown, ["Verdict", "판정"]) ?? "확인 필요",
-    why: extractSectionBulletsAny(markdown, ["Why", "판단 이유", "Why Review Is Needed", "왜 검토가 필요한가"], 4),
-    requiredVerification: extractSectionBulletsAny(markdown, ["Required Verification", "필요한 검증", "Verification To Run", "실행할 검증"], 5),
+    verdict: firstSectionBulletAny(markdown, ["Verdict", "판정", "Final Verdict", "최종 판정"]) ?? "확인 필요",
+    why: extractSectionBulletsAny(markdown, ["Why", "판단 이유", "Why Review Is Needed", "왜 검토가 필요한가", "Why This Verdict", "왜 이 판정이 나왔는가"], 4),
+    requiredVerification: extractSectionBulletsAny(markdown, ["Required Verification", "필요한 검증", "Verification To Run", "실행할 검증", "Next QA", "다음 QA"], 5),
     reviewItems: extractSectionBulletsAny(markdown, ["Additional Checks", "Review Items", "검토 권장 항목", "추가로 검토하면 좋은 점"], 6),
     blockedItems: extractSectionBulletsAny(markdown, ["Blocked Items", "먼저 해결해야 할 항목"], 6)
   };
