@@ -1925,13 +1925,15 @@ function dedupeReviewItems(items: QualityReviewItem[]): QualityReviewItem[] {
 const reportCopy = {
   "en-US": {
     title: "Completion Quality Report",
-    finalVerdict: "1. Final Verdict",
-    qaSummary: "2. QA Summary",
-    changed: "3. What Changed",
-    qaResult: "4. QA Result",
-    risks: "5. Risks Found",
-    why: "6. Why This Verdict",
-    nextQa: "7. Next QA",
+    qaSnapshot: "1. QA Summary",
+    finalVerdict: "2. Final Verdict",
+    qaSummary: "3. QA Result Summary",
+    impact: "4. Impact",
+    changed: "5. What Changed",
+    qaResult: "6. QA Checklist",
+    regressionRisk: "7. Regression Risk",
+    why: "8. Why This Verdict",
+    nextQa: "9. Next QA",
     aiSummary: "AI Summary",
     riskChecklist: "Risk Checklist",
     beforeCommit: "Before Commit",
@@ -1940,13 +1942,15 @@ const reportCopy = {
   },
   "ko-KR": {
     title: "완료 품질 보고서",
-    finalVerdict: "1. 최종 판정",
-    qaSummary: "2. QA 요약",
-    changed: "3. 이번 변경 내용",
-    qaResult: "4. QA 결과",
-    risks: "5. 발견된 위험 요소",
-    why: "6. 왜 이 판정이 나왔는가",
-    nextQa: "7. 다음 QA",
+    qaSnapshot: "1. QA Summary",
+    finalVerdict: "2. 최종 판정",
+    qaSummary: "3. QA 결과 요약",
+    impact: "4. 변경 영향",
+    changed: "5. 이번 변경 내용",
+    qaResult: "6. QA Checklist",
+    regressionRisk: "7. 잠재 회귀 위험",
+    why: "8. 왜 이 판정이 나왔는가",
+    nextQa: "9. 다음 QA",
     aiSummary: "AI 요약",
     riskChecklist: "위험 점검표",
     beforeCommit: "커밋 전 확인",
@@ -2002,6 +2006,10 @@ function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale):
   return [
     `# ${copy.title}`,
     "",
+    `## ${copy.qaSnapshot}`,
+    "",
+    ...formatQASnapshot(report, locale),
+    "",
     `## ${copy.finalVerdict}`,
     "",
     ...formatFinalVerdict(report, locale),
@@ -2009,6 +2017,10 @@ function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale):
     `## ${copy.qaSummary}`,
     "",
     ...formatQASummary(report, locale),
+    "",
+    `## ${copy.impact}`,
+    "",
+    ...formatQualityImpact(report, locale),
     "",
     `## ${copy.changed}`,
     "",
@@ -2018,9 +2030,9 @@ function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale):
     "",
     ...formatQAResults(report, locale),
     "",
-    `## ${copy.risks}`,
+    `## ${copy.regressionRisk}`,
     "",
-    ...formatQARisks(report, locale),
+    ...formatRegressionRisk(report, locale),
     "",
     `## ${copy.why}`,
     "",
@@ -2041,6 +2053,10 @@ function renderNeedsReviewQualityReport(report: QualityReport, locale: DevGuardL
   return [
     `# ${copy.title}`,
     "",
+    `## ${copy.qaSnapshot}`,
+    "",
+    ...formatQASnapshot(report, locale),
+    "",
     `## ${copy.finalVerdict}`,
     "",
     ...formatFinalVerdict(report, locale),
@@ -2048,6 +2064,10 @@ function renderNeedsReviewQualityReport(report: QualityReport, locale: DevGuardL
     `## ${copy.qaSummary}`,
     "",
     ...formatQASummary(report, locale),
+    "",
+    `## ${copy.impact}`,
+    "",
+    ...formatQualityImpact(report, locale),
     "",
     `## ${copy.changed}`,
     "",
@@ -2057,9 +2077,9 @@ function renderNeedsReviewQualityReport(report: QualityReport, locale: DevGuardL
     "",
     ...formatQAResults(report, locale),
     "",
-    `## ${copy.risks}`,
+    `## ${copy.regressionRisk}`,
     "",
-    ...formatQARisks(report, locale),
+    ...formatRegressionRisk(report, locale),
     "",
     `## ${copy.why}`,
     "",
@@ -2080,6 +2100,10 @@ function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocal
   return [
     `# ${copy.title}`,
     "",
+    `## ${copy.qaSnapshot}`,
+    "",
+    ...formatQASnapshot(report, locale),
+    "",
     `## ${copy.finalVerdict}`,
     "",
     ...formatFinalVerdict(report, locale),
@@ -2087,6 +2111,10 @@ function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocal
     `## ${copy.qaSummary}`,
     "",
     ...formatQASummary(report, locale),
+    "",
+    `## ${copy.impact}`,
+    "",
+    ...formatQualityImpact(report, locale),
     "",
     `## ${copy.changed}`,
     "",
@@ -2096,9 +2124,9 @@ function renderBlockedQualityReport(report: QualityReport, locale: DevGuardLocal
     "",
     ...formatQAResults(report, locale),
     "",
-    `## ${copy.risks}`,
+    `## ${copy.regressionRisk}`,
     "",
-    ...formatQARisks(report, locale),
+    ...formatRegressionRisk(report, locale),
     "",
     `## ${copy.why}`,
     "",
@@ -2116,6 +2144,37 @@ function formatAIQualitySection(report: QualityReport, locale: DevGuardLocale): 
   return note.length > 0 ? ["", `## ${reportCopy[locale].aiSummary}`, "", ...note] : [];
 }
 
+function formatQASnapshot(report: QualityReport, locale: DevGuardLocale): string[] {
+  const overall = report.verdict === "PASS" ? "🟢 PASS" : report.verdict === "BLOCKED" ? "🔴 BLOCKED" : "🟡 NEEDS_REVIEW";
+  const buildStatus = qaCommandStatus(report, /\bbuild\b/i, locale);
+  const selfCheckStatus = qaCommandStatus(report, /self-check/i, locale);
+  const manualStatus = manualQAStatus(report, locale);
+  const regression = regressionRiskLevel(report, locale);
+  const labels = locale === "ko-KR"
+    ? { overall: "Overall", build: "Build", self: "Self Check", manual: "Manual QA", regression: "Regression Risk" }
+    : { overall: "Overall", build: "Build", self: "Self Check", manual: "Manual QA", regression: "Regression Risk" };
+  return [
+    `| ${locale === "ko-KR" ? "항목" : "Item"} | ${locale === "ko-KR" ? "상태" : "Status"} |`,
+    "| --- | --- |",
+    `| ${labels.overall} | ${overall} |`,
+    `| ${labels.build} | ${buildStatus} |`,
+    `| ${labels.self} | ${selfCheckStatus} |`,
+    `| ${labels.manual} | ${manualStatus} |`,
+    `| ${labels.regression} | ${regression} |`
+  ];
+}
+
+function qaCommandStatus(report: QualityReport, pattern: RegExp, locale: DevGuardLocale): string {
+  const command = report.requiredVerification.find((item) => pattern.test(item));
+  if (!command) return locale === "ko-KR" ? "미기록" : "Not recorded";
+  return locale === "ko-KR" ? `미기록 (${command})` : `Not recorded (${command})`;
+}
+
+function manualQAStatus(report: QualityReport, locale: DevGuardLocale): string {
+  if (report.verdict === "PASS") return locale === "ko-KR" ? "현재 규칙상 추가 요구 없음" : "Not required by current rules";
+  return locale === "ko-KR" ? "대기" : "Pending";
+}
+
 function formatFinalVerdict(report: QualityReport, locale: DevGuardLocale): string[] {
   const icon = report.verdict === "PASS" ? "🟢" : report.verdict === "BLOCKED" ? "🔴" : "🟡";
   const summary = verdictOneLine(report, locale);
@@ -2124,9 +2183,9 @@ function formatFinalVerdict(report: QualityReport, locale: DevGuardLocale): stri
 
 function verdictOneLine(report: QualityReport, locale: DevGuardLocale): string {
   if (locale === "ko-KR") {
-    if (report.verdict === "PASS") return "현재 품질 규칙에서 차단 항목이 발견되지 않았습니다.";
-    if (report.verdict === "BLOCKED") return "완료를 막는 항목이 있어 먼저 수정이 필요합니다.";
-    return "기본 검사는 진행됐지만 생성물이나 실제 동작 확인이 남아 있습니다.";
+    if (report.verdict === "PASS") return "현재 품질 규칙에서 차단 항목이 발견되지 않았고, 추가 QA 요구가 없습니다.";
+    if (report.verdict === "BLOCKED") return "완료를 막는 항목이 있어 먼저 수정해야 합니다.";
+    return "자동 품질 규칙은 실행됐지만 생성물 또는 실제 동작 확인이 남아 있습니다.";
   }
   if (report.verdict === "PASS") return "No blocking item was found by the current quality rules.";
   if (report.verdict === "BLOCKED") return "A blocking item must be fixed before this can be considered complete.";
@@ -2141,6 +2200,31 @@ function formatQASummary(report: QualityReport, locale: DevGuardLocale): string[
       : ["DevGuard could not produce a detailed change summary automatically.", "Use the changed files and QA result sections below to verify behavior."];
   }
   return lines.map((line) => localizeSentence(line, locale));
+}
+
+function formatQualityImpact(report: QualityReport, locale: DevGuardLocale): string[] {
+  const files = new Set(report.relatedFiles);
+  const affected = new Set<string>();
+  const notAffected = new Set<string>(["Watch", "Hooks", "Release"]);
+  if ([...files].some((file) => /runtime-state\.ts$/.test(file))) {
+    affected.add("Quality Report");
+    affected.add("Generated reports");
+    notAffected.add("Dashboard");
+    notAffected.add("Hooks");
+    notAffected.add("Watch");
+  }
+  if ([...files].some((file) => /dashboard/i.test(file))) affected.add("Dashboard");
+  if ([...files].some((file) => /locale|dashboard-i18n/i.test(file))) affected.add("Locale");
+  if ([...files].some((file) => /handoff|prompt/i.test(file))) affected.add("Handoff");
+  if ([...files].some((file) => /index\.tsx?$|configure|config/i.test(file))) affected.add("CLI");
+  if (affected.size === 0) affected.add(locale === "ko-KR" ? "확인 필요" : "Needs confirmation");
+  for (const item of affected) notAffected.delete(item);
+  const lines = locale === "ko-KR" ? ["영향 있음"] : ["Affected"];
+  for (const item of affected) lines.push(`- ${item}`);
+  lines.push("");
+  lines.push(locale === "ko-KR" ? "영향 없음 또는 변경 없음" : "No direct change detected");
+  for (const item of [...notAffected].slice(0, 6)) lines.push(`- ${item}`);
+  return lines;
 }
 
 function formatQualityChangedFiles(report: QualityReport, locale: DevGuardLocale): string[] {
@@ -2234,15 +2318,29 @@ function unrecordedVerificationLines(commands: string[], locale: DevGuardLocale)
   );
 }
 
-function formatQARisks(report: QualityReport, locale: DevGuardLocale): string[] {
+function formatRegressionRisk(report: QualityReport, locale: DevGuardLocale): string[] {
   const risks = report.checklist.filter((item) => item.status !== "PASS" && item.affectsVerdict !== false);
   if (risks.length === 0) {
-    return [locale === "ko-KR" ? "특별한 위험 요소는 발견되지 않았습니다." : "No specific risk was found."];
+    return locale === "ko-KR"
+      ? ["Regression Risk: None", "", "현재 품질 규칙에서 회귀 위험을 높이는 항목은 발견되지 않았습니다."]
+      : ["Regression Risk: None", "", "No current quality rule increased regression risk."];
   }
-  return risks.slice(0, 6).map((item) => {
+  const level = regressionRiskLevel(report, locale);
+  const lines = [locale === "ko-KR" ? `Regression Risk: ${level}` : `Regression Risk: ${level}`, ""];
+  lines.push(locale === "ko-KR" ? "잠재 영향" : "Potential impact");
+  for (const item of risks.slice(0, 4)) {
     const reason = userFacingReason(item, report.relatedFiles, []);
-    return `- ${localizeSentence(sanitizeQualitySentence(reason), locale)}`;
-  });
+    lines.push(`- ${localizeSentence(sanitizeQualitySentence(reason), locale)}`);
+  }
+  return lines;
+}
+
+function regressionRiskLevel(report: QualityReport, locale: DevGuardLocale): string {
+  if (report.verdict === "BLOCKED") return "High";
+  const warnings = report.checklist.filter((item) => item.status === "WARN" && item.affectsVerdict !== false);
+  if (warnings.some((item) => /risky areas|package|CLI|watch/i.test(item.label))) return "Medium";
+  if (warnings.length > 0) return "Low";
+  return "None";
 }
 
 function formatQualityVerdictReasons(report: QualityReport, locale: DevGuardLocale): string[] {
