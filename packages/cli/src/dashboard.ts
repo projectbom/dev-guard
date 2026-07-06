@@ -658,13 +658,13 @@ function renderPage(): string {
     a { color: inherit; text-decoration: none; }
 
     /* ── Page ── */
-    .page { max-width: 1060px; margin: 0 auto; padding: 24px 20px 56px; }
-    .gap { display: grid; gap: 12px; }
+    .page { max-width: 1060px; margin: 0 auto; padding: 18px 18px 42px; }
+    .gap { display: grid; gap: 10px; }
     .g2 { grid-template-columns: 1fr 1fr; }
     .g2w { grid-template-columns: 1.5fr 1fr; }
 
     /* ── Top bar ── */
-    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; flex-wrap: wrap; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
     .brand-name { font-size: 17px; font-weight: 700; letter-spacing: -.3px; }
     .brand-sub { font-size: 12px; color: var(--muted); }
     .topbar-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
@@ -677,18 +677,18 @@ function renderPage(): string {
     .timestamp { font: 11px/1 var(--mono); color: var(--muted); }
 
     /* ── Status banner ── */
-    .banner { border-radius: var(--r); padding: 20px 22px; margin-bottom: 12px; border: 1px solid transparent; display: flex; align-items: flex-start; gap: 14px; }
+    .banner { border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; border: 1px solid transparent; display: flex; align-items: flex-start; gap: 11px; }
     .banner.idle { background: var(--ok-bg); border-color: var(--ok-ring); }
     .banner.working { background: var(--warn-bg); border-color: var(--warn-ring); }
     .banner.finalizing, .banner.ready_for_done { background: var(--accent-bg); border-color: #bfdbfe; }
     .banner.processed { background: var(--purple-bg); border-color: var(--purple-ring); }
     .banner.setup { background: var(--accent-bg); border-color: #bfdbfe; }
     .banner.offline { background: var(--surface); border-color: var(--line2); }
-    .banner-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
+    .banner-icon { font-size: 20px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
     .banner-text { flex: 1; min-width: 0; }
     .section-label { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: 6px; }
-    .banner-title { font-size: 18px; font-weight: 700; line-height: 1.25; letter-spacing: -.2px; }
-    .banner-body { color: var(--ink2); margin-top: 3px; font-size: 14px; }
+    .banner-title { font-size: 17px; font-weight: 740; line-height: 1.22; letter-spacing: -.2px; }
+    .banner-body { color: var(--ink2); margin-top: 2px; font-size: 13px; }
     .banner-cmd { display: inline-block; margin-top: 8px; font: 13px/1.4 var(--mono); background: rgba(0,0,0,.06); border-radius: 5px; padding: 4px 9px; }
     .setup-list { display: grid; gap: 6px; margin: -2px 0 12px; padding: 12px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); }
     .setup-item { display: flex; align-items: center; gap: 8px; color: var(--ink2); font-size: 13px; }
@@ -718,20 +718,30 @@ function renderPage(): string {
     .mini-btn { border: 1px solid var(--line2); background: var(--ink); color: #fff; border-radius: var(--r-sm); padding: 7px 11px; font: 12px/1 var(--sans); font-weight: 700; cursor: pointer; }
     .mini-btn.ghost { background: var(--surface); color: var(--ink2); }
     .mini-btn:hover { filter: brightness(.96); }
+    .quick-bar { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px; margin-bottom: 10px; }
+    .quick-title { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 9px; }
+    .quick-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+    .quick-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 30px; border-radius: var(--r-sm); border: 1px solid var(--line2); background: var(--surface2); color: var(--ink); padding: 6px 10px; font: 12px/1 var(--sans); font-weight: 700; cursor: pointer; text-decoration: none; white-space: nowrap; }
+    .quick-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .quick-btn:disabled { opacity: .55; cursor: not-allowed; }
+    .settings-panel { margin: -2px 0 10px; }
+    .settings-panel details { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
+    .settings-panel summary { padding: 10px 12px; font-size: 11px; }
+    .settings-body { padding: 0 12px 12px; display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
     /* ── Assistant prompt / summary ── */
     .prompt-list { display: grid; gap: 7px; margin-top: 10px; }
     .prompt-item { display: flex; gap: 8px; align-items: flex-start; color: var(--ink2); font-size: 13px; line-height: 1.45; }
     .prompt-item span { color: var(--accent); font-weight: 800; line-height: 1.4; }
-    .summary-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-    .summary-item { border: 1px solid var(--line); background: var(--surface2); border-radius: var(--r-sm); padding: 11px 12px; }
-    .summary-value { font-size: 16px; font-weight: 760; color: var(--ink); line-height: 1.2; }
+    .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .summary-item { border: 1px solid var(--line); background: var(--surface2); border-radius: var(--r-sm); padding: 10px 11px; min-width: 0; }
+    .summary-value { font-size: 15px; font-weight: 760; color: var(--ink); line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .summary-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-top: 3px; }
-    .summary-evidence { margin-top: 8px; display: grid; gap: 3px; }
+    .summary-evidence { margin-top: 6px; display: grid; gap: 3px; }
     .summary-evidence div { font: 11px/1.35 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* ── Card ── */
-    .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; }
+    .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; }
     .card-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 12px; }
 
     /* ── Activity card ── */
@@ -795,22 +805,22 @@ function renderPage(): string {
     .trend-dot.bad { background: var(--bad); }
 
     /* ── Next action ── */
-    .next-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 22px; margin-bottom: 12px; }
+    .next-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; }
     .next-card.pass { border-color: var(--ok-ring); background: var(--ok-bg); }
     .next-card.warn { border-color: var(--warn-ring); background: var(--warn-bg); }
     .next-card.blocked { border-color: var(--bad-ring); background: var(--bad-bg); }
     .next-top { display: flex; align-items: flex-start; gap: 13px; }
-    .next-icon { font-size: 24px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
-    .next-title { font-size: 19px; line-height: 1.25; font-weight: 760; letter-spacing: -.2px; }
-    .next-body { font-size: 14px; color: var(--ink2); line-height: 1.5; font-weight: 500; margin-top: 4px; max-width: 720px; }
-    .next-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+    .next-icon { font-size: 20px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
+    .next-title { font-size: 16px; line-height: 1.25; font-weight: 760; letter-spacing: -.2px; }
+    .next-body { font-size: 13px; color: var(--ink2); line-height: 1.4; font-weight: 500; margin-top: 3px; max-width: 720px; }
+    .next-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
     .next-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 34px; border-radius: var(--r-sm); border: 1px solid var(--line2); background: var(--surface); color: var(--ink); padding: 8px 13px; font: 13px/1 var(--sans); font-weight: 700; cursor: pointer; }
     .next-btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
     .next-card.blocked .next-btn.primary { min-height: 40px; padding: 10px 16px; font-size: 14px; box-shadow: 0 1px 6px rgba(37,99,235,.18); }
     .next-btn.danger { border-color: var(--bad); background: var(--bad); color: #fff; }
     .next-btn:disabled { opacity: .65; cursor: wait; }
-    .review-steps { display: grid; grid-template-columns: 1fr; gap: 8px; margin-top: 14px; max-width: 560px; }
-    .review-step { display: flex; align-items: center; background: rgba(255,255,255,.78); border: 1px solid rgba(0,0,0,.08); border-radius: var(--r-sm); padding: 11px 12px; font-size: 13px; font-weight: 680; color: var(--ink2); }
+    .review-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin-top: 10px; max-width: 760px; }
+    .review-step { display: flex; align-items: center; background: rgba(255,255,255,.78); border: 1px solid rgba(0,0,0,.08); border-radius: var(--r-sm); padding: 8px 9px; font-size: 12px; font-weight: 680; color: var(--ink2); min-width: 0; }
     .review-step span { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: var(--surface); border: 1px solid var(--line2); color: var(--muted); font: 11px/1 var(--mono); margin-right: 9px; flex-shrink: 0; }
     .review-step:first-child { border-color: var(--accent); color: var(--ink); }
     .review-step:first-child span { border-color: var(--accent); color: var(--accent); }
@@ -829,7 +839,7 @@ function renderPage(): string {
     .tl-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
 
     /* ── Advanced details ── */
-    .adv-wrap { margin-top: 12px; }
+    .adv-wrap { margin-top: 10px; }
     details { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
     summary { display: flex; align-items: center; gap: 8px; padding: 13px 18px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); cursor: pointer; user-select: none; background: var(--surface); }
     summary::-webkit-details-marker { display: none; }
@@ -863,7 +873,7 @@ function renderPage(): string {
     }
     @media (max-width: 720px) {
       .page { padding: 14px 12px 40px; }
-      .g2, .g2w, .adv-grid, .rpt-grid, .stat-row, .review-steps, .summary-grid { grid-template-columns: 1fr; }
+      .g2, .g2w, .adv-grid, .rpt-grid, .stat-row, .review-steps, .summary-grid, .settings-body { grid-template-columns: 1fr; }
       .banner-title { font-size: 16px; }
       .session-meta { flex-direction: column; align-items: flex-end; gap: 3px; }
     }
@@ -1040,6 +1050,9 @@ function statusView(s) {
   if (s.setup?.active) return { icon:'🔵', cls:'setup', title:t('setupTitle'), body:t('setupBody'), activity:t('activityInit'), next:t('nextStartWatch') };
   if (!s.initialized) return { icon:'⚙️', cls:'offline', title:t('notInitializedTitle'), body:t('notInitializedBody'), cmd:'dev-guard watch', activity:t('activityInit'), next:t('nextInit') };
   if (!s.watchRunning)  return { icon:'⏸', cls:'offline', title:t('watchNotRunningTitle'), body:t('watchNotRunningBody'), cmd:'dev-guard watch', activity:t('activityStartWatch'), next:t('nextStartWatch') };
+  if ((s.status === 'idle' || s.status === 'processed') && s.qualityVerdict === 'PASS') return { icon:'✓', cls:'idle', title:t('statusQualityPassTitle'), body:t('statusQualityPassBody'), activity:t('activityMonitoring'), next:t('nextMonitoring') };
+  if ((s.status === 'idle' || s.status === 'processed') && s.qualityVerdict === 'NEEDS_REVIEW') return { icon:'!', cls:'working', title:t('statusQualityReviewTitle'), body:t('statusQualityReviewBody'), activity:t('activityProcessed'), next:t('nextReviewQuality') };
+  if ((s.status === 'idle' || s.status === 'processed') && s.qualityVerdict === 'BLOCKED') return { icon:'⛔', cls:'offline', title:t('statusQualityBlockedTitle'), body:t('statusQualityBlockedBody'), activity:t('activityProcessed'), next:t('nextReviewQuality') };
   const m = {
     working:       { icon:'🟡', cls:'working',      title:t('statusWorkingTitle'),    body:t('statusWorkingBody'),    activity:t('activitySettling'),    next:t('nextSettling') },
     ready_for_done:{ icon:'🔵', cls:'ready_for_done',title:t('statusReadyTitle'),     body:t('statusReadyBody'),      activity:t('activityAiCompletion'),next:t('nextAiCompletion') },
@@ -1261,6 +1274,18 @@ function recommendedActions(s) {
   return actions;
 }
 
+function quickActionButton(label, key, opts = {}) {
+  const cls = 'quick-btn' + (opts.primary ? ' primary' : '');
+  if (!opts.available) return '<button class="' + cls + '" disabled>' + esc(label) + '</button>';
+  if (opts.settings) return '<button class="' + cls + '" onclick="toggleSettings()">' + esc(label) + '</button>';
+  return '<a class="' + cls + '" href="/api/file?path=' + esc(key) + '" target="_blank" rel="noopener">' + esc(label) + '</a>';
+}
+
+function toggleSettings() {
+  const panel = document.getElementById('settingsPanel');
+  if (panel) panel.open = !panel.open;
+}
+
 function assistantPromptLines(s) {
   if (s.qualityVerdict === 'BLOCKED') {
     return [t('promptBlockedQuality'), t('promptBlockedValidate'), t('promptBlockedComplete')];
@@ -1284,10 +1309,9 @@ function sessionSummaryItems(s) {
         ? [fmt('reasonVerificationCount', { count: q.requiredVerificationCount })]
         : [t('summaryNoQualityIssues')];
   return [
-    { label: t('summaryFiles'), value: String(s.sessionFileCount || impact.files.length || 0), evidence: fileEvidence },
-    { label: t('summaryDocs'), value: String(impact.docsFiles.length), evidence: impact.docsFiles.length ? impact.docsFiles.slice(0, 2).map(f => basename(f)) : [t('summaryNoDocs')] },
+    { label: t('summaryChanged'), value: String(s.sessionFileCount || impact.files.length || 0), evidence: fileEvidence },
     { label: t('summaryQuality'), value: quality, evidence: qualityEvidence },
-    { label: t('summaryArchitecture'), value: impact.architectureText, evidence: impactEvidence(impact) }
+    { label: t('summaryImpact'), value: impact.architectureText, evidence: impactEvidence(impact) }
   ];
 }
 
@@ -1319,7 +1343,8 @@ function nextActionView(s, v) {
       title: t('reviewRecommendedTitle'),
       body: t('reviewRecommendedBody'),
       primary: s.reports.qualityReportExists ? t('openQualityReport') : null,
-      primaryHref: '/api/file?path=quality'
+      primaryHref: '/api/file?path=quality',
+      steps: [t('reviewStepReport'), t('reviewStepRunApp'), t('reviewStepContinue')]
     };
   }
   if (s.qualityVerdict === 'PASS' && (s.status === 'idle' || s.status === 'processed')) {
@@ -1327,7 +1352,8 @@ function nextActionView(s, v) {
       cls: 'pass',
       icon: '✓',
       title: t('monitoringReadyTitle'),
-      body: t('monitoringReadyBody')
+      body: t('monitoringReadyBody'),
+      steps: [t('reviewStepContinue')]
     };
   }
   return {
@@ -1400,22 +1426,28 @@ function render(s) {
     ? (s.knowledge.updatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.knowledge.updatedAt) : s.knowledge.framework || null)
     : t('knowledgeHint');
   const actions = recommendedActions(s);
-
-  const actionCenter = '<div class="ac-section">' +
-    '<div class="ac-title">' + esc(t('recommendedTitle')) + '</div>' +
-    '<div class="ac-list">' +
-    actions.map((action, index) => recommendedActionCard(action, index)).join('') +
+  const quickActions = '<div class="quick-bar">' +
+    '<div class="quick-title">' + esc(t('quickActionsTitle')) + '</div>' +
+    '<div class="quick-actions">' +
+    quickActionButton(t('actionQualityTitle'), 'quality', { available: s.reports.qualityReportExists, primary: s.qualityVerdict === 'NEEDS_REVIEW' || s.qualityVerdict === 'BLOCKED' }) +
+    quickActionButton(t('actionHandoffTitle'), 'handoff', { available: s.reports.handoffExists }) +
+    quickActionButton(t('knowledgeTitle'), 'knowledge', { available: s.knowledge.exists }) +
+    quickActionButton(t('settingsTitle'), '', { available: true, settings: true }) +
     '</div></div>';
 
-  const openAISettings = '<div class="card openai-card">' +
-    '<div class="card-title">' + esc(t('openAIKeyTitle')) + '</div>' +
+  const openAISettings = '<div class="settings-panel"><details id="settingsPanel"><summary>' + esc(t('settingsTitle')) + '</summary><div class="settings-body">' +
+    '<div class="card openai-card"><div class="card-title">' + esc(t('openAIKeyTitle')) + '</div>' +
     '<div class="activity-row"><span class="activity-label">' + esc(t('openAIKeyStatus')) + '</span><span class="activity-value">' +
     esc(s.openAI.configured ? t('openAIKeyConfigured') : t('openAIKeyNotConfigured')) + '</span></div>' +
     '<div class="setting-help">' + esc(s.openAI.configured ? t('openAIKeyConfiguredHelp') : t('openAIKeyMissingHelp')) + '</div>' +
     '<div class="setting-actions">' +
     '<button class="mini-btn" onclick="setOpenAIKey(this)">' + esc(s.openAI.configured ? t('openAIKeyUpdate') : t('openAIKeySet')) + '</button>' +
     (s.openAI.configured && s.openAI.source === 'config' ? '<button class="mini-btn ghost" onclick="removeOpenAIKey(this)">' + esc(t('openAIKeyRemove')) + '</button>' : '') +
-    '</div></div>';
+    '</div></div>' +
+    '<div class="card"><div class="card-title">' + esc(t('dashboardSettingsTitle')) + '</div>' +
+    '<div class="activity-row"><span class="activity-label">' + esc(t('language')) + '</span><span class="activity-value">' + esc(s.locale || t('unknown')) + '</span></div>' +
+    '<div class="activity-row"><span class="activity-label">' + esc(t('internalStatus')) + '</span><span class="activity-value">' + esc(s.status || '—') + '</span></div>' +
+    '</div></div></details></div>';
 
   /* Activity card */
   const actRows = [
@@ -1508,7 +1540,6 @@ function render(s) {
     '<div class="next-top"><div class="next-icon" aria-hidden="true">' + esc(na.icon) + '</div><div>' +
     '<div class="next-title">' + esc(na.title) + '</div>' +
     '<div class="next-body">' + esc(na.body) + '</div>' +
-    '<div class="prompt-list">' + assistantPromptLines(s).map(line => '<div class="prompt-item"><span>•</span><div>' + esc(line) + '</div></div>').join('') + '</div>' +
     reviewSteps + nextButtons +
     '</div></div></div>';
 
@@ -1535,13 +1566,14 @@ function render(s) {
     rptBlock(t('reportHandoff'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
     rptBlock(t('reportQuality'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
     rptBlock(t('reportContext'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
-    '</div></div></details></div>';
+    '</div>' +
+    '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
+    '<div class="gap g2w" style="margin-top:12px">' + sessionsCard + progressCard + '</div>' +
+    '<div class="gap g2" style="margin-top:12px">' + healthCard + timelineCard + '</div>' +
+    '</div></details></div>';
 
   root.innerHTML =
-    nextCard + banner + setupList + actionCenter + openAISettings +
-    '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
-    '<div class="gap g2w" style="margin-top:12px">' + summaryCard + sessionsCard + '</div>' +
-    '<div class="gap g2" style="margin-top:12px">' + healthCard + timelineCard + '</div>' +
+    banner + nextCard + setupList + quickActions + summaryCard + openAISettings +
     advanced;
 }
 
