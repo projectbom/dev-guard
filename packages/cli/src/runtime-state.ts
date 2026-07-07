@@ -162,6 +162,7 @@ interface DocumentationFileChange {
   type: ChangeType[];
   purpose: string;
   changes: string[];
+  userImpact: string[];
   qa: string[];
 }
 
@@ -626,13 +627,14 @@ export async function generateProjectHandoff(root: string): Promise<string> {
 
 export async function generateWorkingContext(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
+  const locale = await refreshRuntimeLocale(root);
   const [state, historyRecords, projectKnowledge] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
     readHistoryRecords(root, 5),
     readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
   ]);
   const files = workingContextFiles(state, historyRecords);
-  const context = renderWorkingContext({ files, state, historyRecords, projectKnowledge });
+  const context = renderWorkingContext({ files, state, historyRecords, projectKnowledge, locale });
   await writeTextFile(fromRoot(root, workingContextPath), context);
   return workingContextPath;
 }
@@ -695,17 +697,17 @@ function workingContextFiles(state: ProjectState, records: HistoryRecord[]): str
   return [...new Set(files.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)))].sort();
 }
 
-function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string }): string {
+function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string; locale: DevGuardLocale }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const domains = inferWorkingDomains(input.files);
   const changedAreas = input.files.length > 0 ? input.files : ["확인 필요"];
   const documentationSummary = input.state.lastDocumentationSummary;
   const entryFiles = workingEntryFiles(input.files, profile);
   const componentTree = workingComponentTree(domains);
-  const nextAreas = documentationSummary?.remainingWork.length ? documentationSummary.remainingWork : workingNextAreas(domains);
-  const excludedAreas = documentationSummary?.excludedAreas.length ? documentationSummary.excludedAreas : workingExcludedAreas(domains);
-  const currentWork = documentationSummary?.goal ?? workingCurrentWork(input.state, domains);
-  const structure = documentationSummary?.structure.length ? documentationSummary.structure : workingCurrentStructure(domains);
+  const nextAreas = documentationSummary?.remainingWork.length ? documentationSummary.remainingWork.map((item) => localizeSentence(item, input.locale)) : workingNextAreas(domains);
+  const excludedAreas = documentationSummary?.excludedAreas.length ? documentationSummary.excludedAreas.map((item) => localizeSentence(item, input.locale)) : workingExcludedAreas(domains);
+  const currentWork = documentationSummary?.goal ? localizeSentence(documentationSummary.goal, input.locale) : workingCurrentWork(input.state, domains);
+  const structure = documentationSummary?.structure.length ? documentationSummary.structure.map((item) => localizeSentence(item, input.locale)) : workingCurrentStructure(domains);
   const tips = workingTips(domains);
   const resume = workingResumeStart(entryFiles, nextAreas);
 
@@ -733,7 +735,7 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
     "",
     "## 이번 세션에서 수정한 영역",
     ...(documentationSummary?.fileChanges.length
-      ? documentationSummary.fileChanges.slice(0, 12).map((file) => workingDocumentationFileLine(file))
+      ? documentationSummary.fileChanges.slice(0, 12).map((file) => workingDocumentationFileLine(file, input.locale))
       : changedAreas.slice(0, 12).map((file) => workingChangedFileLine(file, domains))),
     ...(changedAreas.length > 12 ? [`- ... +${changedAreas.length - 12} files`] : []),
     "",
@@ -888,8 +890,8 @@ function workingChangedFileLine(file: string, domains: Set<string>): string {
   return `- \`${file}\`\n  - 변경 이유: ${reason.reason}\n  - 주요 변경: ${reason.change}\n  - 확인 필요: ${reason.check}`;
 }
 
-function workingDocumentationFileLine(file: DocumentationFileChange): string {
-  return `- \`${file.file}\`\n  - 변경 이유: ${file.purpose}\n  - 주요 변경: ${(file.changes[0] ?? "diff detail needs confirmation")}\n  - 확인 필요: ${(file.qa[0] ?? "specific QA point was not inferred")}`;
+function workingDocumentationFileLine(file: DocumentationFileChange, locale: DevGuardLocale): string {
+  return `- \`${file.file}\`\n  - 변경 이유: ${localizeSentence(file.purpose, locale)}\n  - 주요 변경: ${localizeSentence(file.changes[0] ?? "feature change needs confirmation", locale)}\n  - 사용자/AI 영향: ${localizeSentence(file.userImpact[0] ?? "impact needs confirmation", locale)}\n  - 확인 필요: ${localizeSentence(file.qa[0] ?? "specific QA point was not inferred", locale)}`;
 }
 
 function workingFileReason(file: string, domains: Set<string>): { reason: string; change: string; check: string } {
@@ -1006,11 +1008,16 @@ function renderAgentContext(input: {
       ? [
           "- concrete changes:",
           ...input.documentationSummary.fileChanges.slice(0, 6).flatMap((file) => [
-            `  - ${file.file}: ${file.changes[0] ?? file.purpose}`
+            `  - ${file.file}: ${file.changes[0] ?? file.purpose}`,
+            ...(file.userImpact[0] ? [`    impact: ${file.userImpact[0]}`] : [])
           ])
         ]
       : []),
-    ...input.recentHistory.map((line) => `- ${line}`),
+    ...input.recentHistory
+      .map(sanitizeHandoffText)
+      .filter(isUsefulHandoffText)
+      .slice(0, 5)
+      .map((line) => `- ${line}`),
     "",
     "## Quality Status",
     `- verdict: ${input.qualityVerdict}`,
@@ -1098,7 +1105,7 @@ function buildDocumentationSummary(input: {
     fileChanges,
     qaChecks: documentationQAChecks(fileChanges, changeTypes, input.qaResults),
     remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults),
-    structure: documentationStructure(changeTypes),
+    structure: documentationStructure(changeTypes, fileChanges),
     excludedAreas: unaffectedAreasFromDocumentation(affected)
   };
 }
@@ -1129,11 +1136,13 @@ function summarizeDocumentationFileChange(file: string, diff: string): Documenta
   const added = diffLines(diff, "+");
   const removed = diffLines(diff, "-");
   const type = inferDocumentationChangeTypes(file, added, removed);
+  const changes = inferConcreteChanges(file, added, removed, type);
   return {
     file,
     type,
     purpose: inferDocumentationFilePurpose(file, type),
-    changes: inferConcreteChanges(added, removed, type),
+    changes,
+    userImpact: inferUserImpact(file, changes, type),
     qa: inferConcreteQA(file, type, added, removed)
   };
 }
@@ -1150,7 +1159,7 @@ function diffLines(diff: string, prefix: "+" | "-"): string[] {
 function inferDocumentationChangeTypes(file: string, added: string[], removed: string[]): ChangeType[] {
   const text = `${file}\n${added.join("\n")}\n${removed.join("\n")}`;
   const types = new Set<ChangeType>();
-  if (/\.(tsx|jsx)$|components\/|dashboard\.ts|profile-view/i.test(file) || /className|<details|<summary|aria-|button|card|layout|spacing|mobile|overflow/i.test(text)) types.add("UI");
+  if (/\.(tsx|jsx)$|components\/|dashboard\.ts|profile-view/i.test(file) || (!/runtime-state\.ts$/i.test(file) && /className|<details|<summary|aria-|button|card|layout|spacing|mobile|overflow/i.test(text))) types.add("UI");
   if (/dashboard-i18n|locale|translation/i.test(file)) types.add("i18n");
   if (/runtime-state|quality|handoff|context|report|prompt|summary|QA|documentation/i.test(file) || /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(text)) types.add("QA");
   if (/package\.json|pnpm-lock|package-lock|yarn\.lock|bun\.lockb?|\.npmrc|tsconfig/i.test(file)) types.add("Config");
@@ -1177,14 +1186,17 @@ function inferDocumentationFilePurpose(file: string, types: ChangeType[]): strin
   return "implementation logic";
 }
 
-function inferConcreteChanges(added: string[], removed: string[], types: ChangeType[]): string[] {
+function inferConcreteChanges(file: string, added: string[], removed: string[], types: ChangeType[]): string[] {
   const changes = new Set<string>();
+  for (const change of inferFeatureLevelChanges(file, added, removed)) changes.add(change);
   if (added.some((line) => /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(line))) {
-    changes.add("Adds a shared Documentation Summary generated from git diff before artifacts render.");
-    changes.add("Routes the same summary into Quality Report, Handoff, Working Context, and Agent Context.");
+    changes.add("Builds a shared Change Intelligence summary before generated artifacts are rendered.");
+    changes.add("Uses the same feature-level summary in Quality Report, Handoff, Working Context, and Agent Context.");
   }
-  for (const change of detectTextReplacements(added, removed)) changes.add(change);
-  if (added.some((line) => /<details|details/i.test(line))) changes.add("Adds or changes collapsible details behavior.");
+  if (!/runtime-state\.ts$/i.test(file)) {
+    for (const change of detectTextReplacements(added, removed)) changes.add(change);
+  }
+  if (!/runtime-state\.ts$/i.test(file) && added.some((line) => /<details|details/i.test(line))) changes.add("Moves long supporting content into collapsible details sections.");
   if (added.some((line) => /Working Context|working-context|작업 구조/i.test(line))) changes.add("Connects Working Context as an AI-readable startup artifact.");
   if (added.some((line) => /Agent Context|에이전트 지침/i.test(line))) changes.add("Exposes Agent Context as a first-class assistant guidance artifact.");
   if (added.some((line) => /Quick Actions|빠른 실행|quickAction/i.test(line))) changes.add("Updates Dashboard Quick Actions.");
@@ -1197,6 +1209,52 @@ function inferConcreteChanges(added: string[], removed: string[], types: ChangeT
   return [...changes].slice(0, 5);
 }
 
+function inferFeatureLevelChanges(file: string, added: string[], removed: string[]): string[] {
+  const text = [...added, ...removed].join("\n");
+  const changes = new Set<string>();
+  if (/runtime-state\.ts$/i.test(file)) {
+    if (/Change Intelligence|feature-level|feature level|completion report|완료 보고|git diff|diff stat/i.test(text)) {
+      changes.add("Turns generated DevGuard documents from diff/code summaries into feature-level Change Intelligence.");
+      changes.add("Prioritizes completion report, user goal, diff, changed files, and QA results when generating document context.");
+    }
+    if (/userImpact|inferUserImpact|inferFeatureLevelChanges|documentationStructure/i.test(text)) {
+      changes.add("Adds file-level user and AI impact so generated documents explain why each change matters.");
+    }
+    if (/Quality Report|Handoff|Working Context|Agent Context/i.test(text)) {
+      changes.add("Keeps Quality Report, Handoff, Working Context, and Agent Context aligned on the same change summary.");
+    }
+    return [...changes].slice(0, 6);
+  }
+  if (/avoidThis/i.test(text) && /doThis/i.test(text)) changes.add("Uses doThis guidance instead of avoidThis guidance.");
+  if (/confidence/i.test(removed.join("\n")) && !/confidence/i.test(added.join("\n"))) changes.add("Removes the visible confidence display.");
+  if (/강점 활용법|strength usage|ability hero|hero card/i.test(text)) changes.add("Adds or updates the Ability Hero Card / strength-usage section.");
+  if (/보완하면 좋은 점/i.test(removed.join("\n")) && /강점 활용법/i.test(added.join("\n"))) changes.add("Renames the growth guidance from 보완하면 좋은 점 to 강점 활용법.");
+  if (/back card|Back Card|4장|four card|grid-cols-4|repeat\(4/i.test(text)) changes.add("Compresses the Back Card into a four-card structure.");
+  if (/<details|<summary|details/i.test(text)) changes.add("Moves long secondary content into collapsible details sections.");
+  if (/theme toggle|Theme Toggle|dark mode|light mode/i.test(text)) changes.add("Adds or adjusts the Theme Toggle.");
+  if (/\bfooter\b|Footer|site footer/i.test(text)) changes.add("Adds or adjusts the Footer.");
+  if (/DocumentationSummary|documentationSummary|Change Intelligence|feature-level|feature level/i.test(text)) changes.add("Turns generated DevGuard documents from diff/code summaries into feature-level Change Intelligence.");
+  if (/completion report|완료 보고|git diff|diff stat/i.test(text)) changes.add("Prioritizes completion report, user goal, diff, changed files, and QA results when generating document context.");
+  return [...changes].filter((change) => !isCodeLevelChange(change)).slice(0, 6);
+}
+
+function inferUserImpact(file: string, changes: string[], types: ChangeType[]): string[] {
+  const text = `${file}\n${changes.join("\n")}`;
+  const impact = new Set<string>();
+  if (/Ability Hero|strength-usage|강점 활용법/i.test(text)) impact.add("Users can understand the profile's key strength faster from the front card.");
+  if (/confidence/i.test(text)) impact.add("The UI avoids exposing an unclear confidence signal to users.");
+  if (/Back Card|four-card/i.test(text)) impact.add("The back side is easier to scan because related details are grouped into fewer cards.");
+  if (/details/i.test(text)) impact.add("Long secondary content stays available without overwhelming the main screen.");
+  if (/Theme Toggle/i.test(text)) impact.add("Users can switch visual theme from the visible UI control.");
+  if (/Footer/i.test(text)) impact.add("The page has clearer bottom navigation or product framing.");
+  if (/Change Intelligence|feature-level/i.test(text)) impact.add("AI and human readers can resume from feature meaning instead of re-reading raw diffs.");
+  if (/Quality Report|Handoff|Working Context|Agent Context/i.test(text)) impact.add("Generated DevGuard documents share the same understanding of what changed.");
+  if (types.includes("Docs")) impact.add("Readers get guidance that better matches the current workflow.");
+  if (impact.size === 0 && types.includes("UI")) impact.add("The changed UI should be checked in the actual user flow.");
+  if (impact.size === 0 && types.includes("QA")) impact.add("Generated QA and handoff documents should be reviewed as the behavior under test.");
+  return [...impact].slice(0, 4);
+}
+
 function detectTextReplacements(added: string[], removed: string[]): string[] {
   const additions = extractQuotedTerms(added);
   const removals = extractQuotedTerms(removed);
@@ -1204,14 +1262,18 @@ function detectTextReplacements(added: string[], removed: string[]): string[] {
   for (let index = 0; index < Math.min(additions.length, removals.length, 6); index += 1) {
     if (additions[index] && removals[index] && additions[index] !== removals[index]) {
       if (isGenericReplacementTerm(additions[index]) || isGenericReplacementTerm(removals[index])) continue;
-      replacements.push(`Changes label/text from "${removals[index]}" to "${additions[index]}".`);
+      replacements.push(`Updates the user-facing wording from "${removals[index]}" to "${additions[index]}".`);
     }
   }
   return replacements;
 }
 
+function isCodeLevelChange(value: string): boolean {
+  return /className|Tailwind|HTML attribute|aria-|const |function |interface |type |import |export|return /i.test(value);
+}
+
 function isGenericReplacementTerm(value: string): boolean {
-  return /^(none|확인 필요|low|medium|high|pass|fail|unknown|needs_review|blocked|en-US|ko-KR)$/i.test(value.trim());
+  return /^(none|확인 필요|low|medium|high|pass|fail|unknown|needs_review|blocked|en-US|ko-KR|documentationSummary|DocumentationSummary|changeTypes|fileChanges|overview|userImpact)$/i.test(value.trim());
 }
 
 function extractQuotedTerms(lines: string[]): string[] {
@@ -1227,6 +1289,19 @@ function extractQuotedTerms(lines: string[]): string[] {
 
 function inferConcreteQA(file: string, types: ChangeType[], added: string[], removed: string[]): string[] {
   const checks = new Set<string>();
+  const text = `${file}\n${added.join("\n")}\n${removed.join("\n")}`;
+  if (/runtime-state\.ts$/.test(file)) {
+    checks.add("Run `pnpm cli done` and verify generated artifacts describe feature-level changes, not code-token changes.");
+    checks.add("Read Quality Report, Handoff, Working Context, and Agent Context for the same Change Intelligence summary.");
+    checks.add("Confirm feature examples inside the generator are not reported as actual product changes unless the related product files changed.");
+    return [...checks].slice(0, 5);
+  }
+  if (/ability hero|강점 활용법|보완하면 좋은 점|hero card/i.test(text)) checks.add("Verify the Ability Hero Card / strength-usage section communicates the intended guidance without overflowing.");
+  if (/back card|4장|four card/i.test(text)) checks.add("Verify the Back Card four-card order, spacing, and responsive layout.");
+  if (/avoidThis|doThis/i.test(text)) checks.add("Verify the UI now shows the intended doThis guidance and no longer depends on avoidThis copy.");
+  if (/confidence/i.test(text)) checks.add("Verify removing confidence does not leave empty spacing or stale labels.");
+  if (/theme toggle/i.test(text)) checks.add("Click the Theme Toggle and confirm the selected theme is visible and persistent as intended.");
+  if (/<details|<summary|details/i.test(text)) checks.add("Expand and collapse details sections and confirm long content remains readable.");
   if (types.includes("UI")) {
     checks.add("Verify the changed UI in desktop and mobile width.");
     checks.add("Check overflow, spacing, and click/keyboard interaction for changed controls.");
@@ -1238,10 +1313,6 @@ function inferConcreteQA(file: string, types: ChangeType[], added: string[], rem
   if (types.includes("Config") || types.includes("Release")) checks.add("Verify package versions, dependency specifiers, and lockfile are consistent.");
   if (types.includes("Docs")) checks.add("Confirm docs describe commands and artifacts that actually exist.");
   if (types.includes("QA")) checks.add("Regenerate Quality Report, Handoff, Working Context, and Agent Context and read the generated output.");
-  if (/runtime-state\.ts$/.test(file)) {
-    checks.add("Run `pnpm cli done` and verify generated artifacts use concrete diff-based changes.");
-    checks.add("Read Quality Report, Handoff, Working Context, and Agent Context for the same change summary.");
-  }
   if (/install-agent-instructions\.ts$/.test(file)) checks.add("Run `pnpm cli install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.");
   return [...checks].slice(0, 5);
 }
@@ -1249,7 +1320,8 @@ function inferConcreteQA(file: string, types: ChangeType[], added: string[], rem
 function documentationOverview(files: DocumentationFileChange[], types: ChangeType[]): string[] {
   if (files.length === 0) return ["No source changes were detected in the current diff."];
   const primary = files.slice(0, 4).flatMap((file) => file.changes.slice(0, 2));
-  return [`Change types: ${types.join(", ")}.`, ...primary].slice(0, 6);
+  if (primary.length > 0) return primary.slice(0, 6);
+  return [`Change types: ${types.join(", ")}.`].slice(0, 6);
 }
 
 function affectedAreasFromDocumentation(files: DocumentationFileChange[], types: ChangeType[]): string[] {
@@ -1283,7 +1355,7 @@ function documentationRemainingWork(files: DocumentationFileChange[], types: Cha
   if (!qaResults?.["self-check"]) remaining.add("Self Check result is not recorded for this generated report.");
   if (types.includes("UI")) remaining.add("Manual browser/mobile QA is still needed for UI changes.");
   if (types.includes("Docs")) remaining.add("Read changed docs and confirm examples match current CLI output.");
-  if (types.includes("QA")) remaining.add("Read regenerated artifacts and confirm they describe concrete diff-based changes.");
+  if (types.includes("QA")) remaining.add("Read regenerated artifacts and confirm they describe feature-level changes instead of code-token changes.");
   if (files.length === 0) remaining.add("No changed files were available; rerun after a real diff if this is unexpected.");
   return [...remaining].slice(0, 8);
 }
@@ -1292,16 +1364,20 @@ function documentationRisk(files: DocumentationFileChange[], types: ChangeType[]
   if (files.length === 0) return { level: "None", reason: "No changed files were detected." };
   if (types.includes("Config") || types.includes("Release")) return { level: "Medium", reason: "Package or release metadata changed and should be checked before publishing." };
   if (types.includes("UI")) return { level: "Medium", reason: "UI changes need manual interaction and responsive checks." };
-  if (types.includes("QA")) return { level: "Medium", reason: "Generated documentation logic changed; build success does not prove output quality." };
+  if (types.includes("QA")) return { level: "Medium", reason: "Generated documentation logic changed; build success does not prove the artifacts explain the actual feature changes." };
   if (types.includes("Docs")) return { level: "Low", reason: "Documentation changed without direct runtime logic changes." };
   return { level: "Low", reason: "No high-risk area was detected from changed file paths and diff content." };
 }
 
-function documentationStructure(types: ChangeType[]): string[] {
-  if (types.includes("UI")) return ["UI entry", "↓", "render/state mapping", "↓", "user-visible interaction"];
-  if (types.includes("QA")) return ["dev-guard done", "↓", "Documentation Summary", "↓", "Quality Report / Handoff / Working Context / Agent Context"];
+function documentationStructure(types: ChangeType[], files: DocumentationFileChange[] = []): string[] {
+  const text = files.flatMap((file) => file.changes).join("\n");
+  if (/Profile|Ability|Back Card|Hero|Meta Map|details/i.test(text)) {
+    return ["Profile Card", "├── Front: Hero / Ability / Strength / Growth", "├── Back: Meta Map / MBTI / Evidence / Details", "└── Excluded: DB / Auth / Routing / Engine"];
+  }
+  if (types.includes("UI")) return ["UI entry", "↓", "feature-level UI state", "↓", "user-visible interaction"];
+  if (types.includes("QA")) return ["dev-guard done", "↓", "Change Intelligence", "↓", "Quality Report / Handoff / Working Context / Agent Context"];
   if (types.includes("Docs")) return ["User docs", "↓", "agent startup guidance", "↓", "current DevGuard workflow"];
-  return ["changed files", "↓", "Documentation Summary", "↓", "generated DevGuard artifacts"];
+  return ["changed files", "↓", "Change Intelligence", "↓", "generated DevGuard artifacts"];
 }
 
 function documentationGoal(taskText: string, files: DocumentationFileChange[], types: ChangeType[]): string {
@@ -1310,7 +1386,7 @@ function documentationGoal(taskText: string, files: DocumentationFileChange[], t
     .map((line) => line.replace(/^[-#*\s]+/, "").trim())
     .find((line) => /목표|goal|이번|작업|improve|fix|update/i.test(line) && line.length > 8 && line.length < 160);
   if (explicit) return explicit;
-  if (types.includes("QA")) return "Improve generated DevGuard documentation so it reflects concrete diff-based changes.";
+  if (types.includes("QA")) return "Improve generated DevGuard documentation so it explains feature-level changes from the current session.";
   if (types.includes("UI")) return "Update the user-facing UI behavior and verify the changed interaction.";
   if (types.includes("Docs")) return "Update documentation to match the current DevGuard workflow.";
   if (files.length > 0) return `Update ${files.slice(0, 3).map((file) => file.file).join(", ")}.`;
@@ -2930,6 +3006,10 @@ function formatQualityChangedFiles(report: QualityReport, locale: DevGuardLocale
       lines.push(`  - ${locale === "ko-KR" ? "역할" : "Role"}: ${localizeSentence(file.purpose, locale)}`);
       lines.push(`  - ${locale === "ko-KR" ? "주요 변경" : "Main changes"}:`);
       for (const change of file.changes.slice(0, 4)) lines.push(`    - ${localizeSentence(change, locale)}`);
+      if (file.userImpact.length > 0) {
+        lines.push(`  - ${locale === "ko-KR" ? "사용자/AI 영향" : "User/AI impact"}:`);
+        for (const impact of file.userImpact.slice(0, 3)) lines.push(`    - ${localizeSentence(impact, locale)}`);
+      }
       if (file.qa.length > 0) {
         lines.push(`  - ${locale === "ko-KR" ? "QA 포인트" : "QA points"}:`);
         for (const qa of file.qa.slice(0, 3)) lines.push(`    - ${localizeSentence(qa, locale)}`);
@@ -3491,16 +3571,46 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "State, history, prompt, or report generation changed. Confirm done/status/handoff regenerate the expected files without stale state.": "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff가 오래된 상태 없이 필요한 파일을 재생성하는지 확인하세요.",
     "The changed files may include work outside the current request. Confirm each changed file supports the same task before finishing.": "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.",
     "Improve generated DevGuard documentation so it reflects concrete diff-based changes.": "DevGuard 생성 문서가 실제 diff 기반 변경 내용을 반영하도록 개선합니다.",
+    "Improve generated DevGuard documentation so it explains feature-level changes from the current session.": "DevGuard 생성 문서가 이번 세션의 기능 단위 변경을 설명하도록 개선합니다.",
     "Adds a shared Documentation Summary generated from git diff before artifacts render.": "문서 산출물을 렌더링하기 전에 git diff 기반 공통 Documentation Summary를 생성합니다.",
+    "Builds a shared Change Intelligence summary before generated artifacts are rendered.": "문서 산출물을 렌더링하기 전에 공통 Change Intelligence 요약을 생성합니다.",
     "Routes the same summary into Quality Report, Handoff, Working Context, and Agent Context.": "같은 요약을 Quality Report, Handoff, Working Context, Agent Context에 전달합니다.",
+    "Uses the same feature-level summary in Quality Report, Handoff, Working Context, and Agent Context.": "Quality Report, Handoff, Working Context, Agent Context가 같은 기능 단위 요약을 사용합니다.",
     "Introduces a shared documentation summary used by generated artifacts.": "생성 문서들이 함께 사용하는 공통 Documentation Summary를 추가합니다.",
+    "Turns generated DevGuard documents from diff/code summaries into feature-level Change Intelligence.": "DevGuard 생성 문서를 diff/code 요약이 아니라 기능 단위 Change Intelligence로 전환합니다.",
+    "Adds file-level user and AI impact so generated documents explain why each change matters.": "파일별 사용자/AI 영향을 추가해 각 변경이 왜 중요한지 생성 문서가 설명하도록 합니다.",
+    "Keeps Quality Report, Handoff, Working Context, and Agent Context aligned on the same change summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 변경 요약으로 정렬되도록 합니다.",
     "generated documentation intelligence and DevGuard artifact generation": "DevGuard 문서 지능과 산출물 생성 로직",
     "Generated documentation": "생성 문서",
     "Generated documentation logic changed; build success does not prove output quality.": "생성 문서 로직이 바뀌었으므로 빌드 통과만으로 출력 품질을 보장할 수 없습니다.",
+    "Generated documentation logic changed; build success does not prove the artifacts explain the actual feature changes.": "생성 문서 로직이 바뀌었으므로 빌드 통과만으로 산출물이 실제 기능 변경을 설명하는지 보장할 수 없습니다.",
     "Regenerate Quality Report, Handoff, Working Context, and Agent Context and read the generated output.": "Quality Report, Handoff, Working Context, Agent Context를 재생성한 뒤 출력 내용을 직접 읽어 확인하세요.",
     "Run `pnpm cli done` and verify generated artifacts use concrete diff-based changes.": "`pnpm cli done`을 실행하고 생성 산출물이 구체적인 diff 기반 변경 내용을 사용하는지 확인하세요.",
+    "Run `pnpm cli done` and verify generated artifacts describe feature-level changes, not code-token changes.": "`pnpm cli done`을 실행하고 생성 산출물이 코드 토큰 변경이 아니라 기능 단위 변경을 설명하는지 확인하세요.",
     "Read Quality Report, Handoff, Working Context, and Agent Context for the same change summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 변경 요약을 사용하는지 확인하세요.",
-    "Read regenerated artifacts and confirm they describe concrete diff-based changes.": "재생성된 산출물을 읽고 실제 diff 기반 변경 내용을 설명하는지 확인하세요."
+    "Read Quality Report, Handoff, Working Context, and Agent Context for the same Change Intelligence summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 Change Intelligence 요약을 사용하는지 확인하세요.",
+    "Confirm feature examples inside the generator are not reported as actual product changes unless the related product files changed.": "관련 제품 파일이 바뀌지 않았다면 생성기 내부의 feature 예시가 실제 제품 변경으로 보고되지 않는지 확인하세요.",
+    "Read regenerated artifacts and confirm they describe concrete diff-based changes.": "재생성된 산출물을 읽고 실제 diff 기반 변경 내용을 설명하는지 확인하세요.",
+    "Read regenerated artifacts and confirm they describe feature-level changes instead of code-token changes.": "재생성된 산출물이 코드 토큰이 아니라 기능 단위 변경을 설명하는지 확인하세요.",
+    "AI and human readers can resume from feature meaning instead of re-reading raw diffs.": "AI와 사람 모두 raw diff를 다시 읽지 않고 기능 의미를 기준으로 이어서 작업할 수 있습니다.",
+    "Generated DevGuard documents share the same understanding of what changed.": "DevGuard 생성 문서들이 무엇이 바뀌었는지 같은 이해를 공유합니다.",
+    "Generated QA and handoff documents should be reviewed as the behavior under test.": "생성된 QA와 인수인계 문서 자체가 이번 테스트 대상입니다.",
+    "Readers get guidance that better matches the current workflow.": "독자는 현재 워크플로우에 더 맞는 안내를 받습니다.",
+    "Users can understand the profile's key strength faster from the front card.": "사용자는 Front Card에서 핵심 강점을 더 빠르게 이해할 수 있습니다.",
+    "The UI avoids exposing an unclear confidence signal to users.": "사용자에게 의미가 불명확한 confidence 신호를 노출하지 않습니다.",
+    "The back side is easier to scan because related details are grouped into fewer cards.": "관련 내용이 더 적은 카드로 묶여 Back Card를 더 쉽게 훑어볼 수 있습니다.",
+    "Long secondary content stays available without overwhelming the main screen.": "긴 보조 내용은 유지하되 메인 화면을 과하게 차지하지 않습니다.",
+    "Users can switch visual theme from the visible UI control.": "사용자는 화면의 Theme Toggle로 테마를 전환할 수 있습니다.",
+    "The page has clearer bottom navigation or product framing.": "페이지 하단의 탐색 또는 제품 맥락이 더 명확해집니다.",
+    "Uses doThis guidance instead of avoidThis guidance.": "avoidThis 대신 doThis 안내를 사용합니다.",
+    "Removes the visible confidence display.": "화면에 보이는 confidence 표시를 제거합니다.",
+    "Adds or updates the Ability Hero Card / strength-usage section.": "Ability Hero Card 또는 강점 활용법 영역을 추가하거나 조정합니다.",
+    "Renames the growth guidance from 보완하면 좋은 점 to 강점 활용법.": "성장 안내 문구를 ‘보완하면 좋은 점’에서 ‘강점 활용법’으로 바꿉니다.",
+    "Compresses the Back Card into a four-card structure.": "Back Card를 4장 카드 구조로 압축합니다.",
+    "Moves long secondary content into collapsible details sections.": "긴 보조 내용을 접을 수 있는 details 영역으로 이동합니다.",
+    "Adds or adjusts the Theme Toggle.": "Theme Toggle을 추가하거나 조정합니다.",
+    "Adds or adjusts the Footer.": "Footer를 추가하거나 조정합니다.",
+    "Prioritizes completion report, user goal, diff, changed files, and QA results when generating document context.": "문서 컨텍스트 생성 시 완료 보고, 사용자 목표, diff, 변경 파일, QA 결과를 우선 반영합니다."
   };
   if (exact[value]) return exact[value];
   return value
@@ -3665,6 +3775,7 @@ function handoffFileChanges(files: string[], quality: ParsedQuality, locale: Dev
       lines.push(`- \`${file.file}\``);
       lines.push(`  - ${locale === "ko-KR" ? "변경 이유" : "Reason"}: ${localizeSentence(file.purpose, locale)}`);
       lines.push(`  - ${locale === "ko-KR" ? "주요 변경" : "Main change"}: ${localizeSentence(file.changes[0] ?? "Diff detail needs confirmation.", locale)}`);
+      if (file.userImpact[0]) lines.push(`  - ${locale === "ko-KR" ? "사용자/AI 영향" : "User/AI impact"}: ${localizeSentence(file.userImpact[0], locale)}`);
       lines.push(`  - ${locale === "ko-KR" ? "확인 필요" : "Needs check"}: ${localizeSentence(file.qa[0] ?? "No specific QA point was inferred from the diff.", locale)}`);
     }
     if (documentationSummary.fileChanges.length > 8) lines.push(locale === "ko-KR" ? `- 그 외 ${documentationSummary.fileChanges.length - 8}개 파일은 Quality Report의 관련 파일 목록을 확인하세요.` : `- ${documentationSummary.fileChanges.length - 8} more files are listed in the Quality Report related files section.`);
@@ -3934,7 +4045,10 @@ function sanitizeHandoffText(value: string): string {
 
 function isUsefulHandoffText(value: string): boolean {
   const clean = value.trim();
-  return clean.length > 0 && !/^(none|확인 필요|low|medium|high)$/i.test(clean) && !/^(INTENT|SCOPE|DRIFT):/i.test(clean);
+  return clean.length > 0
+    && !/^(none|확인 필요|low|medium|high)$/i.test(clean)
+    && !/^(INTENT|SCOPE|DRIFT):/i.test(clean)
+    && !/^\d{4}-\d{2}-\d{2}T[\d:.]+Z:?$/.test(clean);
 }
 
 function looksStaleHandoffTask(value: string, files: string[]): boolean {
