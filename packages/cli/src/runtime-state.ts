@@ -96,7 +96,10 @@ export interface DoneProcessingResult {
   decisionCandidatesPath: string;
   qualityReportPath: string;
   projectHandoffPath: string;
+  readMapPath: string;
+  codeMapPath: string;
   workingContextPath: string;
+  agentBriefPath: string;
   agentContextPath: string;
   nextClaudePromptPath: string;
   projectKnowledgePath: string;
@@ -231,6 +234,8 @@ const historySummaryPath = devguardPaths.historySummary;
 const decisionCandidatesPath = devguardPaths.decisionCandidates;
 const qualityReportPath = devguardPaths.qualityReport;
 const projectHandoffPath = devguardPaths.projectHandoff;
+const readMapPath = devguardPaths.readMap;
+const codeMapPath = devguardPaths.codeMap;
 const workingContextPath = devguardPaths.workingContext;
 const hookStatusPath = devguardPaths.hookStatus;
 
@@ -561,7 +566,10 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   ]);
   await Promise.all([
     generateProjectHandoff(root),
+    generateReadMap(root),
+    generateCodeMap(root),
     generateWorkingContext(root),
+    generateAgentBrief(root),
     generateAgentContext(root),
     generateNextClaudePrompt(root),
     generateProjectKnowledge(root)
@@ -576,7 +584,10 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     decisionCandidatesPath,
     qualityReportPath,
     projectHandoffPath,
+    readMapPath,
+    codeMapPath,
     workingContextPath,
+    agentBriefPath: devguardPaths.agentBrief,
     agentContextPath: devguardPaths.agentContext,
     nextClaudePromptPath: devguardPaths.nextClaudePrompt,
     projectKnowledgePath: devguardPaths.projectKnowledge,
@@ -623,6 +634,57 @@ export async function generateProjectHandoff(root: string): Promise<string> {
   });
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
   return projectHandoffPath;
+}
+
+export async function generateReadMap(root: string): Promise<string> {
+  await ensureDevguardWorkspace(root);
+  const locale = await refreshRuntimeLocale(root);
+  const [state, records, projectKnowledge] = await Promise.all([
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readHistoryRecords(root, 5),
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+  ]);
+  const files = workingContextFiles(state, records);
+  const markdown = renderReadMap({ files, state, projectKnowledge, locale });
+  await writeTextFile(fromRoot(root, readMapPath), markdown);
+  return readMapPath;
+}
+
+export async function generateCodeMap(root: string): Promise<string> {
+  await ensureDevguardWorkspace(root);
+  const locale = await refreshRuntimeLocale(root);
+  const [state, records, projectKnowledge] = await Promise.all([
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readHistoryRecords(root, 5),
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+  ]);
+  const files = workingContextFiles(state, records);
+  const fileContents = await Promise.all(
+    files.slice(0, 6).map(async (file) => ({
+      file,
+      content: await readTextFile(fromRoot(root, file))
+    }))
+  );
+  const markdown = renderCodeMap({ files, fileContents, state, projectKnowledge, locale });
+  await writeTextFile(fromRoot(root, codeMapPath), markdown);
+  return codeMapPath;
+}
+
+export async function generateAgentBrief(root: string): Promise<string> {
+  await ensureDevguardWorkspace(root);
+  const locale = await refreshRuntimeLocale(root);
+  const [state, records, qualityContent, projectKnowledge] = await Promise.all([
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readHistoryRecords(root, 5),
+    readTextFile(fromRoot(root, qualityReportPath)),
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+  ]);
+  const files = workingContextFiles(state, records);
+  const quality = parseQuality(qualityContent);
+  const markdown = renderAgentBrief({ files, state, quality, projectKnowledge, locale });
+  await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
+  await writeTextFile(fromRoot(root, devguardPaths.agentBrief), markdown);
+  return devguardPaths.agentBrief;
 }
 
 export async function generateWorkingContext(root: string): Promise<string> {
@@ -695,6 +757,200 @@ export async function generateNextClaudePrompt(root: string): Promise<string> {
 function workingContextFiles(state: ProjectState, records: HistoryRecord[]): string[] {
   const files = state.lastChangedFiles?.length ? state.lastChangedFiles : lastHistoryFiles(records);
   return [...new Set(files.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)))].sort();
+}
+
+function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; locale: DevGuardLocale }): string {
+  const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
+  const documentationSummary = input.state.lastDocumentationSummary;
+  const entryFiles = readMapEntryFiles(input.files, profile, documentationSummary);
+  const readTargets = readMapTargets(documentationSummary, input.files, input.locale);
+  const skipTargets = readMapSkips(documentationSummary, input.files, input.locale);
+  const recentChanges = documentationSummary?.overview?.length
+    ? documentationSummary.overview.slice(0, 4).map((item) => localizeSentence(item, input.locale))
+    : [input.locale === "ko-KR" ? "최근 변경 요약 없음" : "No recent change summary available"];
+  return [
+    "# Read Map",
+    "",
+    "> Before-Agent guide. Read this before opening source files.",
+    "",
+    "## Agent Brief",
+    "",
+    `- ${localizeSentence(documentationSummary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
+    "",
+    "## 읽기 순서",
+    ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
+    "",
+    "## 우선 읽을 영역",
+    ...formatBullets(readTargets),
+    "",
+    "## 읽지 않아도 되는 영역",
+    ...formatBullets(skipTargets),
+    "",
+    "## 최근 변경",
+    ...formatBullets(recentChanges),
+    "",
+    "## QA 주의사항",
+    ...formatBullets((documentationSummary?.qaChecks ?? []).slice(0, 5).map((item) => localizeSentence(item, input.locale))),
+    "",
+    "## 사용 규칙",
+    "- 위 진입 파일과 우선 영역부터 읽는다.",
+    "- 전체 프로젝트 검색은 Read Map으로 부족할 때만 수행한다.",
+    "- 수정 제외 영역은 사용자가 명시하지 않는 한 열지 않는다."
+  ].join("\n") + "\n";
+}
+
+function renderCodeMap(input: {
+  files: string[];
+  fileContents: Array<{ file: string; content: string }>;
+  state: ProjectState;
+  projectKnowledge: string;
+  locale: DevGuardLocale;
+}): string {
+  const documentationSummary = input.state.lastDocumentationSummary;
+  const files = input.fileContents.length > 0 ? input.fileContents : input.files.slice(0, 6).map((file) => ({ file, content: "" }));
+  const lines: string[] = [
+    "# Code Map",
+    "",
+    "> File-internal map. Use this to avoid reading entire files.",
+    "",
+    "## 현재 작업 구조",
+    ...(documentationSummary?.structure?.length ? documentationSummary.structure.map((item) => localizeSentence(item, input.locale)) : ["확인 필요"]),
+    "",
+    "## 파일별 읽기 지도"
+  ];
+  for (const item of files) {
+    const sections = extractCodeSections(item.file, item.content);
+    const summary = documentationSummary?.fileChanges.find((file) => file.file === item.file);
+    lines.push("", `### \`${item.file}\``);
+    lines.push("", "역할", `- ${localizeSentence(summary?.purpose ?? codeMapFilePurpose(item.file), input.locale)}`);
+    lines.push("", "먼저 읽을 영역");
+    for (const section of sections.readFirst) lines.push(`- ${section}`);
+    lines.push("", "수정 후보");
+    for (const section of codeMapEditTargets(summary, sections.readFirst, input.locale)) lines.push(`- ${section}`);
+    lines.push("", "읽지 않아도 되는 영역");
+    for (const section of sections.skip) lines.push(`- ${section}`);
+  }
+  if (files.length === 0) {
+    lines.push("", "- 변경 파일 없음. Project Knowledge와 Handoff를 기준으로 진입 파일을 다시 확인하세요.");
+  }
+  return lines.join("\n") + "\n";
+}
+
+function renderAgentBrief(input: {
+  files: string[];
+  state: ProjectState;
+  quality: ParsedQuality;
+  projectKnowledge: string;
+  locale: DevGuardLocale;
+}): string {
+  const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
+  const summary = input.state.lastDocumentationSummary;
+  const entryFiles = readMapEntryFiles(input.files, profile, summary).slice(0, 5);
+  const readTargets = readMapTargets(summary, input.files, input.locale).slice(0, 5);
+  const skipTargets = readMapSkips(summary, input.files, input.locale).slice(0, 8);
+  const qa = (summary?.qaChecks ?? input.quality.requiredVerification).slice(0, 4).map((item) => localizeSentence(item, input.locale));
+  return [
+    "# Agent Brief",
+    "",
+    "> Compact before-agent brief. Use this to start without repository-wide discovery.",
+    "",
+    "## 현재 목표",
+    `- ${localizeSentence(summary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
+    "",
+    "## 수정 대상",
+    ...formatBullets(readTargets),
+    "",
+    "## 수정 제외",
+    ...formatBullets(skipTargets),
+    "",
+    "## 진입 파일",
+    ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
+    "",
+    "## 읽기 규칙",
+    `1. \`${devguardPaths.readMap}\`으로 읽기 순서를 확인한다.`,
+    `2. \`${devguardPaths.codeMap}\`에서 파일 내부 수정 영역만 확인한다.`,
+    "3. 필요한 경우에만 진입 파일 주변을 추가로 연다.",
+    "4. 전체 프로젝트 검색은 마지막 수단으로만 사용한다.",
+    "",
+    "## QA 주의사항",
+    ...formatBullets(qa)
+  ].join("\n") + "\n";
+}
+
+function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; architecture: Array<{ name: string; files: string[] }> }, summary?: DocumentationSummary): string[] {
+  const summaryFiles = summary?.fileChanges.map((file) => file.file) ?? [];
+  return [...new Set([...summaryFiles, ...files, ...profile.entryPoints])].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
+}
+
+function readMapTargets(summary: DocumentationSummary | undefined, files: string[], locale: DevGuardLocale): string[] {
+  if (summary?.fileChanges.length) {
+    return summary.fileChanges.flatMap((file) => [
+      `${file.file}: ${localizeSentence(file.changes[0] ?? file.purpose, locale)}`,
+      ...(file.userImpact[0] ? [`${file.file}: ${localizeSentence(file.userImpact[0], locale)}`] : [])
+    ]).slice(0, 8);
+  }
+  return files.length > 0 ? files.slice(0, 8).map((file) => `${file}: ${locale === "ko-KR" ? "변경 지점 확인" : "check changed area"}`) : [locale === "ko-KR" ? "수정 대상 확인 필요" : "Targets need confirmation"];
+}
+
+function readMapSkips(summary: DocumentationSummary | undefined, files: string[], locale: DevGuardLocale): string[] {
+  const excluded = summary?.excludedAreas?.length ? summary.excludedAreas : workingExcludedAreas(inferWorkingDomains(files));
+  return excluded.map((item) => localizeSentence(item, locale)).slice(0, 10);
+}
+
+function extractCodeSections(file: string, content: string): { readFirst: string[]; skip: string[] } {
+  if (!content.trim()) {
+    return {
+      readFirst: [codeMapFilePurpose(file)],
+      skip: ["Unchanged adjacent modules"]
+    };
+  }
+  const names = new Set<string>();
+  const patterns = [
+    /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)/gm,
+    /^\s*(?:export\s+)?const\s+([A-Za-z0-9_]+)\s*=/gm,
+    /^\s*(?:export\s+)?interface\s+([A-Za-z0-9_]+)/gm,
+    /^\s*(?:export\s+)?type\s+([A-Za-z0-9_]+)/gm,
+    /<([A-Z][A-Za-z0-9_.]*)\b/g
+  ];
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      if (match[1] && names.size < 12) names.add(match[1]);
+    }
+  }
+  const readFirst = [...names].slice(0, 8);
+  return {
+    readFirst: readFirst.length > 0 ? readFirst : [codeMapFilePurpose(file)],
+    skip: codeMapSkipSections(file, content)
+  };
+}
+
+function codeMapFilePurpose(file: string): string {
+  if (/runtime-state\.ts$/.test(file)) return "done / report / handoff / context generation";
+  if (/dashboard\.ts$/.test(file)) return "dashboard rendering and API state";
+  if (/watch\.ts$/.test(file)) return "watch engine";
+  if (/index\.ts$/.test(file)) return "CLI router";
+  if (/install-agent-instructions\.ts$/.test(file)) return "AGENTS.md / CLAUDE.md generation";
+  if (/README|docs\//i.test(file)) return "user documentation";
+  return "changed file";
+}
+
+function codeMapEditTargets(summary: DocumentationFileChange | undefined, fallback: string[], locale: DevGuardLocale): string[] {
+  if (summary?.changes.length) return summary.changes.slice(0, 4).map((item) => localizeSentence(item, locale));
+  return fallback.slice(0, 4);
+}
+
+function codeMapSkipSections(file: string, content: string): string[] {
+  const skips = new Set<string>();
+  if (!/runtime-state\.ts$/.test(file)) skips.add("Unrelated helpers in this file");
+  if (/runtime-state\.ts$/.test(file)) {
+    skips.add("watch runtime write path unless watch behavior is requested");
+    skips.add("hook runtime integration unless hook behavior is requested");
+    skips.add("dashboard rendering unless dashboard files changed");
+  }
+  if (/dashboard\.ts$/.test(file)) skips.add("report generation logic");
+  if (/auth|login|session/i.test(content)) skips.add("Auth flow unless directly requested");
+  if (/database|schema|prisma|supabase/i.test(content)) skips.add("Database flow unless directly requested");
+  return [...skips].slice(0, 6);
 }
 
 function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string; locale: DevGuardLocale }): string {
@@ -1045,6 +1301,9 @@ function renderAgentContext(input: {
     "",
     "## Additional Context",
     `- project knowledge: \`${devguardPaths.projectKnowledge}\``,
+    `- read map: \`${devguardPaths.readMap}\``,
+    `- code map: \`${devguardPaths.codeMap}\``,
+    `- agent brief: \`${devguardPaths.agentBrief}\``,
     `- working context: \`${devguardPaths.workingContext}\``,
     `- full handoff: \`${devguardPaths.projectHandoff}\``,
     `- architecture: \`${devguardPaths.architecture}\``,
@@ -1060,11 +1319,13 @@ function renderNextClaudePrompt(input: { qualityVerdict: string; nextBestTask: s
     "",
     "Before starting any work, read:",
     "",
-    `1. \`${devguardPaths.workingContext}\` — code structure map for the current work area`,
-    `2. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
-    `3. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
-    `4. \`${devguardPaths.agentContext}\` — current state, quality status, next task`,
-    `5. \`${devguardPaths.projectKnowledge}\` — static project structure for AI sessions`,
+    `1. \`${devguardPaths.readMap}\` — what to read first`,
+    `2. \`${devguardPaths.codeMap}\` — where to read inside changed files`,
+    `3. \`${devguardPaths.agentBrief}\` — compact current-task brief`,
+    `4. \`${devguardPaths.workingContext}\` — current work structure`,
+    `5. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
+    `6. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
+    `7. \`${devguardPaths.agentContext}\` — current state, quality status, next task`,
     "",
     "Use dev-guard context as the primary source of project state.",
     "Do not perform repository-wide scans before reading them.",
@@ -1188,20 +1449,22 @@ function inferDocumentationFilePurpose(file: string, types: ChangeType[]): strin
 
 function inferConcreteChanges(file: string, added: string[], removed: string[], types: ChangeType[]): string[] {
   const changes = new Set<string>();
+  const fileSpecificChanges = inferFileSpecificPipelineChanges(file, added, removed);
+  for (const change of fileSpecificChanges) changes.add(change);
   for (const change of inferFeatureLevelChanges(file, added, removed)) changes.add(change);
   if (added.some((line) => /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(line))) {
     changes.add("Builds a shared Change Intelligence summary before generated artifacts are rendered.");
     changes.add("Uses the same feature-level summary in Quality Report, Handoff, Working Context, and Agent Context.");
   }
-  if (!/runtime-state\.ts$/i.test(file)) {
+  if (fileSpecificChanges.length === 0 && !/runtime-state\.ts$/i.test(file)) {
     for (const change of detectTextReplacements(added, removed)) changes.add(change);
   }
   if (!/runtime-state\.ts$/i.test(file) && added.some((line) => /<details|details/i.test(line))) changes.add("Moves long supporting content into collapsible details sections.");
-  if (added.some((line) => /Working Context|working-context|작업 구조/i.test(line))) changes.add("Connects Working Context as an AI-readable startup artifact.");
-  if (added.some((line) => /Agent Context|에이전트 지침/i.test(line))) changes.add("Exposes Agent Context as a first-class assistant guidance artifact.");
-  if (added.some((line) => /Quick Actions|빠른 실행|quickAction/i.test(line))) changes.add("Updates Dashboard Quick Actions.");
-  if (added.some((line) => /0\.7\.0/.test(line))) changes.add("Prepares package metadata for version 0.7.0.");
-  if (added.some((line) => /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(line))) changes.add("Introduces a shared documentation summary used by generated artifacts.");
+  if (fileSpecificChanges.length === 0 && added.some((line) => /Working Context|working-context|작업 구조/i.test(line))) changes.add("Connects Working Context as an AI-readable startup artifact.");
+  if (fileSpecificChanges.length === 0 && added.some((line) => /Agent Context|에이전트 지침/i.test(line))) changes.add("Exposes Agent Context as a first-class assistant guidance artifact.");
+  if (fileSpecificChanges.length === 0 && added.some((line) => /Quick Actions|빠른 실행|quickAction/i.test(line))) changes.add("Updates Dashboard Quick Actions.");
+  if (fileSpecificChanges.length === 0 && added.some((line) => /0\.7\.0/.test(line))) changes.add("Prepares package metadata for version 0.7.0.");
+  if (fileSpecificChanges.length === 0 && added.some((line) => /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(line))) changes.add("Introduces a shared documentation summary used by generated artifacts.");
   if (types.includes("Docs") && changes.size === 0) changes.add("Updates documentation text to match the current workflow.");
   if (types.includes("i18n") && changes.size === 0) changes.add("Updates localized user-facing copy.");
   if (types.includes("UI") && changes.size === 0) changes.add("Adjusts UI rendering or interaction behavior.");
@@ -1238,9 +1501,39 @@ function inferFeatureLevelChanges(file: string, added: string[], removed: string
   return [...changes].filter((change) => !isCodeLevelChange(change)).slice(0, 6);
 }
 
+function inferFileSpecificPipelineChanges(file: string, added: string[], removed: string[]): string[] {
+  const text = [...added, ...removed].join("\n");
+  const changes = new Set<string>();
+  if (/^(AGENTS|CLAUDE)\.md$/.test(file)) {
+    changes.add("Updates agent startup instructions to read Read Map, Code Map, and Agent Brief before broad repository exploration.");
+    changes.add("Tells agents to open only targeted entry files after reading DevGuard context.");
+  }
+  if (/install-agent-instructions\.ts$/.test(file)) {
+    changes.add("Updates generated AGENTS.md / CLAUDE.md sections with the Before Agent pipeline.");
+    changes.add("Changes resume guidance to start from Read Map, Code Map, and Agent Brief.");
+  }
+  if (/paths\.ts$/.test(file) && /readMap|codeMap|agentBrief/i.test(text)) {
+    changes.add("Adds managed artifact paths for Read Map, Code Map, and Agent Brief.");
+  }
+  if (/index\.ts$/.test(file) && /readMapPath|codeMapPath|agentBriefPath|generateReadMap|generateCodeMap|generateAgentBrief/i.test(text)) {
+    changes.add("Shows Read Map, Code Map, and Agent Brief in done/handoff generated output.");
+    changes.add("Updates the new-session prompt to start from the Before Agent artifacts.");
+  }
+  if (/runtime-state\.ts$/.test(file) && /generateReadMap|generateCodeMap|generateAgentBrief|renderReadMap|renderCodeMap|renderAgentBrief/i.test(text)) {
+    changes.add("Adds rule-based Before Agent artifacts: Read Map, Code Map, and Agent Brief.");
+    changes.add("Connects the new Before Agent artifacts to done and handoff regeneration.");
+    changes.add("Reuses existing Change Intelligence instead of generating a second summary.");
+  }
+  return [...changes];
+}
+
 function inferUserImpact(file: string, changes: string[], types: ChangeType[]): string[] {
   const text = `${file}\n${changes.join("\n")}`;
   const impact = new Set<string>();
+  if (/Read Map|Code Map|Agent Brief|Before Agent/i.test(text)) impact.add("Agents can start from a smaller reading plan before opening source files.");
+  if (/targeted entry files|broad repository exploration/i.test(text)) impact.add("Expensive agents are less likely to spend tokens rediscovering the repository.");
+  if (/managed artifact paths/i.test(text)) impact.add("The new pipeline files are addressed through shared DevGuard path constants.");
+  if (/done\/handoff generated output|new-session prompt/i.test(text)) impact.add("Users can see the Before Agent artifacts immediately after done or handoff.");
   if (/Ability Hero|strength-usage|강점 활용법/i.test(text)) impact.add("Users can understand the profile's key strength faster from the front card.");
   if (/confidence/i.test(text)) impact.add("The UI avoids exposing an unclear confidence signal to users.");
   if (/Back Card|four-card/i.test(text)) impact.add("The back side is easier to scan because related details are grouped into fewer cards.");
@@ -3559,6 +3852,8 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Regenerate the Quality Report and confirm it reads like a QA result: verdict, change summary, file-level changes, completed QA, missing QA, risks, and next QA.": "Quality Report를 재생성하고 판정, 변경 요약, 파일별 변경, 완료된 QA, 남은 QA, 위험 요소, 다음 QA를 설명하는 QA 결과 보고서처럼 읽히는지 확인하세요.",
     "Confirm the diff is focused on Quality Report QA wording and generation behavior without changing Dashboard, Handoff, watch, hook, or release behavior.": "diff가 Dashboard, Handoff, watch, hook, release 동작을 바꾸지 않고 Quality Report QA 문구와 생성 동작에만 집중되어 있는지 확인하세요.",
     "Confirm no internal rule names appear in the main sections.": "주요 섹션에 내부 규칙 이름이 그대로 노출되지 않는지 확인하세요.",
+    "Confirm docs describe commands and artifacts that actually exist.": "문서가 실제 존재하는 명령과 산출물을 설명하는지 확인하세요.",
+    "Run `pnpm cli install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.": "`pnpm cli install-agent-instructions --force`를 실행한 뒤 AGENTS.md / CLAUDE.md를 확인하세요.",
     "Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read.": "변경된 소스 동작이 명령어, Dashboard 문구, 설정, hook, 보고서, 사용자가 읽는 생성 파일에 영향을 주는지 확인하세요.",
     "Confirm the changed files all support the current request and remove or split unrelated work before finishing.": "변경된 파일이 모두 현재 요청을 뒷받침하는지 확인하고, 관련 없는 작업은 제거하거나 분리하세요.",
     "Confirm the changed files still belong to one coherent task and split unrelated work if needed.": "변경 파일이 하나의 작업 목표에 속하는지 확인하고, 관련 없는 작업은 필요하면 분리하세요.",
@@ -3611,6 +3906,21 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Adds or adjusts the Theme Toggle.": "Theme Toggle을 추가하거나 조정합니다.",
     "Adds or adjusts the Footer.": "Footer를 추가하거나 조정합니다.",
     "Prioritizes completion report, user goal, diff, changed files, and QA results when generating document context.": "문서 컨텍스트 생성 시 완료 보고, 사용자 목표, diff, 변경 파일, QA 결과를 우선 반영합니다."
+    ,
+    "Updates agent startup instructions to read Read Map, Code Map, and Agent Brief before broad repository exploration.": "에이전트가 전체 저장소를 탐색하기 전에 Read Map, Code Map, Agent Brief를 먼저 읽도록 시작 지침을 갱신합니다.",
+    "Tells agents to open only targeted entry files after reading DevGuard context.": "DevGuard 컨텍스트를 읽은 뒤 필요한 진입 파일만 열도록 안내합니다.",
+    "Updates generated AGENTS.md / CLAUDE.md sections with the Before Agent pipeline.": "생성되는 AGENTS.md / CLAUDE.md 섹션에 Before Agent 파이프라인을 반영합니다.",
+    "Changes resume guidance to start from Read Map, Code Map, and Agent Brief.": "새 세션 재개 안내가 Read Map, Code Map, Agent Brief에서 시작하도록 바꿉니다.",
+    "Adds managed artifact paths for Read Map, Code Map, and Agent Brief.": "Read Map, Code Map, Agent Brief의 관리 경로를 추가합니다.",
+    "Shows Read Map, Code Map, and Agent Brief in done/handoff generated output.": "done/handoff 생성 결과에 Read Map, Code Map, Agent Brief를 표시합니다.",
+    "Updates the new-session prompt to start from the Before Agent artifacts.": "새 세션 안내가 Before Agent 산출물에서 시작하도록 갱신합니다.",
+    "Adds rule-based Before Agent artifacts: Read Map, Code Map, and Agent Brief.": "rule-based Before Agent 산출물인 Read Map, Code Map, Agent Brief를 추가합니다.",
+    "Connects the new Before Agent artifacts to done and handoff regeneration.": "새 Before Agent 산출물을 done과 handoff 재생성 흐름에 연결합니다.",
+    "Reuses existing Change Intelligence instead of generating a second summary.": "별도 요약을 다시 만들지 않고 기존 Change Intelligence를 재사용합니다.",
+    "Agents can start from a smaller reading plan before opening source files.": "에이전트는 소스 파일을 열기 전에 더 작은 읽기 계획에서 시작할 수 있습니다.",
+    "Expensive agents are less likely to spend tokens rediscovering the repository.": "비싼 에이전트가 저장소를 다시 파악하는 데 쓰는 토큰을 줄일 수 있습니다.",
+    "The new pipeline files are addressed through shared DevGuard path constants.": "새 파이프라인 파일은 공통 DevGuard 경로 상수로 관리됩니다.",
+    "Users can see the Before Agent artifacts immediately after done or handoff.": "사용자는 done 또는 handoff 직후 Before Agent 산출물을 바로 확인할 수 있습니다."
   };
   if (exact[value]) return exact[value];
   return value

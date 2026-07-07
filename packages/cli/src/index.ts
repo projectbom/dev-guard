@@ -21,7 +21,7 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
-import { generateAgentContext, generateNextClaudePrompt, generateProjectHandoff, generateWorkingContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
+import { generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
@@ -299,7 +299,7 @@ Commands:
   watch                   Monitor AI coding session; prepares project on first run
   "requirement"           Generate task.md and a compact Codex prompt
   done                    Manual recovery — normally watch auto-finalizes
-  handoff                 Regenerate project-handoff.md and agent-context.md
+  handoff                 Regenerate handoff, read-map, code-map, brief, and agent-context
   knowledge               Generate and summarize .devguard/project/project-knowledge.json
   status                  Show pending watch state, hook state, quality verdict
   configure / config      Configure dev-guard settings (AI provider, watch tuning)
@@ -394,7 +394,10 @@ async function runDone(root: string): Promise<void> {
     console.log(`- ${result.decisionCandidatesPath}`);
     console.log(`- ${result.qualityReportPath}`);
     console.log(`- ${result.projectHandoffPath}`);
+    console.log(`- ${result.readMapPath}`);
+    console.log(`- ${result.codeMapPath}`);
     console.log(`- ${result.workingContextPath}`);
+    console.log(`- ${result.agentBriefPath}`);
     console.log(`- ${result.agentContextPath}`);
     console.log(`- ${result.nextClaudePromptPath}`);
     console.log(`- ${result.projectKnowledgePath}`);
@@ -402,7 +405,7 @@ async function runDone(root: string): Promise<void> {
     console.log(`Quality: ${result.qualityVerdict}`);
     console.log("");
     console.log(copy.newSession);
-    console.log(`  Read ${result.workingContextPath}, ${result.projectHandoffPath}, and ${result.qualityReportPath}; then continue.`);
+    console.log(`  Read ${result.readMapPath}, ${result.codeMapPath}, and ${result.agentBriefPath}; then continue.`);
     console.log("");
     console.log(copy.nextTask);
     console.log(locale === "ko-KR" ? `${result.promptPath} 확인 후 필요한 수정 진행` : `Review ${result.promptPath} and continue with the required fixes.`);
@@ -417,21 +420,27 @@ async function runHandoff(root: string): Promise<void> {
   try {
     const locale = await refreshRuntimeLocale(root);
     const copy = cliCopy(locale);
-    const [handoffPath, workingContextPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
+    const [handoffPath, readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
       generateProjectHandoff(root),
+      generateReadMap(root),
+      generateCodeMap(root),
       generateWorkingContext(root),
+      generateAgentBrief(root),
       generateAgentContext(root),
       generateNextClaudePrompt(root)
     ]);
     console.log("dev-guard handoff");
     console.log("generated:");
     console.log(`- ${handoffPath}`);
+    console.log(`- ${readMapPath}`);
+    console.log(`- ${codeMapPath}`);
     console.log(`- ${workingContextPath}`);
+    console.log(`- ${agentBriefPath}`);
     console.log(`- ${agentContextPath}`);
     console.log(`- ${nextClaudePromptPath}`);
     console.log("");
     console.log(copy.resumePrompt);
-    console.log(`  Read ${devguardPaths.workingContext}, ${devguardPaths.projectHandoff}, and ${devguardPaths.qualityReport}; then continue.`);
+    console.log(`  Read ${devguardPaths.readMap}, ${devguardPaths.codeMap}, and ${devguardPaths.agentBrief}; then continue.`);
   } catch (error) {
     console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
     process.exitCode = 1;

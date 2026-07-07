@@ -6,12 +6,15 @@ DevGuard is a CLI context guard for AI coding sessions. It keeps project context
 
 Before changing code:
 
-1. Read `.devguard/reports/working-context.md` — code structure map for the current work area.
-2. Read `.devguard/reports/project-handoff.md` — next-session work instructions.
-3. Read `.devguard/reports/quality-report.md` — QA result and remaining verification.
-4. Read `.devguard/project/project-knowledge.json` before broad repository exploration.
-5. Read `.devguard/context/agent-context.md` when agent-specific rules or current state are needed.
-6. Run `dev-guard status` when the current state is unclear.
+1. Read `.devguard/reports/read-map.md` — what to read first.
+2. Read `.devguard/reports/code-map.md` — where to read inside changed files.
+3. Read `.devguard/context/agent-brief.md` — compact current-task brief.
+4. Read `.devguard/reports/working-context.md` — current work structure.
+5. Read `.devguard/reports/project-handoff.md` — next-session work instructions.
+6. Read `.devguard/reports/quality-report.md` — QA result and remaining verification.
+7. Read `.devguard/context/agent-context.md` when agent-specific rules or current state are needed.
+8. Read `.devguard/project/project-knowledge.json` before broad repository exploration.
+9. Run `dev-guard status` when the current state is unclear.
 
 Common commands:
 
@@ -30,15 +33,17 @@ Common commands:
 
 Session workflow:
 
-- Start: read the Working Context entry files first, then inspect only the files needed for the task.
+- Start: read the Read Map and Code Map first, then inspect only the targeted file regions needed for the task.
 - During work: keep `dev-guard watch` running in another terminal when continuous change tracking is wanted.
 - Finish: run the relevant project checks, then run `dev-guard done` and `dev-guard status` so handoff/status files are current.
-- Next Codex session: use `.devguard/reports/working-context.md`, `.devguard/reports/project-handoff.md`, `.devguard/context/agent-context.md`, or `.devguard/prompts/next-codex-prompt.md` to resume without rediscovering the repo.
+- Next Codex session: use `.devguard/reports/read-map.md`, `.devguard/reports/code-map.md`, `.devguard/context/agent-brief.md`, `.devguard/reports/working-context.md`, or `.devguard/prompts/next-codex-prompt.md` to resume without rediscovering the repo.
 
 Rules:
 
 - Use DevGuard artifacts as the primary source of current project state.
-- Start from the entry files and excluded areas in `.devguard/reports/working-context.md`; do not scan the full repository first.
+- Start from `.devguard/reports/read-map.md` and `.devguard/reports/code-map.md`; do not scan the full repository first.
+- Use `.devguard/context/agent-brief.md` as the compact before-agent task brief.
+- Use `.devguard/reports/working-context.md` for the current work structure.
 - Use `.devguard/reports/project-handoff.md` as the next work instruction.
 - Use `.devguard/reports/quality-report.md` only for QA results and verification status.
 - Treat `.devguard/project/project-knowledge.json` as the primary source of project structure before broad repository exploration.
