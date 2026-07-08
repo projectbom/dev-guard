@@ -296,10 +296,12 @@ export async function readRuntimeState(root: string): Promise<RuntimeState> {
   }
 }
 
-export async function writeRuntimeState(root: string, state: RuntimeState): Promise<void> {
+export async function writeRuntimeState(root: string, state: RuntimeState, options: { replacePending?: boolean } = {}): Promise<void> {
   await ensureDevguardWorkspace(root);
   try {
-    await writeAtomicTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(state), null, 2)}\n`);
+    const current = options.replacePending ? undefined : await readJsonFile<RuntimeState>(fromRoot(root, runtimePath), defaultRuntime).catch(() => undefined);
+    const next = current ? mergeRuntimeStateForWrite(current, state) : state;
+    await writeAtomicTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(next), null, 2)}\n`);
   } catch (error) {
     await logRuntimeWriteWarning(root, `runtime_write=failed path=${runtimePath} error=${quoteLogValue(errorMessage(error))}`);
   }
@@ -326,7 +328,7 @@ export async function resetRuntimeState(root: string, options: { preserveQaResul
     ...defaultRuntime,
     idleSinceAt: new Date().toISOString(),
     ...(options.preserveQaResults && current?.qaResults ? { qaResults: current.qaResults } : {})
-  });
+  }, { replacePending: true });
 }
 
 export async function readProjectState(root: string): Promise<ProjectState> {
@@ -387,7 +389,7 @@ export async function markRuntimeStable(root: string, diffHash: string): Promise
   const project = await readProjectState(root);
   if (isRuntimeOlderThanProcessed(current, project.lastProcessedAt)) {
     await logRuntimeWriteWarning(root, "runtime_write=skipped reason=stale_stable_after_done");
-    await writeRuntimeState(root, defaultRuntime);
+    await writeRuntimeState(root, defaultRuntime, { replacePending: true });
     return defaultRuntime;
   }
   const next: RuntimeState = {
@@ -457,9 +459,10 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const gitChanges = await loadChangesWithFallback(root, runtime);
   const changeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
   const rawChangedFiles = [...new Set(gitChanges.changeFiles.map((file) => file.path))].sort();
+  const runtimeChangedFiles = runtime.pendingChangedFiles.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file));
   const changedFiles = [
     ...new Set(
-      (changeFiles.length > 0 ? changeFiles.map((file) => file.path) : runtime.pendingChangedFiles).filter(
+      [...runtimeChangedFiles, ...changeFiles.map((file) => file.path)].filter(
         (file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)
       )
     )
@@ -2223,6 +2226,56 @@ function normalizeRuntimeState(state: RuntimeState): RuntimeState {
     revision: (state.revision ?? 0) + 1,
     updatedAt: now
   };
+}
+
+function mergeRuntimeStateForWrite(current: RuntimeState, next: RuntimeState): RuntimeState {
+  const pendingChangedFiles = [...new Set([...(current.pendingChangedFiles ?? []), ...(next.pendingChangedFiles ?? [])])].sort();
+  const currentLastChanged = current.lastChangedAt ? Date.parse(current.lastChangedAt) : 0;
+  const nextLastChanged = next.lastChangedAt ? Date.parse(next.lastChangedAt) : 0;
+  const keepCurrentActivity = currentLastChanged > nextLastChanged;
+  const keepCurrentStatus =
+    keepCurrentActivity ||
+    (currentLastChanged === nextLastChanged && statusPriority(current.lastStatus) > statusPriority(next.lastStatus));
+  return {
+    ...current,
+    ...next,
+    pendingChangedFiles,
+    firstChangedAt: earliestIso(current.firstChangedAt, next.firstChangedAt),
+    lastChangedAt: keepCurrentActivity ? current.lastChangedAt : next.lastChangedAt ?? current.lastChangedAt,
+    lastChangedFile: keepCurrentActivity ? current.lastChangedFile : next.lastChangedFile ?? current.lastChangedFile,
+    lastActivityAt: latestIso(current.lastActivityAt, next.lastActivityAt),
+    changeCountSinceIdle: Math.max(current.changeCountSinceIdle ?? 0, next.changeCountSinceIdle ?? 0),
+    lastStatus: keepCurrentStatus ? current.lastStatus : next.lastStatus ?? current.lastStatus
+  };
+}
+
+function statusPriority(status?: RuntimeState["lastStatus"]): number {
+  switch (status) {
+    case "finalizing":
+      return 5;
+    case "ready_for_done":
+      return 4;
+    case "active":
+      return 3;
+    case "processed":
+      return 2;
+    case "idle":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function earliestIso(a?: string, b?: string): string | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return Date.parse(a) <= Date.parse(b) ? a : b;
+}
+
+function latestIso(a?: string, b?: string): string | undefined {
+  if (!a) return b;
+  if (!b) return a;
+  return Date.parse(a) >= Date.parse(b) ? a : b;
 }
 
 function isRuntimeOlderThanProcessed(runtime: RuntimeState, lastProcessedAt?: string): boolean {
