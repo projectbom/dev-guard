@@ -2,7 +2,7 @@
 
 ## DevGuard Instructions for Claude
 
-DevGuard is a CLI context guard for AI coding sessions. It keeps project context, pending changes, quality checks, and next-session handoff files under `.devguard/`.
+DevGuard is an AI Coding Context Provider. It prepares context before AI work and preserves context after AI work in local `.devguard/` files.
 
 Before changing code:
 
@@ -10,11 +10,14 @@ Before changing code:
 2. Read `.devguard/reports/code-map.md` — where to read inside changed files.
 3. Read `.devguard/context/agent-brief.md` — compact current-task brief.
 4. Read `.devguard/reports/working-context.md` — current work structure.
-5. Read `.devguard/reports/project-handoff.md` — next-session work instructions.
-6. Read `.devguard/reports/quality-report.md` — QA result and remaining verification.
-7. Read `.devguard/context/agent-context.md` when agent-specific rules or current state are needed.
-8. Read `.devguard/project/project-knowledge.json` before broad repository exploration.
-9. Run `dev-guard status` when the current state is unclear.
+
+Read only when needed:
+
+- `.devguard/reports/project-handoff.md` — next-session work instruction.
+- `.devguard/reports/quality-report.md` — QA result and remaining verification.
+- `.devguard/context/agent-context.md` — agent rules and current constraints.
+- `.devguard/project/project-knowledge.json` — long-term project structure before broad exploration.
+- `dev-guard status` — current runtime state when unclear.
 
 Common commands:
 
@@ -42,11 +45,9 @@ Rules:
 
 - Use DevGuard artifacts as the primary source of current project state.
 - Start from `.devguard/reports/read-map.md` and `.devguard/reports/code-map.md`; do not scan the full repository first.
-- Use `.devguard/context/agent-brief.md` as the compact before-agent task brief.
-- Use `.devguard/reports/working-context.md` for the current work structure.
-- Use `.devguard/reports/project-handoff.md` as the next work instruction.
-- Use `.devguard/reports/quality-report.md` only for QA results and verification status.
-- Treat `.devguard/project/project-knowledge.json` as the primary source of project structure before broad repository exploration.
+- Use `.devguard/context/agent-brief.md` as the compact task brief and `.devguard/reports/working-context.md` for work structure.
+- Use `.devguard/reports/project-handoff.md` for next-work instructions and `.devguard/reports/quality-report.md` only for QA status.
+- Treat `.devguard/project/project-knowledge.json` as long-term structure memory, not a task instruction.
 - Do not perform repository-wide scans before reading the current DevGuard context.
 - Do not make broad unrelated changes.
 - Do not invent unsupported DevGuard commands; verify commands with `dev-guard --help` or the current CLI source.

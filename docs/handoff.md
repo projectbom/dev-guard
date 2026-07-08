@@ -11,6 +11,20 @@
 
 `next-codex-prompt.md` is a compact execution prompt. `project-handoff.md` is the compressed context-overflow recovery file for a fresh Claude/Codex thread. The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
 
+## Role In The Context Pipeline
+
+Handoff is only one part of the DevGuard context pipeline:
+
+- `read-map.md`: what the next agent should read first.
+- `code-map.md`: where to read inside the relevant files.
+- `agent-brief.md`: compact current-task brief.
+- `quality-report.md`: QA result and remaining verification.
+- `project-handoff.md`: next-session work instruction.
+- `working-context.md`: current work structure and boundaries.
+- `agent-context.md`: agent rules and operating constraints.
+
+These documents should not each invent a new summary. They reuse the same Change Intelligence and render it for different readers.
+
 ## Prompt Sections
 
 `next-codex-prompt.md` includes:

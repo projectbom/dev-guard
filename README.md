@@ -2,7 +2,14 @@
 
 [English](./README.md) | [한국어](./README.ko.md)
 
-dev-guard is a CLI context guard for AI coding sessions. It keeps project context, changed files, quality checks, and next-session handoff prompts in local `.devguard/` files so Codex/Claude work can resume without rediscovering the repository.
+dev-guard is an **AI Coding Context Provider**.
+
+It is not an IDE, wrapper, or autonomous coding agent. Its job is narrower:
+
+- before AI work: prepare the smallest useful context for the agent
+- after AI work: preserve what changed, what was checked, and where the next agent should continue
+
+DevGuard keeps this context in local `.devguard/` files so Codex/Claude work can resume without rediscovering the repository.
 
 The default workflow requires only one command after installation:
 
@@ -15,6 +22,93 @@ dev-guard handoff
 ```
 
 Use it when an AI coding session spans multiple prompts, multiple agents, or a context window reset.
+
+## Product Boundary
+
+DevGuard provides context around an AI coding agent. It does not replace the agent.
+
+```text
+Before AI
+  -> Prepare Context
+  -> Read Map / Code Map / Agent Brief
+
+AI Work
+  -> Claude / Codex / GPT edits code
+
+After AI
+  -> Preserve Context
+  -> Quality Report / Handoff / Working Context / Memory
+```
+
+DevGuard does not implement a vector database, background full-project indexer, cloud sync, IDE integration, or automatic code interception. Those are roadmap-level ideas, not part of the current product.
+
+## Context Pipeline
+
+The official DevGuard pipeline is:
+
+```text
+Prepare
+  -> Read Map
+  -> Code Map
+  -> Agent Brief
+  -> Work
+  -> Done
+  -> Change Intelligence
+  -> Quality Report
+  -> Handoff
+  -> Working Context
+  -> Agent Context
+  -> Memory Update
+```
+
+One Change Intelligence summary is generated after `done`; downstream documents reuse it instead of creating competing summaries.
+
+## Artifact Roles
+
+| Artifact | Role |
+| --- | --- |
+| Project Knowledge | Long-term project structure memory. |
+| Read Map | What the next agent should read first. |
+| Code Map | Where to read inside the relevant files. |
+| Agent Brief | Compact summary for the next coding agent. |
+| Quality Report | QA result and remaining verification. |
+| Project Handoff | Next-session work instruction. |
+| Working Context | Current work structure and boundaries. |
+| Agent Context | Agent rules and current operating constraints. |
+| Next Prompt | Ready-to-paste execution prompt for a new AI session. |
+| Dashboard | Human overview of status and next action. |
+
+## Feature Classification
+
+**Core**
+
+- `.devguard/` local context store
+- `watch`, `done`, `status`, `handoff`
+- Project Knowledge
+- Read Map, Code Map, Agent Brief
+- Change Intelligence
+- Quality Report
+- Project Handoff
+- Working Context and Agent Context
+- memory files: `.devguard/memory/code-index.json`, `.devguard/memory/change-log.jsonl`
+
+**Keep**
+
+- Dashboard
+- `install-agent-instructions`
+- `install-hooks`
+- `knowledge`
+- OpenAI-assisted Quality Report summary
+- `self-check`, `doctor`
+- locale-aware user-facing reports
+
+**Experimental**
+
+- `scan`, `refresh`
+- `review`, `task-ai`, natural-language task helpers
+- `update --write`
+- Codex JSONL listener helper
+- advanced hook/notify strategies beyond the default watch flow
 
 ## Problem
 
@@ -170,6 +264,9 @@ If you edit during the grace period, the timer resets and the cycle starts again
 After finalization, DevGuard writes quality and handoff artifacts:
 - `.devguard/reports/quality-report.md`
 - `.devguard/reports/project-handoff.md`
+- `.devguard/reports/read-map.md`
+- `.devguard/reports/code-map.md`
+- `.devguard/context/agent-brief.md`
 - `.devguard/prompts/next-codex-prompt.md`
 
 User-facing artifacts such as the dashboard, quality report, and project handoff follow the detected locale. DevGuard checks `.devguard/config.json` `locale`, then OS locale (`LANG`, `LC_ALL`, `LC_MESSAGES`), then falls back to `en-US`. The dashboard language toggle writes the same project locale setting. AI-facing artifacts such as `next-codex-prompt.md` stay in English.
@@ -210,7 +307,7 @@ The file is refreshed after session completion and can be regenerated manually:
 dev-guard knowledge
 ```
 
-Generated `AGENTS.md` and `CLAUDE.md` instructions tell agents to read project knowledge before opening source files broadly.
+Generated `AGENTS.md` and `CLAUDE.md` instructions tell agents to start with Read Map, Code Map, Agent Brief, and Working Context before opening source files broadly.
 
 ## Local Dashboard
 
@@ -272,16 +369,27 @@ dev-guard keeps runtime artifacts under `.devguard/`:
   state.json
   runtime.json
   history.jsonl
+  memory/
+    code-index.json
+    change-log.jsonl
+  context/
+    agent-brief.md
+    agent-context.md
   prompts/
     next-codex-prompt.md
+    next-claude-prompt.md
   reports/
     last-run.md
     history-summary.md
     decision-candidates.md
     quality-report.md
+    project-handoff.md
+    read-map.md
+    code-map.md
+    working-context.md
 ```
 
-The same `.devguard/` directory also stores guard config, task files, runs, memory cache, and code graph data.
+The same `.devguard/` directory also stores guard config and task files.
 
 Generated runtime/cache files are local-only by default and should not be committed unless a project intentionally changes its tracking policy. See [docs/configuration.md](./docs/configuration.md).
 
@@ -293,9 +401,16 @@ Generated runtime/cache files are local-only by default and should not be commit
 - `.devguard/history.jsonl`: append-only run history
 - `.devguard/reports/history-summary.md`: recent 5-run summary
 - `.devguard/reports/decision-candidates.md`: decisions worth manually recording
-- `.devguard/reports/quality-report.md`: PASS / NEEDS_REVIEW / BLOCKED quality verdict
-- `.devguard/prompts/next-codex-prompt.md`: ready-to-paste Codex/Claude handoff prompt
-- `.devguard/reports/project-handoff.md`: compressed project resume file for a new Claude/Codex thread
+- `.devguard/memory/code-index.json`: local code range index without source code
+- `.devguard/memory/change-log.jsonl`: compact session change history
+- `.devguard/reports/read-map.md`: what to read first
+- `.devguard/reports/code-map.md`: where to read inside changed files
+- `.devguard/context/agent-brief.md`: compact before-agent brief
+- `.devguard/reports/quality-report.md`: QA result and remaining verification
+- `.devguard/reports/project-handoff.md`: next-session work instruction
+- `.devguard/reports/working-context.md`: current work structure and boundaries
+- `.devguard/context/agent-context.md`: agent rules and current constraints
+- `.devguard/prompts/next-codex-prompt.md`: ready-to-paste Codex prompt
 
 Example:
 
@@ -308,6 +423,9 @@ Generated:
 - .devguard/reports/decision-candidates.md
 - .devguard/reports/quality-report.md
 - .devguard/reports/project-handoff.md
+- .devguard/reports/read-map.md
+- .devguard/reports/code-map.md
+- .devguard/context/agent-brief.md
 ```
 
 Read more in [docs/handoff.md](./docs/handoff.md).
@@ -392,34 +510,32 @@ In the new thread, attach or ask the agent to read `.devguard/reports/project-ha
 
 ## Multi-Agent Workflow
 
-`dev-guard done` (or Auto Mode) now generates `.devguard/context/agent-context.md` — a single-entry document for new agent sessions. Read it instead of scanning the whole repository.
+`dev-guard done` (or Auto Mode) generates context files for new agent sessions. Start with the Before-AI files, then read the after-work files only when needed.
 
 ### Recommended session handoff order
 
 1. `dev-guard watch` — start the watcher
 2. Claude/Codex edits files; Stop Hooks run `done` automatically
-3. `dev-guard done` — generates all artifacts including `agent-context.md`
+3. `dev-guard done` — generates Read Map, Code Map, Agent Brief, QA, handoff, context, and memory artifacts
 4. Start a new agent session
-5. Read `.devguard/context/agent-context.md` — pick up from there
+5. Read `.devguard/reports/read-map.md`, `.devguard/reports/code-map.md`, and `.devguard/context/agent-brief.md`
 
 ### When switching between Codex and Claude (or any agent)
 
 Paste this as the opening prompt in the new session:
 
 ```txt
-Read .devguard/context/agent-context.md and continue.
+Read .devguard/reports/read-map.md, .devguard/reports/code-map.md, and .devguard/context/agent-brief.md; then continue from the targeted file ranges.
 ```
 
-This covers: current state, last completed work, quality status, next task, important decisions, relevant files, and what not to touch.
-
-For a full compressed resume, also read `.devguard/reports/project-handoff.md`.
+For the full next-session instruction, also read `.devguard/reports/project-handoff.md`. For QA state, read `.devguard/reports/quality-report.md`.
 
 ### Generated agent context files
 
 `dev-guard done` and `dev-guard handoff` produce:
 
 - `.devguard/reports/working-context.md` — code structure map for AI agents to start from the right files
-- `.devguard/context/agent-context.md` — single-entry context document for new sessions
+- `.devguard/context/agent-context.md` — agent rules and current operating constraints
 - `.devguard/prompts/next-claude-prompt.md` — structured startup prompt for Claude sessions
 - `.devguard/prompts/next-codex-prompt.md` — compact execution prompt for Codex sessions
 
@@ -439,7 +555,7 @@ These files are project-level guidance for:
 - Codex (reads `AGENTS.md`)
 - Other agents that honor project-level instruction files
 
-The files contain suggestions, not enforced rules. They recommend reading Working Context, Handoff, and Quality Report before repository-wide scans so agents can start from the right entry files and avoid rebuilding context. Existing content is preserved; dev-guard only appends or updates its own section (marked with HTML comment markers).
+The files contain suggestions, not enforced rules. They recommend reading Read Map, Code Map, Agent Brief, and Working Context before repository-wide scans so agents can start from the right ranges and avoid rebuilding context. Existing content is preserved; dev-guard only appends or updates its own section (marked with HTML comment markers).
 
 ## Quality Flow
 

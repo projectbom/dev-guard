@@ -2,7 +2,9 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-dev-guard is a pnpm TypeScript monorepo with a local-first CLI workflow.
+dev-guard is a pnpm TypeScript monorepo with a local-first AI Coding Context Provider workflow.
+
+DevGuard is not an IDE, wrapper, or autonomous coding agent. It provides context before AI work and records context after AI work.
 
 ```text
 packages/
@@ -12,7 +14,24 @@ packages/
 
 ## Current Workflow
 
-The public MVP workflow is event based:
+The official context pipeline is:
+
+```text
+Prepare
+  -> Read Map
+  -> Code Map
+  -> Agent Brief
+  -> Work
+  -> Done
+  -> Change Intelligence
+  -> Quality Report
+  -> Handoff
+  -> Working Context
+  -> Agent Context
+  -> Memory Update
+```
+
+The public workflow remains event based:
 
 ```text
 watch
@@ -23,14 +42,17 @@ watch
 done
   -> collect git diff and pending runtime files
   -> classify changed areas
-  -> infer diff intent and drift candidates
+  -> build one Change Intelligence summary
+  -> update memory/code-index.json and memory/change-log.jsonl
   -> append history.jsonl
   -> write last-run report
   -> write history summary
   -> write decision candidates
+  -> write read map, code map, and agent brief
   -> write quality report
-  -> write next Codex/Claude handoff prompt
+  -> write next Codex/Claude prompt
   -> write project handoff for context overflow recovery
+  -> write working context and agent context
   -> clear pending runtime state
 
 status
@@ -55,28 +77,88 @@ The event workflow uses `.devguard/`:
   state.json
   runtime.json
   history.jsonl
+  memory/code-index.json
+  memory/change-log.jsonl
+  context/agent-brief.md
+  context/agent-context.md
   prompts/next-codex-prompt.md
   reports/last-run.md
   reports/history-summary.md
   reports/decision-candidates.md
   reports/quality-report.md
+  reports/project-handoff.md
+  reports/read-map.md
+  reports/code-map.md
+  reports/working-context.md
 ```
 
 These files are generated or project-local. Existing markdown files are not overwritten when the workspace is initialized.
 
-## Advanced Memory And Config
+## Artifact Roles
+
+| Artifact | Role |
+| --- | --- |
+| Project Knowledge | Long-term project structure memory. |
+| Read Map | What the next agent should read first. |
+| Code Map | Where to read inside relevant files. |
+| Agent Brief | Compact current task brief. |
+| Quality Report | QA result and remaining verification. |
+| Project Handoff | Next-session work instruction. |
+| Working Context | Current work structure and boundaries. |
+| Agent Context | Agent rules and operating constraints. |
+| Memory | Accumulated local context index and change history. |
+
+One information source should be generated once and then reused. Change Intelligence is the shared source for Quality Report, Handoff, Working Context, Agent Context, Read Map, Code Map, and Agent Brief.
+
+## Feature Classification
+
+Core:
+
+- `.devguard/` local context store
+- `watch`, `done`, `status`, `handoff`
+- Project Knowledge
+- Read Map, Code Map, Agent Brief
+- Change Intelligence
+- Quality Report, Project Handoff, Working Context, Agent Context
+- `.devguard/memory/code-index.json`, `.devguard/memory/change-log.jsonl`
+
+Keep:
+
+- Dashboard
+- `install-agent-instructions`
+- `install-hooks`
+- `knowledge`
+- OpenAI-assisted Quality Report summary
+- `self-check`, `doctor`
+- locale-aware user-facing reports
+
+Experimental:
+
+- `scan`, `refresh`
+- `review`, `task-ai`, natural-language task helpers
+- `update --write`
+- Codex JSONL listener helper
+- advanced hook/notify strategies outside the default watch flow
+
+Out of scope for the current product:
+
+- wrapper/intercept runtime
+- embeddings or vector DB
+- background full-project indexer
+- cloud sync
+- IDE-specific features
+
+## Memory And Config
 
 The same `.devguard/` path also stores advanced features:
 
 - `.devguard/config.json`
 - `.devguard/task.md`
 - `.devguard/runs/`
-- `.devguard/project-index.json`
-- `.devguard/file-summaries.json`
-- `.devguard/code-graph.json`
-- `.devguard/project-map.md`
+- `.devguard/memory/code-index.json`
+- `.devguard/memory/change-log.jsonl`
 
-`scan` and `refresh` maintain project memory cache here. The event workflow can reuse this context when available, but the main user flow no longer requires manual scan/refresh.
+Memory is a local JSON/JSONL context store. It should help DevGuard understand the project over time without storing full source code or requiring a database.
 
 ## Analysis Layers
 

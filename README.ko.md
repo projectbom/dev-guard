@@ -2,7 +2,14 @@
 
 [English](./README.md) | [한국어](./README.ko.md)
 
-dev-guard는 AI 코딩 세션을 이어가기 위한 CLI context guard입니다. 프로젝트 맥락, 변경 파일, 품질 체크, 다음 세션용 handoff prompt를 로컬 `.devguard/` 파일로 보존해서 Codex/Claude 작업을 레포지토리 재탐색 없이 이어갈 수 있게 합니다.
+dev-guard는 **AI Coding Context Provider**입니다.
+
+IDE도 아니고, wrapper도 아니며, 스스로 코드를 수정하는 AI Agent도 아닙니다. 역할은 더 좁습니다.
+
+- AI 작업 전: Agent가 바로 시작할 수 있는 최소 컨텍스트 제공
+- AI 작업 후: 무엇이 바뀌었고, 무엇을 검증했으며, 다음 Agent가 어디서 이어가야 하는지 기록
+
+DevGuard는 이 컨텍스트를 로컬 `.devguard/` 파일로 보존해서 Codex/Claude 작업을 레포지토리 재탐색 없이 이어갈 수 있게 합니다.
 
 설치 후 기본 워크플로우에 필요한 명령어는 단 하나입니다.
 
@@ -15,6 +22,93 @@ dev-guard handoff
 ```
 
 context window가 끊기거나, 여러 Agent를 오가거나, 긴 AI 코딩 작업을 다음 세션으로 넘겨야 할 때 사용합니다.
+
+## 제품 경계
+
+DevGuard는 AI Coding Agent 앞뒤에서 컨텍스트를 제공하는 도구입니다. Agent를 대체하지 않습니다.
+
+```text
+Before AI
+  -> Prepare Context
+  -> Read Map / Code Map / Agent Brief
+
+AI Work
+  -> Claude / Codex / GPT가 코드 수정
+
+After AI
+  -> Preserve Context
+  -> Quality Report / Handoff / Working Context / Memory
+```
+
+DevGuard는 vector DB, background full-project indexer, cloud sync, IDE 전용 통합, 자동 코드 intercept를 구현하지 않습니다. 이런 항목은 현재 제품이 아니라 roadmap 수준의 아이디어로만 둡니다.
+
+## Context Pipeline
+
+DevGuard의 공식 파이프라인은 다음과 같습니다.
+
+```text
+Prepare
+  -> Read Map
+  -> Code Map
+  -> Agent Brief
+  -> Work
+  -> Done
+  -> Change Intelligence
+  -> Quality Report
+  -> Handoff
+  -> Working Context
+  -> Agent Context
+  -> Memory Update
+```
+
+`done` 이후 하나의 Change Intelligence 요약을 만들고, 이후 문서들은 각자 새 요약을 만들지 않고 이 요약을 자기 역할에 맞게 사용합니다.
+
+## 산출물 역할
+
+| 산출물 | 역할 |
+| --- | --- |
+| Project Knowledge | 프로젝트 장기 구조 기억 |
+| Read Map | 다음 Agent가 무엇을 먼저 읽을지 |
+| Code Map | 관련 파일 안에서 어디를 읽을지 |
+| Agent Brief | 다음 코딩 Agent를 위한 짧은 작업 요약 |
+| Quality Report | QA 결과와 남은 검증 |
+| Project Handoff | 다음 세션 작업 인계 |
+| Working Context | 현재 작업 구조와 수정 경계 |
+| Agent Context | Agent 작업 규칙과 현재 제약 |
+| Next Prompt | 새 AI 세션에 붙여넣을 실행 프롬프트 |
+| Dashboard | 사람을 위한 현재 상태와 다음 행동 요약 |
+
+## 기능 분류
+
+**Core**
+
+- `.devguard/` 로컬 컨텍스트 저장소
+- `watch`, `done`, `status`, `handoff`
+- Project Knowledge
+- Read Map, Code Map, Agent Brief
+- Change Intelligence
+- Quality Report
+- Project Handoff
+- Working Context, Agent Context
+- memory 파일: `.devguard/memory/code-index.json`, `.devguard/memory/change-log.jsonl`
+
+**Keep**
+
+- Dashboard
+- `install-agent-instructions`
+- `install-hooks`
+- `knowledge`
+- OpenAI 보조 Quality Report 요약
+- `self-check`, `doctor`
+- locale 기반 사용자 문서
+
+**Experimental**
+
+- `scan`, `refresh`
+- `review`, `task-ai`, 자연어 task helper
+- `update --write`
+- Codex JSONL listener helper
+- 기본 watch 흐름 밖의 고급 hook/notify 전략
 
 ## 문제 정의
 
@@ -155,14 +249,24 @@ dev-guard dashboard [--port 3737]
   state.json
   runtime.json
   history.jsonl
+  memory/
+    code-index.json
+    change-log.jsonl
+  context/
+    agent-brief.md
+    agent-context.md
   prompts/
     next-codex-prompt.md
+    next-claude-prompt.md
   reports/
     last-run.md
     history-summary.md
     decision-candidates.md
     quality-report.md
     project-handoff.md
+    read-map.md
+    code-map.md
+    working-context.md
 ```
 
 `.devguard/` runtime 산출물은 기본적으로 git ignore 대상입니다.
@@ -175,12 +279,20 @@ dev-guard dashboard [--port 3737]
 - `.devguard/history.jsonl`
 - `.devguard/reports/history-summary.md`
 - `.devguard/reports/decision-candidates.md`
+- `.devguard/memory/code-index.json`
+- `.devguard/memory/change-log.jsonl`
+- `.devguard/reports/read-map.md`
+- `.devguard/reports/code-map.md`
+- `.devguard/context/agent-brief.md`
 - `.devguard/reports/quality-report.md`
-- `.devguard/prompts/next-codex-prompt.md`
 - `.devguard/reports/project-handoff.md`
+- `.devguard/reports/working-context.md`
+- `.devguard/context/agent-context.md`
+- `.devguard/prompts/next-codex-prompt.md`
 
-`next-codex-prompt.md`는 다음 Claude/Codex에 바로 전달할 수 있는 인수인계 문서입니다.
+`read-map.md`와 `code-map.md`는 다음 Agent가 무엇을 먼저 읽을지 알려줍니다.
 `project-handoff.md`는 context window 초과 후 새 Claude/Codex 스레드에서 바로 이어가기 위한 압축 인수인계 문서입니다.
+`next-codex-prompt.md`는 새 Codex 세션에 붙여넣을 실행 프롬프트입니다.
 
 Dashboard, 품질 보고서, 프로젝트 인수인계처럼 사용자가 직접 읽는 산출물은 locale을 따릅니다. DevGuard는 `.devguard/config.json`의 `locale`, OS locale(`LANG`, `LC_ALL`, `LC_MESSAGES`), 기본값 `en-US` 순서로 결정합니다. Dashboard 언어 토글도 같은 프로젝트 locale 설정을 저장합니다. `next-codex-prompt.md` 같은 AI 전용 산출물은 영어를 유지합니다.
 
@@ -303,33 +415,35 @@ cat .devguard/reports/project-handoff.md
 
 ## Multi-Agent Workflow
 
-`dev-guard done` (또는 Auto Mode)은 이제 `.devguard/context/agent-context.md`를 생성합니다. 새 Agent 세션이 가장 먼저 읽는 단일 진입 문서입니다. 레포지토리 전체를 스캔하는 대신 이 파일을 읽으면 됩니다.
+`dev-guard done` (또는 Auto Mode)은 새 Agent 세션을 위한 컨텍스트 파일 묶음을 생성합니다. 새 Agent는 전체 레포지토리를 스캔하기 전에 Before-AI 파일부터 읽습니다.
 
 ### 권장 세션 인수인계 순서
 
 1. `dev-guard watch` — watcher 시작
 2. Claude/Codex가 파일 수정; Stop Hook이 `done` 자동 실행
-3. `dev-guard done` — agent-context.md를 포함한 모든 산출물 생성
+3. `dev-guard done` — Read Map, Code Map, Agent Brief, QA, handoff, context, memory 산출물 생성
 4. 새 Agent 세션 시작
-5. `.devguard/context/agent-context.md` 읽기 — 이어서 작업
+5. `.devguard/reports/read-map.md`, `.devguard/reports/code-map.md`, `.devguard/context/agent-brief.md` 읽기
 
 ### Codex ↔ Claude 전환 시 (또는 다른 Agent로 전환)
 
 새 세션 시작 프롬프트:
 
 ```txt
-Read .devguard/context/agent-context.md and continue.
+Read .devguard/reports/read-map.md, .devguard/reports/code-map.md, and .devguard/context/agent-brief.md; then continue from the targeted file ranges.
 ```
 
-이 파일에는 현재 상태, 최근 완료 작업, 품질 상태, 다음 작업, 주요 결정, 관련 파일, 수정 금지 영역이 포함됩니다.
-
-더 상세한 인수인계가 필요하면 `.devguard/reports/project-handoff.md`도 읽습니다.
+전체 다음 작업 지시가 필요하면 `.devguard/reports/project-handoff.md`를 읽습니다. QA 상태가 필요하면 `.devguard/reports/quality-report.md`를 읽습니다.
 
 ### 생성되는 Agent context 파일
 
 `dev-guard done`과 `dev-guard handoff`는 다음 파일을 생성합니다.
 
 - `.devguard/context/agent-context.md` — 새 세션용 단일 진입 컨텍스트 문서
+- `.devguard/reports/read-map.md` — 무엇을 먼저 읽을지
+- `.devguard/reports/code-map.md` — 관련 파일 내부에서 어디를 읽을지
+- `.devguard/context/agent-brief.md` — 다음 Agent를 위한 짧은 작업 요약
+- `.devguard/reports/working-context.md` — 현재 작업 구조와 수정 경계
 - `.devguard/prompts/next-claude-prompt.md` — Claude 세션용 시작 프롬프트
 - `.devguard/prompts/next-codex-prompt.md` — Codex 세션용 압축 실행 프롬프트
 

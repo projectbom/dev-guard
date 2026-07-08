@@ -1,6 +1,8 @@
 # dev-guard CLI
 
-`dev-guard` is a CLI context guard for Codex / Claude coding sessions. It keeps project context, changed files, quality checks, and next-session handoff prompts under `.devguard/`.
+`dev-guard` is an AI Coding Context Provider for Codex / Claude coding sessions.
+
+It is not an IDE, wrapper, or autonomous coding agent. It prepares context before AI work and preserves context after AI work under `.devguard/`.
 
 ## Install Or Update
 
@@ -47,12 +49,36 @@ DevGuard checks `.devguard/config.json`, then `DEV_GUARD_OPENAI_API_KEY`, then `
 
 The instructions tell agents to read:
 
-- `.devguard/project/project-knowledge.json`
-- `.devguard/context/agent-context.md`
+- `.devguard/reports/read-map.md`
+- `.devguard/reports/code-map.md`
+- `.devguard/context/agent-brief.md`
+- `.devguard/reports/working-context.md`
+
+Then, when needed:
+
 - `.devguard/reports/project-handoff.md`
 - `.devguard/reports/quality-report.md`
+- `.devguard/context/agent-context.md`
+- `.devguard/project/project-knowledge.json`
 
 This keeps new Codex / Claude sessions aligned with the latest dev-guard state before broad repository exploration.
+
+## Context Pipeline
+
+```text
+Prepare
+  -> Read Map
+  -> Code Map
+  -> Agent Brief
+  -> Work
+  -> Done
+  -> Change Intelligence
+  -> Quality Report
+  -> Handoff
+  -> Working Context
+  -> Agent Context
+  -> Memory Update
+```
 
 ## Daily CLI Flow
 
