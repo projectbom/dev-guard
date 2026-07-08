@@ -236,6 +236,8 @@ interface CodeIndexFile {
   hash: string;
   role: string;
   summary: string;
+  userImpact?: string[];
+  developerImpact?: string[];
   imports: string[];
   exports: string[];
   symbols: CodeIndexSymbol[];
@@ -249,6 +251,10 @@ interface CodeIndexSymbol {
   startLine: number;
   endLine: number;
   summary: string;
+  role?: string;
+  editPoint?: string;
+  qa?: string;
+  priority?: number;
 }
 
 interface ChangeLogEntry {
@@ -872,6 +878,14 @@ function renderCodeMap(input: {
     const summary = documentationSummary?.fileChanges.find((file) => file.file === item.file);
     lines.push("", `### \`${item.file}\``);
     lines.push("", "역할", `- ${localizeSentence(summary?.purpose ?? codeMapFilePurpose(item.file), input.locale)}`);
+    if (indexed?.userImpact?.length) {
+      lines.push("", "사용자 영향");
+      for (const impact of indexed.userImpact.slice(0, 2)) lines.push(`- ${localizeSentence(impact, input.locale)}`);
+    }
+    if (indexed?.developerImpact?.length) {
+      lines.push("", "개발자 영향");
+      for (const impact of indexed.developerImpact.slice(0, 2)) lines.push(`- ${localizeSentence(impact, input.locale)}`);
+    }
     lines.push("", "먼저 읽을 영역");
     for (const section of codeMapReadRanges(indexed, sections.readFirst).slice(0, 8)) lines.push(`- ${section}`);
     lines.push("", "수정 후보");
@@ -929,15 +943,25 @@ function renderAgentBrief(input: {
 
 function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; architecture: Array<{ name: string; files: string[] }> }, summary?: DocumentationSummary): string[] {
   const summaryFiles = summary?.fileChanges.map((file) => file.file) ?? [];
-  return [...new Set([...summaryFiles, ...files, ...profile.entryPoints])].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
+  const changedEntryFiles = [...new Set([...summaryFiles, ...files])].filter((file) => !isDevguardManagedDocPath(file));
+  if (changedEntryFiles.length > 0) return changedEntryFiles.slice(0, 8);
+  return [...new Set(profile.entryPoints)].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
 }
 
 function readMapTargets(summary: DocumentationSummary | undefined, files: string[], index: CodeIndex, locale: DevGuardLocale): string[] {
   if (summary?.fileChanges.length) {
-    return summary.fileChanges.flatMap((file) => [
-      `${file.file}${formatPrimaryRange(index.files[file.file])}: ${localizeSentence(file.changes[0] ?? file.purpose, locale)}`,
-      ...(file.userImpact[0] ? [`${file.file}: ${localizeSentence(file.userImpact[0], locale)}`] : [])
-    ]).slice(0, 8);
+    return summary.fileChanges.flatMap((file) => {
+      const indexed = index.files[file.file];
+      const primary = primaryIndexedSymbol(indexed);
+      const mainReason = indexed?.summary ?? file.changes[0] ?? file.purpose;
+      const developerHint = indexed?.developerImpact?.[0];
+      return [
+        `${file.file}${formatPrimaryRange(indexed)}: ${localizeSentence(mainReason, locale)}`,
+        ...(primary?.editPoint ? [`${file.file}:${primary.startLine}-${primary.endLine}: ${localizeSentence(primary.editPoint, locale)}`] : []),
+        ...(file.userImpact[0] ? [`${file.file}: ${localizeSentence(file.userImpact[0], locale)}`] : []),
+        ...(developerHint ? [`${file.file}: ${localizeSentence(developerHint, locale)}`] : [])
+      ];
+    }).slice(0, 10);
   }
   return files.length > 0 ? files.slice(0, 8).map((file) => `${file}: ${locale === "ko-KR" ? "변경 지점 확인" : "check changed area"}`) : [locale === "ko-KR" ? "수정 대상 확인 필요" : "Targets need confirmation"];
 }
@@ -948,24 +972,42 @@ function readMapSkips(summary: DocumentationSummary | undefined, files: string[]
 }
 
 function formatPrimaryRange(file?: CodeIndexFile): string {
-  const symbol = file?.symbols[0] ?? file?.blocks[0];
+  const symbol = primaryIndexedSymbol(file);
   return symbol ? `:${symbol.startLine}-${symbol.endLine}` : "";
 }
 
 function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[]): string[] {
   if (!file) return fallback;
-  const candidates = [...file.symbols, ...file.blocks].sort((a, b) => codeMapSymbolPriority(file.path, a) - codeMapSymbolPriority(file.path, b));
-  const ranges = candidates.slice(0, 8).map((symbol) =>
-    `${symbol.name} (${symbol.kind}) lines ${symbol.startLine}-${symbol.endLine}: ${symbol.summary}`
+  const candidates = indexedReadCandidates(file);
+  const ranges = candidates.slice(0, 8).map((symbol, index) =>
+    [
+      `${index + 1}. ${symbol.name} (${symbol.kind}) lines ${symbol.startLine}-${symbol.endLine}`,
+      `   - 역할: ${symbol.role ?? symbol.summary}`,
+      `   - 수정 포인트: ${symbol.editPoint ?? symbol.summary}`,
+      `   - QA: ${symbol.qa ?? "changed behavior stays inside this range"}`
+    ].join("\n")
   );
   return ranges.length > 0 ? ranges : fallback;
 }
 
+function primaryIndexedSymbol(file?: CodeIndexFile): CodeIndexSymbol | undefined {
+  if (!file) return undefined;
+  return indexedReadCandidates(file)[0];
+}
+
+function indexedReadCandidates(file: CodeIndexFile): CodeIndexSymbol[] {
+  return [...file.blocks, ...file.symbols].sort((a, b) => {
+    const priority = codeMapSymbolPriority(file.path, a) - codeMapSymbolPriority(file.path, b);
+    return priority !== 0 ? priority : a.startLine - b.startLine;
+  });
+}
+
 function codeMapSymbolPriority(file: string, symbol: CodeIndexSymbol): number {
   const name = symbol.name.toLowerCase();
+  if (typeof symbol.priority === "number") return symbol.priority;
   if (/runtime-state\.ts$/.test(file)) {
-    if (/readmap|codemap|agentbrief|codeindex|changelog|agent brief|read map|code map/.test(name)) return 0;
-    if (/documentation|workingcontext|agentcontext|handoff/.test(name)) return 1;
+    if (/readmap|codemap|agentbrief|codeindex|changelog|agent brief|read map|code map|updatecodeindex|appendchangelog/.test(name)) return 0;
+    if (/documentation|workingcontext|agentcontext|handoff|processdoneevent/.test(name)) return 1;
   }
   if (/paths\.ts$/.test(file) && /devguardpaths|read map|code map|agent brief/.test(name)) return 0;
   if (/install-agent-instructions\.ts$/.test(file) && /shareddevguardinstructions|agentsmdsection|claudemdsection/.test(name)) return 0;
@@ -1601,9 +1643,16 @@ function inferFileSpecificPipelineChanges(file: string, added: string[], removed
     changes.add("Updates the new-session prompt to start from the Before Agent artifacts.");
   }
   if (/runtime-state\.ts$/.test(file) && /generateReadMap|generateCodeMap|generateAgentBrief|renderReadMap|renderCodeMap|renderAgentBrief/i.test(text)) {
-    changes.add("Adds rule-based Before Agent artifacts: Read Map, Code Map, and Agent Brief.");
-    changes.add("Connects the new Before Agent artifacts to done and handoff regeneration.");
-    changes.add("Reuses existing Change Intelligence instead of generating a second summary.");
+    if (/functionalCodeIndexSummary|developerImpact|userImpact|symbolInsight|indexedReadCandidates|codeMapSymbolPriority|Block Intelligence/i.test(text)) {
+      changes.add("Improves Agent Context Router output from diff fragments to functional read intelligence.");
+      changes.add("Adds user impact and developer impact to Code Index entries.");
+      changes.add("Prioritizes actionable generation functions and blocks over types, constants, and broad entry files.");
+      changes.add("Adds role, edit point, and QA point metadata to indexed symbols and blocks.");
+    } else {
+      changes.add("Adds rule-based Before Agent artifacts: Read Map, Code Map, and Agent Brief.");
+      changes.add("Connects the new Before Agent artifacts to done and handoff regeneration.");
+      changes.add("Reuses existing Change Intelligence instead of generating a second summary.");
+    }
   }
   return [...changes];
 }
@@ -1828,13 +1877,54 @@ function buildCodeIndexFile(file: string, content: string, summary?: Documentati
     path: file,
     hash: hashText(content),
     role: summary?.purpose ?? codeMapFilePurpose(file),
-    summary: summary?.changes.slice(0, 2).join(" ") || codeMapFilePurpose(file),
+    summary: functionalCodeIndexSummary(file, summary),
+    userImpact: summary?.userImpact ?? [],
+    developerImpact: inferDeveloperImpact(file, content, summary),
     imports: extractImports(content),
     exports: extractExports(content),
     symbols: extractCodeSymbols(content),
     blocks: extractCodeBlocks(content),
     updatedAt: new Date().toISOString()
   };
+}
+
+function functionalCodeIndexSummary(file: string, summary?: DocumentationFileChange): string {
+  if (!summary) return codeMapFilePurpose(file);
+  const featureChanges = summary.changes
+    .filter((change) => !isCodeLevelChange(change))
+    .filter((change) => !/^Updates the user-facing wording from/i.test(change))
+    .slice(0, 3);
+  if (featureChanges.length > 0) return featureChanges.join(" ");
+  if (/runtime-state\.ts$/.test(file)) return "Maintains DevGuard context generation, quality reporting, handoff, and router artifacts.";
+  if (/dashboard\.ts$/.test(file)) return "Maintains Dashboard state rendering and user-facing workflow controls.";
+  if (/paths\.ts$/.test(file)) return "Centralizes DevGuard managed artifact paths.";
+  return summary.purpose;
+}
+
+function inferDeveloperImpact(file: string, content: string, summary?: DocumentationFileChange): string[] {
+  const impact = new Set<string>();
+  const text = `${file}\n${content.slice(0, 20000)}\n${summary?.changes.join("\n") ?? ""}`;
+  if (/runtime-state\.ts$/.test(file)) {
+    impact.add("Keep Read Map, Code Map, Agent Brief, Quality Report, Handoff, and Working Context on the same DocumentationSummary source.");
+    impact.add("For router output changes, start from renderReadMap, renderCodeMap, renderAgentBrief, and updateCodeIndex before opening unrelated runtime paths.");
+    impact.add("Avoid watch, hook, and dashboard paths unless the changed file list includes those areas.");
+  }
+  if (/paths\.ts$/.test(file)) {
+    impact.add("Add generated artifact paths through devguardPaths and reuse them instead of hardcoding `.devguard` paths.");
+  }
+  if (/dashboard\.ts$/.test(file)) {
+    impact.add("Keep Dashboard rendering separate from report generation; verify API responses do not expose raw secret values.");
+  }
+  if (/install-agent-instructions\.ts$/.test(file)) {
+    impact.add("Update generated AGENTS.md / CLAUDE.md copy without changing the underlying command behavior.");
+  }
+  if (/profile-view|profile-card|components\/profile/i.test(file)) {
+    impact.add("Start from the visible profile sections before opening data, auth, or routing modules.");
+    if (/ability|Ability/i.test(text)) impact.add("Ability changes should stay near the Ability/strength section unless data shape changes are explicit.");
+    if (/theme|getCardTheme|Theme/i.test(text)) impact.add("Theme changes should reuse the existing theme helper instead of introducing a parallel style path.");
+  }
+  if (impact.size === 0) impact.add("Start from the indexed symbols and blocks before reading the full file.");
+  return [...impact].slice(0, 4);
 }
 
 function extractImports(content: string): string[] {
@@ -1871,11 +1961,137 @@ function extractCodeSymbols(content: string): CodeIndexSymbol[] {
       if (!match) continue;
       const startLine = index + 1;
       const endLine = inferSymbolEndLine(lines, index);
-      symbols.push({ name: match[1], kind: pattern.kind, startLine, endLine, summary: `${pattern.kind} ${match[1]}` });
+      const insight = symbolInsight(match[1], pattern.kind);
+      symbols.push({ name: match[1], kind: pattern.kind, startLine, endLine, ...insight });
       break;
     }
   }
-  return symbols.slice(0, 120);
+  return symbols
+    .sort((a, b) => {
+      const priority = baseSymbolPriority(a) - baseSymbolPriority(b);
+      return priority !== 0 ? priority : a.startLine - b.startLine;
+    })
+    .slice(0, 160);
+}
+
+function symbolInsight(name: string, kind: CodeIndexSymbol["kind"]): Pick<CodeIndexSymbol, "summary" | "role" | "editPoint" | "qa" | "priority"> {
+  const lower = name.toLowerCase();
+  if (kind === "const" && /path$/.test(lower)) {
+    return {
+      summary: `${name} path constant`,
+      role: "Generated artifact path constant.",
+      editPoint: "Modify only when the artifact path itself changes.",
+      qa: "Generated command output should point to the same path.",
+      priority: 6
+    };
+  }
+  if (/^(renderreadmap|generatereadmap|readmaptargets|readmapentryfiles|readmapskips)$/.test(lower)) {
+    return {
+      summary: "Read Map generation and rendering",
+      role: "Defines the priority order for what the next agent should read first.",
+      editPoint: "Change this when read targets, skip areas, or first-file ordering are wrong.",
+      qa: "Generated read-map.md should point to relevant changed files and ranges, not broad project entry points.",
+      priority: 0
+    };
+  }
+  if (/^(rendercodemap|generatecodemap|codemapreadranges|codemapsymbolpriority|extractcodesections|codemapedittargets)$/.test(lower)) {
+    return {
+      summary: "Code Map generation and file-internal reading plan",
+      role: "Turns indexed symbols and blocks into a narrow file-internal reading plan.",
+      editPoint: "Change this when Code Map lists generic symbols instead of actionable sections.",
+      qa: "Generated code-map.md should show roles, edit points, QA points, and skip areas.",
+      priority: 0
+    };
+  }
+  if (/^(renderagentbrief|generateagentbrief)$/.test(lower)) {
+    return {
+      summary: "Agent Brief compression",
+      role: "Compresses current task, read targets, skip targets, and QA cautions for the next agent.",
+      editPoint: "Change this when agent-brief.md is too broad or duplicates Handoff.",
+      qa: "Agent Brief should be short and should tell the next agent exactly where to start.",
+      priority: 0
+    };
+  }
+  if (/^(updatecodeindex|buildcodeindexfile|extractcodesymbols|extractcodeblocks|functionalcodeindexsummary)$/.test(lower)) {
+    return {
+      summary: "Code Index maintenance",
+      role: "Stores file hashes, functional summaries, symbols, and block ranges without storing source code.",
+      editPoint: "Change this when index entries expose diff fragments or miss relevant ranges.",
+      qa: "code-index.json should contain functional summary, user impact, developer impact, and prioritized ranges.",
+      priority: 0
+    };
+  }
+  if (/appendchangelog|changelog/.test(lower)) {
+    return {
+      summary: "Change Log maintenance",
+      role: "Appends compact done-session metadata for future context routing.",
+      editPoint: "Change this when change-log.jsonl misses changed files or related files.",
+      qa: "change-log.jsonl should append one compact entry per done run.",
+      priority: 1
+    };
+  }
+  if (/processdoneevent/.test(lower)) {
+    return {
+      summary: "done session pipeline",
+      role: "Coordinates quality assessment and generated DevGuard artifacts after a session completes.",
+      editPoint: "Change this only when the done pipeline order or artifact list must change.",
+      qa: "done should still generate quality report, handoff, working context, read map, code map, and agent brief.",
+      priority: 1
+    };
+  }
+  if ((kind === "interface" || kind === "type") && /codeindex|changelog/.test(lower)) {
+    return {
+      summary: `${kind} ${name}`,
+      role: "Memory schema support.",
+      editPoint: "Read after generation functions unless the schema itself changes.",
+      qa: "Typecheck should cover schema compatibility.",
+      priority: 5
+    };
+  }
+  if (kind === "component") {
+    return {
+      summary: `${name} UI component`,
+      role: "Entry UI component or visible section.",
+      editPoint: "Start here for user-facing layout or interaction changes.",
+      qa: "Check the visible state that this component renders.",
+      priority: 2
+    };
+  }
+  if (kind === "function") {
+    return {
+      summary: `${name} behavior helper`,
+      role: "Implementation function for current behavior.",
+      editPoint: "Read this when the generated output or runtime behavior points to this function.",
+      qa: "Verify its caller still receives the expected result.",
+      priority: 3
+    };
+  }
+  if (kind === "const") {
+    return {
+      summary: `${name} constant or local helper`,
+      role: "Supporting constant/helper.",
+      editPoint: "Modify only when this value participates in the target behavior.",
+      qa: "Check downstream rendering or command output that consumes it.",
+      priority: 5
+    };
+  }
+  return {
+    summary: `${kind} ${name}`,
+    role: "Type or structural support.",
+    editPoint: "Read after behavior functions unless the task changes data shape.",
+    qa: "Typecheck should cover this range.",
+    priority: kind === "type" || kind === "interface" ? 7 : 6
+  };
+}
+
+function baseSymbolPriority(symbol: CodeIndexSymbol): number {
+  if (typeof symbol.priority === "number") return symbol.priority;
+  if (symbol.kind === "component") return 2;
+  if (symbol.kind === "function") return 3;
+  if (symbol.kind === "class") return 4;
+  if (symbol.kind === "const") return 5;
+  if (symbol.kind === "type" || symbol.kind === "interface") return 7;
+  return 6;
 }
 
 function inferSymbolEndLine(lines: string[], startIndex: number): number {
@@ -1899,21 +2115,84 @@ function inferSymbolEndLine(lines: string[], startIndex: number): number {
 function extractCodeBlocks(content: string): CodeIndexSymbol[] {
   const lines = content.split(/\r?\n/);
   const blocks: CodeIndexSymbol[] = [];
-  const markers: Array<{ name: string; regex: RegExp }> = [
-    { name: "Read Map", regex: /Read Map|readMap/i },
-    { name: "Code Map", regex: /Code Map|codeMap/i },
-    { name: "Agent Brief", regex: /Agent Brief|agentBrief/i },
+  const markers: Array<{ name: string; regex: RegExp; role?: string; editPoint?: string; qa?: string; priority?: number }> = [
+    {
+      name: "Code Index",
+      regex: /updateCodeIndex|buildCodeIndexFile|extractCodeSymbols|extractCodeBlocks|functionalCodeIndexSummary/i,
+      role: "Keeps the local code memory current for changed files.",
+      editPoint: "Use this block when summaries, user impact, developer impact, or symbol ranges are too generic.",
+      qa: "code-index.json should contain functional summaries and actionable ranges.",
+      priority: 0
+    },
+    {
+      name: "Change Log",
+      regex: /appendChangeLog|relatedFilesFromCodeIndex/i,
+      role: "Keeps compact done-session history for future routing.",
+      editPoint: "Use this block when done sessions are not recorded with changed and related files.",
+      qa: "change-log.jsonl should append one compact entry after done.",
+      priority: 1
+    },
+    {
+      name: "Read Map",
+      regex: /renderReadMap|generateReadMap|readMapTargets|readMapEntryFiles/i,
+      role: "Builds the first-read order for the next agent.",
+      editPoint: "Use this block when irrelevant files appear in read-map.md or the first range is too broad.",
+      qa: "Read Map should point to changed files and actionable ranges only.",
+      priority: 0
+    },
+    {
+      name: "Code Map",
+      regex: /renderCodeMap|generateCodeMap|codeMapReadRanges|extractCodeSections/i,
+      role: "Builds the file-internal reading order from indexed symbols and blocks.",
+      editPoint: "Use this block when Code Map lists generic function/type names instead of useful edit sections.",
+      qa: "Code Map should include role, edit point, QA point, and skip areas for each important range.",
+      priority: 0
+    },
+    {
+      name: "Agent Brief",
+      regex: /renderAgentBrief|generateAgentBrief/i,
+      role: "Compresses the current task into a short before-agent brief.",
+      editPoint: "Use this block when Agent Brief is too long, too generic, or duplicates Handoff.",
+      qa: "Agent Brief should tell the next agent where to start without repository-wide discovery.",
+      priority: 0
+    },
+    { name: "Front Card", regex: /Front Card|front card|Hero|Ability|Strength|Growth|Summary/i },
+    { name: "Back Card", regex: /Back Card|back card|Meta Map|Evidence|Timeline|MBTI/i },
+    { name: "Ability", regex: /Ability|abilityBars|strength|강점|대표 능력/i },
+    { name: "Footer", regex: /Footer|footer/i },
+    { name: "Theme", regex: /Theme|getCardTheme|theme toggle|dark mode|light mode/i },
+    { name: "Meta Map", regex: /Meta Map|meta-map|MetaMap/i },
+    { name: "Quick Match", regex: /Quick Match|quick match|QuickMatch/i },
     { name: "Quality Report", regex: /Quality Report|qualityReport/i },
     { name: "Handoff", regex: /Handoff|handoff/i },
     { name: "Working Context", regex: /Working Context|workingContext/i },
     { name: "Status", regex: /Status|status/i },
     { name: "Settings", regex: /Settings|settings/i }
-  ];
+  ].map((marker) => ({
+    role: `${marker.name} related code block.`,
+    editPoint: `Read this block only when the task directly changes ${marker.name}.`,
+    qa: `${marker.name} behavior should remain consistent after the change.`,
+    priority: marker.name === "Read Map" || marker.name === "Code Map" || marker.name === "Agent Brief" ? 0 : 3,
+    ...marker
+  }));
   for (const marker of markers) {
     const index = lines.findIndex((line) => marker.regex.test(line));
-    if (index >= 0) blocks.push({ name: marker.name, kind: "block", startLine: index + 1, endLine: Math.min(lines.length, index + 40), summary: `${marker.name} related block` });
+    if (index >= 0) {
+      const role = marker.role ?? `${marker.name} related code block.`;
+      blocks.push({
+        name: marker.name,
+        kind: "block",
+        startLine: index + 1,
+        endLine: Math.min(lines.length, index + 40),
+        summary: role,
+        role,
+        editPoint: marker.editPoint ?? `Read this block only when the task directly changes ${marker.name}.`,
+        qa: marker.qa ?? `${marker.name} behavior should remain consistent after the change.`,
+        priority: marker.priority ?? 3
+      });
+    }
   }
-  return blocks.slice(0, 20);
+  return blocks.sort((a, b) => baseSymbolPriority(a) - baseSymbolPriority(b) || a.startLine - b.startLine).slice(0, 24);
 }
 
 async function appendChangeLog(root: string, entry: ChangeLogEntry): Promise<void> {
