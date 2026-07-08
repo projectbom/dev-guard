@@ -225,6 +225,40 @@ interface NextTaskPlan {
   success: string[];
 }
 
+interface CodeIndex {
+  schemaVersion: 1;
+  generatedAt: string;
+  files: Record<string, CodeIndexFile>;
+}
+
+interface CodeIndexFile {
+  path: string;
+  hash: string;
+  role: string;
+  summary: string;
+  imports: string[];
+  exports: string[];
+  symbols: CodeIndexSymbol[];
+  blocks: CodeIndexSymbol[];
+  updatedAt: string;
+}
+
+interface CodeIndexSymbol {
+  name: string;
+  kind: "function" | "component" | "class" | "interface" | "type" | "const" | "block";
+  startLine: number;
+  endLine: number;
+  summary: string;
+}
+
+interface ChangeLogEntry {
+  timestamp: string;
+  changedFiles: string[];
+  diffSummary: string[];
+  relatedFiles: string[];
+  qualityVerdict?: string;
+}
+
 const runtimePath = devguardPaths.runtime;
 const statePath = devguardPaths.state;
 const historyPath = devguardPaths.history;
@@ -237,6 +271,8 @@ const projectHandoffPath = devguardPaths.projectHandoff;
 const readMapPath = devguardPaths.readMap;
 const codeMapPath = devguardPaths.codeMap;
 const workingContextPath = devguardPaths.workingContext;
+const codeIndexPath = devguardPaths.codeIndex;
+const changeLogPath = devguardPaths.changeLog;
 const hookStatusPath = devguardPaths.hookStatus;
 
 const defaultRuntime: RuntimeState = {
@@ -462,6 +498,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     taskText: [tasksMarkdown, projectMarkdown].join("\n\n"),
     qaResults: runtime.qaResults
   });
+  const codeIndex = await updateCodeIndex(root, changedFiles, documentationSummary);
   const timestamp = new Date().toISOString();
   const majorChanges = inferMajorChanges({ summary, changedFiles, areas, diffText });
   const testCandidates = await inferTestCandidates(root, { areas, changedFiles });
@@ -508,6 +545,13 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     documentationSummary
   });
   historyRecord.qualityVerdict = qualityReport.verdict;
+  await appendChangeLog(root, {
+    timestamp,
+    changedFiles,
+    diffSummary: documentationSummary.overview,
+    relatedFiles: relatedFilesFromCodeIndex(changedFiles, codeIndex),
+    qualityVerdict: qualityReport.verdict
+  });
   const reportMarkdown = renderLastRunReport({
     timestamp,
     changedFiles,
@@ -639,13 +683,14 @@ export async function generateProjectHandoff(root: string): Promise<string> {
 export async function generateReadMap(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [state, records, projectKnowledge] = await Promise.all([
+  const [state, records, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
     readHistoryRecords(root, 5),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
+    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
   const files = workingContextFiles(state, records);
-  const markdown = renderReadMap({ files, state, projectKnowledge, locale });
+  const markdown = renderReadMap({ files, state, projectKnowledge, codeIndex, locale });
   await writeTextFile(fromRoot(root, readMapPath), markdown);
   return readMapPath;
 }
@@ -653,10 +698,11 @@ export async function generateReadMap(root: string): Promise<string> {
 export async function generateCodeMap(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [state, records, projectKnowledge] = await Promise.all([
+  const [state, records, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
     readHistoryRecords(root, 5),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
+    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
   const files = workingContextFiles(state, records);
   const fileContents = await Promise.all(
@@ -665,7 +711,7 @@ export async function generateCodeMap(root: string): Promise<string> {
       content: await readTextFile(fromRoot(root, file))
     }))
   );
-  const markdown = renderCodeMap({ files, fileContents, state, projectKnowledge, locale });
+  const markdown = renderCodeMap({ files, fileContents, state, projectKnowledge, codeIndex, locale });
   await writeTextFile(fromRoot(root, codeMapPath), markdown);
   return codeMapPath;
 }
@@ -673,15 +719,16 @@ export async function generateCodeMap(root: string): Promise<string> {
 export async function generateAgentBrief(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [state, records, qualityContent, projectKnowledge] = await Promise.all([
+  const [state, records, qualityContent, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
     readHistoryRecords(root, 5),
     readTextFile(fromRoot(root, qualityReportPath)),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
+    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
   const files = workingContextFiles(state, records);
   const quality = parseQuality(qualityContent);
-  const markdown = renderAgentBrief({ files, state, quality, projectKnowledge, locale });
+  const markdown = renderAgentBrief({ files, state, quality, projectKnowledge, codeIndex, locale });
   await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
   await writeTextFile(fromRoot(root, devguardPaths.agentBrief), markdown);
   return devguardPaths.agentBrief;
@@ -759,11 +806,11 @@ function workingContextFiles(state: ProjectState, records: HistoryRecord[]): str
   return [...new Set(files.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)))].sort();
 }
 
-function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; locale: DevGuardLocale }): string {
+function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const documentationSummary = input.state.lastDocumentationSummary;
   const entryFiles = readMapEntryFiles(input.files, profile, documentationSummary);
-  const readTargets = readMapTargets(documentationSummary, input.files, input.locale);
+  const readTargets = readMapTargets(documentationSummary, input.files, input.codeIndex, input.locale);
   const skipTargets = readMapSkips(documentationSummary, input.files, input.locale);
   const recentChanges = documentationSummary?.overview?.length
     ? documentationSummary.overview.slice(0, 4).map((item) => localizeSentence(item, input.locale))
@@ -804,6 +851,7 @@ function renderCodeMap(input: {
   fileContents: Array<{ file: string; content: string }>;
   state: ProjectState;
   projectKnowledge: string;
+  codeIndex: CodeIndex;
   locale: DevGuardLocale;
 }): string {
   const documentationSummary = input.state.lastDocumentationSummary;
@@ -820,11 +868,12 @@ function renderCodeMap(input: {
   ];
   for (const item of files) {
     const sections = extractCodeSections(item.file, item.content);
+    const indexed = input.codeIndex.files[item.file];
     const summary = documentationSummary?.fileChanges.find((file) => file.file === item.file);
     lines.push("", `### \`${item.file}\``);
     lines.push("", "역할", `- ${localizeSentence(summary?.purpose ?? codeMapFilePurpose(item.file), input.locale)}`);
     lines.push("", "먼저 읽을 영역");
-    for (const section of sections.readFirst) lines.push(`- ${section}`);
+    for (const section of codeMapReadRanges(indexed, sections.readFirst).slice(0, 8)) lines.push(`- ${section}`);
     lines.push("", "수정 후보");
     for (const section of codeMapEditTargets(summary, sections.readFirst, input.locale)) lines.push(`- ${section}`);
     lines.push("", "읽지 않아도 되는 영역");
@@ -841,12 +890,13 @@ function renderAgentBrief(input: {
   state: ProjectState;
   quality: ParsedQuality;
   projectKnowledge: string;
+  codeIndex: CodeIndex;
   locale: DevGuardLocale;
 }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const summary = input.state.lastDocumentationSummary;
   const entryFiles = readMapEntryFiles(input.files, profile, summary).slice(0, 5);
-  const readTargets = readMapTargets(summary, input.files, input.locale).slice(0, 5);
+  const readTargets = readMapTargets(summary, input.files, input.codeIndex, input.locale).slice(0, 5);
   const skipTargets = readMapSkips(summary, input.files, input.locale).slice(0, 8);
   const qa = (summary?.qaChecks ?? input.quality.requiredVerification).slice(0, 4).map((item) => localizeSentence(item, input.locale));
   return [
@@ -882,10 +932,10 @@ function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; ar
   return [...new Set([...summaryFiles, ...files, ...profile.entryPoints])].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
 }
 
-function readMapTargets(summary: DocumentationSummary | undefined, files: string[], locale: DevGuardLocale): string[] {
+function readMapTargets(summary: DocumentationSummary | undefined, files: string[], index: CodeIndex, locale: DevGuardLocale): string[] {
   if (summary?.fileChanges.length) {
     return summary.fileChanges.flatMap((file) => [
-      `${file.file}: ${localizeSentence(file.changes[0] ?? file.purpose, locale)}`,
+      `${file.file}${formatPrimaryRange(index.files[file.file])}: ${localizeSentence(file.changes[0] ?? file.purpose, locale)}`,
       ...(file.userImpact[0] ? [`${file.file}: ${localizeSentence(file.userImpact[0], locale)}`] : [])
     ]).slice(0, 8);
   }
@@ -895,6 +945,34 @@ function readMapTargets(summary: DocumentationSummary | undefined, files: string
 function readMapSkips(summary: DocumentationSummary | undefined, files: string[], locale: DevGuardLocale): string[] {
   const excluded = summary?.excludedAreas?.length ? summary.excludedAreas : workingExcludedAreas(inferWorkingDomains(files));
   return excluded.map((item) => localizeSentence(item, locale)).slice(0, 10);
+}
+
+function formatPrimaryRange(file?: CodeIndexFile): string {
+  const symbol = file?.symbols[0] ?? file?.blocks[0];
+  return symbol ? `:${symbol.startLine}-${symbol.endLine}` : "";
+}
+
+function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[]): string[] {
+  if (!file) return fallback;
+  const candidates = [...file.symbols, ...file.blocks].sort((a, b) => codeMapSymbolPriority(file.path, a) - codeMapSymbolPriority(file.path, b));
+  const ranges = candidates.slice(0, 8).map((symbol) =>
+    `${symbol.name} (${symbol.kind}) lines ${symbol.startLine}-${symbol.endLine}: ${symbol.summary}`
+  );
+  return ranges.length > 0 ? ranges : fallback;
+}
+
+function codeMapSymbolPriority(file: string, symbol: CodeIndexSymbol): number {
+  const name = symbol.name.toLowerCase();
+  if (/runtime-state\.ts$/.test(file)) {
+    if (/readmap|codemap|agentbrief|codeindex|changelog|agent brief|read map|code map/.test(name)) return 0;
+    if (/documentation|workingcontext|agentcontext|handoff/.test(name)) return 1;
+  }
+  if (/paths\.ts$/.test(file) && /devguardpaths|read map|code map|agent brief/.test(name)) return 0;
+  if (/install-agent-instructions\.ts$/.test(file) && /shareddevguardinstructions|agentsmdsection|claudemdsection/.test(name)) return 0;
+  if (/index\.ts$/.test(file) && /rundone|runhandoff|printhelp/.test(name)) return 0;
+  if (symbol.kind === "block") return 2;
+  if (symbol.kind === "function" || symbol.kind === "component") return 3;
+  return 5;
 }
 
 function extractCodeSections(file: string, content: string): { readFirst: string[]; skip: string[] } {
@@ -1459,7 +1537,7 @@ function inferConcreteChanges(file: string, added: string[], removed: string[], 
   if (fileSpecificChanges.length === 0 && !/runtime-state\.ts$/i.test(file)) {
     for (const change of detectTextReplacements(added, removed)) changes.add(change);
   }
-  if (!/runtime-state\.ts$/i.test(file) && added.some((line) => /<details|details/i.test(line))) changes.add("Moves long supporting content into collapsible details sections.");
+  if (!/runtime-state\.ts$/i.test(file) && added.some((line) => /<details|<summary|collapsible details/i.test(line))) changes.add("Moves long supporting content into collapsible details sections.");
   if (fileSpecificChanges.length === 0 && added.some((line) => /Working Context|working-context|작업 구조/i.test(line))) changes.add("Connects Working Context as an AI-readable startup artifact.");
   if (fileSpecificChanges.length === 0 && added.some((line) => /Agent Context|에이전트 지침/i.test(line))) changes.add("Exposes Agent Context as a first-class assistant guidance artifact.");
   if (fileSpecificChanges.length === 0 && added.some((line) => /Quick Actions|빠른 실행|quickAction/i.test(line))) changes.add("Updates Dashboard Quick Actions.");
@@ -1468,7 +1546,7 @@ function inferConcreteChanges(file: string, added: string[], removed: string[], 
   if (types.includes("Docs") && changes.size === 0) changes.add("Updates documentation text to match the current workflow.");
   if (types.includes("i18n") && changes.size === 0) changes.add("Updates localized user-facing copy.");
   if (types.includes("UI") && changes.size === 0) changes.add("Adjusts UI rendering or interaction behavior.");
-  if (changes.size === 0) changes.add(added.length > 0 || removed.length > 0 ? "Updates implementation details visible in the diff." : "No diff detail was available for this file.");
+  if (changes.size === 0) changes.add(added.length > 0 || removed.length > 0 ? "Updates implementation support for the current request." : "No diff detail was available for this file.");
   return [...changes].slice(0, 5);
 }
 
@@ -1493,7 +1571,7 @@ function inferFeatureLevelChanges(file: string, added: string[], removed: string
   if (/강점 활용법|strength usage|ability hero|hero card/i.test(text)) changes.add("Adds or updates the Ability Hero Card / strength-usage section.");
   if (/보완하면 좋은 점/i.test(removed.join("\n")) && /강점 활용법/i.test(added.join("\n"))) changes.add("Renames the growth guidance from 보완하면 좋은 점 to 강점 활용법.");
   if (/back card|Back Card|4장|four card|grid-cols-4|repeat\(4/i.test(text)) changes.add("Compresses the Back Card into a four-card structure.");
-  if (/<details|<summary|details/i.test(text)) changes.add("Moves long secondary content into collapsible details sections.");
+  if (/<details|<summary|collapsible details/i.test(text)) changes.add("Moves long secondary content into collapsible details sections.");
   if (/theme toggle|Theme Toggle|dark mode|light mode/i.test(text)) changes.add("Adds or adjusts the Theme Toggle.");
   if (/\bfooter\b|Footer|site footer/i.test(text)) changes.add("Adds or adjusts the Footer.");
   if (/DocumentationSummary|documentationSummary|Change Intelligence|feature-level|feature level/i.test(text)) changes.add("Turns generated DevGuard documents from diff/code summaries into feature-level Change Intelligence.");
@@ -1514,6 +1592,9 @@ function inferFileSpecificPipelineChanges(file: string, added: string[], removed
   }
   if (/paths\.ts$/.test(file) && /readMap|codeMap|agentBrief/i.test(text)) {
     changes.add("Adds managed artifact paths for Read Map, Code Map, and Agent Brief.");
+  }
+  if (/paths\.ts$/.test(file) && /memoryDir|codeIndex|changeLog/i.test(text)) {
+    changes.add("Adds managed memory paths for code-index.json and change-log.jsonl.");
   }
   if (/index\.ts$/.test(file) && /readMapPath|codeMapPath|agentBriefPath|generateReadMap|generateCodeMap|generateAgentBrief/i.test(text)) {
     changes.add("Shows Read Map, Code Map, and Agent Brief in done/handoff generated output.");
@@ -1537,7 +1618,7 @@ function inferUserImpact(file: string, changes: string[], types: ChangeType[]): 
   if (/Ability Hero|strength-usage|강점 활용법/i.test(text)) impact.add("Users can understand the profile's key strength faster from the front card.");
   if (/confidence/i.test(text)) impact.add("The UI avoids exposing an unclear confidence signal to users.");
   if (/Back Card|four-card/i.test(text)) impact.add("The back side is easier to scan because related details are grouped into fewer cards.");
-  if (/details/i.test(text)) impact.add("Long secondary content stays available without overwhelming the main screen.");
+  if (/collapsible details|<details|details sections/i.test(text)) impact.add("Long secondary content stays available without overwhelming the main screen.");
   if (/Theme Toggle/i.test(text)) impact.add("Users can switch visual theme from the visible UI control.");
   if (/Footer/i.test(text)) impact.add("The page has clearer bottom navigation or product framing.");
   if (/Change Intelligence|feature-level/i.test(text)) impact.add("AI and human readers can resume from feature meaning instead of re-reading raw diffs.");
@@ -1706,6 +1787,149 @@ export function classifyAreas(files: string[]): string[] {
     if (/^(app|pages|components|src\/app|src\/components|styles|public)\//i.test(file)) areas.add("ui");
   }
   return areas.size > 0 ? [...areas].sort() : ["unknown"];
+}
+
+async function updateCodeIndex(root: string, changedFiles: string[], documentationSummary: DocumentationSummary): Promise<CodeIndex> {
+  const current = await readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    files: {}
+  });
+  const next: CodeIndex = {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    files: { ...current.files }
+  };
+  for (const file of changedFiles.filter(isIndexableSourceFile)) {
+    const content = await readTextFile(fromRoot(root, file));
+    if (!content.trim()) continue;
+    const hash = hashText(content);
+    const summary = documentationSummary.fileChanges.find((item) => item.file === file);
+    const expectedSummary = summary?.changes.slice(0, 2).join(" ") || codeMapFilePurpose(file);
+    if (next.files[file]?.hash === hash && next.files[file]?.summary === expectedSummary) continue;
+    next.files[file] = buildCodeIndexFile(file, content, summary);
+  }
+  await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
+function isIndexableSourceFile(file: string): boolean {
+  if (isIgnoredWatchPath(file) || isDevguardManagedDocPath(file)) return false;
+  if (/(^|\/)(node_modules|dist|build|\.next|coverage)\//i.test(file)) return false;
+  return /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json)$/i.test(file);
+}
+
+function hashText(content: string): string {
+  return createHash("sha1").update(content).digest("hex");
+}
+
+function buildCodeIndexFile(file: string, content: string, summary?: DocumentationFileChange): CodeIndexFile {
+  return {
+    path: file,
+    hash: hashText(content),
+    role: summary?.purpose ?? codeMapFilePurpose(file),
+    summary: summary?.changes.slice(0, 2).join(" ") || codeMapFilePurpose(file),
+    imports: extractImports(content),
+    exports: extractExports(content),
+    symbols: extractCodeSymbols(content),
+    blocks: extractCodeBlocks(content),
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function extractImports(content: string): string[] {
+  const imports = new Set<string>();
+  for (const match of content.matchAll(/^\s*import\s+(?:.+?\s+from\s+)?["']([^"']+)["']/gm)) imports.add(match[1]);
+  for (const match of content.matchAll(/^\s*const\s+\w+\s*=\s*require\(["']([^"']+)["']\)/gm)) imports.add(match[1]);
+  return [...imports].slice(0, 40);
+}
+
+function extractExports(content: string): string[] {
+  const exports = new Set<string>();
+  for (const match of content.matchAll(/^\s*export\s+(?:async\s+)?(?:function|class|interface|type|const|let|var)\s+([A-Za-z0-9_]+)/gm)) exports.add(match[1]);
+  for (const match of content.matchAll(/^\s*export\s*\{([^}]+)\}/gm)) {
+    for (const name of match[1].split(",")) exports.add(name.trim().replace(/\s+as\s+.+$/, ""));
+  }
+  return [...exports].filter(Boolean).slice(0, 60);
+}
+
+function extractCodeSymbols(content: string): CodeIndexSymbol[] {
+  const lines = content.split(/\r?\n/);
+  const symbols: CodeIndexSymbol[] = [];
+  const patterns: Array<{ regex: RegExp; kind: CodeIndexSymbol["kind"] }> = [
+    { regex: /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Z][A-Za-z0-9_]*)\b/, kind: "component" },
+    { regex: /^\s*(?:export\s+)?(?:async\s+)?function\s+([a-z_][A-Za-z0-9_]*)\b/, kind: "function" },
+    { regex: /^\s*(?:export\s+)?const\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:\([^)]*\)\s*=>|function|\w+\()/, kind: "component" },
+    { regex: /^\s*(?:export\s+)?const\s+([a-z_][A-Za-z0-9_]*)\s*=/, kind: "const" },
+    { regex: /^\s*(?:export\s+)?class\s+([A-Za-z0-9_]+)/, kind: "class" },
+    { regex: /^\s*(?:export\s+)?interface\s+([A-Za-z0-9_]+)/, kind: "interface" },
+    { regex: /^\s*(?:export\s+)?type\s+([A-Za-z0-9_]+)/, kind: "type" }
+  ];
+  for (let index = 0; index < lines.length; index += 1) {
+    for (const pattern of patterns) {
+      const match = pattern.regex.exec(lines[index]);
+      if (!match) continue;
+      const startLine = index + 1;
+      const endLine = inferSymbolEndLine(lines, index);
+      symbols.push({ name: match[1], kind: pattern.kind, startLine, endLine, summary: `${pattern.kind} ${match[1]}` });
+      break;
+    }
+  }
+  return symbols.slice(0, 120);
+}
+
+function inferSymbolEndLine(lines: string[], startIndex: number): number {
+  let braceDepth = 0;
+  let sawBrace = false;
+  for (let index = startIndex; index < lines.length; index += 1) {
+    for (const char of lines[index]) {
+      if (char === "{") {
+        braceDepth += 1;
+        sawBrace = true;
+      } else if (char === "}") {
+        braceDepth -= 1;
+      }
+    }
+    if (sawBrace && braceDepth <= 0 && index > startIndex) return index + 1;
+    if (!sawBrace && index > startIndex && /^\s*(?:export\s+)?(?:async\s+)?(?:function|const|class|interface|type)\s+/.test(lines[index])) return index;
+  }
+  return Math.min(lines.length, startIndex + 20);
+}
+
+function extractCodeBlocks(content: string): CodeIndexSymbol[] {
+  const lines = content.split(/\r?\n/);
+  const blocks: CodeIndexSymbol[] = [];
+  const markers: Array<{ name: string; regex: RegExp }> = [
+    { name: "Read Map", regex: /Read Map|readMap/i },
+    { name: "Code Map", regex: /Code Map|codeMap/i },
+    { name: "Agent Brief", regex: /Agent Brief|agentBrief/i },
+    { name: "Quality Report", regex: /Quality Report|qualityReport/i },
+    { name: "Handoff", regex: /Handoff|handoff/i },
+    { name: "Working Context", regex: /Working Context|workingContext/i },
+    { name: "Status", regex: /Status|status/i },
+    { name: "Settings", regex: /Settings|settings/i }
+  ];
+  for (const marker of markers) {
+    const index = lines.findIndex((line) => marker.regex.test(line));
+    if (index >= 0) blocks.push({ name: marker.name, kind: "block", startLine: index + 1, endLine: Math.min(lines.length, index + 40), summary: `${marker.name} related block` });
+  }
+  return blocks.slice(0, 20);
+}
+
+async function appendChangeLog(root: string, entry: ChangeLogEntry): Promise<void> {
+  await appendTextFile(fromRoot(root, changeLogPath), `${JSON.stringify(entry)}\n`);
+}
+
+function relatedFilesFromCodeIndex(changedFiles: string[], index: CodeIndex): string[] {
+  const changed = new Set(changedFiles);
+  const imports = new Set(changedFiles.flatMap((file) => index.files[file]?.imports ?? []));
+  const related = new Set<string>();
+  for (const file of Object.keys(index.files)) {
+    if (changed.has(file)) continue;
+    const fileIndex = index.files[file];
+    if (fileIndex.imports.some((specifier) => imports.has(specifier))) related.add(file);
+  }
+  return [...related].slice(0, 12);
 }
 
 export function hashRuntimeFiles(files: string[]): string {
@@ -4574,6 +4798,7 @@ function isGeneratedRuntimePath(file: string): boolean {
     file.startsWith(`${devguardPaths.reportsDir}/`) ||
     file.startsWith(`${devguardPaths.promptsDir}/`) ||
     file.startsWith(`${devguardPaths.contextDir}/`) ||
+    file.startsWith(`${devguardPaths.memoryDir}/`) ||
     file.startsWith(`${devguardPaths.logsDir}/`) ||
     file.startsWith(`${devguardPaths.hooksDir}/`) ||
     file.startsWith(".devguard/runs/") ||
