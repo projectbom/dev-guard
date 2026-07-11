@@ -818,9 +818,10 @@ function workingContextFiles(state: ProjectState, records: HistoryRecord[]): str
 function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const documentationSummary = input.state.lastDocumentationSummary;
-  const entryFiles = readMapEntryFiles(input.files, profile, documentationSummary);
-  const readTargets = readMapTargets(documentationSummary, input.files, input.codeIndex, input.locale);
-  const skipTargets = readMapSkips(documentationSummary, input.files, input.locale);
+  const files = readableContextFiles(input.files, documentationSummary, input.codeIndex);
+  const entryFiles = readMapEntryFiles(files, profile, documentationSummary);
+  const readTargets = readMapTargets(documentationSummary, files, input.codeIndex, input.locale);
+  const skipTargets = readMapSkips(documentationSummary, files, input.locale);
   const recentChanges = documentationSummary?.overview?.length
     ? documentationSummary.overview.slice(0, 4).map((item) => localizeSentence(item, input.locale))
     : [input.locale === "ko-KR" ? "최근 변경 요약 없음" : "No recent change summary available"];
@@ -864,7 +865,9 @@ function renderCodeMap(input: {
   locale: DevGuardLocale;
 }): string {
   const documentationSummary = input.state.lastDocumentationSummary;
-  const files = input.fileContents.length > 0 ? input.fileContents : input.files.slice(0, 6).map((file) => ({ file, content: "" }));
+  const readableFiles = readableContextFiles(input.files, documentationSummary, input.codeIndex);
+  const fileContents = input.fileContents.filter((item) => readableFiles.includes(item.file) && (item.content.trim() || input.codeIndex.files[item.file]));
+  const files = fileContents.length > 0 ? fileContents : readableFiles.slice(0, 6).map((file) => ({ file, content: "" }));
   const lines: string[] = [
     "# Code Map",
     "",
@@ -912,9 +915,10 @@ function renderAgentBrief(input: {
 }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const summary = input.state.lastDocumentationSummary;
-  const entryFiles = readMapEntryFiles(input.files, profile, summary).slice(0, 5);
-  const readTargets = readMapTargets(summary, input.files, input.codeIndex, input.locale).slice(0, 5);
-  const skipTargets = readMapSkips(summary, input.files, input.locale).slice(0, 8);
+  const files = readableContextFiles(input.files, summary, input.codeIndex);
+  const entryFiles = readMapEntryFiles(files, profile, summary).slice(0, 5);
+  const readTargets = readMapTargets(summary, files, input.codeIndex, input.locale).slice(0, 5);
+  const skipTargets = readMapSkips(summary, files, input.locale).slice(0, 8);
   const qa = (summary?.qaChecks ?? input.quality.requiredVerification).slice(0, 4).map((item) => localizeSentence(item, input.locale));
   return [
     "# Agent Brief",
@@ -944,8 +948,18 @@ function renderAgentBrief(input: {
   ].join("\n") + "\n";
 }
 
+function readableContextFiles(files: string[], summary: DocumentationSummary | undefined, index: CodeIndex): string[] {
+  if (!summary?.fileChanges.length) return files;
+  const allowed = new Set(files);
+  return summary.fileChanges
+    .map((file) => file.file)
+    .filter((file) => allowed.has(file))
+    .filter((file) => !isIndexableSourceFile(file) || Boolean(index.files[file]));
+}
+
 function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; architecture: Array<{ name: string; files: string[] }> }, summary?: DocumentationSummary): string[] {
-  const summaryFiles = summary?.fileChanges.map((file) => file.file) ?? [];
+  const available = new Set(files);
+  const summaryFiles = summary?.fileChanges.map((file) => file.file).filter((file) => available.has(file)) ?? [];
   const changedEntryFiles = [...new Set([...summaryFiles, ...files])].filter((file) => !isDevguardManagedDocPath(file));
   if (changedEntryFiles.length > 0) return changedEntryFiles.slice(0, 8);
   return [...new Set(profile.entryPoints)].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
@@ -953,7 +967,9 @@ function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; ar
 
 function readMapTargets(summary: DocumentationSummary | undefined, files: string[], index: CodeIndex, locale: DevGuardLocale): string[] {
   if (summary?.fileChanges.length) {
+    const readable = new Set(files);
     return summary.fileChanges.flatMap((file) => {
+      if (!readable.has(file.file)) return [];
       const indexed = index.files[file.file];
       const primary = primaryIndexedSymbol(indexed);
       const mainReason = indexed?.summary ?? file.changes[0] ?? file.purpose;
@@ -1852,17 +1868,38 @@ async function updateCodeIndex(root: string, changedFiles: string[], documentati
     generatedAt: new Date().toISOString(),
     files: { ...current.files }
   };
-  for (const file of changedFiles.filter(isIndexableSourceFile)) {
+  for (const file of changedFiles) {
+    if (!isIndexableSourceFile(file)) {
+      delete next.files[file];
+      continue;
+    }
+    if (!(await fileExists(fromRoot(root, file)))) {
+      delete next.files[file];
+      continue;
+    }
     const content = await readTextFile(fromRoot(root, file));
-    if (!content.trim()) continue;
+    if (!content.trim()) {
+      delete next.files[file];
+      continue;
+    }
     const hash = hashText(content);
     const summary = documentationSummary.fileChanges.find((item) => item.file === file);
-    const expectedSummary = summary?.changes.slice(0, 2).join(" ") || codeMapFilePurpose(file);
+    const expectedSummary = functionalCodeIndexSummary(file, summary);
     if (next.files[file]?.hash === hash && next.files[file]?.summary === expectedSummary) continue;
     next.files[file] = buildCodeIndexFile(file, content, summary);
   }
   await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
   return next;
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function isIndexableSourceFile(file: string): boolean {
