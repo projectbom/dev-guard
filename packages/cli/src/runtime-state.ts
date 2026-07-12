@@ -257,6 +257,18 @@ interface CodeIndexSymbol {
   priority?: number;
 }
 
+type ContextPriority = "Required" | "Recommended" | "Optional";
+type ContextFreshness = "Fresh" | "Stale" | "Unknown";
+type ContextConfidence = "High" | "Medium" | "Low";
+
+interface ContextTrust {
+  priority: ContextPriority;
+  freshness: ContextFreshness;
+  confidence: ContextConfidence;
+  source: string;
+  reason: string;
+}
+
 interface ChangeLogEntry {
   timestamp: string;
   changedFiles: string[];
@@ -821,6 +833,7 @@ function renderReadMap(input: { files: string[]; state: ProjectState; projectKno
   const files = readableContextFiles(input.files, documentationSummary, input.codeIndex);
   const entryFiles = readMapEntryFiles(files, profile, documentationSummary);
   const readTargets = readMapTargets(documentationSummary, files, input.codeIndex, input.locale);
+  const trustSummary = contextTrustSummary(files, input.codeIndex, input.locale);
   const skipTargets = readMapSkips(documentationSummary, files, input.locale);
   const recentChanges = documentationSummary?.overview?.length
     ? documentationSummary.overview.slice(0, 4).map((item) => localizeSentence(item, input.locale))
@@ -830,7 +843,17 @@ function renderReadMap(input: { files: string[]; state: ProjectState; projectKno
     "",
     "> Before-Agent guide. Read this before opening source files.",
     "",
-    "## Agent Brief",
+    "## Agent Lifecycle",
+    "",
+    "- Phase: Before Agent",
+    "- Priority: Required",
+    "- Use this before repository search or broad file reads.",
+    "",
+    "## Context Trust",
+    "",
+    ...formatBullets(trustSummary),
+    "",
+    "## Task Goal",
     "",
     `- ${localizeSentence(documentationSummary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
     "",
@@ -873,6 +896,12 @@ function renderCodeMap(input: {
     "",
     "> File-internal map. Use this to avoid reading entire files.",
     "",
+    "## Agent Lifecycle",
+    "",
+    "- Phase: During Agent",
+    "- Priority: Required after Read Map selects a file.",
+    "- Use listed ranges first; open the rest of the file only when the range is insufficient.",
+    "",
     "## 현재 작업 구조",
     ...(documentationSummary?.structure?.length ? documentationSummary.structure.map((item) => localizeSentence(item, input.locale)) : ["확인 필요"]),
     "",
@@ -881,8 +910,10 @@ function renderCodeMap(input: {
   for (const item of files) {
     const sections = extractCodeSections(item.file, item.content);
     const indexed = input.codeIndex.files[item.file];
+    const trust = contextTrustForFile(item.file, indexed, item.content, input.locale);
     const summary = documentationSummary?.fileChanges.find((file) => file.file === item.file);
     lines.push("", `### \`${item.file}\``);
+    lines.push("", "Context Trust", `- ${formatContextTrust(trust)}`);
     lines.push("", "역할", `- ${localizeSentence(summary?.purpose ?? codeMapFilePurpose(item.file), input.locale)}`);
     if (indexed?.userImpact?.length) {
       lines.push("", "사용자 영향");
@@ -918,12 +949,23 @@ function renderAgentBrief(input: {
   const files = readableContextFiles(input.files, summary, input.codeIndex);
   const entryFiles = readMapEntryFiles(files, profile, summary).slice(0, 5);
   const readTargets = readMapTargets(summary, files, input.codeIndex, input.locale).slice(0, 5);
+  const trustSummary = contextTrustSummary(files, input.codeIndex, input.locale).slice(0, 5);
   const skipTargets = readMapSkips(summary, files, input.locale).slice(0, 8);
   const qa = (summary?.qaChecks ?? input.quality.requiredVerification).slice(0, 4).map((item) => localizeSentence(item, input.locale));
   return [
     "# Agent Brief",
     "",
     "> Compact before-agent brief. Use this to start without repository-wide discovery.",
+    "",
+    "## Agent Lifecycle",
+    "",
+    "- Phase: Before Agent",
+    "- Priority: Required",
+    "- Trust this brief for task intent; use Read Map and Code Map for exact file ranges.",
+    "",
+    "## Context Trust",
+    "",
+    ...formatBullets(trustSummary),
     "",
     "## 현재 목표",
     `- ${localizeSentence(summary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
@@ -942,6 +984,7 @@ function renderAgentBrief(input: {
     `2. \`${devguardPaths.codeMap}\`에서 파일 내부 수정 영역만 확인한다.`,
     "3. 필요한 경우에만 진입 파일 주변을 추가로 연다.",
     "4. 전체 프로젝트 검색은 마지막 수단으로만 사용한다.",
+    "5. Stale 또는 Unknown 범위는 신뢰하지 말고 `dev-guard done` 또는 `dev-guard handoff` 후 다시 확인한다.",
     "",
     "## QA 주의사항",
     ...formatBullets(qa)
@@ -972,13 +1015,15 @@ function readMapTargets(summary: DocumentationSummary | undefined, files: string
       if (!readable.has(file.file)) return [];
       const indexed = index.files[file.file];
       const primary = primaryIndexedSymbol(indexed);
+      const trust = contextTrustForFile(file.file, indexed, undefined, locale);
+      const trustPrefix = `[${trust.priority} · ${trust.freshness} · ${trust.confidence}]`;
       const mainReason = indexed?.summary ?? file.changes[0] ?? file.purpose;
       const developerHint = indexed?.developerImpact?.[0];
       return [
-        `${file.file}${formatPrimaryRange(indexed)}: ${localizeSentence(mainReason, locale)}`,
-        ...(primary?.editPoint ? [`${file.file}:${primary.startLine}-${primary.endLine}: ${localizeSentence(primary.editPoint, locale)}`] : []),
-        ...(file.userImpact[0] ? [`${file.file}: ${localizeSentence(file.userImpact[0], locale)}`] : []),
-        ...(developerHint ? [`${file.file}: ${localizeSentence(developerHint, locale)}`] : [])
+        `${file.file}${formatPrimaryRange(indexed)}: ${trustPrefix} ${localizeSentence(mainReason, locale)}`,
+        ...(primary?.editPoint ? [`${file.file}:${primary.startLine}-${primary.endLine}: ${trustPrefix} ${localizeSentence(primary.editPoint, locale)}`] : []),
+        ...(file.userImpact[0] ? [`${file.file}: ${trustPrefix} ${localizeSentence(file.userImpact[0], locale)}`] : []),
+        ...(developerHint ? [`${file.file}: ${trustPrefix} ${localizeSentence(developerHint, locale)}`] : [])
       ];
     }).slice(0, 10);
   }
@@ -993,6 +1038,66 @@ function readMapSkips(summary: DocumentationSummary | undefined, files: string[]
 function formatPrimaryRange(file?: CodeIndexFile): string {
   const symbol = primaryIndexedSymbol(file);
   return symbol ? `:${symbol.startLine}-${symbol.endLine}` : "";
+}
+
+function contextTrustSummary(files: string[], index: CodeIndex, locale: DevGuardLocale): string[] {
+  if (files.length === 0) {
+    return [
+      locale === "ko-KR"
+        ? "Priority: Required; Freshness: Unknown; Confidence: Low; Source: Rule Only; Reason: 변경 파일이 없어 진입 범위를 확인할 수 없습니다."
+        : "Priority: Required; Freshness: Unknown; Confidence: Low; Source: Rule Only; Reason: no changed files are available."
+    ];
+  }
+  return files.slice(0, 6).map((file) => `${file}: ${formatContextTrust(contextTrustForFile(file, index.files[file], undefined, locale))}`);
+}
+
+function contextTrustForFile(file: string, indexed: CodeIndexFile | undefined, content: string | undefined, locale: DevGuardLocale): ContextTrust {
+  if (indexed && content?.trim()) {
+    const freshness: ContextFreshness = hashText(content) === indexed.hash ? "Fresh" : "Stale";
+    return {
+      priority: "Required",
+      freshness,
+      confidence: freshness === "Fresh" ? "High" : "Medium",
+      source: freshness === "Fresh" ? "Code Index + Current Hash" : "Code Index + Hash Mismatch",
+      reason:
+        freshness === "Fresh"
+          ? locale === "ko-KR"
+            ? "현재 파일 해시가 Code Index와 일치합니다."
+            : "current file hash matches the Code Index."
+          : locale === "ko-KR"
+            ? "파일 내용이 Code Index 이후 변경되었습니다."
+            : "file content changed after the Code Index was generated."
+    };
+  }
+  if (indexed) {
+    return {
+      priority: "Required",
+      freshness: "Fresh",
+      confidence: "High",
+      source: "Code Index",
+      reason: locale === "ko-KR" ? "현재 done/handoff 흐름에서 갱신된 Code Index 항목입니다." : "Code Index entry is available from the current done/handoff flow."
+    };
+  }
+  if (isIndexableSourceFile(file)) {
+    return {
+      priority: "Required",
+      freshness: "Stale",
+      confidence: "Low",
+      source: "Rule Only",
+      reason: locale === "ko-KR" ? "소스 파일이지만 Code Index 항목이 없습니다." : "source file has no Code Index entry."
+    };
+  }
+  return {
+    priority: "Recommended",
+    freshness: "Unknown",
+    confidence: "Medium",
+    source: "Rule Only",
+    reason: locale === "ko-KR" ? "문서 또는 설정 파일은 line-range 신뢰도를 계산하지 않습니다." : "document or config file ranges are not hash-verified."
+  };
+}
+
+function formatContextTrust(trust: ContextTrust): string {
+  return `Priority: ${trust.priority}; Freshness: ${trust.freshness}; Confidence: ${trust.confidence}; Source: ${trust.source}; Reason: ${trust.reason}`;
 }
 
 function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[]): string[] {
