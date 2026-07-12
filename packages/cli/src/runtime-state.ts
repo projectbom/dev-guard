@@ -259,12 +259,16 @@ interface CodeIndexSymbol {
 
 type ContextPriority = "Required" | "Recommended" | "Optional";
 type ContextFreshness = "Fresh" | "Stale" | "Unknown";
+type ContextRelevance = "Targeted" | "Candidate" | "Unknown";
 type ContextConfidence = "High" | "Medium" | "Low";
+type ContextCoverage = "Focused" | "Partial" | "Unknown";
 
 interface ContextTrust {
   priority: ContextPriority;
   freshness: ContextFreshness;
+  relevance: ContextRelevance;
   confidence: ContextConfidence;
+  coverage: ContextCoverage;
   source: string;
   reason: string;
 }
@@ -984,7 +988,8 @@ function renderAgentBrief(input: {
     `2. \`${devguardPaths.codeMap}\`에서 파일 내부 수정 영역만 확인한다.`,
     "3. 필요한 경우에만 진입 파일 주변을 추가로 연다.",
     "4. 전체 프로젝트 검색은 마지막 수단으로만 사용한다.",
-    "5. Stale 또는 Unknown 범위는 신뢰하지 말고 `dev-guard done` 또는 `dev-guard handoff` 후 다시 확인한다.",
+    "5. Stale 또는 Unknown 범위는 authoritative range로 신뢰하지 말고 현재 파일의 해당 주변 코드를 직접 확인한다.",
+    "6. 작업 전 context 자체가 오래됐다고 판단되면 `dev-guard status`로 pending 상태를 확인하고, 세션 완료 시점에만 `dev-guard done`으로 재생성한다.",
     "",
     "## QA 주의사항",
     ...formatBullets(qa)
@@ -1016,7 +1021,7 @@ function readMapTargets(summary: DocumentationSummary | undefined, files: string
       const indexed = index.files[file.file];
       const primary = primaryIndexedSymbol(indexed);
       const trust = contextTrustForFile(file.file, indexed, undefined, locale);
-      const trustPrefix = `[${trust.priority} · ${trust.freshness} · ${trust.confidence}]`;
+      const trustPrefix = contextTrustBadge(trust);
       const mainReason = indexed?.summary ?? file.changes[0] ?? file.purpose;
       const developerHint = indexed?.developerImpact?.[0];
       return [
@@ -1044,8 +1049,8 @@ function contextTrustSummary(files: string[], index: CodeIndex, locale: DevGuard
   if (files.length === 0) {
     return [
       locale === "ko-KR"
-        ? "Priority: Required; Freshness: Unknown; Confidence: Low; Source: Rule Only; Reason: 변경 파일이 없어 진입 범위를 확인할 수 없습니다."
-        : "Priority: Required; Freshness: Unknown; Confidence: Low; Source: Rule Only; Reason: no changed files are available."
+        ? "Priority: Required; Index Freshness: Unknown; Relevance: Unknown; Range Confidence: Low; Coverage: Unknown; Source: Rule Only; Reason: 변경 파일이 없어 진입 범위를 확인할 수 없습니다."
+        : "Priority: Required; Index Freshness: Unknown; Relevance: Unknown; Range Confidence: Low; Coverage: Unknown; Source: Rule Only; Reason: no changed files are available."
     ];
   }
   return files.slice(0, 6).map((file) => `${file}: ${formatContextTrust(contextTrustForFile(file, index.files[file], undefined, locale))}`);
@@ -1057,13 +1062,15 @@ function contextTrustForFile(file: string, indexed: CodeIndexFile | undefined, c
     return {
       priority: "Required",
       freshness,
-      confidence: freshness === "Fresh" ? "High" : "Medium",
+      relevance: "Candidate",
+      confidence: freshness === "Fresh" ? "Medium" : "Low",
+      coverage: "Focused",
       source: freshness === "Fresh" ? "Code Index + Current Hash" : "Code Index + Hash Mismatch",
       reason:
         freshness === "Fresh"
           ? locale === "ko-KR"
-            ? "현재 파일 해시가 Code Index와 일치합니다."
-            : "current file hash matches the Code Index."
+            ? "현재 파일 해시가 Code Index와 일치합니다. 이는 최신성 신호이며 작업 관련성이나 range 정확도를 보장하지는 않습니다."
+            : "current file hash matches the Code Index. This proves freshness, not task relevance or range accuracy."
           : locale === "ko-KR"
             ? "파일 내용이 Code Index 이후 변경되었습니다."
             : "file content changed after the Code Index was generated."
@@ -1073,16 +1080,20 @@ function contextTrustForFile(file: string, indexed: CodeIndexFile | undefined, c
     return {
       priority: "Required",
       freshness: "Fresh",
-      confidence: "High",
+      relevance: "Candidate",
+      confidence: "Medium",
+      coverage: "Partial",
       source: "Code Index",
-      reason: locale === "ko-KR" ? "현재 done/handoff 흐름에서 갱신된 Code Index 항목입니다." : "Code Index entry is available from the current done/handoff flow."
+      reason: locale === "ko-KR" ? "Code Index 항목이 있습니다. 이는 읽기 후보 신호이며 누락 파일이 없다는 보장은 아닙니다." : "Code Index entry is available. This is a read-candidate signal, not a guarantee that coverage is complete."
     };
   }
   if (isIndexableSourceFile(file)) {
     return {
       priority: "Required",
       freshness: "Stale",
+      relevance: "Candidate",
       confidence: "Low",
+      coverage: "Unknown",
       source: "Rule Only",
       reason: locale === "ko-KR" ? "소스 파일이지만 Code Index 항목이 없습니다." : "source file has no Code Index entry."
     };
@@ -1090,14 +1101,20 @@ function contextTrustForFile(file: string, indexed: CodeIndexFile | undefined, c
   return {
     priority: "Recommended",
     freshness: "Unknown",
-    confidence: "Medium",
+    relevance: "Unknown",
+    confidence: "Low",
+    coverage: "Unknown",
     source: "Rule Only",
-    reason: locale === "ko-KR" ? "문서 또는 설정 파일은 line-range 신뢰도를 계산하지 않습니다." : "document or config file ranges are not hash-verified."
+    reason: locale === "ko-KR" ? "문서 또는 설정 파일은 line-range 신뢰도와 coverage를 계산하지 않습니다." : "document or config file ranges and coverage are not hash-verified."
   };
 }
 
 function formatContextTrust(trust: ContextTrust): string {
-  return `Priority: ${trust.priority}; Freshness: ${trust.freshness}; Confidence: ${trust.confidence}; Source: ${trust.source}; Reason: ${trust.reason}`;
+  return `Priority: ${trust.priority}; Index Freshness: ${trust.freshness}; Relevance: ${trust.relevance}; Range Confidence: ${trust.confidence}; Coverage: ${trust.coverage}; Source: ${trust.source}; Reason: ${trust.reason}`;
+}
+
+function contextTrustBadge(trust: ContextTrust): string {
+  return `[${trust.priority} · ${trust.freshness} index · ${trust.relevance} relevance · ${trust.confidence} range]`;
 }
 
 function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[]): string[] {
