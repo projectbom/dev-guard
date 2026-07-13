@@ -928,7 +928,7 @@ function renderCodeMap(input: {
       for (const impact of indexed.developerImpact.slice(0, 2)) lines.push(`- ${localizeSentence(impact, input.locale)}`);
     }
     lines.push("", "먼저 읽을 영역");
-    for (const section of codeMapReadRanges(indexed, sections.readFirst).slice(0, 8)) lines.push(`- ${section}`);
+    for (const section of codeMapReadRanges(indexed, sections.readFirst, documentationSummary, summary).slice(0, 8)) lines.push(`- ${section}`);
     lines.push("", "수정 후보");
     for (const section of codeMapEditTargets(summary, sections.readFirst, input.locale)) lines.push(`- ${section}`);
     lines.push("", "읽지 않아도 되는 영역");
@@ -1329,9 +1329,9 @@ function contextTrustBadge(trust: ContextTrust): string {
   return `[${trust.priority} · ${trust.freshness} index · ${trust.relevance} relevance · ${trust.confidence} range]`;
 }
 
-function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[]): string[] {
+function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[], taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): string[] {
   if (!file) return fallback;
-  const candidates = indexedReadCandidates(file);
+  const candidates = indexedReadCandidates(file, taskSummary, fileSummary);
   const ranges = candidates.slice(0, 8).map((symbol, index) =>
     [
       `${index + 1}. ${symbol.name} (${symbol.kind}) lines ${symbol.startLine}-${symbol.endLine}`,
@@ -1348,11 +1348,116 @@ function primaryIndexedSymbol(file?: CodeIndexFile): CodeIndexSymbol | undefined
   return indexedReadCandidates(file)[0];
 }
 
-function indexedReadCandidates(file: CodeIndexFile): CodeIndexSymbol[] {
-  return [...file.blocks, ...file.symbols].sort((a, b) => {
+function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): CodeIndexSymbol[] {
+  const sorted = [...file.blocks, ...file.symbols].sort((a, b) => {
+    const score = codeMapRangeScore(file, b, taskSummary, fileSummary) - codeMapRangeScore(file, a, taskSummary, fileSummary);
+    if (score !== 0) return score;
     const priority = codeMapSymbolPriority(file.path, a) - codeMapSymbolPriority(file.path, b);
     return priority !== 0 ? priority : a.startLine - b.startLine;
   });
+  return dedupeOverlappingRanges(sorted);
+}
+
+function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): number {
+  const taskText = [
+    taskSummary ? taskRoutingText(taskSummary) : "",
+    fileSummary?.purpose ?? "",
+    ...(fileSummary?.changes ?? []),
+    ...(fileSummary?.userImpact ?? []),
+    ...(fileSummary?.qa ?? [])
+  ].join("\n");
+  const taskTokens = meaningfulRankingTokens([
+    taskText
+  ].join("\n"));
+  const rangeText = [
+    symbol.name,
+    symbol.kind,
+    symbol.summary,
+    symbol.role ?? "",
+    symbol.editPoint ?? "",
+    symbol.qa ?? ""
+  ].join("\n");
+  const rangeTokens = meaningfulRankingTokens([
+    rangeText
+  ].join("\n"));
+  const nameTokens = meaningfulRankingTokens(symbol.name);
+  const editTokens = meaningfulRankingTokens(`${symbol.role ?? ""}\n${symbol.editPoint ?? ""}\n${symbol.summary}`);
+  const tokenOverlap = [...taskTokens].filter((token) => rangeTokens.has(token)).length;
+  const nameOverlap = [...taskTokens].filter((token) => nameTokens.has(token)).length;
+  const editOverlap = [...taskTokens].filter((token) => editTokens.has(token)).length;
+  const lineCount = Math.max(1, symbol.endLine - symbol.startLine + 1);
+  const fileMaxLine = Math.max(...[...file.blocks, ...file.symbols].map((candidate) => candidate.endLine), lineCount);
+  const isUiTask = taskSummary?.changeTypes.includes("UI") || /ui|layout|interaction|card|section|screen|view|front|back|cta|button|form/i.test(taskText);
+  const uiRange = /visible|user-facing|layout|interaction|cta|form|button|section|card|page|screen|view|front|back|hero|footer/i.test(rangeText);
+  const behaviorRange = /handler|route|response|login|auth|submit|click|toggle|open|close|show|hide/i.test(rangeText);
+  let score = 0;
+
+  score += nameOverlap * 18;
+  score += editOverlap * 10;
+  score += tokenOverlap * 6;
+  if (file.exports.includes(symbol.name)) score += 8;
+  if (symbol.kind === "block") score += 6;
+  if (symbol.kind === "component" || symbol.kind === "function" || symbol.kind === "class") score += 5;
+  if (uiRange || behaviorRange) score += 4;
+  if (isUiTask && symbol.kind === "block" && uiRange) score += 18;
+  if (isUiTask && symbol.kind === "component" && uiRange) score += 8;
+  if (isUiTask && (symbol.kind === "function" || symbol.kind === "const") && !uiRange && !behaviorRange) score -= 12;
+  if (isUiTask && symbol.kind === "function" && tokenOverlap < 2 && nameOverlap === 0) score -= 10;
+  if (typeof symbol.priority === "number") score += Math.max(0, 8 - symbol.priority);
+
+  if (nameOverlap === 0 && /mark|brand|logo|icon|seal|watermark/i.test(symbol.name)) score -= 30;
+  if (nameOverlap === 0 && tokenOverlap === 0 && /helper|utility|util|constant/i.test(symbol.name)) score -= 12;
+  if (symbol.kind === "type" || symbol.kind === "interface") score -= 8;
+  if (symbol.kind === "const") score -= tokenOverlap > 0 ? 10 : 18;
+  if (lineCount <= 2 && symbol.kind !== "const" && symbol.kind !== "type" && symbol.kind !== "interface") score -= 3;
+  if (lineCount > 250) score -= 10;
+  if (fileMaxLine > 80 && lineCount / fileMaxLine > 0.75) score -= 8;
+  return score;
+}
+
+function dedupeOverlappingRanges(candidates: CodeIndexSymbol[]): CodeIndexSymbol[] {
+  const selected: CodeIndexSymbol[] = [];
+  for (const candidate of candidates) {
+    const duplicateIndex = selected.findIndex((existing) => rangesOverlapRatio(existing, candidate) >= 0.8 && rangeSizeRatio(existing, candidate) >= 0.7);
+    if (duplicateIndex >= 0) {
+      const existing = selected[duplicateIndex];
+      const existingSize = existing.endLine - existing.startLine + 1;
+      const candidateSize = candidate.endLine - candidate.startLine + 1;
+      if (candidateSize < existingSize && candidateSize >= 4) selected[duplicateIndex] = candidate;
+      continue;
+    }
+    const enclosing = selected.find((existing) => existing.startLine <= candidate.startLine && existing.endLine >= candidate.endLine);
+    if (enclosing) {
+      const enclosingSize = enclosing.endLine - enclosing.startLine + 1;
+      const candidateSize = candidate.endLine - candidate.startLine + 1;
+      if (candidateSize >= 4 && candidateSize / enclosingSize < 0.7) selected.push(candidate);
+      continue;
+    }
+    const enclosed = selected.find((existing) => candidate.startLine <= existing.startLine && candidate.endLine >= existing.endLine);
+    if (enclosed) {
+      const enclosedSize = enclosed.endLine - enclosed.startLine + 1;
+      const candidateSize = candidate.endLine - candidate.startLine + 1;
+      if ((candidate.kind === "component" || candidate.kind === "function" || candidate.kind === "class") && enclosedSize / candidateSize < 0.7) selected.push(candidate);
+      continue;
+    }
+    selected.push(candidate);
+  }
+  return selected;
+}
+
+function rangeSizeRatio(a: CodeIndexSymbol, b: CodeIndexSymbol): number {
+  const aSize = a.endLine - a.startLine + 1;
+  const bSize = b.endLine - b.startLine + 1;
+  return Math.min(aSize, bSize) / Math.max(1, Math.max(aSize, bSize));
+}
+
+function rangesOverlapRatio(a: CodeIndexSymbol, b: CodeIndexSymbol): number {
+  const start = Math.max(a.startLine, b.startLine);
+  const end = Math.min(a.endLine, b.endLine);
+  if (end < start) return 0;
+  const overlap = end - start + 1;
+  const smaller = Math.min(a.endLine - a.startLine + 1, b.endLine - b.startLine + 1);
+  return overlap / Math.max(1, smaller);
 }
 
 function codeMapSymbolPriority(file: string, symbol: CodeIndexSymbol): number {
