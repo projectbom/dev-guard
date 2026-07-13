@@ -21,7 +21,7 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
-import { generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
+import { generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
@@ -263,7 +263,7 @@ All commands:
   dev-guard init
   dev-guard "requirement"
   dev-guard done
-  dev-guard handoff
+  dev-guard handoff [--task "<current task>"]
   dev-guard knowledge
   dev-guard status
   dev-guard reset
@@ -299,7 +299,7 @@ Commands:
   watch                   Monitor AI coding session; prepares project on first run
   "requirement"           Generate task.md and a compact Codex prompt
   done                    Manual recovery — normally watch auto-finalizes
-  handoff                 Regenerate handoff, read-map, code-map, brief, and agent-context
+  handoff                 Regenerate handoff/context; --task prepares Before-Agent context
   knowledge               Generate and summarize .devguard/project/project-knowledge.json
   status                  Show pending watch state, hook state, quality verdict
   configure / config      Configure dev-guard settings (AI provider, watch tuning)
@@ -420,6 +420,24 @@ async function runHandoff(root: string): Promise<void> {
   try {
     const locale = await refreshRuntimeLocale(root);
     const copy = cliCopy(locale);
+    const task = readStringOption(process.argv.slice(3), "--task");
+    if (task !== undefined) {
+      const result = await prepareBeforeAgentContext(root, task);
+      console.log("dev-guard before-agent context");
+      console.log(`task: ${result.task}`);
+      console.log(`source: ${result.source}`);
+      console.log("generated:");
+      console.log(`- ${result.readMapPath}`);
+      console.log(`- ${result.codeMapPath}`);
+      console.log(`- ${result.workingContextPath}`);
+      console.log(`- ${result.agentBriefPath}`);
+      console.log(`- ${result.agentContextPath}`);
+      console.log(`- ${result.nextClaudePromptPath}`);
+      console.log("");
+      console.log(copy.resumePrompt);
+      console.log(`  Read ${result.agentBriefPath}, ${result.readMapPath}, and ${result.codeMapPath}; then start the task.`);
+      return;
+    }
     const [handoffPath, readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
       generateProjectHandoff(root),
       generateReadMap(root),
@@ -445,6 +463,16 @@ async function runHandoff(root: string): Promise<void> {
     console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
     process.exitCode = 1;
   }
+}
+
+function readStringOption(args: string[], name: string): string | undefined {
+  const equals = args.find((arg) => arg.startsWith(`${name}=`));
+  if (equals) return equals.slice(name.length + 1).trim();
+  const index = args.indexOf(name);
+  if (index === -1) return undefined;
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) return "";
+  return value.trim();
 }
 
 async function runStatus(root: string): Promise<void> {

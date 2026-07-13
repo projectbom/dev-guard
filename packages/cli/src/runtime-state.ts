@@ -27,6 +27,7 @@ const execFileAsync = promisify(execFile);
 
 export interface RuntimeState {
   pendingChangedFiles: string[];
+  currentTask?: BeforeAgentTask;
   firstChangedAt?: string;
   lastChangedAt?: string;
   lastChangedFile?: string;
@@ -46,6 +47,12 @@ export interface RuntimeState {
   locale?: DevGuardLocale;
   setupStatus?: SetupStatus;
   qaResults?: Record<string, QAExecutionResult>;
+}
+
+export interface BeforeAgentTask {
+  text: string;
+  source: "explicit-before-agent-input";
+  createdAt: string;
 }
 
 export interface QAExecutionResult {
@@ -106,6 +113,17 @@ export interface DoneProcessingResult {
   qualityVerdict: QualityVerdict;
   summary: string;
   drift: "low" | "medium" | "high";
+}
+
+export interface BeforeAgentPreparationResult {
+  task: string;
+  source: BeforeAgentTask["source"];
+  readMapPath: string;
+  codeMapPath: string;
+  workingContextPath: string;
+  agentBriefPath: string;
+  agentContextPath: string;
+  nextClaudePromptPath: string;
 }
 
 type QualityVerdict = "PASS" | "NEEDS_REVIEW" | "BLOCKED";
@@ -520,7 +538,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     changedFiles,
     diffText,
     diffStat,
-    taskText: [tasksMarkdown, projectMarkdown].join("\n\n"),
+    taskText: [runtime.currentTask?.text ?? "", tasksMarkdown, projectMarkdown].join("\n\n"),
     qaResults: runtime.qaResults
   });
   const codeIndex = await updateCodeIndex(root, changedFiles, documentationSummary);
@@ -669,6 +687,37 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   };
 }
 
+export async function prepareBeforeAgentContext(root: string, task: string): Promise<BeforeAgentPreparationResult> {
+  await ensureDevguardWorkspace(root);
+  const text = task.trim();
+  if (!text) throw new Error("--task requires a non-empty task description.");
+  const current = await readRuntimeState(root);
+  const currentTask: BeforeAgentTask = {
+    text,
+    source: "explicit-before-agent-input",
+    createdAt: new Date().toISOString()
+  };
+  await writeRuntimeState(root, { ...current, currentTask });
+  const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
+    generateReadMap(root),
+    generateCodeMap(root),
+    generateWorkingContext(root),
+    generateAgentBrief(root),
+    generateAgentContext(root),
+    generateNextClaudePrompt(root)
+  ]);
+  return {
+    task: text,
+    source: currentTask.source,
+    readMapPath,
+    codeMapPath,
+    workingContextPath,
+    agentBriefPath,
+    agentContextPath,
+    nextClaudePromptPath
+  };
+}
+
 export async function generateProjectHandoff(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
@@ -711,14 +760,15 @@ export async function generateProjectHandoff(root: string): Promise<string> {
 export async function generateReadMap(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [state, records, projectKnowledge, codeIndex] = await Promise.all([
+  const [state, runtime, records, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readRuntimeState(root),
     readHistoryRecords(root, 5),
     readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
     readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
-  const files = workingContextFiles(state, records);
-  const markdown = renderReadMap({ files, state, projectKnowledge, codeIndex, locale });
+  const context = resolveBeforeAgentContext({ state, runtime, records, codeIndex });
+  const markdown = renderReadMap({ files: context.files, state, projectKnowledge, codeIndex, locale, documentationSummary: context.summary, taskSource: context.source });
   await writeTextFile(fromRoot(root, readMapPath), markdown);
   return readMapPath;
 }
@@ -726,20 +776,22 @@ export async function generateReadMap(root: string): Promise<string> {
 export async function generateCodeMap(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [state, records, projectKnowledge, codeIndex] = await Promise.all([
+  const [state, runtime, records, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readRuntimeState(root),
     readHistoryRecords(root, 5),
     readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
     readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
-  const files = readableContextFiles(workingContextFiles(state, records), state.lastDocumentationSummary, codeIndex);
-  const fileContents = await Promise.all(
-    files.slice(0, 6).map(async (file) => ({
+  const context = resolveBeforeAgentContext({ state, runtime, records, codeIndex });
+  const files = readableContextFiles(context.files, context.summary, codeIndex);
+  const fileContents = context.source === "explicit-before-agent-input"
+    ? []
+    : await Promise.all(files.slice(0, 6).map(async (file) => ({
       file,
       content: await readTextFile(fromRoot(root, file))
-    }))
-  );
-  const markdown = renderCodeMap({ files, fileContents, state, projectKnowledge, codeIndex, locale });
+    })));
+  const markdown = renderCodeMap({ files, fileContents, state, projectKnowledge, codeIndex, locale, documentationSummary: context.summary });
   await writeTextFile(fromRoot(root, codeMapPath), markdown);
   return codeMapPath;
 }
@@ -747,16 +799,17 @@ export async function generateCodeMap(root: string): Promise<string> {
 export async function generateAgentBrief(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [state, records, qualityContent, projectKnowledge, codeIndex] = await Promise.all([
+  const [state, runtime, records, qualityContent, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readRuntimeState(root),
     readHistoryRecords(root, 5),
     readTextFile(fromRoot(root, qualityReportPath)),
     readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
     readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
-  const files = workingContextFiles(state, records);
+  const context = resolveBeforeAgentContext({ state, runtime, records, codeIndex });
   const quality = parseQuality(qualityContent);
-  const markdown = renderAgentBrief({ files, state, quality, projectKnowledge, codeIndex, locale });
+  const markdown = renderAgentBrief({ files: context.files, state, quality, projectKnowledge, codeIndex, locale, documentationSummary: context.summary, taskSource: context.source });
   await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
   await writeTextFile(fromRoot(root, devguardPaths.agentBrief), markdown);
   return devguardPaths.agentBrief;
@@ -765,32 +818,37 @@ export async function generateAgentBrief(root: string): Promise<string> {
 export async function generateWorkingContext(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [state, historyRecords, projectKnowledge] = await Promise.all([
+  const [state, runtime, historyRecords, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readRuntimeState(root),
     readHistoryRecords(root, 5),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge))
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
+    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
-  const files = workingContextFiles(state, historyRecords);
-  const context = renderWorkingContext({ files, state, historyRecords, projectKnowledge, locale });
+  const beforeAgent = resolveBeforeAgentContext({ state, runtime, records: historyRecords, codeIndex });
+  const context = renderWorkingContext({ files: beforeAgent.files, state, historyRecords, projectKnowledge, locale, documentationSummary: beforeAgent.summary, taskSource: beforeAgent.source });
   await writeTextFile(fromRoot(root, workingContextPath), context);
   return workingContextPath;
 }
 
 export async function generateAgentContext(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
-  const [project, decisions, qualityContent, historyRecords, state] = await Promise.all([
+  const [project, decisions, qualityContent, historyRecords, state, runtime, codeIndex] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
     readTextFile(fromRoot(root, devguardPaths.decisions)),
     readTextFile(fromRoot(root, qualityReportPath)),
     readHistoryRecords(root, 5),
-    readJsonFile<ProjectState>(fromRoot(root, statePath), {})
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    readRuntimeState(root),
+    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
   const projectPurpose = firstSectionBullet(project, "프로젝트 목적") ?? "확인 필요";
   const currentGoal = firstSectionBullet(project, "현재 목표") ?? "확인 필요";
   const quality = parseQuality(qualityContent);
   const importantDecisions = extractDecisionLines(decisions);
   const lastChangedFiles = state.lastChangedFiles ?? [];
-  const documentationSummary = state.lastDocumentationSummary;
+  const beforeAgent = resolveBeforeAgentContext({ state, runtime, records: historyRecords, codeIndex });
+  const documentationSummary = beforeAgent.summary;
   const lastSummary = documentationSummary?.overview?.join("; ") ?? state.lastSummary ?? "확인 필요";
   const recentHistory = historyRecords
     .slice(-3)
@@ -805,7 +863,8 @@ export async function generateAgentContext(root: string): Promise<string> {
     qualityVerdict: quality.verdict,
     qualityWhy: quality.why,
     importantDecisions,
-    documentationSummary
+    documentationSummary,
+    taskSource: beforeAgent.source
   });
   await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
   await writeTextFile(fromRoot(root, devguardPaths.agentContext), markdown);
@@ -831,9 +890,103 @@ function workingContextFiles(state: ProjectState, records: HistoryRecord[]): str
   return [...new Set(files.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)))].sort();
 }
 
-function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale }): string {
+function resolveBeforeAgentContext(input: {
+  state: ProjectState;
+  runtime: RuntimeState;
+  records: HistoryRecord[];
+  codeIndex: CodeIndex;
+}): { summary?: DocumentationSummary; files: string[]; source: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" } {
+  const currentTask = input.runtime.currentTask?.text?.trim();
+  if (currentTask) {
+    const baseSummary = beforeAgentTaskSummary(currentTask, input.codeIndex);
+    const candidateFiles = taskRelevantIndexCandidates(baseSummary, input.codeIndex, new Set()).slice(0, 12);
+    const summary = beforeAgentTaskSummary(currentTask, input.codeIndex, candidateFiles);
+    return {
+      summary,
+      files: readableContextFiles(candidateFiles, summary, input.codeIndex),
+      source: "explicit-before-agent-input"
+    };
+  }
+  const files = workingContextFiles(input.state, input.records);
+  if (input.state.lastDocumentationSummary) {
+    return {
+      summary: input.state.lastDocumentationSummary,
+      files,
+      source: "last-documentation-summary"
+    };
+  }
+  return {
+    files,
+    source: files.length > 0 ? "history-fallback" : "unknown"
+  };
+}
+
+function beforeAgentTaskSummary(task: string, index: CodeIndex, candidates: string[] = []): DocumentationSummary {
+  const types = inferTaskChangeTypes(task);
+  const affected = affectedAreasFromDocumentation([], types);
+  return {
+    goal: task,
+    overview: [`Current Task: ${task}`, ...beforeAgentTaskIntentHints(task), "Task Source: Explicit Before-Agent Input"],
+    changeTypes: types,
+    impact: {
+      affected,
+      unaffected: unaffectedAreasFromDocumentation(affected),
+      risk: "None",
+      riskReason: "Before-Agent context preparation only; no source change has been finalized."
+    },
+    fileChanges: candidates.map((file) => beforeAgentFileChange(file, index.files[file], types)),
+    qaChecks: ["Use Read Map to choose the first file.", "Use Code Map ranges before opening full files."],
+    remainingWork: ["Implement the current task after reading the targeted context."],
+    structure: ["Before-Agent task", "↓", "Code Index Task Routing", "↓", "Read Map / Code Map / Agent Brief"],
+    excludedAreas: unaffectedAreasFromDocumentation(affected)
+  };
+}
+
+function beforeAgentTaskIntentHints(task: string): string[] {
+  const text = task.toLowerCase();
+  const hints: string[] = [];
+  if (/api|route|handler|response|og|이미지|응답|endpoint/.test(text)) hints.push("Task Intent: API route response handler");
+  if (/og|이미지/.test(text)) hints.push("Task Intent: OG image response");
+  if (/ui|화면|카드|card|component|컴포넌트|layout|button|cta|문장|영역/.test(text) && !/api|route|handler|response|og|응답|endpoint/.test(text)) {
+    hints.push("Task Intent: user-facing UI component");
+  }
+  return hints;
+}
+
+function inferTaskChangeTypes(task: string): ChangeType[] {
+  const text = task.toLowerCase();
+  const types = new Set<ChangeType>();
+  const isRouteOrApiTask = /api|route|handler|response|og|응답|endpoint/.test(text);
+  if (/api|route|handler|response|og|이미지|응답|endpoint/.test(text)) types.add("Logic");
+  if (!isRouteOrApiTask && /ui|화면|카드|card|component|컴포넌트|layout|button|cta|profile|프로필|문장|영역/.test(text)) types.add("UI");
+  if (/docs|readme|문서/.test(text)) types.add("Docs");
+  if (/config|설정|package|환경/.test(text)) types.add("Config");
+  if (/locale|i18n|번역|한국어|영어/.test(text)) types.add("i18n");
+  return types.size > 0 ? [...types] : ["Logic"];
+}
+
+function beforeAgentFileChange(file: string, indexed: CodeIndexFile | undefined, types: ChangeType[]): DocumentationFileChange {
+  const primary = primaryIndexedSymbol(indexed);
+  return {
+    file,
+    type: types,
+    purpose: indexed?.role ?? indexed?.summary ?? "Code Index matched this file to the current task.",
+    changes: [indexed?.summary ?? "Read this candidate because it matched the current task."],
+    userImpact: indexed?.userImpact?.slice(0, 2) ?? [],
+    qa: [primary?.editPoint ?? "Open the Code Map range before reading the full file."]
+  };
+}
+
+function taskSourceLabel(source: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown", locale: DevGuardLocale): string {
+  if (source === "explicit-before-agent-input") return locale === "ko-KR" ? "Explicit Before-Agent Input" : "Explicit Before-Agent Input";
+  if (source === "last-documentation-summary") return locale === "ko-KR" ? "Last Documentation Summary fallback" : "Last Documentation Summary fallback";
+  if (source === "history-fallback") return locale === "ko-KR" ? "History fallback" : "History fallback";
+  return locale === "ko-KR" ? "Unknown" : "Unknown";
+}
+
+function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
-  const documentationSummary = input.state.lastDocumentationSummary;
+  const documentationSummary = input.documentationSummary ?? input.state.lastDocumentationSummary;
   const files = readableContextFiles(input.files, documentationSummary, input.codeIndex);
   const entryFiles = readMapEntryFiles(files, profile, documentationSummary);
   const readTargets = readMapTargets(documentationSummary, files, input.codeIndex, input.locale);
@@ -860,6 +1013,7 @@ function renderReadMap(input: { files: string[]; state: ProjectState; projectKno
     "## Task Goal",
     "",
     `- ${localizeSentence(documentationSummary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
+    `- Task Source: ${taskSourceLabel(input.taskSource ?? "unknown", input.locale)}`,
     "",
     "## 읽기 순서",
     ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
@@ -890,8 +1044,9 @@ function renderCodeMap(input: {
   projectKnowledge: string;
   codeIndex: CodeIndex;
   locale: DevGuardLocale;
+  documentationSummary?: DocumentationSummary;
 }): string {
-  const documentationSummary = input.state.lastDocumentationSummary;
+  const documentationSummary = input.documentationSummary ?? input.state.lastDocumentationSummary;
   const readableFiles = readableContextFiles(input.files, documentationSummary, input.codeIndex);
   const fileContents = input.fileContents.filter((item) => readableFiles.includes(item.file) && (item.content.trim() || input.codeIndex.files[item.file]));
   const files = fileContents.length > 0 ? fileContents : readableFiles.slice(0, 6).map((file) => ({ file, content: "" }));
@@ -947,9 +1102,11 @@ function renderAgentBrief(input: {
   projectKnowledge: string;
   codeIndex: CodeIndex;
   locale: DevGuardLocale;
+  documentationSummary?: DocumentationSummary;
+  taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown";
 }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
-  const summary = input.state.lastDocumentationSummary;
+  const summary = input.documentationSummary ?? input.state.lastDocumentationSummary;
   const files = readableContextFiles(input.files, summary, input.codeIndex);
   const entryFiles = readMapEntryFiles(files, profile, summary).slice(0, 5);
   const skipTargets = readMapSkips(summary, files, input.locale).slice(0, 8);
@@ -970,6 +1127,7 @@ function renderAgentBrief(input: {
     "",
     "## 현재 목표",
     `- ${localizeSentence(summary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
+    `- Task Source: ${taskSourceLabel(input.taskSource ?? "unknown", input.locale)}`,
     "",
     "## 작업 초점",
     ...formatBullets(focus),
@@ -1145,6 +1303,7 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   const isDocsTask = summary.changeTypes.includes("Docs");
   const isConfigTask = summary.changeTypes.includes("Config") || summary.changeTypes.includes("Release");
   const isQaTask = summary.changeTypes.includes("QA");
+  const isRouteOrApiTask = summary.changeTypes.includes("Logic") && /api|route|handler|response|og|응답|endpoint/i.test(taskText);
   const hasComponentOwner = Boolean(indexed?.symbols.some((symbol) => symbol.kind === "component"));
   const hasUiBlock = Boolean(indexed?.blocks.some((block) => /card|hero|layout|status|settings|footer|theme|button|form|modal|view|screen|page/i.test(block.name)));
   const routeLike = /(^|\/)(api|routes?)\/|\/route\.[tj]sx?$/i.test(file);
@@ -1172,6 +1331,12 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
     if (pageLike && implementationOwner) score += 4;
     if (helperLike && tokenOverlap === 0) score -= 6;
     if (routeLike && tokenOverlap === 0 && !hasUiBlock) score -= 14;
+  }
+
+  if (isRouteOrApiTask) {
+    if (routeLike) score += 22;
+    if (pageLike && pathTokenOverlap > 0) score += 4;
+    if (componentLike && pathTokenOverlap === 0 && symbolTokenOverlap === 0) score -= 12;
   }
 
   if (isDocsTask) {
@@ -1238,7 +1403,7 @@ function meaningfulRankingTokens(value: string): Set<string> {
     expanded
       .split(/[^a-z0-9가-힣]+/i)
       .map((token) => token.trim())
-      .filter((token) => token.length >= 3 && !stop.has(token))
+      .filter((token) => (token.length >= 3 || token === "og") && !stop.has(token))
   );
 }
 
@@ -1526,10 +1691,10 @@ function codeMapSkipSections(file: string, content: string): string[] {
   return [...skips].slice(0, 6);
 }
 
-function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string; locale: DevGuardLocale }): string {
+function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const domains = inferWorkingDomains(input.files);
-  const documentationSummary = input.state.lastDocumentationSummary;
+  const documentationSummary = input.documentationSummary ?? input.state.lastDocumentationSummary;
   const entryFiles = workingEntryFiles(input.files, profile);
   const componentTree = workingComponentTree(domains);
   const excludedAreas = documentationSummary?.excludedAreas.length ? documentationSummary.excludedAreas.map((item) => localizeSentence(item, input.locale)) : workingExcludedAreas(domains);
@@ -1550,6 +1715,7 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
     "",
     "## 현재 작업",
     `- ${currentWork}`,
+    `- Task Source: ${taskSourceLabel(input.taskSource ?? "unknown", input.locale)}`,
     "",
     "## 작업 범위",
     "",
@@ -1811,6 +1977,7 @@ function renderAgentContext(input: {
   qualityWhy: string[];
   importantDecisions: string[];
   documentationSummary?: DocumentationSummary;
+  taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown";
 }): string {
   return [
     "# Agent Context",
@@ -1828,6 +1995,7 @@ function renderAgentContext(input: {
     "## Current State",
     `- project purpose: ${input.projectPurpose}`,
     `- current goal: ${input.currentGoal}`,
+    `- task source: ${taskSourceLabel(input.taskSource ?? "unknown", "en-US")}`,
     "",
     "## Session Snapshot",
     `- ${input.lastSummary}`,
