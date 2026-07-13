@@ -729,7 +729,7 @@ export async function generateCodeMap(root: string): Promise<string> {
     readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
     readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
-  const files = workingContextFiles(state, records);
+  const files = readableContextFiles(workingContextFiles(state, records), state.lastDocumentationSummary, codeIndex);
   const fileContents = await Promise.all(
     files.slice(0, 6).map(async (file) => ({
       file,
@@ -999,16 +999,17 @@ function renderAgentBrief(input: {
 function readableContextFiles(files: string[], summary: DocumentationSummary | undefined, index: CodeIndex): string[] {
   if (!summary?.fileChanges.length) return files;
   const allowed = new Set(files);
-  return summary.fileChanges
+  const readable = summary.fileChanges
     .map((file) => file.file)
     .filter((file) => allowed.has(file))
     .filter((file) => !isIndexableSourceFile(file) || Boolean(index.files[file]));
+  return sortReadMapCandidates(readable, summary, index);
 }
 
 function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; architecture: Array<{ name: string; files: string[] }> }, summary?: DocumentationSummary): string[] {
   const available = new Set(files);
   const summaryFiles = summary?.fileChanges.map((file) => file.file).filter((file) => available.has(file)) ?? [];
-  const changedEntryFiles = [...new Set([...summaryFiles, ...files])].filter((file) => !isDevguardManagedDocPath(file));
+  const changedEntryFiles = [...new Set([...files, ...summaryFiles])].filter((file) => !isDevguardManagedDocPath(file));
   if (changedEntryFiles.length > 0) return changedEntryFiles.slice(0, 8);
   return [...new Set(profile.entryPoints)].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
 }
@@ -1016,7 +1017,7 @@ function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; ar
 function readMapTargets(summary: DocumentationSummary | undefined, files: string[], index: CodeIndex, locale: DevGuardLocale): string[] {
   if (summary?.fileChanges.length) {
     const readable = new Set(files);
-    return summary.fileChanges.flatMap((file) => {
+    return sortDocumentationFileChanges(summary.fileChanges, files, index, summary).flatMap((file) => {
       if (!readable.has(file.file)) return [];
       const indexed = index.files[file.file];
       const primary = primaryIndexedSymbol(indexed);
@@ -1033,6 +1034,86 @@ function readMapTargets(summary: DocumentationSummary | undefined, files: string
     }).slice(0, 10);
   }
   return files.length > 0 ? files.slice(0, 8).map((file) => `${file}: ${locale === "ko-KR" ? "변경 지점 확인" : "check changed area"}`) : [locale === "ko-KR" ? "수정 대상 확인 필요" : "Targets need confirmation"];
+}
+
+function sortDocumentationFileChanges(
+  changes: DocumentationFileChange[],
+  readableFiles: string[],
+  index: CodeIndex,
+  summary: DocumentationSummary
+): DocumentationFileChange[] {
+  const readable = new Set(readableFiles);
+  return [...changes]
+    .filter((change) => readable.has(change.file))
+    .sort((a, b) => readMapCandidateScore(b.file, summary, index, b) - readMapCandidateScore(a.file, summary, index, a) || a.file.localeCompare(b.file));
+}
+
+function sortReadMapCandidates(files: string[], summary: DocumentationSummary, index: CodeIndex): string[] {
+  return [...new Set(files)].sort((a, b) => {
+    const aChange = summary.fileChanges.find((change) => change.file === a);
+    const bChange = summary.fileChanges.find((change) => change.file === b);
+    return readMapCandidateScore(b, summary, index, bChange) - readMapCandidateScore(a, summary, index, aChange) || a.localeCompare(b);
+  });
+}
+
+function readMapCandidateScore(file: string, summary: DocumentationSummary, index: CodeIndex, change?: DocumentationFileChange): number {
+  const indexed = index.files[file];
+  const text = [
+    file,
+    summary.goal,
+    summary.overview.join("\n"),
+    summary.structure.join("\n"),
+    change?.purpose ?? "",
+    ...(change?.changes ?? []),
+    ...(change?.userImpact ?? []),
+    indexed?.summary ?? "",
+    ...(indexed?.developerImpact ?? []),
+    ...(indexed?.blocks.map((block) => block.name) ?? []),
+    ...(indexed?.symbols.slice(0, 8).map((symbol) => symbol.name) ?? [])
+  ].join("\n");
+  const isUiTask = summary.changeTypes.includes("UI") || /user-facing UI|layout|interaction|component|profile card|front card|back card|ability|hero/i.test(text);
+  const isDocsTask = summary.changeTypes.includes("Docs");
+  const isConfigTask = summary.changeTypes.includes("Config") || summary.changeTypes.includes("Release");
+  const isQaTask = summary.changeTypes.includes("QA");
+  let score = 0;
+
+  if (change) score += 20;
+  if (indexed) score += 8;
+  if (indexed?.symbols.some((symbol) => symbol.kind === "component")) score += 8;
+  if (indexed?.blocks.length) score += 4;
+  const developerImpact = indexed?.developerImpact?.join("\n") ?? "";
+  if (/Start from the visible profile sections/i.test(developerImpact)) score += 18;
+  if (/Start from the indexed symbols and blocks before reading the full file/i.test(developerImpact)) score -= 4;
+
+  if (isUiTask) {
+    if (/^(src\/)?components\//i.test(file)) score += 35;
+    if (/components\/profile\//i.test(file)) score += 25;
+    if (/profile-view|profile-card|profile-page-client/i.test(file)) score += 22;
+    if (/shared-profile|cta/i.test(file)) score += 10;
+    if (/components\/survey\/result-screen/i.test(file)) score += 10;
+    if (/^(app|src\/app)\/.+\/page\.tsx$/i.test(file)) score += 4;
+    if (/^(app|src\/app)\/page\.tsx$/i.test(file)) score -= 8;
+    if (/^(app|src\/app)\/api\//i.test(file)) score -= 45;
+    if (/^(app|src\/app)\/api\/og\//i.test(file)) score -= 18;
+    if (/\/route\.[tj]sx?$/i.test(file)) score -= 18;
+    if (/^(lib|utils|hooks)\//i.test(file)) score -= 10;
+  }
+
+  if (isDocsTask) {
+    if (/^(docs|README|.*\.md$)/i.test(file)) score += 25;
+    if (/\.(tsx|jsx)$/i.test(file)) score -= 8;
+  }
+  if (isConfigTask) {
+    if (/package\.json|pnpm-lock|package-lock|tsconfig|config|\.npmrc/i.test(file)) score += 25;
+  }
+  if (isQaTask) {
+    if (/runtime-state\.ts|quality|handoff|context|report|prompt/i.test(file)) score += 20;
+  }
+
+  if (/Updates the user-facing wording from ".+" to "[@\w/.-]+"/i.test(text)) score -= 12;
+  const primary = primaryIndexedSymbol(indexed);
+  if (primary && primary.endLine - primary.startLine > 250) score -= 8;
+  return score;
 }
 
 function readMapSkips(summary: DocumentationSummary | undefined, files: string[], locale: DevGuardLocale): string[] {
