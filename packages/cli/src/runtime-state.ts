@@ -2417,6 +2417,7 @@ function extractImports(content: string): string[] {
 
 function extractExports(content: string): string[] {
   const exports = new Set<string>();
+  for (const match of content.matchAll(/^\s*export\s+default\s+(?:async\s+)?function\s+([A-Za-z0-9_]+)/gm)) exports.add(match[1]);
   for (const match of content.matchAll(/^\s*export\s+(?:async\s+)?(?:function|class|interface|type|const|let|var)\s+([A-Za-z0-9_]+)/gm)) exports.add(match[1]);
   for (const match of content.matchAll(/^\s*export\s*\{([^}]+)\}/gm)) {
     for (const name of match[1].split(",")) exports.add(name.trim().replace(/\s+as\s+.+$/, ""));
@@ -2428,9 +2429,13 @@ function extractCodeSymbols(content: string): CodeIndexSymbol[] {
   const lines = content.split(/\r?\n/);
   const symbols: CodeIndexSymbol[] = [];
   const patterns: Array<{ regex: RegExp; kind: CodeIndexSymbol["kind"] }> = [
+    { regex: /^\s*(?:export\s+)?(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/, kind: "function" },
+    { regex: /^\s*export\s+default\s+(?:async\s+)?function\s+([A-Z][A-Za-z0-9_]*)\b/, kind: "component" },
+    { regex: /^\s*export\s+default\s+(?:async\s+)?function\s+([a-z_][A-Za-z0-9_]*)\b/, kind: "function" },
     { regex: /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Z][A-Za-z0-9_]*)\b/, kind: "component" },
     { regex: /^\s*(?:export\s+)?(?:async\s+)?function\s+([a-z_][A-Za-z0-9_]*)\b/, kind: "function" },
-    { regex: /^\s*(?:export\s+)?const\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:\([^)]*\)\s*=>|function|\w+\()/, kind: "component" },
+    { regex: /^\s*(?:export\s+)?const\s+([A-Z][A-Za-z0-9_]*)\s*=\s*(?:\([^)]*\)\s*=>|function|(?:[A-Za-z0-9_]+\.)?[A-Za-z0-9_]+\()/, kind: "component" },
+    { regex: /^\s*(?:export\s+)?const\s+(use[A-Z][A-Za-z0-9_]*)\s*=\s*(?:\([^)]*\)\s*=>|function|(?:[A-Za-z0-9_]+\.)?[A-Za-z0-9_]+\()/, kind: "function" },
     { regex: /^\s*(?:export\s+)?const\s+([a-z_][A-Za-z0-9_]*)\s*=/, kind: "const" },
     { regex: /^\s*(?:export\s+)?class\s+([A-Za-z0-9_]+)/, kind: "class" },
     { regex: /^\s*(?:export\s+)?interface\s+([A-Za-z0-9_]+)/, kind: "interface" },
@@ -2443,7 +2448,8 @@ function extractCodeSymbols(content: string): CodeIndexSymbol[] {
       const startLine = index + 1;
       const endLine = inferSymbolEndLine(lines, index);
       const insight = symbolInsight(match[1], pattern.kind);
-      symbols.push({ name: match[1], kind: pattern.kind, startLine, endLine, ...insight });
+      const defaultExportPriority = /^\s*export\s+default\b/.test(lines[index]) ? 1 : insight.priority;
+      symbols.push({ name: match[1], kind: pattern.kind, startLine, endLine, ...insight, priority: defaultExportPriority });
       break;
     }
   }
@@ -2588,7 +2594,7 @@ function inferSymbolEndLine(lines: string[], startIndex: number): number {
       }
     }
     if (sawBrace && braceDepth <= 0 && index > startIndex) return index + 1;
-    if (!sawBrace && index > startIndex && /^\s*(?:export\s+)?(?:async\s+)?(?:function|const|class|interface|type)\s+/.test(lines[index])) return index;
+    if (!sawBrace && index > startIndex && /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|const|class|interface|type)\s+/.test(lines[index])) return index;
   }
   return Math.min(lines.length, startIndex + 20);
 }
@@ -2596,7 +2602,7 @@ function inferSymbolEndLine(lines: string[], startIndex: number): number {
 function extractCodeBlocks(content: string): CodeIndexSymbol[] {
   const lines = content.split(/\r?\n/);
   const blocks: CodeIndexSymbol[] = [];
-  const markers: Array<{ name: string; regex: RegExp; role?: string; editPoint?: string; qa?: string; priority?: number }> = [
+  const markers: Array<{ name: string; regex: RegExp; role?: string; editPoint?: string; qa?: string; priority?: number; requiresJsx?: boolean }> = [
     {
       name: "Code Index",
       regex: /updateCodeIndex|buildCodeIndexFile|extractCodeSymbols|extractCodeBlocks|functionalCodeIndexSummary/i,
@@ -2637,18 +2643,18 @@ function extractCodeBlocks(content: string): CodeIndexSymbol[] {
       qa: "Agent Brief should tell the next agent where to start without repository-wide discovery.",
       priority: 0
     },
-    { name: "Front Card", regex: /Front Card|front card|Hero|Ability|Strength|Growth|Summary/i },
-    { name: "Back Card", regex: /Back Card|back card|Meta Map|Evidence|Timeline|MBTI/i },
-    { name: "Ability", regex: /Ability|abilityBars|strength|강점|대표 능력/i },
-    { name: "Footer", regex: /Footer|footer/i },
-    { name: "Theme", regex: /Theme|getCardTheme|theme toggle|dark mode|light mode/i },
-    { name: "Meta Map", regex: /Meta Map|meta-map|MetaMap/i },
-    { name: "Quick Match", regex: /Quick Match|quick match|QuickMatch/i },
+    { name: "Front Card", regex: /Front Card|front card|Hero|Ability|Strength|Growth|Summary/i, requiresJsx: true },
+    { name: "Back Card", regex: /Back Card|back card|Meta Map|Evidence|Timeline|MBTI/i, requiresJsx: true },
+    { name: "Ability", regex: /Ability|abilityBars|strength|강점|대표 능력/i, requiresJsx: true },
+    { name: "Footer", regex: /Footer|footer/i, requiresJsx: true },
+    { name: "Theme", regex: /Theme|getCardTheme|theme toggle|dark mode|light mode/i, requiresJsx: true },
+    { name: "Meta Map", regex: /Meta Map|meta-map|MetaMap/i, requiresJsx: true },
+    { name: "Quick Match", regex: /Quick Match|quick match|QuickMatch/i, requiresJsx: true },
     { name: "Quality Report", regex: /Quality Report|qualityReport/i },
     { name: "Handoff", regex: /Handoff|handoff/i },
     { name: "Working Context", regex: /Working Context|workingContext/i },
-    { name: "Status", regex: /Status|status/i },
-    { name: "Settings", regex: /Settings|settings/i }
+    { name: "Status", regex: /Status|status/i, requiresJsx: true },
+    { name: "Settings", regex: /Settings|settings/i, requiresJsx: true }
   ].map((marker) => ({
     role: `${marker.name} related code block.`,
     editPoint: `Read this block only when the task directly changes ${marker.name}.`,
@@ -2657,7 +2663,7 @@ function extractCodeBlocks(content: string): CodeIndexSymbol[] {
     ...marker
   }));
   for (const marker of markers) {
-    const index = lines.findIndex((line) => marker.regex.test(line));
+    const index = findCodeBlockMarkerLine(lines, marker.regex, { requiresJsx: marker.requiresJsx });
     if (index >= 0) {
       const role = marker.role ?? `${marker.name} related code block.`;
       blocks.push({
@@ -2673,7 +2679,70 @@ function extractCodeBlocks(content: string): CodeIndexSymbol[] {
       });
     }
   }
+  blocks.push(...extractJsxReturnBlocks(lines));
   return blocks.sort((a, b) => baseSymbolPriority(a) - baseSymbolPriority(b) || a.startLine - b.startLine).slice(0, 24);
+}
+
+function findCodeBlockMarkerLine(lines: string[], regex: RegExp, options: { requiresJsx?: boolean } = {}): number {
+  const matches: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (regex.test(lines[index])) matches.push(index);
+  }
+  if (matches.length === 0) return -1;
+  const jsxMatch = matches.find((index) => hasNearbyJsx(lines, index));
+  if (options.requiresJsx) return jsxMatch ?? -1;
+  return jsxMatch ?? matches[0];
+}
+
+function hasNearbyJsx(lines: string[], index: number): boolean {
+  const start = Math.max(0, index - 2);
+  const end = Math.min(lines.length, index + 6);
+  return lines.slice(start, end).some((line) => isJsxLikeLine(line));
+}
+
+function extractJsxReturnBlocks(lines: string[]): CodeIndexSymbol[] {
+  const blocks: CodeIndexSymbol[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/\breturn\s*\(/.test(lines[index])) continue;
+    const windowText = lines.slice(index, Math.min(lines.length, index + 25)).join("\n");
+    if (!windowText.split(/\r?\n/).some((line) => isJsxLikeLine(line))) continue;
+    const endLine = inferParenBlockEndLine(lines, index);
+    const lineSpan = endLine - index;
+    blocks.push({
+      name: "JSX Return",
+      kind: "block",
+      startLine: index + 1,
+      endLine,
+      summary: "Main rendered JSX returned by this implementation.",
+      role: "Primary rendered UI block.",
+      editPoint: "Start here when the task changes visible layout, sections, or interactions.",
+      qa: "Check the rendered UI state and interaction flow.",
+      priority: lineSpan >= 40 ? 1 : 4
+    });
+  }
+  return blocks.slice(0, 8);
+}
+
+function isJsxLikeLine(line: string): boolean {
+  if (/\/.*<.*\/[a-z]*[).,;]?/.test(line)) return false;
+  return /(^|[\s(=])<([A-Z][A-Za-z0-9_.]*|section|div|main|article|button|form|header|footer)(?:\s|>|\/)/.test(line) || /className=|aria-/.test(line);
+}
+
+function inferParenBlockEndLine(lines: string[], startIndex: number): number {
+  let depth = 0;
+  let sawParen = false;
+  for (let index = startIndex; index < lines.length; index += 1) {
+    for (const char of lines[index]) {
+      if (char === "(") {
+        depth += 1;
+        sawParen = true;
+      } else if (char === ")") {
+        depth -= 1;
+      }
+    }
+    if (sawParen && depth <= 0 && index > startIndex) return index + 1;
+  }
+  return Math.min(lines.length, startIndex + 120);
 }
 
 async function appendChangeLog(root: string, entry: ChangeLogEntry): Promise<void> {
