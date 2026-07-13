@@ -6,6 +6,8 @@ DevGuard is an AI Coding Context Provider. It prepares context before AI work an
 
 Before changing code:
 
+- If the DevGuard MCP server is available, call `prepare_task_context` with the current task before searching or reading source files.
+
 1. Read `.devguard/reports/read-map.md` — what to read first.
 2. Read `.devguard/reports/code-map.md` — where to read inside changed files.
 3. Read `.devguard/context/agent-brief.md` — compact current-task brief.

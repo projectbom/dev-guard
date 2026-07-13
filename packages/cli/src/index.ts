@@ -16,6 +16,7 @@ import { runReport } from "./report.js";
 import { runFixPrompt, runReview } from "./review.js";
 import { runScan } from "./scan.js";
 import { runSelf, runSelfCheck } from "./self.js";
+import { runMcpServer } from "./mcp.js";
 import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
@@ -66,6 +67,11 @@ async function main(): Promise<void> {
 
   if (command === "handoff") {
     await runHandoff(root);
+    return;
+  }
+
+  if (command === "mcp") {
+    await runMcpServer(root);
     return;
   }
 
@@ -264,6 +270,7 @@ All commands:
   dev-guard "requirement"
   dev-guard done
   dev-guard handoff [--task "<current task>"]
+  dev-guard mcp
   dev-guard knowledge
   dev-guard status
   dev-guard reset
@@ -300,6 +307,7 @@ Commands:
   "requirement"           Generate task.md and a compact Codex prompt
   done                    Manual recovery — normally watch auto-finalizes
   handoff                 Regenerate handoff/context; --task prepares Before-Agent context
+  mcp                     Start the local stdio MCP server for agent context tools
   knowledge               Generate and summarize .devguard/project/project-knowledge.json
   status                  Show pending watch state, hook state, quality verdict
   configure / config      Configure dev-guard settings (AI provider, watch tuning)
@@ -315,6 +323,7 @@ Advanced / recovery:
   scan                    Cache project structure and file summaries into .devguard
   refresh                 Incrementally update project memory cache
   dashboard               Reconnect to dashboard or inspect current watch state
+  mcp                     Start local stdio MCP server; intended for MCP hosts, not direct terminal use
   telemetry               Print privacy-safe drift telemetry summary
   report                  Print compact current-work summary for ChatGPT/Codex handoff
   review                  AI-review current changes against task/rules/mistakes

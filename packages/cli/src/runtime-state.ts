@@ -126,6 +126,45 @@ export interface BeforeAgentPreparationResult {
   nextClaudePromptPath: string;
 }
 
+export interface PrepareTaskContextInput {
+  root: string;
+  task: string;
+  persistTask?: boolean;
+}
+
+export interface PreparedTaskContextResult extends BeforeAgentPreparationResult {
+  taskSource: "explicit";
+  projectRoot: string;
+  indexFreshness: ContextFreshness;
+  coverage: ContextCoverage;
+  files: PreparedTaskContextFile[];
+  constraints: string[];
+  warnings: string[];
+  contextFiles: {
+    agentBrief: string;
+    readMap: string;
+    codeMap: string;
+    workingContext: string;
+    agentContext: string;
+    nextClaudePrompt: string;
+  };
+}
+
+export interface PreparedTaskContextFile {
+  path: string;
+  relevance: ContextRelevance;
+  reason: string;
+  ranges: PreparedTaskContextRange[];
+}
+
+export interface PreparedTaskContextRange {
+  startLine: number;
+  endLine: number;
+  label: string;
+  confidence: ContextConfidence;
+  reason: string;
+}
+
 type QualityVerdict = "PASS" | "NEEDS_REVIEW" | "BLOCKED";
 
 interface QualityCheckItem {
@@ -688,6 +727,21 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
 }
 
 export async function prepareBeforeAgentContext(root: string, task: string): Promise<BeforeAgentPreparationResult> {
+  const result = await prepareTaskContext({ root, task, persistTask: true });
+  return {
+    task: result.task,
+    source: result.source,
+    readMapPath: result.readMapPath,
+    codeMapPath: result.codeMapPath,
+    workingContextPath: result.workingContextPath,
+    agentBriefPath: result.agentBriefPath,
+    agentContextPath: result.agentContextPath,
+    nextClaudePromptPath: result.nextClaudePromptPath
+  };
+}
+
+export async function prepareTaskContext(input: PrepareTaskContextInput): Promise<PreparedTaskContextResult> {
+  const { root, task, persistTask = true } = input;
   await ensureDevguardWorkspace(root);
   const text = task.trim();
   if (!text) throw new Error("--task requires a non-empty task description.");
@@ -697,25 +751,60 @@ export async function prepareBeforeAgentContext(root: string, task: string): Pro
     source: "explicit-before-agent-input",
     createdAt: new Date().toISOString()
   };
-  await writeRuntimeState(root, { ...current, currentTask });
-  const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
-    generateReadMap(root),
-    generateCodeMap(root),
-    generateWorkingContext(root),
-    generateAgentBrief(root),
-    generateAgentContext(root),
-    generateNextClaudePrompt(root)
-  ]);
-  return {
-    task: text,
-    source: currentTask.source,
-    readMapPath,
-    codeMapPath,
-    workingContextPath,
-    agentBriefPath,
-    agentContextPath,
-    nextClaudePromptPath
-  };
+  const runtimeWithTask = { ...current, currentTask };
+  await writeRuntimeState(root, runtimeWithTask);
+  try {
+    const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
+      generateReadMap(root),
+      generateCodeMap(root),
+      generateWorkingContext(root),
+      generateAgentBrief(root),
+      generateAgentContext(root),
+      generateNextClaudePrompt(root)
+    ]);
+    const [state, records, codeIndex] = await Promise.all([
+      readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+      readHistoryRecords(root, 5),
+      readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
+    ]);
+    const context = resolveBeforeAgentContext({
+      state,
+      runtime: runtimeWithTask,
+      records,
+      codeIndex
+    });
+    const files = readableContextFiles(context.files, context.summary, codeIndex).slice(0, 8);
+    const structuredFiles = files.map((file) => preparedTaskContextFile(file, context.summary, codeIndex));
+    const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
+    const warnings = preparedTaskWarnings(structuredFiles, codeIndex);
+    return {
+      task: text,
+      source: currentTask.source,
+      taskSource: "explicit",
+      projectRoot: root,
+      indexFreshness: aggregateFreshness(trusts),
+      coverage: aggregateCoverage(trusts),
+      files: structuredFiles,
+      constraints: readMapSkips(context.summary, files, "en-US"),
+      warnings,
+      contextFiles: {
+        agentBrief: devguardPaths.agentBrief,
+        readMap: readMapPath,
+        codeMap: codeMapPath,
+        workingContext: workingContextPath,
+        agentContext: devguardPaths.agentContext,
+        nextClaudePrompt: nextClaudePromptPath
+      },
+      readMapPath,
+      codeMapPath,
+      workingContextPath,
+      agentBriefPath,
+      agentContextPath,
+      nextClaudePromptPath
+    };
+  } finally {
+    if (!persistTask) await writeRuntimeState(root, current);
+  }
 }
 
 export async function generateProjectHandoff(root: string): Promise<string> {
@@ -982,6 +1071,63 @@ function taskSourceLabel(source: "explicit-before-agent-input" | "last-documenta
   if (source === "last-documentation-summary") return locale === "ko-KR" ? "Last Documentation Summary fallback" : "Last Documentation Summary fallback";
   if (source === "history-fallback") return locale === "ko-KR" ? "History fallback" : "History fallback";
   return locale === "ko-KR" ? "Unknown" : "Unknown";
+}
+
+function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex): PreparedTaskContextFile {
+  const indexed = index.files[file];
+  const trust = contextTrustForFile(file, indexed, undefined, "en-US");
+  const fileSummary = summary?.fileChanges.find((change) => change.file === file);
+  const ranges = indexedReadCandidates(indexed ?? emptyCodeIndexFile(file), summary, fileSummary)
+    .slice(0, 5)
+    .map((range) => ({
+      startLine: range.startLine,
+      endLine: range.endLine,
+      label: range.name,
+      confidence: trust.confidence,
+      reason: range.editPoint ?? range.summary
+    }));
+  return {
+    path: file,
+    relevance: trust.relevance,
+    reason: indexed?.summary ?? fileSummary?.purpose ?? "Code Index candidate matched the current task.",
+    ranges
+  };
+}
+
+function emptyCodeIndexFile(file: string): CodeIndexFile {
+  return {
+    path: file,
+    hash: "",
+    role: "",
+    summary: "",
+    imports: [],
+    exports: [],
+    symbols: [],
+    blocks: [],
+    updatedAt: ""
+  };
+}
+
+function aggregateFreshness(trusts: ContextTrust[]): ContextFreshness {
+  if (trusts.length === 0) return "Unknown";
+  if (trusts.some((trust) => trust.freshness === "Stale")) return "Stale";
+  if (trusts.every((trust) => trust.freshness === "Fresh")) return "Fresh";
+  return "Unknown";
+}
+
+function aggregateCoverage(trusts: ContextTrust[]): ContextCoverage {
+  if (trusts.length === 0) return "Unknown";
+  if (trusts.every((trust) => trust.coverage === "Focused")) return "Focused";
+  if (trusts.some((trust) => trust.coverage === "Partial" || trust.coverage === "Focused")) return "Partial";
+  return "Unknown";
+}
+
+function preparedTaskWarnings(files: PreparedTaskContextFile[], index: CodeIndex): string[] {
+  const warnings: string[] = [];
+  if (Object.keys(index.files).length === 0) warnings.push("Code Index is missing. Run dev-guard done in this project before relying on routed context.");
+  if (files.length === 0) warnings.push("No file candidates were found for this task.");
+  if (files.some((file) => file.ranges.length === 0)) warnings.push("Some candidate files have no range candidates. Open only the listed files first, then inspect manually if needed.");
+  return warnings;
 }
 
 function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" }): string {

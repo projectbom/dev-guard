@@ -39,6 +39,8 @@
   },
   "dependencies": {
     "@dev-guard/core": "0.7.0",
-    "chokidar": "^4.0.3"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "chokidar": "^4.0.3",
+    "zod": "3"
   }
 }

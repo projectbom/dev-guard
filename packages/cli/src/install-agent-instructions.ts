@@ -21,6 +21,8 @@ function sharedDevGuardInstructions(agentName: "Codex" | "Claude"): string[] {
     "",
     "Before changing code:",
     "",
+    "- If the DevGuard MCP server is available, call `prepare_task_context` with the current task before searching or reading source files.",
+    "",
     `1. Read \`${devguardPaths.readMap}\` — what to read first.`,
     `2. Read \`${devguardPaths.codeMap}\` — where to read inside changed files.`,
     `3. Read \`${devguardPaths.agentBrief}\` — compact current-task brief.`,
