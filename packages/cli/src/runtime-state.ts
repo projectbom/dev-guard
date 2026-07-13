@@ -785,11 +785,9 @@ export async function generateAgentContext(root: string): Promise<string> {
     readHistoryRecords(root, 5),
     readJsonFile<ProjectState>(fromRoot(root, statePath), {})
   ]);
-  const nextPromptContent = await readTextFile(fromRoot(root, promptPath));
   const projectPurpose = firstSectionBullet(project, "프로젝트 목적") ?? "확인 필요";
   const currentGoal = firstSectionBullet(project, "현재 목표") ?? "확인 필요";
   const quality = parseQuality(qualityContent);
-  const nextTask = extractNextTask(nextPromptContent, "", JSON.stringify(state));
   const importantDecisions = extractDecisionLines(decisions);
   const lastChangedFiles = state.lastChangedFiles ?? [];
   const documentationSummary = state.lastDocumentationSummary;
@@ -806,7 +804,6 @@ export async function generateAgentContext(root: string): Promise<string> {
     lastChangedFiles,
     qualityVerdict: quality.verdict,
     qualityWhy: quality.why,
-    nextBestTask: nextTask,
     importantDecisions,
     documentationSummary
   });
@@ -955,10 +952,9 @@ function renderAgentBrief(input: {
   const summary = input.state.lastDocumentationSummary;
   const files = readableContextFiles(input.files, summary, input.codeIndex);
   const entryFiles = readMapEntryFiles(files, profile, summary).slice(0, 5);
-  const readTargets = readMapTargets(summary, files, input.codeIndex, input.locale).slice(0, 5);
-  const trustSummary = contextTrustSummary(files, input.codeIndex, input.locale).slice(0, 5);
   const skipTargets = readMapSkips(summary, files, input.locale).slice(0, 8);
   const qa = (summary?.qaChecks ?? input.quality.requiredVerification).slice(0, 4).map((item) => localizeSentence(item, input.locale));
+  const focus = summary?.overview.length ? summary.overview.slice(0, 3).map((item) => localizeSentence(item, input.locale)) : [localizeSentence(summary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)];
   return [
     "# Agent Brief",
     "",
@@ -968,17 +964,15 @@ function renderAgentBrief(input: {
     "",
     "- Phase: Before Agent",
     "- Priority: Required",
-    "- Trust this brief for task intent; use Read Map and Code Map for exact file ranges.",
-    "",
-    "## Context Trust",
-    "",
-    ...formatBullets(trustSummary),
+    "- Role: task intent, constraints, and context consumption order.",
+    "- Source of truth for file priority: `.devguard/reports/read-map.md`.",
+    "- Source of truth for line ranges: `.devguard/reports/code-map.md`.",
     "",
     "## 현재 목표",
     `- ${localizeSentence(summary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
     "",
-    "## 수정 대상",
-    ...formatBullets(readTargets),
+    "## 작업 초점",
+    ...formatBullets(focus),
     "",
     "## 수정 제외",
     ...formatBullets(skipTargets),
@@ -987,12 +981,10 @@ function renderAgentBrief(input: {
     ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
     "",
     "## 읽기 규칙",
-    `1. \`${devguardPaths.readMap}\`으로 읽기 순서를 확인한다.`,
-    `2. \`${devguardPaths.codeMap}\`에서 파일 내부 수정 영역만 확인한다.`,
-    "3. 필요한 경우에만 진입 파일 주변을 추가로 연다.",
+    `1. \`${devguardPaths.readMap}\`에서 읽을 파일을 고른다.`,
+    `2. \`${devguardPaths.codeMap}\`에서 해당 파일의 range만 연다.`,
+    `3. 구조 배경이 필요할 때만 \`${devguardPaths.workingContext}\`를 읽는다.`,
     "4. 전체 프로젝트 검색은 마지막 수단으로만 사용한다.",
-    "5. Stale 또는 Unknown 범위는 authoritative range로 신뢰하지 말고 현재 파일의 해당 주변 코드를 직접 확인한다.",
-    "6. 작업 전 context 자체가 오래됐다고 판단되면 `dev-guard status`로 pending 상태를 확인하고, 세션 완료 시점에만 `dev-guard done`으로 재생성한다.",
     "",
     "## QA 주의사항",
     ...formatBullets(qa)
@@ -1537,21 +1529,24 @@ function codeMapSkipSections(file: string, content: string): string[] {
 function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string; locale: DevGuardLocale }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const domains = inferWorkingDomains(input.files);
-  const changedAreas = input.files.length > 0 ? input.files : ["확인 필요"];
   const documentationSummary = input.state.lastDocumentationSummary;
   const entryFiles = workingEntryFiles(input.files, profile);
   const componentTree = workingComponentTree(domains);
-  const nextAreas = documentationSummary?.remainingWork.length ? documentationSummary.remainingWork.map((item) => localizeSentence(item, input.locale)) : workingNextAreas(domains);
   const excludedAreas = documentationSummary?.excludedAreas.length ? documentationSummary.excludedAreas.map((item) => localizeSentence(item, input.locale)) : workingExcludedAreas(domains);
   const currentWork = documentationSummary?.goal ? localizeSentence(documentationSummary.goal, input.locale) : workingCurrentWork(input.state, domains);
   const structure = documentationSummary?.structure.length ? documentationSummary.structure.map((item) => localizeSentence(item, input.locale)) : workingCurrentStructure(domains);
   const tips = workingTips(domains);
-  const resume = workingResumeStart(entryFiles, nextAreas);
 
   return [
     "# Working Context",
     "",
-    "> AI-readable workspace map. Use this before opening broad repository files.",
+    "> Structural workspace map. Use this for project/work-area context, not for next-step instructions.",
+    "",
+    "## 문서 역할",
+    "- 현재 작업이 속한 구조와 제외 범위를 설명합니다.",
+    `- 파일 읽기 순서는 \`${devguardPaths.readMap}\`이 원본입니다.`,
+    `- 파일 내부 line range는 \`${devguardPaths.codeMap}\`이 원본입니다.`,
+    `- 다음 행동과 검증 상태는 \`${devguardPaths.projectHandoff}\`와 \`${devguardPaths.qualityReport}\`가 원본입니다.`,
     "",
     "## 현재 작업",
     `- ${currentWork}`,
@@ -1570,15 +1565,6 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
     "## 컴포넌트 관계",
     ...componentTree,
     "",
-    "## 이번 세션에서 수정한 영역",
-    ...(documentationSummary?.fileChanges.length
-      ? documentationSummary.fileChanges.slice(0, 12).map((file) => workingDocumentationFileLine(file, input.locale))
-      : changedAreas.slice(0, 12).map((file) => workingChangedFileLine(file, domains))),
-    ...(changedAreas.length > 12 ? [`- ... +${changedAreas.length - 12} files`] : []),
-    "",
-    "## 다음 작업에서 수정해야 하는 영역",
-    ...formatBullets(nextAreas),
-    "",
     "## 수정하지 말아야 하는 영역",
     ...formatBullets(excludedAreas),
     "",
@@ -1586,10 +1572,7 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
     ...structure,
     "",
     "## AI 작업 팁",
-    ...formatBullets(tips),
-    "",
-    "## 재개 시작점",
-    ...resume.map((line) => `- ${line}`)
+    ...formatBullets(tips)
   ].join("\n") + "\n";
 }
 
@@ -1826,50 +1809,43 @@ function renderAgentContext(input: {
   lastChangedFiles: string[];
   qualityVerdict: string;
   qualityWhy: string[];
-  nextBestTask: string;
   importantDecisions: string[];
   documentationSummary?: DocumentationSummary;
 }): string {
   return [
     "# Agent Context",
     "",
-    "> dev-guard generated — read this before exploring the repository.",
+    "> Session state and context usage rules. This is not a Handoff or Quality Report copy.",
+    "",
+    "## Context Order",
+    `1. \`${devguardPaths.agentBrief}\` — task intent and constraints`,
+    `2. \`${devguardPaths.readMap}\` — file priority`,
+    `3. \`${devguardPaths.codeMap}\` — file-internal ranges`,
+    `4. \`${devguardPaths.workingContext}\` — structural background only when needed`,
+    `5. \`${devguardPaths.projectHandoff}\` — next-session action plan`,
+    `6. \`${devguardPaths.qualityReport}\` — QA verdict and verification details`,
     "",
     "## Current State",
     `- project purpose: ${input.projectPurpose}`,
     `- current goal: ${input.currentGoal}`,
     "",
-    "## Last Completed Work",
+    "## Session Snapshot",
     `- ${input.lastSummary}`,
-    ...(input.documentationSummary?.fileChanges.length
-      ? [
-          "- concrete changes:",
-          ...input.documentationSummary.fileChanges.slice(0, 6).flatMap((file) => [
-            `  - ${file.file}: ${file.changes[0] ?? file.purpose}`,
-            ...(file.userImpact[0] ? [`    impact: ${file.userImpact[0]}`] : [])
-          ])
-        ]
-      : []),
     ...input.recentHistory
       .map(sanitizeHandoffText)
       .filter(isUsefulHandoffText)
-      .slice(0, 5)
+      .slice(0, 3)
       .map((line) => `- ${line}`),
     "",
     "## Quality Status",
     `- verdict: ${input.qualityVerdict}`,
-    ...(input.qualityWhy.length > 0 && input.qualityWhy[0] !== "확인 필요"
-      ? ["- reason:", ...input.qualityWhy.map((item) => `  - ${item}`)]
-      : []),
+    `- details: \`${devguardPaths.qualityReport}\``,
     "",
-    "## Next Best Task",
-    `- ${input.nextBestTask}`,
+    "## Next Task Source",
+    `- authoritative handoff: \`${devguardPaths.projectHandoff}\``,
     "",
     "## Important Decisions",
     ...formatBullets(input.importantDecisions),
-    "",
-    "## Important Files",
-    ...formatBullets(input.lastChangedFiles.slice(0, 10).length > 0 ? input.lastChangedFiles.slice(0, 10) : ["확인 필요"]),
     "",
     "## Do Not Touch",
     ...(input.documentationSummary?.excludedAreas.length
@@ -1882,15 +1858,8 @@ function renderAgentContext(input: {
     "",
     "## Additional Context",
     `- project knowledge: \`${devguardPaths.projectKnowledge}\``,
-    `- read map: \`${devguardPaths.readMap}\``,
-    `- code map: \`${devguardPaths.codeMap}\``,
-    `- agent brief: \`${devguardPaths.agentBrief}\``,
-    `- working context: \`${devguardPaths.workingContext}\``,
-    `- full handoff: \`${devguardPaths.projectHandoff}\``,
     `- architecture: \`${devguardPaths.architecture}\``,
-    `- decisions: \`${devguardPaths.decisions}\``,
-    `- quality report: \`${devguardPaths.qualityReport}\``,
-    `- next Codex prompt: \`${devguardPaths.nextCodexPrompt}\``
+    `- decisions: \`${devguardPaths.decisions}\``
   ].join("\n") + "\n";
 }
 
@@ -1900,13 +1869,12 @@ function renderNextClaudePrompt(input: { qualityVerdict: string; nextBestTask: s
     "",
     "Before starting any work, read:",
     "",
-    `1. \`${devguardPaths.readMap}\` — what to read first`,
-    `2. \`${devguardPaths.codeMap}\` — where to read inside changed files`,
-    `3. \`${devguardPaths.agentBrief}\` — compact current-task brief`,
-    `4. \`${devguardPaths.workingContext}\` — current work structure`,
-    `5. \`${devguardPaths.projectHandoff}\` — compressed project resume`,
-    `6. \`${devguardPaths.qualityReport}\` — quality verdict and required verification`,
-    `7. \`${devguardPaths.agentContext}\` — current state, quality status, next task`,
+    `1. \`${devguardPaths.agentBrief}\` — task intent and constraints`,
+    `2. \`${devguardPaths.readMap}\` — what to read first`,
+    `3. \`${devguardPaths.codeMap}\` — where to read inside changed files`,
+    `4. \`${devguardPaths.workingContext}\` — structural background only when needed`,
+    `5. \`${devguardPaths.projectHandoff}\` — next-session action plan`,
+    `6. \`${devguardPaths.qualityReport}\` — QA verdict and required verification`,
     "",
     "Use dev-guard context as the primary source of project state.",
     "Do not perform repository-wide scans before reading them.",
@@ -2963,35 +2931,29 @@ function renderNextPrompt(input: {
   nextTask: NextTaskPlan;
   qualityReport: QualityReport;
 }): string {
-  const semanticChanges = summarizeMeaningfulChanges(input.changedFiles, input.areas, input.summary);
-  const outstanding = outstandingIssuesFromQuality(input.qualityReport, input.riskDetails.map((risk) => risk.content));
-  const executableSteps = executableNextSteps(input.qualityReport, input.nextTask);
-  const recent = formatRecentSessionContext(input.recentHistory).slice(0, 2);
-  const fileLine = compactFileList(input.changedFiles);
+  const firstFiles = input.changedFiles.slice(0, 3);
+  const needsQualityReview = input.qualityReport.verdict !== "PASS";
   return [
     "# Codex Handoff Prompt",
     "",
-    `Read \`${devguardPaths.workingContext}\`, \`${devguardPaths.projectHandoff}\`, and \`${devguardPaths.qualityReport}\` first. Do not scan broadly before that.`,
+    `Read \`${devguardPaths.agentBrief}\`, \`${devguardPaths.readMap}\`, and \`${devguardPaths.codeMap}\` first. Use \`${devguardPaths.projectHandoff}\` for the authoritative next action and \`${devguardPaths.qualityReport}\` for QA details.`,
     "",
     "## Next",
-    ...formatBullets(executableSteps),
+    `- Follow the next action in \`${devguardPaths.projectHandoff}\`.`,
+    `- Use \`${devguardPaths.readMap}\` to choose the first file and \`${devguardPaths.codeMap}\` for ranges.`,
+    ...(needsQualityReview ? [`- Review \`${devguardPaths.qualityReport}\` before marking the session complete.`] : ["- Continue implementation; no extra QA review is required by the current verdict."]),
     "",
     "## State",
-    `- goal: ${input.nextTask.goal}`,
     `- status: ${completionStatus(input.qualityReport.verdict, input.drift)}`,
     `- quality: ${input.qualityReport.verdict}`,
-    `- verify: ${compactCommandList(input.qualityReport.requiredVerification)}`,
+    `- next action source: ${devguardPaths.projectHandoff}`,
+    `- verification source: ${devguardPaths.qualityReport}`,
     "",
-    "## Changed",
-    ...formatBullets(semanticChanges),
-    `- files: ${fileLine}`,
-    "",
-    "## Outstanding",
-    ...formatBullets(outstanding),
-    "",
-    "## Context",
-    ...formatBullets(recent),
-    `- project: ${compactProjectContextLine(input.projectContext)}`,
+    "## Where To Start",
+    ...(firstFiles.length ? firstFiles.map((file, index) => `${index + 1}. \`${file}\``) : ["- Use Read Map to select the first file."]),
+    `- file priority: \`${devguardPaths.readMap}\``,
+    `- line ranges: \`${devguardPaths.codeMap}\``,
+    `- structural background: \`${devguardPaths.workingContext}\``,
     "",
     "## Guardrails",
     "- Do not introduce new features.",
@@ -5546,12 +5508,17 @@ function parseHistoryRecords(text: string): HistoryRecord[] {
 
 function parseQuality(markdown: string): ParsedQuality {
   return {
-    verdict: firstSectionBulletAny(markdown, ["Verdict", "판정", "Final Verdict", "최종 판정"]) ?? "확인 필요",
+    verdict: firstSectionBulletAny(markdown, ["Verdict", "판정", "Final Verdict", "최종 판정"]) ?? extractQualityVerdict(markdown) ?? "확인 필요",
     why: extractSectionBulletsAny(markdown, ["Why", "판단 이유", "Why Review Is Needed", "왜 검토가 필요한가", "Why This Verdict", "왜 이 판정이 나왔는가"], 4),
     requiredVerification: extractSectionBulletsAny(markdown, ["Required Verification", "필요한 검증", "Verification To Run", "실행할 검증", "Next QA", "다음 QA"], 5),
     reviewItems: extractSectionBulletsAny(markdown, ["Additional Checks", "Review Items", "검토 권장 항목", "추가로 검토하면 좋은 점"], 6),
     blockedItems: extractSectionBulletsAny(markdown, ["Blocked Items", "먼저 해결해야 할 항목"], 6)
   };
+}
+
+function extractQualityVerdict(markdown: string): string | undefined {
+  const match = markdown.match(/\b(PASS|NEEDS_REVIEW|BLOCKED)\b/);
+  return match?.[1];
 }
 
 function extractNextTask(nextPrompt: string, tasks: string, state: string): string {
