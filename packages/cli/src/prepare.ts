@@ -5,7 +5,8 @@ import { ensureAgentInstructions } from "./install-agent-instructions.js";
 import { generateProjectKnowledge, getProjectKnowledgeRefreshStatus } from "./knowledge.js";
 import { installHooks } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
-import { readRuntimeState, writeRuntimeState, type SetupStatus, type SetupStatusStep } from "./runtime-state.js";
+import { ensureCodeIndex, readRuntimeState, writeRuntimeState, type SetupStatus, type SetupStatusStep } from "./runtime-state.js";
+import { ensureMcpSetup } from "./mcp-setup.js";
 
 export interface PrepareResult {
   didWork: boolean;
@@ -15,9 +16,11 @@ export interface PrepareResult {
 
 const setupSteps: SetupStatusStep[] = [
   { key: "config", label: "Configuration", status: "pending" },
+  { key: "code_index", label: "Code Index", status: "pending" },
+  { key: "knowledge", label: "Project Knowledge", status: "pending" },
   { key: "agent_instructions", label: "AI Instructions", status: "pending" },
   { key: "hooks", label: "Git Hooks", status: "pending" },
-  { key: "knowledge", label: "Project Knowledge", status: "pending" },
+  { key: "mcp", label: "MCP", status: "pending" },
   { key: "dashboard", label: "Dashboard", status: "pending" }
 ];
 
@@ -38,6 +41,55 @@ export async function prepareWatchProject(
   didWork = didWork || initChanged;
   steps.push({ key: "config", label: "Initialized project", status: "done", changed: initChanged });
   await markStep(root, startedAt, "config", "done");
+
+  await markStep(root, startedAt, "code_index", "running");
+  const indexResult = await ensureCodeIndex(root);
+  didWork = didWork || indexResult.generated;
+  if (indexResult.warning) warnings.push(`Code Index warning: ${indexResult.warning}`);
+  steps.push({
+    key: "code_index",
+    label: "Generated Code Index",
+    status: indexResult.warning ? "warning" : indexResult.generated ? "done" : "skipped",
+    changed: indexResult.generated,
+    detail: indexResult.warning ?? `${indexResult.filesIndexed} files indexed`
+  });
+  await markStep(root, startedAt, "code_index", indexResult.warning ? "warning" : "done", indexResult.warning);
+
+  await markStep(root, startedAt, "knowledge", "running");
+  const knowledgeStatus = await getProjectKnowledgeRefreshStatus(root);
+  let knowledgeChanged = false;
+  let knowledgeWarning: string | undefined;
+  if (knowledgeStatus.shouldGenerate) {
+    try {
+      options.onProgress?.("Learning project...");
+      options.onProgress?.(`Detected: ${knowledgeStatus.detected.packageManager}`);
+      options.onProgress?.(`Detected: ${knowledgeStatus.detected.framework}`);
+      if (knowledgeStatus.detected.buildCommand !== "Unknown") {
+        options.onProgress?.(`Detected: ${knowledgeStatus.detected.buildCommand}`);
+      }
+      if (knowledgeStatus.detected.testCommand !== "Unknown") {
+        options.onProgress?.(`Detected: ${knowledgeStatus.detected.testCommand}`);
+      }
+      if (knowledgeStatus.detected.typecheckCommand !== "Unknown") {
+        options.onProgress?.(`Detected: ${knowledgeStatus.detected.typecheckCommand}`);
+      }
+      options.onProgress?.("Generating Project Knowledge...");
+      await generateProjectKnowledge(root);
+      knowledgeChanged = true;
+      didWork = true;
+    } catch (error) {
+      knowledgeWarning = errorMessage(error);
+      warnings.push(`Project Knowledge warning: ${knowledgeWarning}`);
+    }
+  }
+  steps.push({
+    key: "knowledge",
+    label: "Generated Project Knowledge",
+    status: knowledgeWarning ? "warning" : knowledgeStatus.shouldGenerate ? "done" : "skipped",
+    changed: knowledgeChanged,
+    detail: knowledgeWarning ?? knowledgeDetail(knowledgeStatus)
+  });
+  await markStep(root, startedAt, "knowledge", knowledgeWarning ? "warning" : "done", knowledgeWarning);
 
   await markStep(root, startedAt, "agent_instructions", "running");
   const instructionResult = await ensureAgentInstructions(root);
@@ -81,41 +133,20 @@ export async function prepareWatchProject(
   });
   await markStep(root, startedAt, "hooks", hookWarning ? "warning" : "done", hookWarning);
 
-  await markStep(root, startedAt, "knowledge", "running");
-  const knowledgeStatus = await getProjectKnowledgeRefreshStatus(root);
-  let knowledgeChanged = false;
-  let knowledgeWarning: string | undefined;
-  if (knowledgeStatus.shouldGenerate) {
-    try {
-      options.onProgress?.("Learning project...");
-      options.onProgress?.(`Detected: ${knowledgeStatus.detected.packageManager}`);
-      options.onProgress?.(`Detected: ${knowledgeStatus.detected.framework}`);
-      if (knowledgeStatus.detected.buildCommand !== "Unknown") {
-        options.onProgress?.(`Detected: ${knowledgeStatus.detected.buildCommand}`);
-      }
-      if (knowledgeStatus.detected.testCommand !== "Unknown") {
-        options.onProgress?.(`Detected: ${knowledgeStatus.detected.testCommand}`);
-      }
-      if (knowledgeStatus.detected.typecheckCommand !== "Unknown") {
-        options.onProgress?.(`Detected: ${knowledgeStatus.detected.typecheckCommand}`);
-      }
-      options.onProgress?.("Generating Project Knowledge...");
-      await generateProjectKnowledge(root);
-      knowledgeChanged = true;
-      didWork = true;
-    } catch (error) {
-      knowledgeWarning = errorMessage(error);
-      warnings.push(`Project Knowledge warning: ${knowledgeWarning}`);
-    }
-  }
+  await markStep(root, startedAt, "mcp", "running");
+  const mcpResult = await ensureMcpSetup(root);
+  const mcpChanged = mcpResult.claude === "created" || mcpResult.claude === "updated" || mcpResult.codex === "created" || mcpResult.codex === "updated";
+  didWork = didWork || mcpChanged;
+  warnings.push(...mcpResult.warnings);
+  const mcpDetail = `Claude: ${mcpResult.claude}; Codex: ${mcpResult.codex}; verification: ${mcpResult.verification}`;
   steps.push({
-    key: "knowledge",
-    label: "Generated Project Knowledge",
-    status: knowledgeWarning ? "warning" : knowledgeStatus.shouldGenerate ? "done" : "skipped",
-    changed: knowledgeChanged,
-    detail: knowledgeWarning ?? knowledgeDetail(knowledgeStatus)
+    key: "mcp",
+    label: "Configured MCP",
+    status: mcpResult.warnings.length > 0 || mcpResult.verification === "warning" ? "warning" : mcpChanged ? "done" : "skipped",
+    changed: mcpChanged,
+    detail: mcpDetail
   });
-  await markStep(root, startedAt, "knowledge", knowledgeWarning ? "warning" : "done", knowledgeWarning);
+  await markStep(root, startedAt, "mcp", mcpResult.warnings.length > 0 || mcpResult.verification === "warning" ? "warning" : "done", mcpDetail);
 
   steps.push({
     key: "dashboard",

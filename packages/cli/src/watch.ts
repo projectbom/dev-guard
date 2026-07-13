@@ -378,12 +378,27 @@ function printStartup(input: {
     }
     console.log("");
   } else if (input.preparationStreamStarted) {
+    if (input.showPreparation) {
+      for (const step of input.prepareResult.steps) {
+        if (!input.dashboardEnabled && step.key === "dashboard") {
+          continue;
+        }
+        const marker = step.status === "warning" ? "!" : "✓";
+        console.log(`${marker} ${step.label}`);
+        if (step.detail) {
+          console.log(`  ${step.detail}`);
+        }
+      }
+    }
     for (const warning of input.prepareResult.warnings) {
       console.log(`! ${warning}`);
     }
     if (input.dashboardWarning) {
       console.log(`! Dashboard warning: ${input.dashboardWarning}`);
     }
+    console.log("");
+  } else if (!input.showPreparation) {
+    console.log("DevGuard already initialized.");
     console.log("");
   }
 

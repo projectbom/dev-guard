@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { dirname, join, relative } from "node:path";
-import { mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import {
   analyzeDiff,
@@ -74,7 +74,7 @@ export interface SetupStatus {
 }
 
 export interface SetupStatusStep {
-  key: "config" | "agent_instructions" | "hooks" | "knowledge" | "dashboard";
+  key: "config" | "code_index" | "knowledge" | "agent_instructions" | "hooks" | "mcp" | "dashboard";
   label: string;
   status: "pending" | "running" | "done" | "warning" | "skipped";
   detail?: string;
@@ -860,6 +860,39 @@ export async function generateReadMap(root: string): Promise<string> {
   const markdown = renderReadMap({ files: context.files, state, projectKnowledge, codeIndex, locale, documentationSummary: context.summary, taskSource: context.source });
   await writeTextFile(fromRoot(root, readMapPath), markdown);
   return readMapPath;
+}
+
+export async function ensureCodeIndex(root: string): Promise<{ path: string; generated: boolean; filesIndexed: number; warning?: string }> {
+  await ensureDevguardWorkspace(root);
+  const current = await readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    files: {}
+  });
+  if (Object.keys(current.files).length > 0) {
+    return { path: codeIndexPath, generated: false, filesIndexed: Object.keys(current.files).length };
+  }
+  try {
+    const files = await listInitialCodeIndexFiles(root);
+    const next: CodeIndex = {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      files: {}
+    };
+    for (const file of files) {
+      const content = await readTextFile(fromRoot(root, file));
+      if (content.trim()) next.files[file] = buildCodeIndexFile(file, content);
+    }
+    await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
+    return { path: codeIndexPath, generated: true, filesIndexed: Object.keys(next.files).length };
+  } catch (error) {
+    return {
+      path: codeIndexPath,
+      generated: false,
+      filesIndexed: 0,
+      warning: error instanceof Error ? error.message : String(error)
+    };
+  }
 }
 
 export async function generateCodeMap(root: string): Promise<string> {
@@ -2630,6 +2663,46 @@ function isIndexableSourceFile(file: string): boolean {
   if (isIgnoredWatchPath(file) || isDevguardManagedDocPath(file)) return false;
   if (/(^|\/)(node_modules|dist|build|\.next|coverage)\//i.test(file)) return false;
   return /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json)$/i.test(file);
+}
+
+async function listInitialCodeIndexFiles(root: string): Promise<string[]> {
+  const roots = ["app", "pages", "components", "src", "lib", "hooks", "utils", "packages", "docs"];
+  const rootFiles = ["README.md", "README.ko.md", "package.json", "AGENTS.md", "CLAUDE.md"];
+  const files = new Set<string>();
+  for (const file of rootFiles) {
+    if ((await fileExists(fromRoot(root, file))) && isIndexableSourceFile(file)) files.add(file);
+  }
+  for (const dir of roots) {
+    if (await fileExists(fromRoot(root, dir))) {
+      for (const file of await listIndexableFiles(root, dir, 300)) files.add(file);
+    }
+  }
+  return [...files].sort().slice(0, 1200);
+}
+
+async function listIndexableFiles(root: string, dir: string, limit: number): Promise<string[]> {
+  const out: string[] = [];
+  async function visit(relativeDir: string): Promise<void> {
+    if (out.length >= limit) return;
+    if (/(^|\/)(node_modules|dist|build|\.next|coverage|\.git|\.devguard|devguard)\b/i.test(relativeDir)) return;
+    let entries: Array<{ name: string; isDirectory: () => boolean; isFile: () => boolean }>;
+    try {
+      entries = await readdir(fromRoot(root, relativeDir), { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (out.length >= limit) return;
+      const child = `${relativeDir}/${entry.name}`;
+      if (entry.isDirectory()) {
+        await visit(child);
+      } else if (entry.isFile() && isIndexableSourceFile(child)) {
+        out.push(child);
+      }
+    }
+  }
+  await visit(dir);
+  return out;
 }
 
 function hashText(content: string): string {
