@@ -1058,45 +1058,65 @@ function sortReadMapCandidates(files: string[], summary: DocumentationSummary, i
 
 function readMapCandidateScore(file: string, summary: DocumentationSummary, index: CodeIndex, change?: DocumentationFileChange): number {
   const indexed = index.files[file];
-  const text = [
-    file,
+  const taskText = [
     summary.goal,
     summary.overview.join("\n"),
-    summary.structure.join("\n"),
+    summary.structure.join("\n")
+  ].join("\n");
+  const candidateText = [
+    file,
     change?.purpose ?? "",
     ...(change?.changes ?? []),
     ...(change?.userImpact ?? []),
+    indexed?.role ?? "",
     indexed?.summary ?? "",
+    ...(indexed?.exports ?? []),
     ...(indexed?.developerImpact ?? []),
     ...(indexed?.blocks.map((block) => block.name) ?? []),
-    ...(indexed?.symbols.slice(0, 8).map((symbol) => symbol.name) ?? [])
+    ...(indexed?.symbols.slice(0, 12).map((symbol) => symbol.name) ?? [])
   ].join("\n");
-  const isUiTask = summary.changeTypes.includes("UI") || /user-facing UI|layout|interaction|component|profile card|front card|back card|ability|hero/i.test(text);
+  const text = [
+    taskText,
+    candidateText
+  ].join("\n");
+  const taskTokens = meaningfulRankingTokens(taskText);
+  const candidateTokens = meaningfulRankingTokens(candidateText);
+  const tokenOverlap = [...taskTokens].filter((token) => candidateTokens.has(token)).length;
+  const pathTokenOverlap = [...taskTokens].filter((token) => meaningfulRankingTokens(file).has(token)).length;
+  const symbolTokenOverlap = [...taskTokens].filter((token) =>
+    meaningfulRankingTokens([...(indexed?.exports ?? []), ...(indexed?.symbols.map((symbol) => symbol.name) ?? []), ...(indexed?.blocks.map((block) => block.name) ?? [])].join("\n")).has(token)
+  ).length;
+  const isUiTask = summary.changeTypes.includes("UI") || /user-facing UI|layout|interaction|component|front card|back card|hero/i.test(text);
   const isDocsTask = summary.changeTypes.includes("Docs");
   const isConfigTask = summary.changeTypes.includes("Config") || summary.changeTypes.includes("Release");
   const isQaTask = summary.changeTypes.includes("QA");
+  const hasComponentOwner = Boolean(indexed?.symbols.some((symbol) => symbol.kind === "component"));
+  const hasUiBlock = Boolean(indexed?.blocks.some((block) => /card|hero|layout|status|settings|footer|theme|button|form|modal|view|screen|page/i.test(block.name)));
+  const routeLike = /(^|\/)(api|routes?)\/|\/route\.[tj]sx?$/i.test(file);
+  const pageLike = /(^|\/)(app|pages|src\/app|src\/pages)\/.*page\.[tj]sx?$/i.test(file);
+  const componentLike = /(^|\/)(components|ui|views|screens)\//i.test(file);
+  const helperLike = /(^|\/)(lib|utils|hooks|services|server)\//i.test(file);
+  const implementationOwner = hasComponentOwner || hasUiBlock || indexed?.exports.length;
   let score = 0;
 
   if (change) score += 20;
   if (indexed) score += 8;
-  if (indexed?.symbols.some((symbol) => symbol.kind === "component")) score += 8;
+  score += tokenOverlap * 10;
+  score += pathTokenOverlap * 14;
+  score += symbolTokenOverlap * 12;
+  if (hasComponentOwner) score += 8;
   if (indexed?.blocks.length) score += 4;
   const developerImpact = indexed?.developerImpact?.join("\n") ?? "";
-  if (/Start from the visible profile sections/i.test(developerImpact)) score += 18;
+  if (/visible .*sections?|visible .*component|user-facing .*section|before opening data|before opening auth|before opening routing/i.test(developerImpact)) score += 10;
   if (/Start from the indexed symbols and blocks before reading the full file/i.test(developerImpact)) score -= 4;
 
   if (isUiTask) {
-    if (/^(src\/)?components\//i.test(file)) score += 35;
-    if (/components\/profile\//i.test(file)) score += 25;
-    if (/profile-view|profile-card|profile-page-client/i.test(file)) score += 22;
-    if (/shared-profile|cta/i.test(file)) score += 10;
-    if (/components\/survey\/result-screen/i.test(file)) score += 10;
-    if (/^(app|src\/app)\/.+\/page\.tsx$/i.test(file)) score += 4;
-    if (/^(app|src\/app)\/page\.tsx$/i.test(file)) score -= 8;
-    if (/^(app|src\/app)\/api\//i.test(file)) score -= 45;
-    if (/^(app|src\/app)\/api\/og\//i.test(file)) score -= 18;
-    if (/\/route\.[tj]sx?$/i.test(file)) score -= 18;
-    if (/^(lib|utils|hooks)\//i.test(file)) score -= 10;
+    if (componentLike) score += 12;
+    if (hasComponentOwner) score += 10;
+    if (hasUiBlock) score += 8;
+    if (pageLike && implementationOwner) score += 4;
+    if (helperLike && tokenOverlap === 0) score -= 6;
+    if (routeLike && tokenOverlap === 0 && !hasUiBlock) score -= 14;
   }
 
   if (isDocsTask) {
@@ -1114,6 +1134,48 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   const primary = primaryIndexedSymbol(indexed);
   if (primary && primary.endLine - primary.startLine > 250) score -= 8;
   return score;
+}
+
+function meaningfulRankingTokens(value: string): Set<string> {
+  const expanded = value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[_/.[\]{}():"'`|@]+/g, " ")
+    .toLowerCase();
+  const stop = new Set([
+    "the",
+    "and",
+    "for",
+    "from",
+    "with",
+    "this",
+    "that",
+    "current",
+    "changed",
+    "change",
+    "changes",
+    "update",
+    "updates",
+    "adjusts",
+    "behavior",
+    "implementation",
+    "support",
+    "request",
+    "user",
+    "facing",
+    "source",
+    "file",
+    "files",
+    "tsx",
+    "jsx",
+    "typescript",
+    "javascript"
+  ]);
+  return new Set(
+    expanded
+      .split(/[^a-z0-9가-힣]+/i)
+      .map((token) => token.trim())
+      .filter((token) => token.length >= 3 && !stop.has(token))
+  );
 }
 
 function readMapSkips(summary: DocumentationSummary | undefined, files: string[], locale: DevGuardLocale): string[] {
@@ -1762,7 +1824,7 @@ function diffLines(diff: string, prefix: "+" | "-"): string[] {
 function inferDocumentationChangeTypes(file: string, added: string[], removed: string[]): ChangeType[] {
   const text = `${file}\n${added.join("\n")}\n${removed.join("\n")}`;
   const types = new Set<ChangeType>();
-  if (/\.(tsx|jsx)$|components\/|dashboard\.ts|profile-view/i.test(file) || (!/runtime-state\.ts$/i.test(file) && /className|<details|<summary|aria-|button|card|layout|spacing|mobile|overflow/i.test(text))) types.add("UI");
+  if (/\.(tsx|jsx)$|components\/|dashboard\.ts/i.test(file) || (!/runtime-state\.ts$/i.test(file) && /className|<details|<summary|aria-|button|card|layout|spacing|mobile|overflow/i.test(text))) types.add("UI");
   if (/dashboard-i18n|locale|translation/i.test(file)) types.add("i18n");
   if (/runtime-state|quality|handoff|context|report|prompt|summary|QA|documentation/i.test(file) || /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(text)) types.add("QA");
   if (/package\.json|pnpm-lock|package-lock|yarn\.lock|bun\.lockb?|\.npmrc|tsconfig/i.test(file)) types.add("Config");
@@ -2161,9 +2223,8 @@ function inferDeveloperImpact(file: string, content: string, summary?: Documenta
   if (/install-agent-instructions\.ts$/.test(file)) {
     impact.add("Update generated AGENTS.md / CLAUDE.md copy without changing the underlying command behavior.");
   }
-  if (/profile-view|profile-card|components\/profile/i.test(file)) {
-    impact.add("Start from the visible profile sections before opening data, auth, or routing modules.");
-    if (/ability|Ability/i.test(text)) impact.add("Ability changes should stay near the Ability/strength section unless data shape changes are explicit.");
+  if (/\.(tsx|jsx)$|components\//i.test(file) && /card|section|view|screen|layout|component|className|return\s*\(/i.test(text)) {
+    impact.add("Start from visible user-facing sections before opening data, auth, or routing modules.");
     if (/theme|getCardTheme|Theme/i.test(text)) impact.add("Theme changes should reuse the existing theme helper instead of introducing a parallel style path.");
   }
   if (impact.size === 0) impact.add("Start from the indexed symbols and blocks before reading the full file.");
