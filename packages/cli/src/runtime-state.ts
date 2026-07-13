@@ -998,11 +998,16 @@ function renderAgentBrief(input: {
 
 function readableContextFiles(files: string[], summary: DocumentationSummary | undefined, index: CodeIndex): string[] {
   if (!summary?.fileChanges.length) return files;
-  const allowed = new Set(files);
-  const readable = summary.fileChanges
-    .map((file) => file.file)
-    .filter((file) => allowed.has(file))
+  const changeContext = [...new Set([
+    ...files,
+    ...summary.fileChanges.map((file) => file.file)
+  ])]
+    .filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file))
     .filter((file) => !isIndexableSourceFile(file) || Boolean(index.files[file]));
+  const readable = [
+    ...changeContext,
+    ...taskRelevantIndexCandidates(summary, index, new Set(changeContext))
+  ];
   return sortReadMapCandidates(readable, summary, index);
 }
 
@@ -1014,22 +1019,81 @@ function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; ar
   return [...new Set(profile.entryPoints)].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
 }
 
+function taskRelevantIndexCandidates(summary: DocumentationSummary, index: CodeIndex, existing: Set<string>): string[] {
+  const taskTokens = meaningfulRankingTokens(taskRoutingText(summary));
+  if (taskTokens.size === 0) return [];
+  return Object.values(index.files)
+    .map((file) => ({
+      file: file.path,
+      score: taskIndexCandidateScore(file, taskTokens)
+    }))
+    .filter((candidate) => !existing.has(candidate.file))
+    .filter((candidate) => !isIgnoredWatchPath(candidate.file) && !isDevguardManagedDocPath(candidate.file))
+    .filter((candidate) => candidate.score >= 8)
+    .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
+    .slice(0, 12)
+    .map((candidate) => candidate.file);
+}
+
+function taskIndexCandidateScore(file: CodeIndexFile, taskTokens: Set<string>): number {
+  const candidateTokens = meaningfulRankingTokens(indexedCandidateText(file));
+  const pathTokens = meaningfulRankingTokens(file.path);
+  const symbolTokens = meaningfulRankingTokens([
+    ...file.exports,
+    ...file.symbols.map((symbol) => symbol.name),
+    ...file.blocks.map((block) => block.name)
+  ].join("\n"));
+  const importTokens = meaningfulRankingTokens(file.imports.join("\n"));
+  const tokenOverlap = [...taskTokens].filter((token) => candidateTokens.has(token)).length;
+  const pathOverlap = [...taskTokens].filter((token) => pathTokens.has(token)).length;
+  const symbolOverlap = [...taskTokens].filter((token) => symbolTokens.has(token)).length;
+  const importOverlap = [...taskTokens].filter((token) => importTokens.has(token)).length;
+  if (pathOverlap === 0 && symbolOverlap === 0 && tokenOverlap < 3) return 0;
+  if (tokenOverlap < 2) return 0;
+  const implementationSignal = file.symbols.some((symbol) => symbol.kind === "component" || symbol.kind === "function" || symbol.kind === "class") ? 2 : 0;
+  const blockSignal = file.blocks.length > 0 ? 2 : 0;
+  return pathOverlap * 5 + symbolOverlap * 4 + tokenOverlap * 2 + importOverlap + implementationSignal + blockSignal;
+}
+
+function taskRoutingText(summary: DocumentationSummary): string {
+  return [
+    summary.goal,
+    summary.overview.join("\n"),
+    summary.structure.join("\n"),
+    summary.remainingWork.join("\n"),
+    summary.qaChecks.join("\n")
+  ].join("\n");
+}
+
+function indexedCandidateText(file: CodeIndexFile): string {
+  return [
+    file.path,
+    file.role,
+    file.summary,
+    ...(file.userImpact ?? []),
+    ...(file.developerImpact ?? []),
+    ...file.imports,
+    ...file.exports,
+    ...file.symbols.map((symbol) => `${symbol.name} ${symbol.role ?? ""} ${symbol.summary} ${symbol.editPoint ?? ""}`),
+    ...file.blocks.map((block) => `${block.name} ${block.role ?? ""} ${block.summary} ${block.editPoint ?? ""}`)
+  ].join("\n");
+}
+
 function readMapTargets(summary: DocumentationSummary | undefined, files: string[], index: CodeIndex, locale: DevGuardLocale): string[] {
   if (summary?.fileChanges.length) {
-    const readable = new Set(files);
-    return sortDocumentationFileChanges(summary.fileChanges, files, index, summary).flatMap((file) => {
-      if (!readable.has(file.file)) return [];
-      const indexed = index.files[file.file];
+    return sortReadMapCandidates(files, summary, index).flatMap((filePath) => {
+      const file = summary.fileChanges.find((item) => item.file === filePath);
+      const indexed = index.files[filePath];
       const primary = primaryIndexedSymbol(indexed);
-      const trust = contextTrustForFile(file.file, indexed, undefined, locale);
+      const trust = contextTrustForFile(filePath, indexed, undefined, locale);
       const trustPrefix = contextTrustBadge(trust);
-      const mainReason = indexed?.summary ?? file.changes[0] ?? file.purpose;
+      const mainReason = indexed?.summary ?? file?.changes[0] ?? file?.purpose ?? (locale === "ko-KR" ? "작업 목표와 Code Index가 일치하는 후보입니다." : "Code Index candidate matched the task goal.");
       const developerHint = indexed?.developerImpact?.[0];
       return [
-        `${file.file}${formatPrimaryRange(indexed)}: ${trustPrefix} ${localizeSentence(mainReason, locale)}`,
-        ...(primary?.editPoint ? [`${file.file}:${primary.startLine}-${primary.endLine}: ${trustPrefix} ${localizeSentence(primary.editPoint, locale)}`] : []),
-        ...(file.userImpact[0] ? [`${file.file}: ${trustPrefix} ${localizeSentence(file.userImpact[0], locale)}`] : []),
-        ...(developerHint ? [`${file.file}: ${trustPrefix} ${localizeSentence(developerHint, locale)}`] : [])
+        `${filePath}${formatPrimaryRange(indexed)}: ${trustPrefix} ${localizeSentence(mainReason, locale)}`,
+        ...(primary?.editPoint ? [`${filePath}:${primary.startLine}-${primary.endLine}: ${trustPrefix} ${localizeSentence(primary.editPoint, locale)}`] : []),
+        ...(file?.userImpact[0] ? [`${filePath}: ${trustPrefix} ${localizeSentence(file.userImpact[0], locale)}`] : []),
+        ...(developerHint ? [`${filePath}: ${trustPrefix} ${localizeSentence(developerHint, locale)}`] : [])
       ];
     }).slice(0, 10);
   }
@@ -1058,11 +1122,7 @@ function sortReadMapCandidates(files: string[], summary: DocumentationSummary, i
 
 function readMapCandidateScore(file: string, summary: DocumentationSummary, index: CodeIndex, change?: DocumentationFileChange): number {
   const indexed = index.files[file];
-  const taskText = [
-    summary.goal,
-    summary.overview.join("\n"),
-    summary.structure.join("\n")
-  ].join("\n");
+  const taskText = taskRoutingText(summary);
   const candidateText = [
     file,
     change?.purpose ?? "",
@@ -1157,10 +1217,19 @@ function meaningfulRankingTokens(value: string): Set<string> {
     "updates",
     "adjusts",
     "behavior",
+    "component",
+    "components",
+    "data",
     "implementation",
+    "index",
+    "page",
+    "service",
+    "services",
     "support",
     "request",
     "user",
+    "util",
+    "utils",
     "facing",
     "source",
     "file",
