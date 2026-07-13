@@ -151,6 +151,32 @@ export async function generateProjectKnowledge(root: string): Promise<ProjectKno
   return knowledge;
 }
 
+export async function ensureProjectKnowledge(root: string): Promise<{
+  path: string;
+  generated: boolean;
+  status: ProjectKnowledgeRefreshStatus;
+  warning?: string;
+}> {
+  const status = await getProjectKnowledgeRefreshStatus(root);
+  if (!status.shouldGenerate) {
+    return { path: devguardPaths.projectKnowledge, generated: false, status };
+  }
+  try {
+    await generateProjectKnowledge(root);
+    return { path: devguardPaths.projectKnowledge, generated: true, status };
+  } catch (error) {
+    if (status.exists) {
+      return {
+        path: devguardPaths.projectKnowledge,
+        generated: false,
+        status,
+        warning: error instanceof Error ? error.message : String(error)
+      };
+    }
+    throw error;
+  }
+}
+
 export async function getProjectKnowledgeRefreshStatus(root: string): Promise<ProjectKnowledgeRefreshStatus> {
   const knowledgePath = fromRoot(root, devguardPaths.projectKnowledge);
   const [knowledgeInfo, detected] = await Promise.all([statOptional(knowledgePath), detectProjectBasics(root)]);

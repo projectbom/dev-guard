@@ -19,7 +19,7 @@ import { appendTextFile, fromRoot, readJsonFile, readTextFile, writeFileIfMissin
 import { getDiffForChangeFiles, getGitChanges, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
-import { generateProjectKnowledge } from "./knowledge.js";
+import { ensureProjectKnowledge } from "./knowledge.js";
 import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 
@@ -633,6 +633,10 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     }),
     resetRuntimeState(root, { preserveQaResults: true })
   ]);
+  const ensuredProjectKnowledge = await ensureProjectKnowledge(root);
+  if (ensuredProjectKnowledge.warning) {
+    judgments.push(`Project Knowledge refresh skipped: ${ensuredProjectKnowledge.warning}`);
+  }
   await Promise.all([
     generateProjectHandoff(root),
     generateReadMap(root),
@@ -640,8 +644,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     generateWorkingContext(root),
     generateAgentBrief(root),
     generateAgentContext(root),
-    generateNextClaudePrompt(root),
-    generateProjectKnowledge(root)
+    generateNextClaudePrompt(root)
   ]);
   return {
     changedFiles,
