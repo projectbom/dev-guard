@@ -6,7 +6,7 @@ import { readJsonFile } from "./fs.js";
 
 const SERVER_NAME = "dev-guard";
 const MCP_COMMAND = "npx";
-const MCP_ARGS = ["dev-guard", "mcp"];
+const MCP_ARGS = ["--no-install", "dev-guard", "mcp"];
 
 interface ClaudeMcpConfig {
   mcpServers?: Record<string, unknown>;

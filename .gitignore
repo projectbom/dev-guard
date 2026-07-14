@@ -6,3 +6,4 @@ dist
 # Keep project-local task/runs/cache out of GitHub.
 .devguard/
 devguard.backup-*/
+*.tgz
