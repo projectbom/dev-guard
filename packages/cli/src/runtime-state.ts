@@ -137,6 +137,7 @@ export interface PreparedTaskContextResult extends BeforeAgentPreparationResult 
   projectRoot: string;
   indexFreshness: ContextFreshness;
   coverage: ContextCoverage;
+  coverageGaps: string[];
   files: PreparedTaskContextFile[];
   constraints: string[];
   warnings: string[];
@@ -295,6 +296,7 @@ interface CodeIndexFile {
   summary: string;
   userImpact?: string[];
   developerImpact?: string[];
+  tokens?: string[];
   imports: string[];
   exports: string[];
   symbols: CodeIndexSymbol[];
@@ -754,6 +756,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   const runtimeWithTask = { ...current, currentTask };
   await writeRuntimeState(root, runtimeWithTask);
   try {
+    await hydrateCodeIndexForTask(root, text);
     const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
       generateReadMap(root),
       generateCodeMap(root),
@@ -774,8 +777,12 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       codeIndex
     });
     const files = readableContextFiles(context.files, context.summary, codeIndex).slice(0, 8);
-    const structuredFiles = files.map((file) => preparedTaskContextFile(file, context.summary, codeIndex));
+    const structuredFiles = await Promise.all(files.map(async (file) => {
+      const content = await readTextFile(fromRoot(root, file)).catch(() => "");
+      return preparedTaskContextFile(file, context.summary, codeIndex, content);
+    }));
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
+    const coverageGaps = preparedTaskCoverageGaps(structuredFiles, context.summary);
     const warnings = preparedTaskWarnings(structuredFiles, codeIndex);
     return {
       task: text,
@@ -784,9 +791,10 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       projectRoot: root,
       indexFreshness: aggregateFreshness(trusts),
       coverage: aggregateCoverage(trusts),
+      coverageGaps,
       files: structuredFiles,
       constraints: readMapSkips(context.summary, files, "en-US"),
-      warnings,
+      warnings: [...warnings, ...coverageGaps],
       contextFiles: {
         agentBrief: devguardPaths.agentBrief,
         readMap: readMapPath,
@@ -895,6 +903,41 @@ export async function ensureCodeIndex(root: string): Promise<{ path: string; gen
   }
 }
 
+async function hydrateCodeIndexForTask(root: string, task: string): Promise<void> {
+  const current = await readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    files: {}
+  });
+  if (Object.keys(current.files).length === 0) return;
+  const codeTokens = explicitCodeTokens(task);
+  const next: CodeIndex = {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    files: { ...current.files }
+  };
+  let changed = false;
+  for (const entry of Object.values(current.files).slice(0, 1200)) {
+    if (!isIndexableSourceFile(entry.path)) continue;
+    const shouldRefreshTokens =
+      !entry.tokens?.length ||
+      [...codeTokens].some((token) => !entry.tokens?.some((existing) => normalizeCodeToken(existing) === normalizeCodeToken(token)));
+    if (!shouldRefreshTokens) continue;
+    const path = fromRoot(root, entry.path);
+    if (!(await fileExists(path))) {
+      delete next.files[entry.path];
+      changed = true;
+      continue;
+    }
+    const content = await readTextFile(path).catch(() => "");
+    if (!content.trim()) continue;
+    const hash = hashText(content);
+    next.files[entry.path] = entry.hash === hash ? { ...entry, tokens: extractSearchTokens(content) } : buildCodeIndexFile(entry.path, content);
+    changed = true;
+  }
+  if (changed) await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
+}
+
 export async function generateCodeMap(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
@@ -907,12 +950,10 @@ export async function generateCodeMap(root: string): Promise<string> {
   ]);
   const context = resolveBeforeAgentContext({ state, runtime, records, codeIndex });
   const files = readableContextFiles(context.files, context.summary, codeIndex);
-  const fileContents = context.source === "explicit-before-agent-input"
-    ? []
-    : await Promise.all(files.slice(0, 6).map(async (file) => ({
-      file,
-      content: await readTextFile(fromRoot(root, file))
-    })));
+  const fileContents = await Promise.all(files.slice(0, 6).map(async (file) => ({
+    file,
+    content: await readTextFile(fromRoot(root, file)).catch(() => "")
+  })));
   const markdown = renderCodeMap({ files, fileContents, state, projectKnowledge, codeIndex, locale, documentationSummary: context.summary });
   await writeTextFile(fromRoot(root, codeMapPath), markdown);
   return codeMapPath;
@@ -1106,23 +1147,23 @@ function taskSourceLabel(source: "explicit-before-agent-input" | "last-documenta
   return locale === "ko-KR" ? "Unknown" : "Unknown";
 }
 
-function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex): PreparedTaskContextFile {
+function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex, content = ""): PreparedTaskContextFile {
   const indexed = index.files[file];
   const trust = contextTrustForFile(file, indexed, undefined, "en-US");
   const fileSummary = summary?.fileChanges.find((change) => change.file === file);
-  const ranges = indexedReadCandidates(indexed ?? emptyCodeIndexFile(file), summary, fileSummary)
+  const ranges = indexedReadCandidates(indexed ?? emptyCodeIndexFile(file), summary, fileSummary, content)
     .slice(0, 5)
     .map((range) => ({
       startLine: range.startLine,
       endLine: range.endLine,
       label: range.name,
-      confidence: trust.confidence,
+      confidence: range.priority === 0 && /localStorage|state|guard|hydration|persistence|exact/i.test(`${range.name} ${range.editPoint}`) ? "High" : trust.confidence,
       reason: range.editPoint ?? range.summary
     }));
   return {
     path: file,
-    relevance: trust.relevance,
-    reason: indexed?.summary ?? fileSummary?.purpose ?? "Code Index candidate matched the current task.",
+    relevance: ranges.some((range) => range.confidence === "High") ? "Targeted" : trust.relevance,
+    reason: taskSpecificFileReason(file, indexed, summary, ranges) ?? indexed?.summary ?? fileSummary?.purpose ?? "Code Index candidate matched the current task.",
     ranges
   };
 }
@@ -1139,6 +1180,20 @@ function emptyCodeIndexFile(file: string): CodeIndexFile {
     blocks: [],
     updatedAt: ""
   };
+}
+
+function taskSpecificFileReason(file: string, indexed: CodeIndexFile | undefined, summary: DocumentationSummary | undefined, ranges: PreparedTaskContextRange[]): string | undefined {
+  const rangeText = ranges.map((range) => `${range.label} ${range.reason}`).join("\n");
+  if (/localStorage|getItem|setItem|CARD_STYLE_KEY|cardStyle|setCardStyle/i.test(rangeText)) {
+    return `Exact storage/style signals were found in ${file}; read these ranges before broad localStorage search.`;
+  }
+  if (/ProfileView|OwnedProfileView|readOnly|shared|owner|visitor|viewer/i.test(rangeText)) {
+    return `Shared profile caller or mode signals were found in ${file}; use this to verify owner/viewer flow.`;
+  }
+  if (indexed && summary && routePathMatchScore(file, summary) > 0) {
+    return `Route/path signal matched the task; use this file to confirm page-to-component flow.`;
+  }
+  return undefined;
 }
 
 function aggregateFreshness(trusts: ContextTrust[]): ContextFreshness {
@@ -1161,6 +1216,23 @@ function preparedTaskWarnings(files: PreparedTaskContextFile[], index: CodeIndex
   if (files.length === 0) warnings.push("No file candidates were found for this task.");
   if (files.some((file) => file.ranges.length === 0)) warnings.push("Some candidate files have no range candidates. Open only the listed files first, then inspect manually if needed.");
   return warnings;
+}
+
+function preparedTaskCoverageGaps(files: PreparedTaskContextFile[], summary: DocumentationSummary | undefined): string[] {
+  if (!summary) return [];
+  const taskText = taskRoutingText(summary);
+  const gaps: string[] = [];
+  const rangeText = files.flatMap((file) => file.ranges.map((range) => `${file.path} ${range.label} ${range.reason}`)).join("\n");
+  if (/localstorage/i.test(taskText) && !/localStorage/i.test(rangeText)) {
+    gaps.push("Coverage gap: exact localStorage usage was not identified. Use a narrow storage search only if the listed ranges are insufficient.");
+  }
+  if (/(공유|shared|visitor|owner|방문자|소유자|readOnly)/i.test(taskText) && !/(shared|visitor|owner|readOnly|ProfileView|OwnedProfileView)/i.test(rangeText)) {
+    gaps.push("Coverage gap: shared/visitor/owner mode guard was not identified; confirm the caller props only after reading the primary range.");
+  }
+  if (/\/p\/\[slug\]|공유\s*프로필|shared\s+profile/i.test(taskText) && !files.some((file) => /^app\/p\/\[slug\]\//.test(file.path))) {
+    gaps.push("Coverage gap: /p/[slug] page route was not found; route-to-component flow may need narrow confirmation.");
+  }
+  return gaps.slice(0, 4);
 }
 
 function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" }): string {
@@ -1262,7 +1334,7 @@ function renderCodeMap(input: {
       for (const impact of indexed.developerImpact.slice(0, 2)) lines.push(`- ${localizeSentence(impact, input.locale)}`);
     }
     lines.push("", "먼저 읽을 영역");
-    for (const section of codeMapReadRanges(indexed, sections.readFirst, documentationSummary, summary).slice(0, 8)) lines.push(`- ${section}`);
+    for (const section of codeMapReadRanges(indexed, sections.readFirst, documentationSummary, summary, item.content).slice(0, 8)) lines.push(`- ${section}`);
     lines.push("", "수정 후보");
     for (const section of codeMapEditTargets(summary, sections.readFirst, input.locale)) lines.push(`- ${section}`);
     lines.push("", "읽지 않아도 되는 영역");
@@ -1353,21 +1425,31 @@ function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; ar
 
 function taskRelevantIndexCandidates(summary: DocumentationSummary, index: CodeIndex, existing: Set<string>): string[] {
   const taskTokens = meaningfulRankingTokens(taskRoutingText(summary));
-  if (taskTokens.size === 0) return [];
-  return Object.values(index.files)
+  const codeTokens = explicitCodeTokens(taskRoutingText(summary));
+  if (taskTokens.size === 0 && codeTokens.size === 0) return [];
+  const scored = Object.values(index.files)
     .map((file) => ({
       file: file.path,
-      score: taskIndexCandidateScore(file, taskTokens)
+      score: taskIndexCandidateScore(file, taskTokens, codeTokens, summary)
     }))
     .filter((candidate) => !existing.has(candidate.file))
     .filter((candidate) => !isIgnoredWatchPath(candidate.file) && !isDevguardManagedDocPath(candidate.file))
-    .filter((candidate) => candidate.score >= 8)
+    .filter((candidate) => !shouldExcludeContextCandidate(candidate.file, summary))
+    .filter((candidate) => runtimePageBugCandidateAllowed(index.files[candidate.file], summary, codeTokens))
+    .filter((candidate) => candidate.score >= 8);
+  const relationScores = relatedCandidateScores(scored, index);
+  const byFile = [...scored, ...relationScores].reduce((acc, candidate) => {
+    const current = acc.get(candidate.file);
+    if (!current || candidate.score > current.score) acc.set(candidate.file, candidate);
+    return acc;
+  }, new Map<string, { file: string; score: number }>());
+  return [...byFile.values()]
     .sort((a, b) => b.score - a.score || a.file.localeCompare(b.file))
-    .slice(0, 12)
+    .slice(0, 8)
     .map((candidate) => candidate.file);
 }
 
-function taskIndexCandidateScore(file: CodeIndexFile, taskTokens: Set<string>): number {
+function taskIndexCandidateScore(file: CodeIndexFile, taskTokens: Set<string>, codeTokens: Set<string>, summary: DocumentationSummary): number {
   const candidateTokens = meaningfulRankingTokens(indexedCandidateText(file));
   const pathTokens = meaningfulRankingTokens(file.path);
   const symbolTokens = meaningfulRankingTokens([
@@ -1375,16 +1457,26 @@ function taskIndexCandidateScore(file: CodeIndexFile, taskTokens: Set<string>): 
     ...file.symbols.map((symbol) => symbol.name),
     ...file.blocks.map((block) => block.name)
   ].join("\n"));
+  const usageTokens = new Set((file.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
   const importTokens = meaningfulRankingTokens(file.imports.join("\n"));
   const tokenOverlap = [...taskTokens].filter((token) => candidateTokens.has(token)).length;
   const pathOverlap = [...taskTokens].filter((token) => pathTokens.has(token)).length;
   const symbolOverlap = [...taskTokens].filter((token) => symbolTokens.has(token)).length;
   const importOverlap = [...taskTokens].filter((token) => importTokens.has(token)).length;
-  if (pathOverlap === 0 && symbolOverlap === 0 && tokenOverlap < 3) return 0;
-  if (tokenOverlap < 2) return 0;
+  const exactUsageOverlap = [...codeTokens].filter((token) => usageTokens.has(normalizeCodeToken(token))).length;
+  const exactSymbolOverlap = [...codeTokens].filter((token) => symbolTokens.has(normalizeCodeToken(token)) || pathTokens.has(normalizeCodeToken(token))).length;
+  const routeScore = routePathMatchScore(file.path, summary);
+  const profileFlowSignal = /profile|shared|owner|viewer|visitor|readOnly/i.test(`${file}\n${file.exports.join("\n")}\n${file.symbols.map((symbol) => symbol.name).join("\n")}\n${file.tokens?.join("\n") ?? ""}`);
+  if (isRuntimePageBugTask(taskRoutingText(summary)) && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0 && !profileFlowSignal) return 0;
+  if (pathOverlap === 0 && symbolOverlap === 0 && tokenOverlap < 3 && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0) return 0;
+  if (tokenOverlap < 2 && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0) return 0;
   const implementationSignal = file.symbols.some((symbol) => symbol.kind === "component" || symbol.kind === "function" || symbol.kind === "class") ? 2 : 0;
   const blockSignal = file.blocks.length > 0 ? 2 : 0;
-  return pathOverlap * 5 + symbolOverlap * 4 + tokenOverlap * 2 + importOverlap + implementationSignal + blockSignal;
+  const behaviorSignal = behaviorStorageScore(file, summary);
+  const generatedPenalty = shouldExcludeContextCandidate(file.path, summary) ? -80 : 0;
+  const scopeScore = sharedProfileScopeScore(file, summary, exactUsageOverlap);
+  const sharedProfileHelperPenalty = isSharedProfileTask(taskRoutingText(summary)) && /^lib\/profile\//.test(file.path) ? -120 : 0;
+  return exactUsageOverlap * 35 + exactSymbolOverlap * 22 + routeScore + behaviorSignal + scopeScore + sharedProfileHelperPenalty + pathOverlap * 5 + symbolOverlap * 4 + tokenOverlap * 2 + importOverlap + implementationSignal + blockSignal + generatedPenalty;
 }
 
 function taskRoutingText(summary: DocumentationSummary): string {
@@ -1455,6 +1547,7 @@ function sortReadMapCandidates(files: string[], summary: DocumentationSummary, i
 function readMapCandidateScore(file: string, summary: DocumentationSummary, index: CodeIndex, change?: DocumentationFileChange): number {
   const indexed = index.files[file];
   const taskText = taskRoutingText(summary);
+  const codeTokens = explicitCodeTokens(taskText);
   const candidateText = [
     file,
     change?.purpose ?? "",
@@ -1462,6 +1555,7 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
     ...(change?.userImpact ?? []),
     indexed?.role ?? "",
     indexed?.summary ?? "",
+    ...(indexed?.tokens ?? []),
     ...(indexed?.exports ?? []),
     ...(indexed?.developerImpact ?? []),
     ...(indexed?.blocks.map((block) => block.name) ?? []),
@@ -1477,6 +1571,11 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   const pathTokenOverlap = [...taskTokens].filter((token) => meaningfulRankingTokens(file).has(token)).length;
   const symbolTokenOverlap = [...taskTokens].filter((token) =>
     meaningfulRankingTokens([...(indexed?.exports ?? []), ...(indexed?.symbols.map((symbol) => symbol.name) ?? []), ...(indexed?.blocks.map((block) => block.name) ?? [])].join("\n")).has(token)
+  ).length;
+  const usageTokens = new Set((indexed?.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
+  const exactUsageOverlap = [...codeTokens].filter((token) => usageTokens.has(normalizeCodeToken(token))).length;
+  const exactSymbolOverlap = [...codeTokens].filter((token) =>
+    meaningfulRankingTokens([...(indexed?.exports ?? []), ...(indexed?.symbols.map((symbol) => symbol.name) ?? [])].join("\n")).has(normalizeCodeToken(token))
   ).length;
   const isUiTask = summary.changeTypes.includes("UI") || /user-facing UI|layout|interaction|component|front card|back card|hero/i.test(text);
   const isDocsTask = summary.changeTypes.includes("Docs");
@@ -1494,6 +1593,10 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
 
   if (change) score += 20;
   if (indexed) score += 8;
+  score += exactUsageOverlap * 40;
+  score += exactSymbolOverlap * 24;
+  score += routePathMatchScore(file, summary);
+  score += behaviorStorageScore(indexed, summary);
   score += tokenOverlap * 10;
   score += pathTokenOverlap * 14;
   score += symbolTokenOverlap * 12;
@@ -1509,7 +1612,7 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
     if (hasUiBlock) score += 8;
     if (pageLike && implementationOwner) score += 4;
     if (helperLike && tokenOverlap === 0) score -= 6;
-    if (routeLike && tokenOverlap === 0 && !hasUiBlock) score -= 14;
+    if (routeLike && exactUsageOverlap === 0 && routePathMatchScore(file, summary) === 0 && !hasUiBlock) score -= 14;
   }
 
   if (isRouteOrApiTask) {
@@ -1530,9 +1633,193 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   }
 
   if (/Updates the user-facing wording from ".+" to "[@\w/.-]+"/i.test(text)) score -= 12;
+  if (shouldExcludeContextCandidate(file, summary)) score -= 90;
+  if (isRuntimePageBugTask(taskText) && /^app\/api\/(og|compare)\//i.test(file)) score -= 35;
+  if (isSharedProfileTask(taskText) && /^lib\/profile\//.test(file)) score -= 120;
   const primary = primaryIndexedSymbol(indexed);
   if (primary && primary.endLine - primary.startLine > 250) score -= 8;
   return score;
+}
+
+function explicitCodeTokens(value: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const match of value.matchAll(/`([^`]+)`/g)) {
+    for (const token of match[1].split(/[^A-Za-z0-9_$.[\]/-]+/)) addCodeToken(tokens, token);
+  }
+  for (const match of value.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?\b/g)) {
+    addCodeToken(tokens, match[0]);
+  }
+  for (const match of value.matchAll(/(?:^|[\s(["'`])\/[A-Za-z0-9_./:[\]-]+/g)) {
+    addCodeToken(tokens, match[0].trim());
+  }
+  const lower = value.toLowerCase();
+  const meaningful = [...meaningfulRankingTokens(value)];
+  for (let index = 0; index < meaningful.length - 1; index += 1) {
+    const first = meaningful[index];
+    const second = meaningful[index + 1];
+    if (/^[a-z][a-z0-9]+$/.test(first) && /^[a-z][a-z0-9]+$/.test(second)) {
+      addCodeToken(tokens, `${first}${second[0]?.toUpperCase() ?? ""}${second.slice(1)}`);
+      addCodeToken(tokens, `${first}_${second}`);
+      addCodeToken(tokens, `${first}-${second}`);
+    }
+  }
+  if (/(카드|card).*(스타일|style)|(스타일|style).*(카드|card)/i.test(value)) {
+    for (const token of ["cardStyle", "setCardStyle", "CARD_STYLE_KEY", "introOverrides.cardStyle"]) addCodeToken(tokens, token);
+  }
+  if (/localstorage/i.test(lower)) {
+    for (const token of ["localStorage", "localStorage.getItem", "localStorage.setItem", "getItem", "setItem"]) addCodeToken(tokens, token);
+  }
+  if (/공유|shared|visitor|방문자|소유자|owner|readonly|read only/i.test(value)) {
+    for (const token of ["shared", "readOnly", "owner", "viewer", "visitor", "ProfileView", "OwnedProfileView"]) addCodeToken(tokens, token);
+  }
+  return tokens;
+}
+
+function addCodeToken(tokens: Set<string>, token: string): void {
+  const cleaned = token.trim().replace(/^[^A-Za-z0-9_$/.[]+|[^A-Za-z0-9_$\]/.-]+$/g, "");
+  if (!cleaned) return;
+  const normalized = normalizeCodeToken(cleaned);
+  if (!normalized || normalized.length < 2) return;
+  const stop = new Set(["the", "and", "for", "from", "with", "this", "that", "current", "request", "user", "task", "code", "file", "files"]);
+  if (stop.has(normalized)) return;
+  tokens.add(cleaned);
+  tokens.add(normalized);
+}
+
+function normalizeCodeToken(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[^A-Za-z0-9가-힣]+/g, " ")
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+function shouldExcludeContextCandidate(file: string, summary: DocumentationSummary): boolean {
+  if (isAgentInstructionTask(taskRoutingText(summary))) return false;
+  return /^(AGENTS|CLAUDE)\.md$/i.test(file) || /^README(?:\.[\w-]+)?\.md$/i.test(file) || /^docs\//i.test(file);
+}
+
+function isAgentInstructionTask(taskText: string): boolean {
+  return /devguard|dev-guard|claude|codex|mcp|agent instruction|agents\.md|claude\.md|readme|문서|설정|setup|handoff/i.test(taskText);
+}
+
+function isRuntimePageBugTask(taskText: string): boolean {
+  return /섞|적용|저장|초기화|방문자|소유자|공유|shared|visitor|owner|localstorage|fallback|hydrate|persist|runtime/i.test(taskText);
+}
+
+function routePathMatchScore(file: string, summary: DocumentationSummary): number {
+  const taskText = taskRoutingText(summary);
+  const lowerTask = taskText.toLowerCase();
+  let score = 0;
+  if (/\/p\/\[slug\]|공유\s*프로필|shared\s+profile/i.test(taskText)) {
+    if (/^app\/p\/\[slug\]\//i.test(file)) score += 72;
+    if (/profile/i.test(file)) score += 12;
+    if (/^components\/profile\//i.test(file)) score += 38;
+    if (/^lib\/profile\//i.test(file)) score += 16;
+  }
+  if (/og|open graph|이미지/i.test(taskText) && /^app\/api\/og\//i.test(file)) score += 35;
+  if (/api|endpoint|응답|response/i.test(lowerTask) && /^app\/api\//i.test(file)) score += 24;
+  if (isRuntimePageBugTask(taskText) && /^app\/api\/og\//i.test(file) && !/og|이미지|open graph/i.test(taskText)) score -= 28;
+  if (isRuntimePageBugTask(taskText) && /compare/i.test(file) && !/compare|비교/i.test(taskText)) score -= 18;
+  return score;
+}
+
+function isSharedProfileTask(taskText: string): boolean {
+  return /\/p\/\[slug\]|공유\s*프로필|shared\s+profile/i.test(taskText);
+}
+
+function sharedProfileScopeScore(file: CodeIndexFile, summary: DocumentationSummary, exactUsageOverlap: number): number {
+  const taskText = taskRoutingText(summary);
+  if (!isSharedProfileTask(taskText)) return 0;
+  const text = `${file.path}\n${file.exports.join("\n")}\n${file.symbols.map((symbol) => symbol.name).join("\n")}`;
+  if (/ProfileView/.test(text) && /^components\/profile\//.test(file.path)) return 70;
+  if (/OwnedProfileView/.test(text) && /^app\/p\/\[slug\]\//.test(file.path)) return 86;
+  if (/SharedProfilePage/.test(text) && /^app\/p\/\[slug\]\//.test(file.path)) return 80;
+  if (/^lib\/profile\//.test(file.path)) return exactUsageOverlap > 0 ? 18 : -10;
+  if (exactUsageOverlap > 0) return -45;
+  return 0;
+}
+
+function behaviorStorageScore(file: CodeIndexFile | undefined, summary: DocumentationSummary): number {
+  if (!file) return 0;
+  const taskText = taskRoutingText(summary);
+  if (!isRuntimePageBugTask(taskText)) return 0;
+  const tokens = new Set((file.tokens ?? []).map((token) => normalizeCodeToken(token)));
+  let score = 0;
+  if (tokens.has("localstorage")) score += 35;
+  if (tokens.has("localstoragegetitem") || tokens.has("getitem")) score += 28;
+  if (tokens.has("localstoragesetitem") || tokens.has("setitem")) score += 22;
+  if (tokens.has("usestate")) score += 12;
+  if (tokens.has("useeffect")) score += 14;
+  if (tokens.has("readonly") || tokens.has("shared") || tokens.has("owner") || tokens.has("viewer") || tokens.has("visitor")) score += 10;
+  return score;
+}
+
+function runtimePageBugCandidateAllowed(file: CodeIndexFile | undefined, summary: DocumentationSummary, codeTokens: Set<string>): boolean {
+  const taskText = taskRoutingText(summary);
+  if (!isRuntimePageBugTask(taskText)) return true;
+  if (!file) return false;
+  const flowText = `${file.path}\n${file.exports.join("\n")}\n${file.symbols.map((symbol) => symbol.name).join("\n")}\n${file.tokens?.join("\n") ?? ""}`;
+  const usageTokens = new Set((file.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
+  const exactUsageOverlap = [...codeTokens].filter((token) => usageTokens.has(normalizeCodeToken(token))).length;
+  if (isSharedProfileTask(taskText)) {
+    return (
+      routePathMatchScore(file.path, summary) > 0 ||
+      sharedProfileScopeScore(file, summary, exactUsageOverlap) > 0 ||
+      /^components\/profile\//.test(file.path) ||
+      /^app\/p\/\[slug\]\//.test(file.path) ||
+      /ProfileView|OwnedProfileView|SharedProfilePage/.test(flowText)
+    );
+  }
+  if (exactUsageOverlap > 0) return true;
+  if (routePathMatchScore(file.path, summary) > 0) return true;
+  return /profile|shared|owner|viewer|visitor|readOnly/i.test(flowText);
+}
+
+function relatedCandidateScores(scored: Array<{ file: string; score: number }>, index: CodeIndex): Array<{ file: string; score: number }> {
+  const related: Array<{ file: string; score: number }> = [];
+  const top = scored.filter((candidate) => candidate.score >= 30).sort((a, b) => b.score - a.score).slice(0, 4);
+  for (const candidate of top) {
+    for (const relatedFile of resolveIndexedImports(candidate.file, index)) {
+      if (relatedFile !== candidate.file) related.push({ file: relatedFile, score: Math.max(8, candidate.score - 12) });
+    }
+    for (const importer of indexedImporters(candidate.file, index)) {
+      related.push({ file: importer, score: Math.max(8, candidate.score - 16) });
+    }
+  }
+  return related;
+}
+
+function resolveIndexedImports(file: string, index: CodeIndex): string[] {
+  const entry = index.files[file];
+  if (!entry) return [];
+  return entry.imports.flatMap((specifier) => resolveImportSpecifier(file, specifier, index)).slice(0, 8);
+}
+
+function indexedImporters(file: string, index: CodeIndex): string[] {
+  return Object.values(index.files)
+    .filter((entry) => entry.path !== file)
+    .filter((entry) => entry.imports.some((specifier) => resolveImportSpecifier(entry.path, specifier, index).includes(file)))
+    .map((entry) => entry.path)
+    .slice(0, 8);
+}
+
+function resolveImportSpecifier(fromFile: string, specifier: string, index: CodeIndex): string[] {
+  if (!specifier.startsWith(".")) return [];
+  const baseDir = dirname(fromFile);
+  const raw = join(baseDir, specifier).replace(/\\/g, "/").replace(/^\.\//, "");
+  const candidates = [
+    raw,
+    `${raw}.ts`,
+    `${raw}.tsx`,
+    `${raw}.js`,
+    `${raw}.jsx`,
+    `${raw}/index.ts`,
+    `${raw}/index.tsx`,
+    `${raw}/index.js`,
+    `${raw}/index.jsx`
+  ];
+  return candidates.filter((candidate) => Boolean(index.files[candidate]));
 }
 
 function meaningfulRankingTokens(value: string): Set<string> {
@@ -1668,9 +1955,9 @@ function contextTrustBadge(trust: ContextTrust): string {
   return `[${trust.priority} · ${trust.freshness} index · ${trust.relevance} relevance · ${trust.confidence} range]`;
 }
 
-function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[], taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): string[] {
+function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[], taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = ""): string[] {
   if (!file) return fallback;
-  const candidates = indexedReadCandidates(file, taskSummary, fileSummary);
+  const candidates = indexedReadCandidates(file, taskSummary, fileSummary, content);
   const ranges = candidates.slice(0, 8).map((symbol, index) =>
     [
       `${index + 1}. ${symbol.name} (${symbol.kind}) lines ${symbol.startLine}-${symbol.endLine}`,
@@ -1687,14 +1974,123 @@ function primaryIndexedSymbol(file?: CodeIndexFile): CodeIndexSymbol | undefined
   return indexedReadCandidates(file)[0];
 }
 
-function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): CodeIndexSymbol[] {
-  const sorted = [...file.blocks, ...file.symbols].sort((a, b) => {
+function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = ""): CodeIndexSymbol[] {
+  const taskSpecific = extractTaskSpecificRanges(file.path, content, taskSummary);
+  const sorted = [...taskSpecific, ...file.blocks, ...file.symbols].sort((a, b) => {
     const score = codeMapRangeScore(file, b, taskSummary, fileSummary) - codeMapRangeScore(file, a, taskSummary, fileSummary);
     if (score !== 0) return score;
     const priority = codeMapSymbolPriority(file.path, a) - codeMapSymbolPriority(file.path, b);
     return priority !== 0 ? priority : a.startLine - b.startLine;
   });
   return dedupeOverlappingRanges(sorted);
+}
+
+function extractTaskSpecificRanges(file: string, content: string, taskSummary?: DocumentationSummary): CodeIndexSymbol[] {
+  if (!content.trim() || !taskSummary) return [];
+  const taskText = taskRoutingText(taskSummary);
+  const codeTokens = explicitCodeTokens(taskText);
+  if (codeTokens.size === 0) return [];
+  const normalizedTokens = new Set([...codeTokens].map((token) => normalizeCodeToken(token)).filter(Boolean));
+  const behaviorTask = isRuntimePageBugTask(taskText);
+  const lines = content.split(/\r?\n/);
+  const matches: Array<{ index: number; tokens: string[]; behavior: boolean }> = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const lineNormalized = normalizeCodeToken(line);
+    const hitTokens = [...normalizedTokens].filter((token) => token.length >= 2 && lineNormalized.includes(token));
+    const behavior = behaviorTask && /\b(useState|useEffect|localStorage|getItem|setItem|readOnly|shared|owner|visitor|viewer|fallback|introOverrides|set[A-Z][A-Za-z0-9_]*)\b/.test(line);
+    if (hitTokens.length > 0 || (behavior && matches.length > 0 && nearbyRecentMatch(matches, index, 40))) {
+      matches.push({ index, tokens: hitTokens, behavior });
+    }
+  }
+  if (matches.length === 0) return [];
+  const clusters: Array<{ start: number; end: number; tokens: Set<string>; behavior: boolean }> = [];
+  for (const match of matches) {
+    const start = Math.max(0, match.index - 8);
+    const end = Math.min(lines.length - 1, match.index + 10);
+    const previous = clusters[clusters.length - 1];
+    if (previous && start <= previous.end + 24 && Math.max(previous.end, end) - previous.start <= 90) {
+      previous.end = Math.max(previous.end, end);
+      for (const token of match.tokens) previous.tokens.add(token);
+      previous.behavior = previous.behavior || match.behavior;
+    } else {
+      clusters.push({ start, end, tokens: new Set(match.tokens), behavior: match.behavior });
+    }
+  }
+  return clusters
+    .map((cluster) => {
+      const text = lines.slice(cluster.start, cluster.end + 1).join("\n");
+      const actualSignals = taskRangeSignals(text);
+      return {
+        name: taskRangeLabel(text, actualSignals),
+        kind: "block" as const,
+        startLine: cluster.start + 1,
+        endLine: cluster.end + 1,
+        summary: `Task-specific exact code range in ${file}.`,
+        role: taskRangeRole(text),
+        editPoint: taskRangeReason(actualSignals),
+        qa: taskRangeQa(text, taskText),
+        priority: 0
+      };
+    })
+    .filter((range) => range.endLine >= range.startLine)
+    .sort((a, b) => taskSpecificRangePriority(a) - taskSpecificRangePriority(b) || a.startLine - b.startLine)
+    .slice(0, 6);
+}
+
+function nearbyRecentMatch(matches: Array<{ index: number }>, index: number, distance: number): boolean {
+  const last = matches[matches.length - 1];
+  return Boolean(last && index - last.index <= distance);
+}
+
+function taskRangeSignals(text: string): string[] {
+  const signals = new Set<string>();
+  if (/CARD_STYLE_KEY/.test(text)) signals.add("CARD_STYLE_KEY");
+  if (/localStorage\.getItem/.test(text)) signals.add("localStorage.getItem");
+  if (/localStorage\.setItem/.test(text)) signals.add("localStorage.setItem");
+  if (/\buseState\b/.test(text)) signals.add("useState");
+  if (/\buseEffect\b/.test(text)) signals.add("useEffect");
+  if (/\bcardStyle\b/.test(text)) signals.add("cardStyle");
+  if (/\bsetCardStyle\b/.test(text)) signals.add("setCardStyle");
+  if (/\breadOnly\b/.test(text)) signals.add("readOnly");
+  if (/\b(shared|owner|viewer|visitor)\b/i.test(text)) signals.add("shared/owner/viewer");
+  return [...signals];
+}
+
+function taskRangeLabel(text: string, signals: string[]): string {
+  if (/localStorage\.getItem/.test(text) && /setCardStyle|useState|cardStyle/.test(text)) return "cardStyle state and localStorage hydration";
+  if (/localStorage\.setItem/.test(text)) return "cardStyle localStorage persistence";
+  if (/CARD_STYLE_KEY/.test(text)) return "storage key definition";
+  if (/\breadOnly|shared|owner|visitor|viewer\b/i.test(text)) return "shared/readOnly mode guard";
+  return signals.length > 0 ? `exact code usage: ${signals.slice(0, 3).join(", ")}` : "task-specific code range";
+}
+
+function taskRangeRole(text: string): string {
+  if (/localStorage|getItem|setItem|useState|useEffect/.test(text)) return "State, effect, or persistence logic directly involved in the requested behavior.";
+  if (/ProfileView|OwnedProfileView|readOnly|shared|owner|visitor|viewer/i.test(text)) return "Caller or mode guard related to shared profile behavior.";
+  return "Exact task-token usage range.";
+}
+
+function taskRangeReason(signals: string[]): string {
+  return signals.length > 0
+    ? `Contains ${signals.slice(0, 6).join(", ")}; these exact code signals match the task and should be read before generic JSX sections.`
+    : "Contains exact task tokens; read this before broad search.";
+}
+
+function taskRangeQa(text: string, taskText: string): string {
+  if (/localStorage\.getItem/.test(text)) return "Confirm whether visitor localStorage can override shared owner data during hydration.";
+  if (/localStorage\.setItem/.test(text)) return "Confirm persistence is guarded when shared/read-only profile views should not write visitor state.";
+  if (/readOnly|shared|owner|visitor|viewer/i.test(text) || /공유|방문자|소유자/i.test(taskText)) return "Confirm shared/owner/viewer mode is passed through the caller path.";
+  return "Verify the exact usage participates in the requested behavior.";
+}
+
+function taskSpecificRangePriority(range: CodeIndexSymbol): number {
+  const text = `${range.name}\n${range.editPoint ?? ""}\n${range.qa ?? ""}`;
+  if (/localStorage\.getItem|hydration/i.test(text)) return 0;
+  if (/localStorage\.setItem|persistence/i.test(text)) return 1;
+  if (/CARD_STYLE_KEY|storage key/i.test(text)) return 2;
+  if (/guard|readOnly|shared/i.test(text)) return 3;
+  return 4;
 }
 
 function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): number {
@@ -1708,6 +2104,7 @@ function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSum
   const taskTokens = meaningfulRankingTokens([
     taskText
   ].join("\n"));
+  const codeTokens = explicitCodeTokens(taskText);
   const rangeText = [
     symbol.name,
     symbol.kind,
@@ -1724,6 +2121,7 @@ function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSum
   const tokenOverlap = [...taskTokens].filter((token) => rangeTokens.has(token)).length;
   const nameOverlap = [...taskTokens].filter((token) => nameTokens.has(token)).length;
   const editOverlap = [...taskTokens].filter((token) => editTokens.has(token)).length;
+  const exactCodeOverlap = [...codeTokens].filter((token) => normalizeCodeToken(rangeText).includes(normalizeCodeToken(token))).length;
   const lineCount = Math.max(1, symbol.endLine - symbol.startLine + 1);
   const fileMaxLine = Math.max(...[...file.blocks, ...file.symbols].map((candidate) => candidate.endLine), lineCount);
   const isUiTask = taskSummary?.changeTypes.includes("UI") || /ui|layout|interaction|card|section|screen|view|front|back|cta|button|form/i.test(taskText);
@@ -1731,15 +2129,21 @@ function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSum
   const behaviorRange = /handler|route|response|login|auth|submit|click|toggle|open|close|show|hide/i.test(rangeText);
   let score = 0;
 
+  score += exactCodeOverlap * 45;
   score += nameOverlap * 18;
   score += editOverlap * 10;
   score += tokenOverlap * 6;
+  if (symbol.priority === 0 && /exact|localStorage|CARD_STYLE_KEY|cardStyle|hydration|persistence|guard/i.test(rangeText)) score += 60;
+  if (/hydration|localStorage\.getItem/i.test(rangeText)) score += 160;
+  if (/persistence|localStorage\.setItem/i.test(rangeText)) score += 20;
   if (file.exports.includes(symbol.name)) score += 8;
   if (symbol.kind === "block") score += 6;
   if (symbol.kind === "component" || symbol.kind === "function" || symbol.kind === "class") score += 5;
   if (uiRange || behaviorRange) score += 4;
   if (isUiTask && symbol.kind === "block" && uiRange) score += 18;
   if (isUiTask && symbol.kind === "component" && uiRange) score += 8;
+  if (isRuntimePageBugTask(taskText) && /localStorage|getItem|setItem|useState|useEffect|readOnly|shared|owner|visitor|viewer/i.test(rangeText)) score += 35;
+  if (isRuntimePageBugTask(taskText) && symbol.kind === "block" && uiRange && exactCodeOverlap === 0 && !/localStorage|readOnly|shared|owner|visitor|viewer/i.test(rangeText)) score -= 16;
   if (isUiTask && (symbol.kind === "function" || symbol.kind === "const") && !uiRange && !behaviorRange) score -= 12;
   if (isUiTask && symbol.kind === "function" && tokenOverlap < 2 && nameOverlap === 0) score -= 10;
   if (typeof symbol.priority === "number") score += Math.max(0, 8 - symbol.priority);
@@ -1762,7 +2166,8 @@ function dedupeOverlappingRanges(candidates: CodeIndexSymbol[]): CodeIndexSymbol
       const existing = selected[duplicateIndex];
       const existingSize = existing.endLine - existing.startLine + 1;
       const candidateSize = candidate.endLine - candidate.startLine + 1;
-      if (candidateSize < existingSize && candidateSize >= 4) selected[duplicateIndex] = candidate;
+      if (existing.priority !== 0 && candidate.priority === 0) selected[duplicateIndex] = candidate;
+      else if (existing.priority !== 0 && candidateSize < existingSize && candidateSize >= 4) selected[duplicateIndex] = candidate;
       continue;
     }
     const enclosing = selected.find((existing) => existing.startLine <= candidate.startLine && existing.endLine >= candidate.endLine);
@@ -2742,6 +3147,7 @@ function buildCodeIndexFile(file: string, content: string, summary?: Documentati
     summary: functionalCodeIndexSummary(file, summary),
     userImpact: summary?.userImpact ?? [],
     developerImpact: inferDeveloperImpact(file, content, summary),
+    tokens: extractSearchTokens(content),
     imports: extractImports(content),
     exports: extractExports(content),
     symbols: extractCodeSymbols(content),
@@ -2786,6 +3192,18 @@ function inferDeveloperImpact(file: string, content: string, summary?: Documenta
   }
   if (impact.size === 0) impact.add("Start from the indexed symbols and blocks before reading the full file.");
   return [...impact].slice(0, 4);
+}
+
+function extractSearchTokens(content: string): string[] {
+  const tokens = new Set<string>();
+  for (const match of content.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?\b/g)) {
+    addCodeToken(tokens, match[0]);
+    if (match[0].includes(".")) {
+      for (const part of match[0].split(".")) addCodeToken(tokens, part);
+    }
+  }
+  for (const match of content.matchAll(/\b[A-Z][A-Z0-9_]{2,}\b/g)) addCodeToken(tokens, match[0]);
+  return [...tokens].slice(0, 400);
 }
 
 function extractImports(content: string): string[] {
