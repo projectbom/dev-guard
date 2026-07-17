@@ -352,9 +352,9 @@ function cliCopy(locale: string): {
       detectedAreas: "감지된 영역:",
       judgments: "판단:",
       generated: "생성됨:",
-      newSession: "새 세션 시작 시:",
+      newSession: "새 작업 시작 시:",
       nextTask: "다음 작업:",
-      resumePrompt: "새 세션 재개 프롬프트:",
+      resumePrompt: "작업 재개 안내:",
       idleState: "State: 대기 중"
     };
   }
@@ -363,9 +363,9 @@ function cliCopy(locale: string): {
     detectedAreas: "Detected areas:",
     judgments: "Judgments:",
     generated: "Generated:",
-    newSession: "When starting a new session:",
+    newSession: "When starting a new task:",
     nextTask: "Next task:",
-    resumePrompt: "Resume prompt for new session:",
+    resumePrompt: "Resume guidance:",
     idleState: "State: idle"
   };
 }
@@ -414,7 +414,8 @@ async function runDone(root: string): Promise<void> {
     console.log(`Quality: ${result.qualityVerdict}`);
     console.log("");
     console.log(copy.newSession);
-    console.log(`  Read ${result.readMapPath}, ${result.codeMapPath}, and ${result.agentBriefPath}; then continue.`);
+    console.log("  Call DevGuard MCP prepare_task_context with the current request, then start from the returned files and ranges.");
+    console.log(`  Fallback: read ${result.agentBriefPath}, ${result.readMapPath}, and ${result.codeMapPath}.`);
     console.log("");
     console.log(copy.nextTask);
     console.log(locale === "ko-KR" ? `${result.promptPath} 확인 후 필요한 수정 진행` : `Review ${result.promptPath} and continue with the required fixes.`);
@@ -467,7 +468,8 @@ async function runHandoff(root: string): Promise<void> {
     console.log(`- ${nextClaudePromptPath}`);
     console.log("");
     console.log(copy.resumePrompt);
-    console.log(`  Read ${devguardPaths.readMap}, ${devguardPaths.codeMap}, and ${devguardPaths.agentBrief}; then continue.`);
+    console.log(`  Resume previous work from ${devguardPaths.projectHandoff}, then call DevGuard MCP prepare_task_context with the concrete next action.`);
+    console.log(`  Fallback: read ${devguardPaths.agentBrief}, ${devguardPaths.readMap}, and ${devguardPaths.codeMap}.`);
   } catch (error) {
     console.error(`dev-guard handoff failed: ${errorMessage(error)}`);
     process.exitCode = 1;

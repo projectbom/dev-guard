@@ -93,7 +93,13 @@ export async function prepareWatchProject(
 
   await markStep(root, startedAt, "agent_instructions", "running");
   const instructionResult = await ensureAgentInstructions(root);
-  const instructionsChanged = instructionResult.agents === "created" || instructionResult.claude === "created";
+  const instructionsChanged =
+    instructionResult.agents === "created" ||
+    instructionResult.agents === "section_added" ||
+    instructionResult.agents === "section_updated" ||
+    instructionResult.claude === "created" ||
+    instructionResult.claude === "section_added" ||
+    instructionResult.claude === "section_updated";
   didWork = didWork || instructionsChanged;
   warnings.push(...instructionResult.warnings);
   steps.push({
