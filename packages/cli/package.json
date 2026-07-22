@@ -1,6 +1,6 @@
 {
   "name": "@dev-guard/cli",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": false,
   "description": "CLI context guard for AI coding session continuity, handoff, and next-session recovery.",
   "type": "module",
