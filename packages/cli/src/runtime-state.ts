@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { dirname, join, relative } from "node:path";
 import { mkdir, readdir, rename, stat, writeFile } from "node:fs/promises";
@@ -16,7 +16,7 @@ import {
   type DevGuardConfig
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
-import { getDiffForChangeFiles, getGitChanges, type GitChanges } from "./git.js";
+import { getDiffForChangeFiles, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { ensureProjectKnowledge } from "./knowledge.js";
@@ -47,6 +47,15 @@ export interface RuntimeState {
   locale?: DevGuardLocale;
   setupStatus?: SetupStatus;
   qaResults?: Record<string, QAExecutionResult>;
+  /**
+   * Identifies the current work session/task lineage. Created lazily on the
+   * first `prepare_task_context` call or validation-evidence record, and
+   * preserved across the done-triggered partial runtime reset so that goal
+   * and evidence freshness can be judged against "are we still in the same
+   * session" rather than persisting indefinitely. Cleared only by an
+   * explicit `dev-guard reset`.
+   */
+  sessionId?: string;
 }
 
 export interface BeforeAgentTask {
@@ -56,7 +65,9 @@ export interface BeforeAgentTask {
 }
 
 export type ValidationEvidenceKind = "BUILD" | "TYPECHECK" | "TEST" | "LINT" | "MANUAL_QA" | "RUNTIME_SMOKE" | "CUSTOM";
-export type ValidationEvidenceSource = "self-check" | "external";
+// "external" is kept only as a legacy/generic fallback for old records and callers
+// that don't specify a more precise source; new callers should use "cli" or "mcp-agent".
+export type ValidationEvidenceSource = "self-check" | "external" | "cli" | "mcp-agent";
 
 export interface QAExecutionResult {
   name: string;
@@ -69,6 +80,17 @@ export interface QAExecutionResult {
   reason?: string;
   kind?: ValidationEvidenceKind;
   source?: ValidationEvidenceSource;
+  /** Process exit code, when the reporter actually observed one. Not inferred. */
+  exitCode?: number;
+  /**
+   * Short git HEAD SHA at the moment this evidence was recorded (empty/absent
+   * for non-git projects or repos with no commits yet). Used to detect when
+   * evidence was produced against a code state that the repository has since
+   * moved past.
+   */
+  gitHead?: string;
+  /** Session lineage id at record time; see RuntimeState.sessionId. */
+  sessionId?: string;
 }
 
 export interface RecordValidationEvidenceInput {
@@ -80,6 +102,7 @@ export interface RecordValidationEvidenceInput {
   summary?: string;
   reason?: string;
   source?: ValidationEvidenceSource;
+  exitCode?: number;
 }
 
 export interface SetupStatus {
@@ -109,6 +132,8 @@ export interface ProjectState {
   lastHandoffPath?: string;
   lastTaskGoal?: string;
   lastTaskGoalSource?: "explicit-task" | "diff-inferred";
+  /** Session lineage the recorded lastTaskGoal belongs to; see RuntimeState.sessionId. */
+  lastTaskGoalSessionId?: string;
 }
 
 export interface DoneProcessingResult {
@@ -401,10 +426,30 @@ export async function writeRuntimeState(root: string, state: RuntimeState, optio
   }
 }
 
+function generateSessionId(): string {
+  return `sess_${randomUUID()}`;
+}
+
+async function currentGitHead(root: string): Promise<string> {
+  try {
+    const { gitHead } = await getGitIdentity(root);
+    return gitHead;
+  } catch {
+    return "";
+  }
+}
+
 export async function recordQAExecutionResult(root: string, result: QAExecutionResult): Promise<void> {
   const current = await readRuntimeState(root);
-  const qaResults = { ...(current.qaResults ?? {}), [result.name]: result };
-  await writeRuntimeState(root, { ...current, qaResults });
+  const sessionId = current.sessionId ?? generateSessionId();
+  const gitHead = result.gitHead ?? (await currentGitHead(root));
+  const stamped: QAExecutionResult = {
+    ...result,
+    sessionId: result.sessionId ?? sessionId,
+    gitHead: gitHead || undefined
+  };
+  const qaResults = { ...(current.qaResults ?? {}), [stamped.name]: stamped };
+  await writeRuntimeState(root, { ...current, qaResults, sessionId });
 }
 
 function defaultNameForValidationKind(kind: ValidationEvidenceKind): string {
@@ -439,7 +484,8 @@ export async function recordValidationEvidence(input: RecordValidationEvidenceIn
     durationMs: 0,
     summary: input.summary?.trim() || undefined,
     reason: input.reason?.trim() || undefined,
-    source: input.source ?? "external"
+    source: input.source ?? "external",
+    exitCode: input.exitCode
   };
   await recordQAExecutionResult(input.root, result);
   return result;
@@ -451,6 +497,40 @@ function resolveValidationKind(result: QAExecutionResult): ValidationEvidenceKin
   return "CUSTOM";
 }
 
+/**
+ * Evidence provenance/freshness: an entry is "current" for the given code
+ * state if its recorded git HEAD matches the current HEAD. Git HEAD is
+ * preferred (matches the task's own commit-boundary example) because it is
+ * a precise, non-heuristic signal for source-controlled work. When either
+ * side has no HEAD (non-git project, or a repo with no commits yet), we
+ * fall back to session lineage: evidence recorded within the same
+ * task/session is still treated as current. If neither signal is available
+ * on both sides (e.g. evidence recorded before this feature existed), we
+ * cannot prove staleness, so we do not retroactively invalidate it — that
+ * would silently break existing recorded evidence on upgrade.
+ */
+function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; sessionId?: string }): boolean {
+  if (entry.gitHead && current.gitHead) {
+    return entry.gitHead === current.gitHead;
+  }
+  if (entry.sessionId && current.sessionId) {
+    return entry.sessionId === current.sessionId;
+  }
+  return true;
+}
+
+function filterFreshQaResults(
+  qaResults: Record<string, QAExecutionResult> | undefined,
+  current: { gitHead: string; sessionId?: string }
+): Record<string, QAExecutionResult> | undefined {
+  if (!qaResults) return qaResults;
+  const fresh: Record<string, QAExecutionResult> = {};
+  for (const [key, entry] of Object.entries(qaResults)) {
+    if (isEvidenceFresh(entry, current)) fresh[key] = entry;
+  }
+  return fresh;
+}
+
 function qaEntriesByKind(qaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind): QAExecutionResult[] {
   if (!qaResults) return [];
   return Object.values(qaResults).filter((result) => resolveValidationKind(result) === kind);
@@ -458,15 +538,64 @@ function qaEntriesByKind(qaResults: Record<string, QAExecutionResult> | undefine
 
 type AggregatedValidationStatus = "PASS" | "FAIL" | "UNKNOWN" | "NOT_RECORDED";
 
+/**
+ * Deterministic representative-evidence rule: among entries for the same
+ * validation scope, the most recently recorded one (by completedAt) wins.
+ * This applies within a single kind/name; entries under a different kind,
+ * or under a different name (e.g. distinct RUNTIME_SMOKE sub-checks), are
+ * never combined into one result.
+ */
+function latestValidationEntry(entries: QAExecutionResult[]): QAExecutionResult | undefined {
+  if (entries.length === 0) return undefined;
+  return entries.reduce((latest, entry) => (Date.parse(entry.completedAt) >= Date.parse(latest.completedAt) ? entry : latest));
+}
+
 function aggregateValidationStatus(entries: QAExecutionResult[]): AggregatedValidationStatus {
-  if (entries.length === 0) return "NOT_RECORDED";
-  if (entries.some((entry) => entry.status === "FAIL")) return "FAIL";
-  if (entries.every((entry) => entry.status === "PASS")) return "PASS";
-  return "UNKNOWN";
+  return latestValidationEntry(entries)?.status ?? "NOT_RECORDED";
 }
 
 function hasAnyRecordedValidationEvidence(qaResults: Record<string, QAExecutionResult> | undefined): boolean {
   return Boolean(qaResults && Object.keys(qaResults).length > 0);
+}
+
+interface ResolvedSessionTaskGoal {
+  goal?: string;
+  source?: "explicit-task";
+  sessionId?: string;
+}
+
+/**
+ * Task Goal Lifetime Rule: `runtime.currentTask` is cleared by the
+ * done-triggered partial reset, so on any round after the one where
+ * `prepare_task_context` was called, there is no direct signal left in
+ * runtime state for "we're still working on the same task". We use session
+ * lineage (RuntimeState.sessionId, preserved across that reset but cleared
+ * by an explicit `dev-guard reset`) as the boundary: a previously recorded
+ * goal is only reused while its recorded session id still matches the
+ * current one. This is the single source of truth used both when writing
+ * ProjectState.lastTaskGoal (processDoneEvent) and when rendering Handoff
+ * (generateProjectHandoff), so both agree on the same goal at all times.
+ */
+function resolveSessionTaskGoal(input: {
+  currentTaskText?: string;
+  runtimeSessionId?: string;
+  previousGoal?: string;
+  previousGoalSessionId?: string;
+}): ResolvedSessionTaskGoal {
+  const explicit = input.currentTaskText?.trim();
+  if (explicit) {
+    return { goal: explicit, source: "explicit-task", sessionId: input.runtimeSessionId };
+  }
+  const previousGoal = input.previousGoal?.trim();
+  if (
+    previousGoal &&
+    input.runtimeSessionId &&
+    input.previousGoalSessionId &&
+    input.previousGoalSessionId === input.runtimeSessionId
+  ) {
+    return { goal: previousGoal, source: "explicit-task", sessionId: input.runtimeSessionId };
+  }
+  return {};
 }
 
 export async function refreshRuntimeLocale(root: string): Promise<DevGuardLocale> {
@@ -483,7 +612,12 @@ export async function resetRuntimeState(root: string, options: { preserveQaResul
   await writeRuntimeState(root, {
     ...defaultRuntime,
     idleSinceAt: new Date().toISOString(),
-    ...(options.preserveQaResults && current?.qaResults ? { qaResults: current.qaResults } : {})
+    ...(options.preserveQaResults && current?.qaResults ? { qaResults: current.qaResults } : {}),
+    // Session lineage survives the done-triggered partial reset (so goal/evidence
+    // freshness can still recognize "still the same session" on the next round),
+    // but is intentionally dropped on a full `dev-guard reset`, which is the
+    // explicit signal that a new session/task lineage is starting.
+    ...(options.preserveQaResults && current?.sessionId ? { sessionId: current.sessionId } : {})
   }, { replacePending: true });
 }
 
@@ -613,7 +747,13 @@ async function writeAtomicTextFile(path: string, content: string): Promise<void>
 export async function processDoneEvent(root: string): Promise<DoneProcessingResult> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const runtime = await readRuntimeState(root);
+  let runtime = await readRuntimeState(root);
+  if (!runtime.sessionId) {
+    runtime = { ...runtime, sessionId: generateSessionId() };
+    await writeRuntimeState(root, runtime);
+  }
+  const currentGitState = { gitHead: await currentGitHead(root), sessionId: runtime.sessionId };
+  const freshQaResults = filterFreshQaResults(runtime.qaResults, currentGitState);
   const gitChanges = await loadChangesWithFallback(root, runtime);
   const changeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
   const rawChangedFiles = [...new Set(gitChanges.changeFiles.map((file) => file.path))].sort();
@@ -660,18 +800,23 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const summary = formatInferredDiffIntentClusters(clusters);
   const previousProjectState = await readProjectState(root);
   const canonicalTaskGoal = runtime.currentTask?.text?.trim() || undefined;
+  const resolvedGoal = resolveSessionTaskGoal({
+    currentTaskText: canonicalTaskGoal,
+    runtimeSessionId: runtime.sessionId,
+    previousGoal: previousProjectState.lastTaskGoal,
+    previousGoalSessionId: previousProjectState.lastTaskGoalSessionId
+  });
   const documentationSummary = buildDocumentationSummary({
     changedFiles,
     diffText,
     diffStat,
     taskText: [runtime.currentTask?.text ?? "", tasksMarkdown, projectMarkdown].join("\n\n"),
-    canonicalGoal: canonicalTaskGoal,
-    qaResults: runtime.qaResults
+    canonicalGoal: resolvedGoal.goal,
+    qaResults: freshQaResults
   });
-  const sessionTaskGoal = canonicalTaskGoal ?? previousProjectState.lastTaskGoal;
-  const sessionTaskGoalSource: "explicit-task" | "diff-inferred" = canonicalTaskGoal
-    ? "explicit-task"
-    : previousProjectState.lastTaskGoalSource ?? "diff-inferred";
+  const sessionTaskGoal = resolvedGoal.goal;
+  const sessionTaskGoalSource = resolvedGoal.source;
+  const sessionTaskGoalSessionId = resolvedGoal.sessionId;
   const codeIndex = await updateCodeIndex(root, changedFiles, documentationSummary);
   const timestamp = new Date().toISOString();
   const majorChanges = inferMajorChanges({ summary, changedFiles, areas, diffText });
@@ -704,7 +849,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     testCandidates,
     nextTaskTitle: nextTask.title,
     documentationSummary,
-    qaResults: runtime.qaResults
+    qaResults: freshQaResults
   });
   qualityReport = await enhanceQualityReportWithAI(root, {
     locale,
@@ -778,6 +923,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
       lastChangedFiles: changedFiles,
       lastTaskGoal: sessionTaskGoal,
       lastTaskGoalSource: sessionTaskGoalSource,
+      lastTaskGoalSessionId: sessionTaskGoalSessionId,
       lastReportPath: reportPath,
       lastPromptPath: promptPath,
       lastHandoffPath: projectHandoffPath
@@ -845,7 +991,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     source: "explicit-before-agent-input",
     createdAt: new Date().toISOString()
   };
-  const runtimeWithTask = { ...current, currentTask };
+  const runtimeWithTask = { ...current, currentTask, sessionId: current.sessionId ?? generateSessionId() };
   await writeRuntimeState(root, runtimeWithTask);
   try {
     await hydrateCodeIndexForTask(root, text);
@@ -910,7 +1056,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
 export async function generateProjectHandoff(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [project, architecture, decisions, tasks, history, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state, projectKnowledge] = await Promise.all([
+  const [project, architecture, decisions, tasks, history, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state, projectKnowledge, runtime] = await Promise.all([
     readRequiredText(root, devguardPaths.project),
     readRequiredText(root, devguardPaths.architecture),
     readRequiredText(root, devguardPaths.decisions),
@@ -924,7 +1070,8 @@ export async function generateProjectHandoff(root: string): Promise<string> {
     readJsonFile<ProjectState>(fromRoot(root, statePath), {})
       .then((value) => JSON.stringify(value, null, 2))
       .catch(() => "확인 필요"),
-    readRequiredText(root, devguardPaths.projectKnowledge)
+    readRequiredText(root, devguardPaths.projectKnowledge),
+    readRuntimeState(root)
   ]);
   const records = parseHistoryRecords(history.content).slice(-5);
   const handoff = renderProjectHandoff({
@@ -940,7 +1087,9 @@ export async function generateProjectHandoff(root: string): Promise<string> {
     hookStatus,
     state,
     projectKnowledge,
-    locale
+    locale,
+    runtimeSessionId: runtime.sessionId,
+    currentTaskText: runtime.currentTask?.text
   });
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
   return projectHandoffPath;
@@ -5255,18 +5404,11 @@ function notRecordedLabel(locale: DevGuardLocale): string {
 }
 
 function formatKindStatus(report: QualityReport, kind: ValidationEvidenceKind, locale: DevGuardLocale, onNotRecorded?: () => string): string {
-  const entries = qaEntriesByKind(report.qaResults, kind);
-  const aggregate = aggregateValidationStatus(entries);
-  if (aggregate === "NOT_RECORDED") {
+  const latest = latestValidationEntry(qaEntriesByKind(report.qaResults, kind));
+  if (!latest) {
     return onNotRecorded ? onNotRecorded() : notRecordedLabel(locale);
   }
-  if (aggregate === "UNKNOWN") {
-    const detail = entries.find((entry) => entry.status === "UNKNOWN");
-    const reason = detail?.reason || detail?.summary;
-    return `🟡 UNKNOWN${reason ? ` (${reason})` : ""}`;
-  }
-  const failing = entries.find((entry) => entry.status === "FAIL");
-  return formatQAStatus(failing ?? entries[entries.length - 1], locale);
+  return formatQAStatus(latest, locale);
 }
 
 function qaLegacyStatus(report: QualityReport, name: string, locale: DevGuardLocale): string {
@@ -5553,15 +5695,16 @@ function regressionRiskLevel(report: QualityReport, locale: DevGuardLocale): str
 }
 
 function formatQAConfidence(report: QualityReport, locale: DevGuardLocale): string[] {
-  const coreEntries = [
-    ...qaEntriesByKind(report.qaResults, "BUILD"),
-    ...qaEntriesByKind(report.qaResults, "TYPECHECK"),
-    ...qaEntriesByKind(report.qaResults, "TEST"),
-    ...(report.qaResults?.["self-check"] ? [report.qaResults["self-check"]] : [])
+  const allCoreStatuses: AggregatedValidationStatus[] = [
+    aggregateValidationStatus(qaEntriesByKind(report.qaResults, "BUILD")),
+    aggregateValidationStatus(qaEntriesByKind(report.qaResults, "TYPECHECK")),
+    aggregateValidationStatus(qaEntriesByKind(report.qaResults, "TEST")),
+    report.qaResults?.["self-check"]?.status ?? "NOT_RECORDED"
   ];
-  const anyFailed = coreEntries.some((entry) => entry.status === "FAIL");
+  const coreStatuses = allCoreStatuses.filter((status) => status !== "NOT_RECORDED");
+  const anyFailed = coreStatuses.includes("FAIL");
   const anyRecorded = hasAnyRecordedValidationEvidence(report.qaResults);
-  const corePassed = coreEntries.length > 0 && coreEntries.every((entry) => entry.status === "PASS");
+  const corePassed = coreStatuses.length > 0 && coreStatuses.every((status) => status === "PASS");
   if (anyFailed) {
     return locale === "ko-KR"
       ? ["Low", "", "Build/Typecheck/Test 중 기록된 실패 evidence가 있어 QA 신뢰도가 낮습니다."]
@@ -6071,6 +6214,8 @@ function renderProjectHandoff(input: {
   state: string;
   projectKnowledge: RequiredText;
   locale: DevGuardLocale;
+  runtimeSessionId?: string;
+  currentTaskText?: string;
 }): string {
   const copy = handoffCopy[input.locale];
   const quality = parseQuality(input.qualityReport.content);
@@ -6078,7 +6223,13 @@ function renderProjectHandoff(input: {
   const state = parseProjectState(input.state);
   const changedFiles = state.lastChangedFiles ?? lastHistoryFiles(input.records);
   const documentationSummary = state.lastDocumentationSummary;
-  const goal = handoffGoal(nextTask, changedFiles, quality, input.locale, documentationSummary, state.lastTaskGoal);
+  const resolvedGoal = resolveSessionTaskGoal({
+    currentTaskText: input.currentTaskText,
+    runtimeSessionId: input.runtimeSessionId,
+    previousGoal: state.lastTaskGoal,
+    previousGoalSessionId: state.lastTaskGoalSessionId
+  });
+  const goal = handoffGoal(nextTask, changedFiles, quality, input.locale, documentationSummary, resolvedGoal.goal);
   const fileChanges = handoffFileChanges(changedFiles, quality, input.locale, documentationSummary);
   const qualityLines = handoffQualityLines(quality, changedFiles, input.locale, documentationSummary);
   const outstanding = handoffOutstandingItems(quality, changedFiles, input.locale, documentationSummary);

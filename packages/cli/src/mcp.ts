@@ -22,6 +22,7 @@ const recordValidationInputSchema = {
   ),
   name: z.string().optional().describe("Short identifier for this evidence, e.g. 'product-api' or 'attribution'. Defaults to the kind name. Use distinct names to record multiple RUNTIME_SMOKE checks in one session."),
   command: z.string().optional().describe("The command or action actually executed, e.g. 'pnpm build' or 'curl /unit/render'."),
+  exitCode: z.number().int().optional().describe("The process exit code you actually observed, if any. Do not guess or infer one — omit it if you didn't see it."),
   summary: z.string().optional().describe("One-line factual result, e.g. 'clicks 404 rows, ads/impression-click 145 rows'. No secrets or raw credentials/URLs."),
   reason: z.string().optional().describe("Root cause for FAIL/UNKNOWN, only if actually known/observed — do not guess."),
   projectRoot: z.string().optional().describe("Optional project root. Defaults to the MCP server working directory.")
@@ -84,7 +85,7 @@ export async function runMcpServer(root: string): Promise<void> {
         "Call this after you actually run a build, typecheck, test, lint, manual QA step, or runtime smoke check (e.g. a real API call, DB check, or browser check) outside of DevGuard. It records the real PASS/FAIL/UNKNOWN result so the next Quality Report and Handoff reflect actual evidence instead of showing 'not recorded'. Only call this for checks you actually ran — never to report work you did not verify.",
       inputSchema: recordValidationInputSchema
     },
-    async ({ kind, status, name, command, summary, reason, projectRoot }) => {
+    async ({ kind, status, name, command, exitCode, summary, reason, projectRoot }) => {
       try {
         const project = await resolveMcpProjectRoot(root, projectRoot);
         const result = await recordValidationEvidence({
@@ -93,8 +94,10 @@ export async function runMcpServer(root: string): Promise<void> {
           status,
           name,
           command,
+          exitCode,
           summary,
-          reason
+          reason,
+          source: "mcp-agent"
         });
         return {
           content: [

@@ -158,6 +158,8 @@ export async function runRecordValidation(root: string, args: string[]): Promise
   if (!status) {
     throw new Error(`--status is required and must be one of: ${VALIDATION_STATUSES.join(", ")}`);
   }
+  const rawExitCode = options.get("exit-code");
+  const exitCode = parseExitCode(rawExitCode);
   const result = await recordValidationEvidence({
     root,
     kind,
@@ -165,10 +167,21 @@ export async function runRecordValidation(root: string, args: string[]): Promise
     name: options.get("name"),
     command: options.get("command"),
     summary: options.get("summary"),
-    reason: options.get("reason")
+    reason: options.get("reason"),
+    exitCode,
+    source: "cli"
   });
   console.log(`dev-guard record-validation: recorded ${result.kind} "${result.name}" as ${result.status}`);
   console.log("- next: run dev-guard done to regenerate Quality Report / Handoff with this evidence");
+}
+
+function parseExitCode(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value)) {
+    throw new Error(`--exit-code must be an integer, got: ${raw}`);
+  }
+  return value;
 }
 
 function parseFlags(args: string[]): Map<string, string> {

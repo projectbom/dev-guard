@@ -308,7 +308,7 @@ All commands:
   dev-guard self-check
   dev-guard record-validation --kind <BUILD|TYPECHECK|TEST|LINT|MANUAL_QA|RUNTIME_SMOKE|CUSTOM>
                                --status <PASS|FAIL|UNKNOWN> [--name <name>] [--command <cmd>]
-                               [--summary <text>] [--reason <text>]
+                               [--exit-code <n>] [--summary <text>] [--reason <text>]
 
 Commands:
   watch                   Monitor AI coding session; prepares project on first run
