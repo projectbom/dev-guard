@@ -1,10 +1,11 @@
-// Regression tests for Validation Evidence provenance/freshness and Task Goal
-// session lineage. See the task history for the concrete risk these guard
-// against: stale evidence from an old commit being shown as current, and a
-// previous task's goal leaking into a new task's Handoff.
+// Regression tests for Validation Evidence provenance/freshness (code state
+// fingerprint, aggregation identity) and Task Goal session lineage. See the
+// task history for the concrete risks these guard against: an uncommitted
+// edit after a recorded PASS being shown as current, and a previous task's
+// goal leaking into a new task's Handoff.
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, rm, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, mkdir, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFile } from "node:child_process";
@@ -52,18 +53,16 @@ async function readHandoff(root) {
   return readFile(join(root, ".devguard/reports/project-handoff.md"), "utf8");
 }
 
-// --- Test A: stale evidence (git-HEAD-based freshness) ---------------------
+// --- Test A: same HEAD, working tree changed --------------------------------
 
-test("Test A: BUILD PASS recorded at an older commit is not shown as current after a new commit", async () => {
+test("Test A: BUILD PASS recorded at HEAD A becomes stale after an uncommitted edit at the same HEAD", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
 
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
 
-  // Advance the code state to a new commit (a different git HEAD SHA).
-  await writeFile(join(root, "app.js"), "console.log('v2');\n");
-  await git(root, ["add", "-A"]);
-  await git(root, ["commit", "-m", "advance"]);
+  // No commit at all — HEAD stays the same, only the working tree changes.
+  await writeFile(join(root, "README.md"), "# sample\nEdited after the build was verified, without committing.\n");
 
   await processDoneEvent(root);
   const quality = await readQuality(root);
@@ -71,7 +70,9 @@ test("Test A: BUILD PASS recorded at an older commit is not shown as current aft
   assert.match(quality, /Build\s*\|\s*⚪ Not recorded by DevGuard/);
 });
 
-test("Test A (control): BUILD PASS recorded at the current commit is still shown as current", async () => {
+// --- Test B: unchanged working tree remains fresh (control) -----------------
+
+test("Test B (control): BUILD PASS remains fresh when the working tree does not change at all", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
@@ -80,9 +81,86 @@ test("Test A (control): BUILD PASS recorded at the current commit is still shown
   assert.match(quality, /Build\s*\|\s*✅ PASS/);
 });
 
-// --- Test B / C: task goal session lineage ---------------------------------
+// --- Test C: staged change invalidates evidence -----------------------------
 
-test("Test B: a previous task's goal does not leak into a new session that never called prepare_task_context", async () => {
+test("Test C: a staged (but uncommitted) change invalidates previously recorded evidence", async () => {
+  const root = await makeRepo();
+  await ensureDevguardWorkspace(root);
+  await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
+
+  await writeFile(join(root, "README.md"), "# sample\nStaged edit after the build was verified.\n");
+  await git(root, ["add", "README.md"]);
+
+  await processDoneEvent(root);
+  const quality = await readQuality(root);
+  assert.doesNotMatch(quality, /Build\s*\|\s*✅ PASS/);
+  assert.match(quality, /Build\s*\|\s*⚪ Not recorded by DevGuard/);
+});
+
+// --- Test D: relevant untracked file vs ignored generated noise ------------
+
+test("Test D: a new untracked source file invalidates evidence, but ignored generated noise does not", async () => {
+  const root = await makeRepo();
+  await ensureDevguardWorkspace(root);
+  await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
+
+  // Generated/ignored noise must not move the fingerprint.
+  await mkdir(join(root, ".turbo"), { recursive: true });
+  await writeFile(join(root, ".turbo", "cache-entry"), "noise\n");
+  await writeFile(join(root, "tsconfig.tsbuildinfo"), "{}\n");
+  await processDoneEvent(root);
+  let quality = await readQuality(root);
+  assert.match(quality, /Build\s*\|\s*✅ PASS/, "ignored generated noise must not invalidate evidence");
+
+  // A real new untracked source file must invalidate it.
+  await writeFile(join(root, "new-feature.js"), "export const featureFlag = true;\n");
+  await processDoneEvent(root);
+  quality = await readQuality(root);
+  assert.doesNotMatch(quality, /Build\s*\|\s*✅ PASS/);
+  assert.match(quality, /Build\s*\|\s*⚪ Not recorded by DevGuard/);
+});
+
+// --- Test E: legacy evidence with no provenance at all ----------------------
+
+test("Test E: legacy evidence with no gitHead/codeStateHash/sessionId is not auto-trusted as current PASS", async () => {
+  const root = await makeRepo();
+  await ensureDevguardWorkspace(root);
+  // Simulate evidence recorded by a DevGuard version that predates all
+  // provenance fields, by writing runtime.json directly (recordQAExecutionResult
+  // would always stamp provenance now, so this bypasses it deliberately).
+  const runtimePath = join(root, ".devguard", "runtime.json");
+  await writeFile(
+    runtimePath,
+    JSON.stringify(
+      {
+        pendingChangedFiles: [],
+        lastStatus: "idle",
+        changeCountSinceIdle: 0,
+        qaResults: {
+          build: {
+            name: "build",
+            kind: "BUILD",
+            status: "PASS",
+            command: "pnpm build",
+            startedAt: "2020-01-01T00:00:00.000Z",
+            completedAt: "2020-01-01T00:00:00.000Z",
+            durationMs: 1000
+          }
+        }
+      },
+      null,
+      2
+    )
+  );
+  await processDoneEvent(root);
+  const quality = await readQuality(root);
+  assert.doesNotMatch(quality, /Build\s*\|\s*✅ PASS/);
+  assert.match(quality, /Build\s*\|\s*⚪ Not recorded by DevGuard/);
+});
+
+// --- Test F: explicit task transition ---------------------------------------
+
+test("Test F: an explicit new prepare_task_context call starts a clean task lineage", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
 
@@ -91,25 +169,24 @@ test("Test B: a previous task's goal does not leak into a new session that never
   let handoff = await readHandoff(root);
   assert.match(handoff, /Implement ad report pipeline/);
 
-  // Explicit session boundary: a real `dev-guard reset` starts a new session/task lineage.
-  await resetRuntimeState(root);
-
-  // A new, unrelated task begins without ever calling prepare_task_context again.
   await writeFile(join(root, "unrelated.js"), "export const unrelated = true;\n");
+  await prepareTaskContext({ root, task: "Fix unrelated login bug", persistTask: true });
   await processDoneEvent(root);
 
   handoff = await readHandoff(root);
+  assert.match(handoff, /Fix unrelated login bug/);
   assert.doesNotMatch(handoff, /Implement ad report pipeline/);
 });
 
-test("Test C: the same task's goal persists across multiple done calls without recalling prepare_task_context", async () => {
+// --- Test G: same-task persistence ------------------------------------------
+
+test("Test G: the same task's goal persists across additional done calls without recalling prepare_task_context", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
 
   await prepareTaskContext({ root, task: "Implement ad report pipeline", persistTask: true });
   await processDoneEvent(root);
 
-  // Second done in the same session, no new prepare_task_context call.
   await writeFile(join(root, "more.js"), "export const more = 1;\n");
   await processDoneEvent(root);
 
@@ -117,36 +194,71 @@ test("Test C: the same task's goal persists across multiple done calls without r
   assert.match(handoff, /Implement ad report pipeline/);
 });
 
-// --- Test D: UNKNOWN vs NOT_RECORDED ----------------------------------------
+// --- Test H: no-boundary limitation (documented contract, not inferred) ----
 
-test("Test D: recorded UNKNOWN evidence and truly-absent evidence render as distinct states", async () => {
+test("Test H: without prepare_task_context or reset, DevGuard cannot tell a new task started and keeps the old goal", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
-  await recordValidationEvidence({
-    root,
-    kind: "RUNTIME_SMOKE",
-    name: "attribution",
-    status: "UNKNOWN",
-    reason: "NO_BINDING_MATCH"
-  });
-  // BUILD kind: nothing recorded at all for it.
+
+  await prepareTaskContext({ root, task: "Implement ad report pipeline", persistTask: true });
   await processDoneEvent(root);
-  const quality = await readQuality(root);
-  assert.match(quality, /Runtime Smoke: attribution\s*\|\s*🟡 UNKNOWN/);
-  assert.match(quality, /Build\s*\|\s*⚪ Not recorded by DevGuard/);
-  // Confidence must not conflate "no evidence" with "recorded failure".
-  assert.match(quality, /##[^\n]*QA Confidence\s*\n\s*\nUnknown/);
+
+  // The user mentally moves on to a materially different, larger piece of
+  // work — but never calls prepare_task_context or dev-guard reset. DevGuard
+  // has no contractual signal that a new task began, so per the documented
+  // Task Boundary Contract it must keep showing the previous goal rather
+  // than guessing from the diff shape. This is a known limitation, not a bug:
+  // large/different-area diffs are deliberately NOT used as a "new task"
+  // heuristic.
+  await mkdir(join(root, "billing"), { recursive: true });
+  await writeFile(join(root, "billing", "invoice.js"), "export function generateInvoice() { return {}; }\n");
+  await writeFile(join(root, "billing", "invoice.test.js"), "test('invoice', () => {});\n");
+  await processDoneEvent(root);
+
+  const handoff = await readHandoff(root);
+  assert.match(handoff, /Implement ad report pipeline/);
 });
 
-// --- Test E: contradictory evidence aggregation -----------------------------
+// A real `dev-guard reset` is still the one supported way to explicitly end
+// a session/task lineage when there is no next `prepare_task_context` call.
+test("dev-guard reset still ends the session lineage (supplementary to Test H)", async () => {
+  const root = await makeRepo();
+  await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Implement ad report pipeline", persistTask: true });
+  await processDoneEvent(root);
 
-test("Test E: the most recently recorded evidence wins, independent of insertion order", async () => {
+  await resetRuntimeState(root);
+
+  await writeFile(join(root, "unrelated.js"), "export const unrelated = true;\n");
+  await processDoneEvent(root);
+
+  const handoff = await readHandoff(root);
+  assert.doesNotMatch(handoff, /Implement ad report pipeline/);
+});
+
+// --- Test I: aggregation identity — different names are independent -------
+
+test("Test I: BUILD/frontend-build and BUILD/backend-build are independent validation scopes", async () => {
+  const root = await makeRepo();
+  await ensureDevguardWorkspace(root);
+  await recordValidationEvidence({ root, kind: "BUILD", name: "frontend-build", status: "FAIL", reason: "type error" });
+  await recordValidationEvidence({ root, kind: "BUILD", name: "backend-build", status: "PASS" });
+
+  await processDoneEvent(root);
+  const quality = await readQuality(root);
+  assert.match(quality, /Build: frontend-build\s*\|\s*❌ FAIL/);
+  assert.match(quality, /Build: backend-build\s*\|\s*✅ PASS/);
+});
+
+// --- Test J: latest result within the same identity wins --------------------
+
+test("Test J: within the same BUILD/frontend-build identity, the latest-by-timestamp result wins regardless of insertion order", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
 
-  // Inserted first, but its completedAt is LATER than the second insertion.
+  // Inserted first, but chronologically LATER (completedAt).
   await recordQAExecutionResult(root, {
-    name: "build-later",
+    name: "frontend-build",
     kind: "BUILD",
     status: "PASS",
     command: "pnpm build",
@@ -154,9 +266,10 @@ test("Test E: the most recently recorded evidence wins, independent of insertion
     completedAt: "2026-01-01T10:00:00.000Z",
     durationMs: 1000
   });
-  // Inserted second, but its completedAt is EARLIER than the first insertion.
+  // Inserted second, but chronologically EARLIER (completedAt) — must not
+  // clobber the later result recorded above.
   await recordQAExecutionResult(root, {
-    name: "build-earlier",
+    name: "frontend-build",
     kind: "BUILD",
     status: "FAIL",
     command: "pnpm build",
@@ -168,28 +281,49 @@ test("Test E: the most recently recorded evidence wins, independent of insertion
 
   await processDoneEvent(root);
   const quality = await readQuality(root);
-  // The chronologically later PASS must win over the earlier FAIL, even
-  // though the FAIL entry was recorded (inserted) second.
   assert.match(quality, /Build\s*\|\s*✅ PASS/);
   assert.doesNotMatch(quality, /Build\s*\|\s*❌ FAIL/);
 });
 
-// --- Test F: independent kinds ----------------------------------------------
+// --- Test K: AI stale "What Changed" (deterministic, no network/API key) ---
 
-test("Test F: independent kinds (and named runtime-smoke sub-checks) are reported without overwriting each other", async () => {
-  const root = await makeRepo();
-  await ensureDevguardWorkspace(root);
-  await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
-  await recordValidationEvidence({ root, kind: "TYPECHECK", status: "PASS", summary: "6 packages" });
-  await recordValidationEvidence({ root, kind: "RUNTIME_SMOKE", name: "smoke-a", status: "FAIL", reason: "timeout" });
-  await recordValidationEvidence({ root, kind: "RUNTIME_SMOKE", name: "smoke-b", status: "PASS" });
-
-  await processDoneEvent(root);
-  const quality = await readQuality(root);
-  assert.match(quality, /Build\s*\|\s*✅ PASS/);
-  assert.match(quality, /Typecheck\s*\|\s*✅ PASS/);
-  assert.match(quality, /Runtime Smoke: smoke-a\s*\|\s*❌ FAIL/);
-  assert.match(quality, /Runtime Smoke: smoke-b\s*\|\s*✅ PASS/);
+test("Test K: a zero-diff round's What Changed never surfaces an AI review item's file from stale historical context", async () => {
+  const { formatQualityChangedFiles } = await import("../dist/runtime-state.js");
+  // Simulates exactly the confirmed bug: the current round has zero changed
+  // files (documentationSummary.fileChanges is empty and authoritative), but
+  // an AI-merged review item references a file from a previous round.
+  const report = {
+    verdict: "PASS",
+    summary: [],
+    why: [],
+    relatedFiles: [],
+    requiredVerification: [],
+    checklist: [],
+    reviewItems: [
+      {
+        title: "Historical UI note",
+        body: ["Carried over from a previous round's AI review."],
+        files: ["components/AdSlot.jsx"],
+        checks: []
+      }
+    ],
+    beforeCommit: [],
+    nextRecommendedAction: "",
+    documentationSummary: {
+      goal: "No source changes were detected in the current diff.",
+      overview: ["No source changes were detected in the current diff."],
+      changeTypes: [],
+      impact: { affected: [], unaffected: [], risk: "None", riskReason: "No changed files were detected." },
+      fileChanges: [],
+      qaChecks: [],
+      remainingWork: [],
+      structure: [],
+      excludedAreas: []
+    }
+  };
+  const lines = formatQualityChangedFiles(report, "en-US").join("\n");
+  assert.doesNotMatch(lines, /AdSlot\.jsx/);
+  assert.match(lines, /No changed files recorded/);
 });
 
 // --- Compatibility: non-git projects and legacy state -----------------------

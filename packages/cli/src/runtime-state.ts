@@ -84,11 +84,19 @@ export interface QAExecutionResult {
   exitCode?: number;
   /**
    * Short git HEAD SHA at the moment this evidence was recorded (empty/absent
-   * for non-git projects or repos with no commits yet). Used to detect when
-   * evidence was produced against a code state that the repository has since
-   * moved past.
+   * for non-git projects or repos with no commits yet). On its own this only
+   * detects commit-boundary changes — see `codeStateHash` for a signal that
+   * also covers uncommitted edits.
    */
   gitHead?: string;
+  /**
+   * Fingerprint of the full working tree state (HEAD + staged + unstaged +
+   * relevant untracked files) at the moment this evidence was recorded. This
+   * is the strongest freshness signal: it changes even when HEAD does not,
+   * so a build verified before an uncommitted edit is correctly treated as
+   * stale for the edited state. See `computeCodeStateHash`.
+   */
+  codeStateHash?: string;
   /** Session lineage id at record time; see RuntimeState.sessionId. */
   sessionId?: string;
 }
@@ -439,16 +447,107 @@ async function currentGitHead(root: string): Promise<string> {
   }
 }
 
+interface CurrentChangeState {
+  gitHead: string;
+  changeFiles: ChangeFile[];
+  changedFiles: string[];
+  diffText: string;
+  gitChanges: GitChanges;
+  rawChangedFiles: string[];
+}
+
+/**
+ * Gathers the same "what changed right now" inputs that `processDoneEvent`
+ * already computes (git HEAD, filtered change files, the merged
+ * watch+git changed-file list, and diff text), so both the done pipeline and
+ * evidence recording derive their code-state fingerprint from one shared
+ * definition instead of two divergent ones.
+ */
+async function gatherCurrentChangeState(root: string, runtime: RuntimeState): Promise<CurrentChangeState> {
+  const gitHead = await currentGitHead(root);
+  const gitChanges = await loadChangesWithFallback(root, runtime);
+  const changeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
+  const rawChangedFiles = [...new Set(gitChanges.changeFiles.map((file) => file.path))].sort();
+  const runtimeChangedFiles = runtime.pendingChangedFiles.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file));
+  const changedFiles = [
+    ...new Set(
+      [...runtimeChangedFiles, ...changeFiles.map((file) => file.path)].filter(
+        (file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)
+      )
+    )
+  ].sort();
+  const diffText = changeFiles.length > 0 ? await getDiffForChangeFiles(root, changeFiles).catch(() => gitChanges.diffText) : gitChanges.diffText;
+  return { gitHead, changeFiles, changedFiles, diffText, gitChanges, rawChangedFiles };
+}
+
+/**
+ * Fingerprints the current working tree state (HEAD + staged + unstaged +
+ * relevant untracked source files), reusing DevGuard's existing change
+ * detection and noise filtering (`filterDevGuardContextFiles`,
+ * `isIgnoredWatchPath`, `isDevguardManagedDocPath`) rather than a new,
+ * separate git abstraction. Deliberately bounded to the already-filtered
+ * relevant change set — never a full-repository scan — so a `.tsbuildinfo`
+ * or `.turbo/` change never invalidates it, and cost stays proportional to
+ * the size of the current diff, not the size of the repository.
+ *
+ * `diffText` only carries a placeholder line for untracked files (not their
+ * content — see `getDiffForChangeFiles`), so untracked files are hashed by
+ * content directly; this is safe because it is limited to the same bounded
+ * changed-file set.
+ */
+async function computeCodeStateHash(root: string, input: { gitHead: string; changeFiles: ChangeFile[]; changedFiles: string[] }): Promise<string> {
+  // `changedFiles` is already filtered through isIgnoredWatchPath/
+  // isDevguardManagedDocPath (excludes .turbo/, *.tsbuildinfo, .devguard/,
+  // node_modules/, etc). `changeFiles` is not — it still contains every raw
+  // git-observed change. Restrict to the intersection so ignored noise can
+  // never reach the diff or the untracked-content hashing below; this is
+  // also why `diffText` computed elsewhere in processDoneEvent (from the
+  // unfiltered `changeFiles`) is not reused here — it can carry a stray
+  // "Untracked file: tsconfig.tsbuildinfo" marker that must not affect the
+  // fingerprint.
+  const relevantChangeFiles = input.changeFiles.filter((file) => input.changedFiles.includes(file.path));
+  const relevantDiffText = relevantChangeFiles.length > 0 ? await getDiffForChangeFiles(root, relevantChangeFiles).catch(() => "") : "";
+  const hash = createHash("sha1");
+  hash.update(input.gitHead);
+  hash.update(" ");
+  hash.update([...input.changedFiles].sort().join("\n"));
+  hash.update(" ");
+  hash.update(relevantDiffText);
+  const untrackedPaths = [
+    ...new Set(relevantChangeFiles.filter((file) => file.source === "untracked").map((file) => file.path))
+  ].sort();
+  for (const path of untrackedPaths) {
+    const content = await readTextFile(fromRoot(root, path)).catch(() => "");
+    hash.update(` ${path} ${content}`);
+  }
+  return hash.digest("hex");
+}
+
+async function resolveCurrentCodeState(root: string, runtime: RuntimeState): Promise<{ gitHead: string; codeStateHash: string }> {
+  const state = await gatherCurrentChangeState(root, runtime);
+  const codeStateHash = await computeCodeStateHash(root, state);
+  return { gitHead: state.gitHead, codeStateHash };
+}
+
 export async function recordQAExecutionResult(root: string, result: QAExecutionResult): Promise<void> {
   const current = await readRuntimeState(root);
   const sessionId = current.sessionId ?? generateSessionId();
-  const gitHead = result.gitHead ?? (await currentGitHead(root));
+  const { gitHead, codeStateHash } = await resolveCurrentCodeState(root, current);
   const stamped: QAExecutionResult = {
     ...result,
     sessionId: result.sessionId ?? sessionId,
-    gitHead: gitHead || undefined
+    gitHead: result.gitHead ?? (gitHead || undefined),
+    codeStateHash: result.codeStateHash ?? codeStateHash
   };
-  const qaResults = { ...(current.qaResults ?? {}), [stamped.name]: stamped };
+  // `qaResults` is keyed by name, so recording a second result under the same
+  // name/kind replaces the first. That replacement must be timestamp-driven,
+  // not insertion-order-driven — otherwise a delayed/out-of-order report
+  // (e.g. two agents reporting concurrently) could let an older result
+  // clobber a newer one. Only replace when the incoming result is not older
+  // than what's already stored for this identity.
+  const existing = current.qaResults?.[stamped.name];
+  const shouldReplace = !existing || Date.parse(stamped.completedAt) >= Date.parse(existing.completedAt);
+  const qaResults = shouldReplace ? { ...(current.qaResults ?? {}), [stamped.name]: stamped } : current.qaResults ?? {};
   await writeRuntimeState(root, { ...current, qaResults, sessionId });
 }
 
@@ -498,30 +597,41 @@ function resolveValidationKind(result: QAExecutionResult): ValidationEvidenceKin
 }
 
 /**
- * Evidence provenance/freshness: an entry is "current" for the given code
- * state if its recorded git HEAD matches the current HEAD. Git HEAD is
- * preferred (matches the task's own commit-boundary example) because it is
- * a precise, non-heuristic signal for source-controlled work. When either
- * side has no HEAD (non-git project, or a repo with no commits yet), we
- * fall back to session lineage: evidence recorded within the same
- * task/session is still treated as current. If neither signal is available
- * on both sides (e.g. evidence recorded before this feature existed), we
- * cannot prove staleness, so we do not retroactively invalidate it — that
- * would silently break existing recorded evidence on upgrade.
+ * Evidence provenance/freshness precedence — stronger signals always decide
+ * ahead of weaker ones; a weaker signal never overrides a stronger one that
+ * disagrees with it:
+ *
+ * 1. `codeStateHash` on both sides — the strongest signal, since it captures
+ *    HEAD plus staged/unstaged/relevant-untracked content. If it differs,
+ *    the evidence is stale even when `gitHead` still matches (an
+ *    uncommitted edit after the evidence was recorded).
+ * 2. `gitHead` on both sides (no comparable codeStateHash) — a precise,
+ *    non-heuristic commit-boundary signal.
+ * 3. `sessionId` on both sides (no git provenance at all) — non-git
+ *    projects, or repos with no commits yet.
+ * 4. No comparable signal at all on both sides — this includes legacy
+ *    evidence recorded before provenance existed. DevGuard is a
+ *    verification tool: a false PASS is worse than an honest
+ *    "not recorded", so such evidence is treated as stale rather than
+ *    assumed current. It is never deleted from the stored history — only
+ *    excluded from being read as current.
  */
-function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; sessionId?: string }): boolean {
+function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; codeStateHash: string; sessionId?: string }): boolean {
+  if (entry.codeStateHash && current.codeStateHash) {
+    return entry.codeStateHash === current.codeStateHash;
+  }
   if (entry.gitHead && current.gitHead) {
     return entry.gitHead === current.gitHead;
   }
   if (entry.sessionId && current.sessionId) {
     return entry.sessionId === current.sessionId;
   }
-  return true;
+  return false;
 }
 
 function filterFreshQaResults(
   qaResults: Record<string, QAExecutionResult> | undefined,
-  current: { gitHead: string; sessionId?: string }
+  current: { gitHead: string; codeStateHash: string; sessionId?: string }
 ): Record<string, QAExecutionResult> | undefined {
   if (!qaResults) return qaResults;
   const fresh: Record<string, QAExecutionResult> = {};
@@ -548,10 +658,6 @@ type AggregatedValidationStatus = "PASS" | "FAIL" | "UNKNOWN" | "NOT_RECORDED";
 function latestValidationEntry(entries: QAExecutionResult[]): QAExecutionResult | undefined {
   if (entries.length === 0) return undefined;
   return entries.reduce((latest, entry) => (Date.parse(entry.completedAt) >= Date.parse(latest.completedAt) ? entry : latest));
-}
-
-function aggregateValidationStatus(entries: QAExecutionResult[]): AggregatedValidationStatus {
-  return latestValidationEntry(entries)?.status ?? "NOT_RECORDED";
 }
 
 function hasAnyRecordedValidationEvidence(qaResults: Record<string, QAExecutionResult> | undefined): boolean {
@@ -752,20 +858,11 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     runtime = { ...runtime, sessionId: generateSessionId() };
     await writeRuntimeState(root, runtime);
   }
-  const currentGitState = { gitHead: await currentGitHead(root), sessionId: runtime.sessionId };
+  const currentChangeState = await gatherCurrentChangeState(root, runtime);
+  const { gitHead, changeFiles, changedFiles, diffText, gitChanges, rawChangedFiles } = currentChangeState;
+  const codeStateHash = await computeCodeStateHash(root, currentChangeState);
+  const currentGitState = { gitHead, codeStateHash, sessionId: runtime.sessionId };
   const freshQaResults = filterFreshQaResults(runtime.qaResults, currentGitState);
-  const gitChanges = await loadChangesWithFallback(root, runtime);
-  const changeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
-  const rawChangedFiles = [...new Set(gitChanges.changeFiles.map((file) => file.path))].sort();
-  const runtimeChangedFiles = runtime.pendingChangedFiles.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file));
-  const changedFiles = [
-    ...new Set(
-      [...runtimeChangedFiles, ...changeFiles.map((file) => file.path)].filter(
-        (file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)
-      )
-    )
-  ].sort();
-  const diffText = changeFiles.length > 0 ? await getDiffForChangeFiles(root, changeFiles).catch(() => gitChanges.diffText) : gitChanges.diffText;
   const diffStat = await getGitDiffStat(root).catch(() => "git diff stat unavailable");
   const [projectMarkdown, architectureMarkdown, decisionsMarkdown, tasksMarkdown, config, codeGraph] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
@@ -991,7 +1088,19 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     source: "explicit-before-agent-input",
     createdAt: new Date().toISOString()
   };
-  const runtimeWithTask = { ...current, currentTask, sessionId: current.sessionId ?? generateSessionId() };
+  // Task boundary contract: `prepare_task_context` is the one explicit signal
+  // DevGuard has for "a task is starting" (see CLAUDE.md guidance to call it
+  // for every new task). If the requested task text matches the canonical
+  // goal already recorded for the current lineage, this call is treated as
+  // continuing that same task (e.g. re-fetching context mid-task) and keeps
+  // the existing session id. Any other text — including the very first call,
+  // when there is nothing to compare against — starts a new lineage, so
+  // evidence and goal state from a prior task cannot be silently inherited
+  // by a new one that never went through this boundary.
+  const previousProjectState = await readProjectState(root);
+  const continuesSameTask = Boolean(current.sessionId) && previousProjectState.lastTaskGoal?.trim() === text;
+  const sessionId = continuesSameTask ? current.sessionId! : generateSessionId();
+  const runtimeWithTask = { ...current, currentTask, sessionId };
   await writeRuntimeState(root, runtimeWithTask);
   try {
     await hydrateCodeIndexForTask(root, text);
@@ -3233,14 +3342,14 @@ function documentationQAChecks(files: DocumentationFileChange[], types: ChangeTy
     if (entry.status === "FAIL") add(`Fix and re-verify runtime smoke: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
     else if (entry.status === "UNKNOWN") add(`Resolve unresolved runtime smoke: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
   }
-  const manualStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "MANUAL_QA"));
+  const manualStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "MANUAL_QA"));
   if (types.includes("UI") && manualStatus !== "PASS") add("Perform manual browser/mobile QA for the changed UI.");
 
   for (const file of files) {
     for (const qa of file.qa) add(qa);
   }
 
-  const buildStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "BUILD"));
+  const buildStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "BUILD"));
   if ((types.includes("Build") || types.includes("Logic") || types.includes("QA")) && buildStatus !== "PASS") add("Run `pnpm run build`.");
   const selfCheckEntry = qaResults?.["self-check"];
   if (!selfCheckEntry || selfCheckEntry.status !== "PASS") add("Run `dev-guard self-check`.");
@@ -3250,14 +3359,14 @@ function documentationQAChecks(files: DocumentationFileChange[], types: ChangeTy
 
 function documentationRemainingWork(files: DocumentationFileChange[], types: ChangeType[], qaResults?: Record<string, QAExecutionResult>): string[] {
   const remaining = new Set<string>();
-  const buildStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "BUILD"));
+  const buildStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "BUILD"));
   if (buildStatus === "NOT_RECORDED") remaining.add("Build result is not recorded in DevGuard (this does not mean the build was not run, only that no result was recorded).");
   else if (buildStatus === "FAIL") remaining.add("Recorded Build evidence failed; fix the build before this can be considered complete.");
   const selfCheckEntry = qaResults?.["self-check"];
   if (!selfCheckEntry) remaining.add("Self Check result is not recorded in DevGuard.");
   else if (selfCheckEntry.status === "FAIL") remaining.add(`Recorded Self Check evidence failed${selfCheckEntry.reason ? `: ${selfCheckEntry.reason}` : "."}`);
 
-  const manualStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "MANUAL_QA"));
+  const manualStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "MANUAL_QA"));
   if (types.includes("UI")) {
     if (manualStatus === "FAIL") remaining.add("Recorded Manual QA evidence failed for this UI change.");
     else if (manualStatus === "NOT_RECORDED") remaining.add("Manual browser/mobile QA is still needed for UI changes.");
@@ -5379,18 +5488,15 @@ function formatQASnapshot(report: QualityReport, locale: DevGuardLocale): string
     : { overall: "Overall", build: "Build", typecheck: "Typecheck", tests: "Targeted Tests", self: "Self Check", manual: "Manual QA", regression: "Regression Risk", item: "Item", status: "Status" };
   const rows: string[][] = [
     [labels.overall, overall],
-    [labels.build, formatKindStatus(report, "BUILD", locale)],
-    [labels.typecheck, formatKindStatus(report, "TYPECHECK", locale)],
-    [labels.tests, formatKindStatus(report, "TEST", locale)],
+    ...formatKindRows(report, "BUILD", labels.build, locale),
+    ...formatKindRows(report, "TYPECHECK", labels.typecheck, locale),
+    ...formatKindRows(report, "TEST", labels.tests, locale),
     [labels.self, qaLegacyStatus(report, "self-check", locale)],
-    [labels.manual, formatKindStatus(report, "MANUAL_QA", locale, () => manualQAFallback(report, locale))],
+    ...formatKindRows(report, "MANUAL_QA", labels.manual, locale, () => manualQAFallback(report, locale)),
     [labels.regression, regressionRiskLevel(report, locale)]
   ];
-  const smokeEntries = qaEntriesByKind(report.qaResults, "RUNTIME_SMOKE");
-  if (smokeEntries.length > 0) {
-    for (const entry of smokeEntries) {
-      rows.push([`${locale === "ko-KR" ? "Runtime Smoke" : "Runtime Smoke"}: ${entry.name}`, formatQAStatus(entry, locale)]);
-    }
+  if (qaEntriesByKind(report.qaResults, "RUNTIME_SMOKE").length > 0) {
+    rows.push(...formatKindRows(report, "RUNTIME_SMOKE", "Runtime Smoke", locale, undefined, true));
   }
   return [
     `| ${labels.item} | ${labels.status} |`,
@@ -5403,12 +5509,72 @@ function notRecordedLabel(locale: DevGuardLocale): string {
   return locale === "ko-KR" ? "⚪ DevGuard에 결과가 기록되지 않음" : "⚪ Not recorded by DevGuard";
 }
 
-function formatKindStatus(report: QualityReport, kind: ValidationEvidenceKind, locale: DevGuardLocale, onNotRecorded?: () => string): string {
-  const latest = latestValidationEntry(qaEntriesByKind(report.qaResults, kind));
-  if (!latest) {
-    return onNotRecorded ? onNotRecorded() : notRecordedLabel(locale);
+/**
+ * Aggregation identity: two evidence entries represent the same validation
+ * scope only if they share both `kind` and `name` (e.g. BUILD/"frontend-build"
+ * vs BUILD/"backend-build" are independent scopes; `name` already carries
+ * this responsibility — see RUNTIME_SMOKE's per-check names — so no separate
+ * `scope` field is introduced). Within one identity, the latest entry by
+ * `completedAt` wins (see `latestValidationEntry`); across identities,
+ * nothing is merged.
+ */
+function groupEntriesByName(entries: QAExecutionResult[]): Map<string, QAExecutionResult[]> {
+  const groups = new Map<string, QAExecutionResult[]>();
+  for (const entry of entries) {
+    const list = groups.get(entry.name) ?? [];
+    list.push(entry);
+    groups.set(entry.name, list);
   }
-  return formatQAStatus(latest, locale);
+  return groups;
+}
+
+/**
+ * Renders one row per distinct validation identity (kind+name) found for
+ * `kind`. When there is exactly one identity (the common case — a single
+ * default-named check), it renders as a single unqualified row for
+ * backward-compatible output. When multiple distinctly-named scopes exist
+ * (e.g. BUILD "frontend-build" and BUILD "backend-build"), each is rendered
+ * as its own row, qualified by name, so they are never blended together.
+ */
+function formatKindRows(
+  report: QualityReport,
+  kind: ValidationEvidenceKind,
+  label: string,
+  locale: DevGuardLocale,
+  onNotRecorded?: () => string,
+  alwaysQualifyByName = false
+): string[][] {
+  const groups = groupEntriesByName(qaEntriesByKind(report.qaResults, kind));
+  if (groups.size === 0) {
+    return [[label, onNotRecorded ? onNotRecorded() : notRecordedLabel(locale)]];
+  }
+  if (groups.size === 1 && !alwaysQualifyByName) {
+    const [[, entries]] = groups;
+    return [[label, formatQAStatus(latestValidationEntry(entries)!, locale)]];
+  }
+  return [...groups.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, entries]) => [`${label}: ${name}`, formatQAStatus(latestValidationEntry(entries)!, locale)]);
+}
+
+function latestStatusesByName(qaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind): AggregatedValidationStatus[] {
+  const groups = groupEntriesByName(qaEntriesByKind(qaResults, kind));
+  return [...groups.values()].map((entries) => latestValidationEntry(entries)?.status ?? "NOT_RECORDED");
+}
+
+/**
+ * Combines multiple independent validation identities of the same kind
+ * (e.g. BUILD "frontend-build" and BUILD "backend-build") into one signal
+ * for prose that talks about the kind as a whole (confidence, remaining-work
+ * bullets): any recorded failure wins, then "all passed", else UNKNOWN, else
+ * NOT_RECORDED. This is only a combinator for narrative text — it never
+ * feeds back into the per-identity table rows, which always stay separate.
+ */
+function worstStatusAcrossNames(statuses: AggregatedValidationStatus[]): AggregatedValidationStatus {
+  if (statuses.length === 0) return "NOT_RECORDED";
+  if (statuses.includes("FAIL")) return "FAIL";
+  if (statuses.every((status) => status === "PASS")) return "PASS";
+  return "UNKNOWN";
 }
 
 function qaLegacyStatus(report: QualityReport, name: string, locale: DevGuardLocale): string {
@@ -5496,8 +5662,25 @@ function formatQualityImpact(report: QualityReport, locale: DevGuardLocale): str
   return lines;
 }
 
-function formatQualityChangedFiles(report: QualityReport, locale: DevGuardLocale): string[] {
-  if (report.documentationSummary?.fileChanges.length) {
+/**
+ * "What Changed" must reflect only the current round's actual changed
+ * files — never AI historical context. `documentationSummary` is the
+ * authoritative current-round change record built directly from this
+ * round's diff (see `buildDocumentationSummary` in processDoneEvent); AI
+ * enhancement never touches it. When it reports zero files, that IS the
+ * authoritative fact for this round, so we render "no changed files"
+ * directly instead of falling through to `reviewItems`/`relatedFiles` —
+ * `reviewItems` can be replaced by `mergeAIReviewItems` with AI-generated
+ * items whose `files` may reference a previous round's context (the
+ * confirmed stale-file bug). The `relatedFiles`/`reviewItems` fallback below
+ * is kept only for the defensive case where `documentationSummary` itself
+ * is entirely absent (a caller outside the standard done pipeline).
+ */
+export function formatQualityChangedFiles(report: QualityReport, locale: DevGuardLocale): string[] {
+  if (report.documentationSummary) {
+    if (report.documentationSummary.fileChanges.length === 0) {
+      return [locale === "ko-KR" ? "- 변경 파일 없음" : "- No changed files recorded."];
+    }
     const lines: string[] = [];
     for (const file of report.documentationSummary.fileChanges.slice(0, 10)) {
       lines.push(`- \`${file.file}\``);
@@ -5696,9 +5879,9 @@ function regressionRiskLevel(report: QualityReport, locale: DevGuardLocale): str
 
 function formatQAConfidence(report: QualityReport, locale: DevGuardLocale): string[] {
   const allCoreStatuses: AggregatedValidationStatus[] = [
-    aggregateValidationStatus(qaEntriesByKind(report.qaResults, "BUILD")),
-    aggregateValidationStatus(qaEntriesByKind(report.qaResults, "TYPECHECK")),
-    aggregateValidationStatus(qaEntriesByKind(report.qaResults, "TEST")),
+    ...latestStatusesByName(report.qaResults, "BUILD"),
+    ...latestStatusesByName(report.qaResults, "TYPECHECK"),
+    ...latestStatusesByName(report.qaResults, "TEST"),
     report.qaResults?.["self-check"]?.status ?? "NOT_RECORDED"
   ];
   const coreStatuses = allCoreStatuses.filter((status) => status !== "NOT_RECORDED");
