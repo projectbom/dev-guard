@@ -15,7 +15,7 @@ import { runRefresh } from "./refresh.js";
 import { runReport } from "./report.js";
 import { runFixPrompt, runReview } from "./review.js";
 import { runScan } from "./scan.js";
-import { runSelf, runSelfCheck } from "./self.js";
+import { runSelf, runSelfCheck, runRecordValidation } from "./self.js";
 import { runMcpServer } from "./mcp.js";
 import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
@@ -191,6 +191,11 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "record-validation") {
+    await runRecordValidation(root, process.argv.slice(3));
+    return;
+  }
+
   if (!command.startsWith("-")) {
     await runSelf(root, process.argv.slice(2));
     return;
@@ -301,6 +306,9 @@ All commands:
                      [--context-files <n>] [--no-code-context] [--no-cache|--fresh] [--debug-context]
   dev-guard self "<requirement>" [--copy] [--check]
   dev-guard self-check
+  dev-guard record-validation --kind <BUILD|TYPECHECK|TEST|LINT|MANUAL_QA|RUNTIME_SMOKE|CUSTOM>
+                               --status <PASS|FAIL|UNKNOWN> [--name <name>] [--command <cmd>]
+                               [--summary <text>] [--reason <text>]
 
 Commands:
   watch                   Monitor AI coding session; prepares project on first run
@@ -333,6 +341,9 @@ Advanced / recovery:
   task-ai                 Generate .devguard/task.md from natural language
   self                    Dogfood dev-guard on this repo
   self-check              Run build, check, heuristic review, and doctor
+  record-validation       Record external validation evidence (build/test/typecheck/manual QA/runtime smoke)
+                          for Quality Report and Handoff, e.g.:
+                          dev-guard record-validation --kind BUILD --status PASS --command "pnpm build"
 `);
 }
 

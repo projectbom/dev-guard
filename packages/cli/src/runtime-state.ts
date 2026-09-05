@@ -55,15 +55,31 @@ export interface BeforeAgentTask {
   createdAt: string;
 }
 
+export type ValidationEvidenceKind = "BUILD" | "TYPECHECK" | "TEST" | "LINT" | "MANUAL_QA" | "RUNTIME_SMOKE" | "CUSTOM";
+export type ValidationEvidenceSource = "self-check" | "external";
+
 export interface QAExecutionResult {
   name: string;
-  status: "PASS" | "FAIL";
+  status: "PASS" | "FAIL" | "UNKNOWN";
   command: string;
   startedAt: string;
   completedAt: string;
   durationMs: number;
   summary?: string;
   reason?: string;
+  kind?: ValidationEvidenceKind;
+  source?: ValidationEvidenceSource;
+}
+
+export interface RecordValidationEvidenceInput {
+  root: string;
+  kind: ValidationEvidenceKind;
+  status: "PASS" | "FAIL" | "UNKNOWN";
+  name?: string;
+  command?: string;
+  summary?: string;
+  reason?: string;
+  source?: ValidationEvidenceSource;
 }
 
 export interface SetupStatus {
@@ -91,6 +107,8 @@ export interface ProjectState {
   lastReportPath?: string;
   lastPromptPath?: string;
   lastHandoffPath?: string;
+  lastTaskGoal?: string;
+  lastTaskGoalSource?: "explicit-task" | "diff-inferred";
 }
 
 export interface DoneProcessingResult {
@@ -253,6 +271,7 @@ export interface HistoryRecord {
 }
 
 interface PackageJson {
+  name?: string;
   packageManager?: string;
   scripts?: Record<string, string>;
 }
@@ -388,6 +407,68 @@ export async function recordQAExecutionResult(root: string, result: QAExecutionR
   await writeRuntimeState(root, { ...current, qaResults });
 }
 
+function defaultNameForValidationKind(kind: ValidationEvidenceKind): string {
+  switch (kind) {
+    case "BUILD":
+      return "build";
+    case "TYPECHECK":
+      return "typecheck";
+    case "TEST":
+      return "test";
+    case "LINT":
+      return "lint";
+    case "MANUAL_QA":
+      return "manual-qa";
+    case "RUNTIME_SMOKE":
+      return "runtime-smoke";
+    default:
+      return "custom";
+  }
+}
+
+export async function recordValidationEvidence(input: RecordValidationEvidenceInput): Promise<QAExecutionResult> {
+  const now = new Date().toISOString();
+  const name = input.name?.trim() || defaultNameForValidationKind(input.kind);
+  const result: QAExecutionResult = {
+    name,
+    kind: input.kind,
+    status: input.status,
+    command: input.command?.trim() ?? "",
+    startedAt: now,
+    completedAt: now,
+    durationMs: 0,
+    summary: input.summary?.trim() || undefined,
+    reason: input.reason?.trim() || undefined,
+    source: input.source ?? "external"
+  };
+  await recordQAExecutionResult(input.root, result);
+  return result;
+}
+
+function resolveValidationKind(result: QAExecutionResult): ValidationEvidenceKind {
+  if (result.kind) return result.kind;
+  if (result.name === "build") return "BUILD";
+  return "CUSTOM";
+}
+
+function qaEntriesByKind(qaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind): QAExecutionResult[] {
+  if (!qaResults) return [];
+  return Object.values(qaResults).filter((result) => resolveValidationKind(result) === kind);
+}
+
+type AggregatedValidationStatus = "PASS" | "FAIL" | "UNKNOWN" | "NOT_RECORDED";
+
+function aggregateValidationStatus(entries: QAExecutionResult[]): AggregatedValidationStatus {
+  if (entries.length === 0) return "NOT_RECORDED";
+  if (entries.some((entry) => entry.status === "FAIL")) return "FAIL";
+  if (entries.every((entry) => entry.status === "PASS")) return "PASS";
+  return "UNKNOWN";
+}
+
+function hasAnyRecordedValidationEvidence(qaResults: Record<string, QAExecutionResult> | undefined): boolean {
+  return Boolean(qaResults && Object.keys(qaResults).length > 0);
+}
+
 export async function refreshRuntimeLocale(root: string): Promise<DevGuardLocale> {
   const locale = await resolveDevGuardLocale(root);
   const current = await readRuntimeState(root);
@@ -491,6 +572,8 @@ export function isIgnoredWatchPath(path: string): boolean {
     normalized.startsWith("build/") ||
     normalized.startsWith(".git/") ||
     normalized.startsWith("coverage/") ||
+    normalized.startsWith(".turbo/") ||
+    normalized.endsWith(".tsbuildinfo") ||
     normalized === runtimePath ||
     normalized === devguardPaths.state ||
     normalized === devguardPaths.history ||
@@ -575,13 +658,20 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   const judgments = buildJudgments({ areas, clusters, checkFindings: checkReport.findings.map((finding) => finding.message), architectureMarkdown, decisionsMarkdown });
   const drift = clusters.mixedRisk;
   const summary = formatInferredDiffIntentClusters(clusters);
+  const previousProjectState = await readProjectState(root);
+  const canonicalTaskGoal = runtime.currentTask?.text?.trim() || undefined;
   const documentationSummary = buildDocumentationSummary({
     changedFiles,
     diffText,
     diffStat,
     taskText: [runtime.currentTask?.text ?? "", tasksMarkdown, projectMarkdown].join("\n\n"),
+    canonicalGoal: canonicalTaskGoal,
     qaResults: runtime.qaResults
   });
+  const sessionTaskGoal = canonicalTaskGoal ?? previousProjectState.lastTaskGoal;
+  const sessionTaskGoalSource: "explicit-task" | "diff-inferred" = canonicalTaskGoal
+    ? "explicit-task"
+    : previousProjectState.lastTaskGoalSource ?? "diff-inferred";
   const codeIndex = await updateCodeIndex(root, changedFiles, documentationSummary);
   const timestamp = new Date().toISOString();
   const majorChanges = inferMajorChanges({ summary, changedFiles, areas, diffText });
@@ -686,6 +776,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
       lastQualityVerdict: qualityReport.verdict,
       lastQualityNextAction: qualityReport.nextRecommendedAction,
       lastChangedFiles: changedFiles,
+      lastTaskGoal: sessionTaskGoal,
+      lastTaskGoalSource: sessionTaskGoalSource,
       lastReportPath: reportPath,
       lastPromptPath: promptPath,
       lastHandoffPath: projectHandoffPath
@@ -2547,7 +2639,7 @@ function workingResumeStart(entryFiles: string[], nextAreas: string[]): string[]
   return [
     `먼저 \`${firstFile}\`를 열고 현재 변경 지점을 확인한다.`,
     `${firstArea} 범위 안에서만 수정한다.`,
-    "`pnpm run build`, `pnpm cli self-check`, `pnpm cli done` 순서로 검증하고 Working Context가 갱신되는지 확인한다."
+    "`pnpm run build`, `dev-guard self-check`, `dev-guard done` 순서로 검증하고 Working Context가 갱신되는지 확인한다."
   ];
 }
 
@@ -2670,6 +2762,7 @@ function buildDocumentationSummary(input: {
   diffText: string;
   diffStat: string;
   taskText: string;
+  canonicalGoal?: string;
   qaResults?: Record<string, QAExecutionResult>;
 }): DocumentationSummary {
   const fileDiffs = splitUnifiedDiffByFile(input.diffText);
@@ -2680,7 +2773,7 @@ function buildDocumentationSummary(input: {
   const affected = affectedAreasFromDocumentation(fileChanges, changeTypes);
   const risk = documentationRisk(fileChanges, changeTypes);
   return {
-    goal: documentationGoal(input.taskText, fileChanges, changeTypes),
+    goal: documentationGoal(input.taskText, fileChanges, changeTypes, input.canonicalGoal),
     overview: documentationOverview(fileChanges, changeTypes),
     changeTypes,
     impact: {
@@ -2920,7 +3013,7 @@ function inferConcreteQA(file: string, types: ChangeType[], added: string[], rem
   const checks = new Set<string>();
   const text = `${file}\n${added.join("\n")}\n${removed.join("\n")}`;
   if (/runtime-state\.ts$/.test(file)) {
-    checks.add("Run `pnpm cli done` and verify generated artifacts describe feature-level changes, not code-token changes.");
+    checks.add("Run `dev-guard done` and verify generated artifacts describe feature-level changes, not code-token changes.");
     checks.add("Read Quality Report, Handoff, Working Context, and Agent Context for the same Change Intelligence summary.");
     checks.add("Confirm feature examples inside the generator are not reported as actual product changes unless the related product files changed.");
     return [...checks].slice(0, 5);
@@ -2942,15 +3035,22 @@ function inferConcreteQA(file: string, types: ChangeType[], added: string[], rem
   if (types.includes("Config") || types.includes("Release")) checks.add("Verify package versions, dependency specifiers, and lockfile are consistent.");
   if (types.includes("Docs")) checks.add("Confirm docs describe commands and artifacts that actually exist.");
   if (types.includes("QA")) checks.add("Regenerate Quality Report, Handoff, Working Context, and Agent Context and read the generated output.");
-  if (/install-agent-instructions\.ts$/.test(file)) checks.add("Run `pnpm cli install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.");
+  if (/install-agent-instructions\.ts$/.test(file)) checks.add("Run `dev-guard install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.");
   return [...checks].slice(0, 5);
 }
 
+const GENERIC_FILLER_SENTENCES = new Set([
+  "No diff detail was available for this file.",
+  "Updates implementation support for the current request.",
+  "Adjusts UI rendering or interaction behavior."
+]);
+
 function documentationOverview(files: DocumentationFileChange[], types: ChangeType[]): string[] {
   if (files.length === 0) return ["No source changes were detected in the current diff."];
-  const primary = files.slice(0, 4).flatMap((file) => file.changes.slice(0, 2));
-  if (primary.length > 0) return primary.slice(0, 6);
-  return [`Change types: ${types.join(", ")}.`].slice(0, 6);
+  const primary = [...new Set(files.slice(0, 4).flatMap((file) => file.changes.slice(0, 2)))];
+  const meaningful = primary.filter((line) => !GENERIC_FILLER_SENTENCES.has(line));
+  if (meaningful.length > 0) return meaningful.slice(0, 6);
+  return ["Specific change content could not be summarized automatically — check the diff directly."];
 }
 
 function affectedAreasFromDocumentation(files: DocumentationFileChange[], types: ChangeType[]): string[] {
@@ -2971,18 +3071,52 @@ function unaffectedAreasFromDocumentation(affected: string[]): string[] {
 }
 
 function documentationQAChecks(files: DocumentationFileChange[], types: ChangeType[], qaResults?: Record<string, QAExecutionResult>): string[] {
-  const checks = new Set(files.flatMap((file) => file.qa));
-  if (types.includes("Build") || types.includes("Logic") || types.includes("QA")) checks.add("Run `pnpm run build`.");
-  checks.add("Run `pnpm cli self-check`.");
-  checks.add("Run `pnpm cli done`.");
-  return [...checks].slice(0, 10);
+  const checks: string[] = [];
+  const seen = new Set<string>();
+  const add = (item: string) => {
+    if (!seen.has(item)) {
+      seen.add(item);
+      checks.push(item);
+    }
+  };
+
+  for (const entry of qaEntriesByKind(qaResults, "RUNTIME_SMOKE")) {
+    if (entry.status === "FAIL") add(`Fix and re-verify runtime smoke: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
+    else if (entry.status === "UNKNOWN") add(`Resolve unresolved runtime smoke: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
+  }
+  const manualStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "MANUAL_QA"));
+  if (types.includes("UI") && manualStatus !== "PASS") add("Perform manual browser/mobile QA for the changed UI.");
+
+  for (const file of files) {
+    for (const qa of file.qa) add(qa);
+  }
+
+  const buildStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "BUILD"));
+  if ((types.includes("Build") || types.includes("Logic") || types.includes("QA")) && buildStatus !== "PASS") add("Run `pnpm run build`.");
+  const selfCheckEntry = qaResults?.["self-check"];
+  if (!selfCheckEntry || selfCheckEntry.status !== "PASS") add("Run `dev-guard self-check`.");
+  add("Run `dev-guard done`.");
+  return checks.slice(0, 10);
 }
 
 function documentationRemainingWork(files: DocumentationFileChange[], types: ChangeType[], qaResults?: Record<string, QAExecutionResult>): string[] {
   const remaining = new Set<string>();
-  if (!qaResults?.build) remaining.add("Build result is not recorded for this generated report.");
-  if (!qaResults?.["self-check"]) remaining.add("Self Check result is not recorded for this generated report.");
-  if (types.includes("UI")) remaining.add("Manual browser/mobile QA is still needed for UI changes.");
+  const buildStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "BUILD"));
+  if (buildStatus === "NOT_RECORDED") remaining.add("Build result is not recorded in DevGuard (this does not mean the build was not run, only that no result was recorded).");
+  else if (buildStatus === "FAIL") remaining.add("Recorded Build evidence failed; fix the build before this can be considered complete.");
+  const selfCheckEntry = qaResults?.["self-check"];
+  if (!selfCheckEntry) remaining.add("Self Check result is not recorded in DevGuard.");
+  else if (selfCheckEntry.status === "FAIL") remaining.add(`Recorded Self Check evidence failed${selfCheckEntry.reason ? `: ${selfCheckEntry.reason}` : "."}`);
+
+  const manualStatus = aggregateValidationStatus(qaEntriesByKind(qaResults, "MANUAL_QA"));
+  if (types.includes("UI")) {
+    if (manualStatus === "FAIL") remaining.add("Recorded Manual QA evidence failed for this UI change.");
+    else if (manualStatus === "NOT_RECORDED") remaining.add("Manual browser/mobile QA is still needed for UI changes.");
+  }
+  for (const entry of qaEntriesByKind(qaResults, "RUNTIME_SMOKE")) {
+    if (entry.status === "FAIL") remaining.add(`Runtime smoke failed: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
+    if (entry.status === "UNKNOWN") remaining.add(`Runtime smoke unresolved: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
+  }
   if (types.includes("Docs")) remaining.add("Read changed docs and confirm examples match current CLI output.");
   if (types.includes("QA")) remaining.add("Read regenerated artifacts and confirm they describe feature-level changes instead of code-token changes.");
   if (files.length === 0) remaining.add("No changed files were available; rerun after a real diff if this is unexpected.");
@@ -3009,7 +3143,11 @@ function documentationStructure(types: ChangeType[], files: DocumentationFileCha
   return ["changed files", "↓", "Change Intelligence", "↓", "generated DevGuard artifacts"];
 }
 
-function documentationGoal(taskText: string, files: DocumentationFileChange[], types: ChangeType[]): string {
+function documentationGoal(taskText: string, files: DocumentationFileChange[], types: ChangeType[], canonicalGoal?: string): string {
+  const explicitCanonical = canonicalGoal?.trim();
+  if (explicitCanonical) {
+    return explicitCanonical.length > 300 ? `${explicitCanonical.slice(0, 297)}...` : explicitCanonical;
+  }
   const explicit = taskText
     .split(/\r?\n/)
     .map((line) => line.replace(/^[-#*\s]+/, "").trim())
@@ -4065,17 +4203,20 @@ async function inferTestCandidates(root: string, input: { areas: string[]; chang
   const rootScripts = rootPackage.scripts ?? {};
   const cliScripts = cliPackage.scripts ?? {};
   const usesPnpm = (rootPackage.packageManager ?? "").startsWith("pnpm") || Object.keys(rootScripts).some((script) => script === "cli");
+  const isDevGuardRepoItself = rootPackage.name === "dev-guard";
   const tests = new Set<string>();
   const runner = usesPnpm ? "pnpm" : "npm";
   if (rootScripts.build) tests.add(`${runner} run build`);
   if (rootScripts.test) tests.add(`${runner} test`);
-  if (rootScripts.cli) {
+  if (isDevGuardRepoItself && rootScripts.cli) {
     if (input.changedFiles.some((file) => file.includes("watch"))) tests.add(`${runner} cli watch --stable-after 1 --compact`);
     if (input.changedFiles.some((file) => file.includes("runtime") || file.includes("index.ts"))) tests.add(`${runner} cli done`);
     tests.add(`${runner} cli status`);
     if (input.areas.includes("docs")) tests.add(`${runner} cli update`);
-  } else if (cliScripts.cli && usesPnpm) {
+  } else if (isDevGuardRepoItself && cliScripts.cli && usesPnpm) {
     tests.add("pnpm --filter @dev-guard/cli cli status");
+  } else {
+    tests.add("dev-guard status");
   }
   if (tests.size === 0) tests.add("확인 필요: package.json scripts에서 검증 명령을 찾지 못함");
   return [...tests];
@@ -4501,7 +4642,7 @@ function buildQualitySummary(input: {
     return [
       "This change turns the generated Quality Report into a QA result document instead of a generic checklist.",
       "The report should explain the verdict, summarize the change, describe what changed per file, and separate completed QA from missing QA.",
-      "Because the report generation logic changed, the regenerated markdown must be read directly after `pnpm cli done`.",
+      "Because the report generation logic changed, the regenerated markdown must be read directly after `dev-guard done`.",
       "Build success alone cannot prove the generated QA wording is specific, natural, and free of internal rule labels."
     ];
   }
@@ -4670,8 +4811,8 @@ function openAIKeyQualityReviewItem(changedFiles: string[]): QualityReviewItem {
     ],
     files,
     checks: [
-      "pnpm cli config set openaiApiKey <test-key>",
-      "pnpm cli done with no OPENAI_API_KEY/DEV_GUARD_OPENAI_API_KEY",
+      "dev-guard config set openaiApiKey <test-key>",
+      "dev-guard done with no OPENAI_API_KEY/DEV_GUARD_OPENAI_API_KEY",
       "Dashboard /api/state exposes configured/source only",
       "Quality Report and Project Handoff are generated after fallback"
     ]
@@ -4743,7 +4884,7 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
       title: "CLI command and help consistency",
       body: ["Confirm changed CLI routing or output still matches README/docs and the commands users will run."],
       files,
-      checks: ["pnpm cli --help", "pnpm cli help advanced", "pnpm cli status"]
+      checks: ["dev-guard --help", "dev-guard help advanced", "dev-guard status"]
     };
   }
   if (item.label === "watch verification") {
@@ -4751,7 +4892,7 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
       title: "Watch behavior check",
       body: ["Confirm watch still tracks real project changes and ignores DevGuard internal files."],
       files,
-      checks: ["pnpm cli watch --stable-after 1 --compact", "pnpm cli done", "pnpm cli status"]
+      checks: ["dev-guard watch --stable-after 1 --compact", "dev-guard done", "dev-guard status"]
     };
   }
   if (item.label === "state/history verification") {
@@ -4760,14 +4901,14 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
         title: "Quality Report output review",
         body: ["Regenerate the Quality Report and confirm it reads like a QA result: verdict, change summary, file-level changes, completed QA, missing QA, risks, and next QA."],
         files,
-        checks: ["pnpm cli done", "Read .devguard/reports/quality-report.md", "Confirm no internal rule names or generic review-only phrases appear in the main sections."]
+        checks: ["dev-guard done", "Read .devguard/reports/quality-report.md", "Confirm no internal rule names or generic review-only phrases appear in the main sections."]
       };
     }
     return {
       title: "Report and handoff regeneration",
       body: ["Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly."],
       files,
-      checks: ["pnpm cli done", "pnpm cli status", "pnpm cli handoff"]
+      checks: ["dev-guard done", "dev-guard status", "dev-guard handoff"]
     };
   }
   if (item.label === "risky areas") {
@@ -5084,47 +5225,71 @@ function formatAIQualitySection(report: QualityReport, locale: DevGuardLocale): 
 
 function formatQASnapshot(report: QualityReport, locale: DevGuardLocale): string[] {
   const overall = report.verdict === "PASS" ? "🟢 PASS" : report.verdict === "BLOCKED" ? "🔴 BLOCKED" : "🟡 NEEDS_REVIEW";
-  const buildStatus = qaCommandStatus(report, /\bbuild\b/i, locale);
-  const selfCheckStatus = qaCommandStatus(report, /self-check/i, locale);
-  const manualStatus = manualQAStatus(report, locale);
-  const regression = regressionRiskLevel(report, locale);
   const labels = locale === "ko-KR"
-    ? { overall: "Overall", build: "Build", self: "Self Check", manual: "Manual QA", regression: "Regression Risk" }
-    : { overall: "Overall", build: "Build", self: "Self Check", manual: "Manual QA", regression: "Regression Risk" };
+    ? { overall: "Overall", build: "Build", typecheck: "Typecheck", tests: "Targeted Tests", self: "Self Check", manual: "Manual QA", regression: "Regression Risk", item: "항목", status: "상태" }
+    : { overall: "Overall", build: "Build", typecheck: "Typecheck", tests: "Targeted Tests", self: "Self Check", manual: "Manual QA", regression: "Regression Risk", item: "Item", status: "Status" };
+  const rows: string[][] = [
+    [labels.overall, overall],
+    [labels.build, formatKindStatus(report, "BUILD", locale)],
+    [labels.typecheck, formatKindStatus(report, "TYPECHECK", locale)],
+    [labels.tests, formatKindStatus(report, "TEST", locale)],
+    [labels.self, qaLegacyStatus(report, "self-check", locale)],
+    [labels.manual, formatKindStatus(report, "MANUAL_QA", locale, () => manualQAFallback(report, locale))],
+    [labels.regression, regressionRiskLevel(report, locale)]
+  ];
+  const smokeEntries = qaEntriesByKind(report.qaResults, "RUNTIME_SMOKE");
+  if (smokeEntries.length > 0) {
+    for (const entry of smokeEntries) {
+      rows.push([`${locale === "ko-KR" ? "Runtime Smoke" : "Runtime Smoke"}: ${entry.name}`, formatQAStatus(entry, locale)]);
+    }
+  }
   return [
-    `| ${locale === "ko-KR" ? "항목" : "Item"} | ${locale === "ko-KR" ? "상태" : "Status"} |`,
+    `| ${labels.item} | ${labels.status} |`,
     "| --- | --- |",
-    `| ${labels.overall} | ${overall} |`,
-    `| ${labels.build} | ${buildStatus} |`,
-    `| ${labels.self} | ${selfCheckStatus} |`,
-    `| ${labels.manual} | ${manualStatus} |`,
-    `| ${labels.regression} | ${regression} |`
+    ...rows.map(([label, status]) => `| ${label} | ${status} |`)
   ];
 }
 
-function qaCommandStatus(report: QualityReport, pattern: RegExp, locale: DevGuardLocale): string {
-  const result = pattern.source.includes("build") ? report.qaResults?.build : pattern.source.includes("self-check") ? report.qaResults?.["self-check"] : undefined;
-  if (result) return formatQAStatus(result, locale);
-  const command = report.requiredVerification.find((item) => pattern.test(item));
-  if (!command) return locale === "ko-KR" ? "최근 실행 결과 없음" : "No recent result";
-  return locale === "ko-KR" ? `최근 실행 결과 없음 (${command})` : `No recent result (${command})`;
+function notRecordedLabel(locale: DevGuardLocale): string {
+  return locale === "ko-KR" ? "⚪ DevGuard에 결과가 기록되지 않음" : "⚪ Not recorded by DevGuard";
 }
 
-function manualQAStatus(report: QualityReport, locale: DevGuardLocale): string {
+function formatKindStatus(report: QualityReport, kind: ValidationEvidenceKind, locale: DevGuardLocale, onNotRecorded?: () => string): string {
+  const entries = qaEntriesByKind(report.qaResults, kind);
+  const aggregate = aggregateValidationStatus(entries);
+  if (aggregate === "NOT_RECORDED") {
+    return onNotRecorded ? onNotRecorded() : notRecordedLabel(locale);
+  }
+  if (aggregate === "UNKNOWN") {
+    const detail = entries.find((entry) => entry.status === "UNKNOWN");
+    const reason = detail?.reason || detail?.summary;
+    return `🟡 UNKNOWN${reason ? ` (${reason})` : ""}`;
+  }
+  const failing = entries.find((entry) => entry.status === "FAIL");
+  return formatQAStatus(failing ?? entries[entries.length - 1], locale);
+}
+
+function qaLegacyStatus(report: QualityReport, name: string, locale: DevGuardLocale): string {
+  const result = report.qaResults?.[name];
+  if (result) return formatQAStatus(result, locale);
+  return notRecordedLabel(locale);
+}
+
+function manualQAFallback(report: QualityReport, locale: DevGuardLocale): string {
   if (report.verdict === "PASS") return locale === "ko-KR" ? "현재 규칙상 추가 요구 없음" : "Not required by current rules";
-  return locale === "ko-KR" ? "대기" : "Pending";
+  return notRecordedLabel(locale);
 }
 
 function formatQAStatus(result: QAExecutionResult, locale: DevGuardLocale): string {
-  const icon = result.status === "PASS" ? "✅" : "❌";
+  const icon = result.status === "PASS" ? "✅" : result.status === "UNKNOWN" ? "🟡" : "❌";
   const seconds = Math.max(0, Math.round(result.durationMs / 1000));
   const time = new Date(result.completedAt).toLocaleString(locale === "ko-KR" ? "ko-KR" : "en-US", {
     dateStyle: "short",
     timeStyle: "short"
   });
-  return locale === "ko-KR"
-    ? `${icon} ${result.status} (${seconds}s, ${time})`
-    : `${icon} ${result.status} (${seconds}s, ${time})`;
+  const detail = result.summary || result.reason;
+  const suffix = detail ? `, ${detail}` : "";
+  return `${icon} ${result.status} (${seconds}s, ${time}${suffix})`;
 }
 
 function formatFinalVerdict(report: QualityReport, locale: DevGuardLocale): string[] {
@@ -5388,28 +5553,38 @@ function regressionRiskLevel(report: QualityReport, locale: DevGuardLocale): str
 }
 
 function formatQAConfidence(report: QualityReport, locale: DevGuardLocale): string[] {
-  const build = report.qaResults?.build;
-  const selfCheck = report.qaResults?.["self-check"];
-  const automaticPassed = build?.status === "PASS" && selfCheck?.status === "PASS";
-  const anyFailed = build?.status === "FAIL" || selfCheck?.status === "FAIL";
+  const coreEntries = [
+    ...qaEntriesByKind(report.qaResults, "BUILD"),
+    ...qaEntriesByKind(report.qaResults, "TYPECHECK"),
+    ...qaEntriesByKind(report.qaResults, "TEST"),
+    ...(report.qaResults?.["self-check"] ? [report.qaResults["self-check"]] : [])
+  ];
+  const anyFailed = coreEntries.some((entry) => entry.status === "FAIL");
+  const anyRecorded = hasAnyRecordedValidationEvidence(report.qaResults);
+  const corePassed = coreEntries.length > 0 && coreEntries.every((entry) => entry.status === "PASS");
   if (anyFailed) {
     return locale === "ko-KR"
-      ? ["Low", "", "Build 또는 Self Check 실패가 기록되어 QA 신뢰도가 낮습니다."]
-      : ["Low", "", "Build or Self Check failed, so QA confidence is low."];
+      ? ["Low", "", "Build/Typecheck/Test 중 기록된 실패 evidence가 있어 QA 신뢰도가 낮습니다."]
+      : ["Low", "", "A recorded Build/Typecheck/Test failure exists, so QA confidence is low."];
   }
-  if (automaticPassed && report.verdict === "PASS") {
+  if (corePassed && report.verdict === "PASS") {
     return locale === "ko-KR"
-      ? ["High", "", "Build와 Self Check가 통과했고 현재 품질 규칙에서 추가 QA 요구가 없습니다."]
-      : ["High", "", "Build and Self Check passed, and current quality rules do not require more QA."];
+      ? ["High", "", "Build/Typecheck/Test가 통과로 기록되었고 현재 품질 규칙에서 추가 QA 요구가 없습니다."]
+      : ["High", "", "Build/Typecheck/Test are recorded as PASS, and current quality rules do not require more QA."];
   }
-  if (automaticPassed) {
+  if (corePassed) {
     return locale === "ko-KR"
-      ? ["Medium", "", "Build와 Self Check는 통과했지만 Manual QA 또는 생성물 직접 확인이 남아 있습니다."]
-      : ["Medium", "", "Build and Self Check passed, but manual QA or generated output review remains."];
+      ? ["Medium", "", "Build/Typecheck/Test는 통과로 기록되었지만 Manual QA 또는 Runtime Smoke 확인이 남아 있습니다."]
+      : ["Medium", "", "Build/Typecheck/Test are recorded as PASS, but manual QA or runtime smoke evidence still remains."];
+  }
+  if (!anyRecorded) {
+    return locale === "ko-KR"
+      ? ["Unknown", "", "DevGuard에 기록된 검증 evidence가 없어 QA 신뢰도를 판단할 수 없습니다. 실행하지 않았다는 뜻이 아니라 결과가 기록되지 않았다는 뜻입니다."]
+      : ["Unknown", "", "No validation evidence is recorded in DevGuard, so QA confidence cannot be judged. This does not mean the work was not run — only that no result was recorded."];
   }
   return locale === "ko-KR"
-    ? ["Low", "", "Build 또는 Self Check의 최근 실행 결과가 기록되어 있지 않습니다."]
-    : ["Low", "", "No recent Build or Self Check result is recorded."];
+    ? ["Unknown", "", "일부 검증 evidence만 기록되어 있어 Build/Typecheck/Test 전체 결과를 판단할 수 없습니다."]
+    : ["Unknown", "", "Only partial validation evidence is recorded, so the full Build/Typecheck/Test result cannot be judged."];
 }
 
 function formatQualityVerdictReasons(report: QualityReport, locale: DevGuardLocale): string[] {
@@ -5446,7 +5621,7 @@ function formatNextQAActions(report: QualityReport, items: QualityReviewItem[], 
     actions.push(`${start + index}. ${locale === "ko-KR" ? `${formatCommandObject(command)} 실행 결과를 이 보고서의 QA 상태와 비교합니다.` : `Run \`${command}\` and compare the result with this QA status.`}`);
   });
   if (report.verdict !== "PASS") {
-    actions.push(`${actions.length + 1}. ${locale === "ko-KR" ? "필요한 QA가 끝나면 `pnpm cli done`으로 보고서를 다시 생성해 판정이 바뀌는지 확인합니다." : "After QA is complete, run `pnpm cli done` again and confirm whether the verdict changes."}`);
+    actions.push(`${actions.length + 1}. ${locale === "ko-KR" ? "필요한 QA가 끝나면 `dev-guard done`으로 보고서를 다시 생성해 판정이 바뀌는지 확인합니다." : "After QA is complete, run `dev-guard done` again and confirm whether the verdict changes."}`);
   }
   return actions.slice(0, 7);
 }
@@ -5719,7 +5894,7 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.": "이번 변경은 DevGuard가 로컬 점검 결과를 사용자용 Quality Report와 인수인계 안내로 바꾸는 방식에 영향을 줍니다.",
     "This change turns the generated Quality Report into a QA result document instead of a generic checklist.": "이번 변경은 생성되는 Quality Report를 일반 체크리스트가 아니라 QA 결과 보고서로 바꾸는 작업입니다.",
     "The report should explain the verdict, summarize the change, describe what changed per file, and separate completed QA from missing QA.": "보고서는 판정 이유, 변경 요약, 파일별 변경 내용, 완료된 QA와 남은 QA를 구분해서 설명해야 합니다.",
-    "Because the report generation logic changed, the regenerated markdown must be read directly after `pnpm cli done`.": "보고서 생성 로직이 바뀌었으므로 `pnpm cli done` 후 재생성된 markdown을 직접 읽어야 합니다.",
+    "Because the report generation logic changed, the regenerated markdown must be read directly after `dev-guard done`.": "보고서 생성 로직이 바뀌었으므로 `dev-guard done` 후 재생성된 markdown을 직접 읽어야 합니다.",
     "Build success alone cannot prove the generated QA wording is specific, natural, and free of internal rule labels.": "빌드 통과만으로는 생성된 QA 문구가 구체적이고 자연스러우며 내부 rule label을 노출하지 않는지 보장할 수 없습니다.",
     "Quality Report generation changed, so the generated markdown itself is the behavior under test.": "Quality Report 생성 로직이 바뀌었으므로 생성된 markdown 자체가 이번 QA 대상입니다.",
     "The report must show what changed, why the verdict was chosen, what QA is complete, and what QA remains.": "보고서는 무엇이 바뀌었는지, 왜 이 판정이 나왔는지, 어떤 QA가 끝났고 무엇이 남았는지 보여줘야 합니다.",
@@ -5751,7 +5926,7 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Confirm the diff is focused on Quality Report QA wording and generation behavior without changing Dashboard, Handoff, watch, hook, or release behavior.": "diff가 Dashboard, Handoff, watch, hook, release 동작을 바꾸지 않고 Quality Report QA 문구와 생성 동작에만 집중되어 있는지 확인하세요.",
     "Confirm no internal rule names appear in the main sections.": "주요 섹션에 내부 규칙 이름이 그대로 노출되지 않는지 확인하세요.",
     "Confirm docs describe commands and artifacts that actually exist.": "문서가 실제 존재하는 명령과 산출물을 설명하는지 확인하세요.",
-    "Run `pnpm cli install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.": "`pnpm cli install-agent-instructions --force`를 실행한 뒤 AGENTS.md / CLAUDE.md를 확인하세요.",
+    "Run `dev-guard install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.": "`dev-guard install-agent-instructions --force`를 실행한 뒤 AGENTS.md / CLAUDE.md를 확인하세요.",
     "Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read.": "변경된 소스 동작이 명령어, Dashboard 문구, 설정, hook, 보고서, 사용자가 읽는 생성 파일에 영향을 주는지 확인하세요.",
     "Confirm the changed files all support the current request and remove or split unrelated work before finishing.": "변경된 파일이 모두 현재 요청을 뒷받침하는지 확인하고, 관련 없는 작업은 제거하거나 분리하세요.",
     "Confirm the changed files still belong to one coherent task and split unrelated work if needed.": "변경 파일이 하나의 작업 목표에 속하는지 확인하고, 관련 없는 작업은 필요하면 분리하세요.",
@@ -5778,8 +5953,8 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Generated documentation logic changed; build success does not prove output quality.": "생성 문서 로직이 바뀌었으므로 빌드 통과만으로 출력 품질을 보장할 수 없습니다.",
     "Generated documentation logic changed; build success does not prove the artifacts explain the actual feature changes.": "생성 문서 로직이 바뀌었으므로 빌드 통과만으로 산출물이 실제 기능 변경을 설명하는지 보장할 수 없습니다.",
     "Regenerate Quality Report, Handoff, Working Context, and Agent Context and read the generated output.": "Quality Report, Handoff, Working Context, Agent Context를 재생성한 뒤 출력 내용을 직접 읽어 확인하세요.",
-    "Run `pnpm cli done` and verify generated artifacts use concrete diff-based changes.": "`pnpm cli done`을 실행하고 생성 산출물이 구체적인 diff 기반 변경 내용을 사용하는지 확인하세요.",
-    "Run `pnpm cli done` and verify generated artifacts describe feature-level changes, not code-token changes.": "`pnpm cli done`을 실행하고 생성 산출물이 코드 토큰 변경이 아니라 기능 단위 변경을 설명하는지 확인하세요.",
+    "Run `dev-guard done` and verify generated artifacts use concrete diff-based changes.": "`dev-guard done`을 실행하고 생성 산출물이 구체적인 diff 기반 변경 내용을 사용하는지 확인하세요.",
+    "Run `dev-guard done` and verify generated artifacts describe feature-level changes, not code-token changes.": "`dev-guard done`을 실행하고 생성 산출물이 코드 토큰 변경이 아니라 기능 단위 변경을 설명하는지 확인하세요.",
     "Read Quality Report, Handoff, Working Context, and Agent Context for the same change summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 변경 요약을 사용하는지 확인하세요.",
     "Read Quality Report, Handoff, Working Context, and Agent Context for the same Change Intelligence summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 Change Intelligence 요약을 사용하는지 확인하세요.",
     "Confirm feature examples inside the generator are not reported as actual product changes unless the related product files changed.": "관련 제품 파일이 바뀌지 않았다면 생성기 내부의 feature 예시가 실제 제품 변경으로 보고되지 않는지 확인하세요.",
@@ -5840,8 +6015,8 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     .replace(/^(.+) Focus on (.+)\. Then run the required verification commands\.$/, "$1 관련 파일: $2. 그런 다음 필요한 검증 명령을 실행하세요.")
     .replace(/^Change types: /, "변경 유형: ")
     .replace(/^Run `pnpm run build`\.$/, "`pnpm run build`를 실행하세요.")
-    .replace(/^Run `pnpm cli self-check`\.$/, "`pnpm cli self-check`를 실행하세요.")
-    .replace(/^Run `pnpm cli done`\.$/, "`pnpm cli done`을 실행하세요.")
+    .replace(/^Run `dev-guard self-check`\.$/, "`dev-guard self-check`를 실행하세요.")
+    .replace(/^Run `dev-guard done`\.$/, "`dev-guard done`을 실행하세요.")
     .replace(/\bRefactor\b/g, "리팩터링")
     .replace(/\bLogic\b/g, "로직")
     .replace(/\bData\b/g, "데이터")
@@ -5903,7 +6078,7 @@ function renderProjectHandoff(input: {
   const state = parseProjectState(input.state);
   const changedFiles = state.lastChangedFiles ?? lastHistoryFiles(input.records);
   const documentationSummary = state.lastDocumentationSummary;
-  const goal = handoffGoal(nextTask, changedFiles, quality, input.locale, documentationSummary);
+  const goal = handoffGoal(nextTask, changedFiles, quality, input.locale, documentationSummary, state.lastTaskGoal);
   const fileChanges = handoffFileChanges(changedFiles, quality, input.locale, documentationSummary);
   const qualityLines = handoffQualityLines(quality, changedFiles, input.locale, documentationSummary);
   const outstanding = handoffOutstandingItems(quality, changedFiles, input.locale, documentationSummary);
@@ -5939,15 +6114,18 @@ function renderProjectHandoff(input: {
   return body.join("\n") + "\n";
 }
 
-function handoffGoal(nextTask: string, changedFiles: string[], quality: ParsedQuality, locale: DevGuardLocale, documentationSummary?: DocumentationSummary): string[] {
+function handoffGoal(nextTask: string, changedFiles: string[], quality: ParsedQuality, locale: DevGuardLocale, documentationSummary?: DocumentationSummary, canonicalTaskGoal?: string): string[] {
   const cleanTask = sanitizeHandoffText(nextTask);
   const inferred = inferGoalFromFiles(changedFiles, locale);
+  const canonicalGoal = canonicalTaskGoal?.trim();
   const summaryGoal = documentationSummary?.goal ? localizeSentence(documentationSummary.goal, locale) : undefined;
-  const goal = summaryGoal && isUsefulHandoffText(summaryGoal)
-    ? summaryGoal
-    : isUsefulHandoffText(cleanTask) && !looksStaleHandoffTask(cleanTask, changedFiles)
-      ? cleanTask
-      : inferred;
+  const goal = canonicalGoal && isUsefulHandoffText(canonicalGoal)
+    ? canonicalGoal
+    : summaryGoal && isUsefulHandoffText(summaryGoal)
+      ? summaryGoal
+      : isUsefulHandoffText(cleanTask) && !looksStaleHandoffTask(cleanTask, changedFiles)
+        ? cleanTask
+        : inferred;
   const status = completionStatus(quality.verdict);
   if (locale === "ko-KR") {
     return [
@@ -6164,7 +6342,7 @@ function handoffNextActions(quality: ParsedQuality, nextTask: string, files: str
         ? "2. BLOCKED 이유에 해당하는 파일과 실패 원인을 먼저 수정합니다."
         : "2. 문제가 있으면 해당 파일의 Handoff 생성 문구와 필터링 로직만 수정합니다.",
       `3. 수정 후 ${formatCommandRunList(handoffVerificationCommands(quality, files))}을 실행합니다.`,
-      "4. `pnpm cli done`으로 Handoff를 재생성하고 내부 분석값이나 rule id가 노출되지 않는지 직접 엽니다."
+      "4. `dev-guard done`으로 Handoff를 재생성하고 내부 분석값이나 rule id가 노출되지 않는지 직접 엽니다."
     ];
     return actions;
   }
@@ -6172,7 +6350,7 @@ function handoffNextActions(quality: ParsedQuality, nextTask: string, files: str
     targetFile ? `1. First confirm \`${targetFile}\` is scoped to the current request.` : "1. First review changed files and keep only files directly tied to the current request.",
     quality.verdict === "BLOCKED" ? "2. Fix the file and cause named by the BLOCKED reason first." : "2. If needed, adjust only the Handoff copy and filtering logic in the related file.",
     `3. Run ${compactCommandList(handoffVerificationCommands(quality, files))} after changes.`,
-    "4. Run `pnpm cli done` to regenerate Handoff, then open it and confirm internal analysis values or rule identifiers are not exposed."
+    "4. Run `dev-guard done` to regenerate Handoff, then open it and confirm internal analysis values or rule identifiers are not exposed."
   ];
 }
 
@@ -6180,13 +6358,13 @@ function handoffVerificationLines(quality: ParsedQuality, locale: DevGuardLocale
   const planned = handoffVerificationCommands(quality, files);
   if (locale === "ko-KR") {
     return [
-      "- `pnpm cli done`: pass. 현재 인수인계 파일이 생성되었습니다.",
+      "- `dev-guard done`: pass. 현재 인수인계 파일이 생성되었습니다.",
       `- 외부 검증 결과: ${handoffCopy[locale].noExecutedVerification}`,
       ...planned.map((command) => `- 다음 세션에서 실행할 검증: \`${command}\``)
     ];
   }
   return [
-    "- `pnpm cli done`: pass. The current Handoff file was generated.",
+    "- `dev-guard done`: pass. The current Handoff file was generated.",
     `- External verification result: ${handoffCopy[locale].noExecutedVerification}`,
     ...planned.map((command) => `- Verification to run next: \`${command}\``)
   ];
@@ -6202,7 +6380,7 @@ function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[
       `먼저 ${fileText}를 열어 변경 이유와 현재 요청 범위가 일치하는지 확인하세요.`,
       `그다음 ${firstStep}`,
       "문제가 있으면 관련 파일의 Handoff 생성 문구와 내부 분석값 필터링만 수정하세요.",
-      "`pnpm run build`, `pnpm cli self-check`, `pnpm cli done`을 실행한 뒤 `.devguard/reports/project-handoff.md`를 직접 열어 결과를 확인하세요."
+      "`pnpm run build`, `dev-guard self-check`, `dev-guard done`을 실행한 뒤 `.devguard/reports/project-handoff.md`를 직접 열어 결과를 확인하세요."
     ].join("\n");
   }
   return [
@@ -6210,7 +6388,7 @@ function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[
     `Open ${fileText} first and confirm the change rationale matches the current request.`,
     firstStep,
     "If there is a problem, only adjust the Handoff copy and internal-analysis filtering in the related file.",
-    "Run `pnpm run build`, `pnpm cli self-check`, and `pnpm cli done`, then open `.devguard/reports/project-handoff.md` to verify the result."
+    "Run `pnpm run build`, `dev-guard self-check`, and `dev-guard done`, then open `.devguard/reports/project-handoff.md` to verify the result."
   ].join("\n");
 }
 
@@ -6222,8 +6400,8 @@ function handoffVerificationCommands(quality: ParsedQuality, files: string[]): s
   const commands = new Set<string>();
   if (files.some((file) => /runtime-state\.ts$/.test(file))) {
     commands.add("pnpm run build");
-    commands.add("pnpm cli self-check");
-    commands.add("pnpm cli done");
+    commands.add("dev-guard self-check");
+    commands.add("dev-guard done");
     return [...commands];
   }
   for (const command of quality.requiredVerification) commands.add(command);
@@ -6449,10 +6627,11 @@ function extractSectionBullets(markdown: string, heading: string, limit: number)
 }
 
 function extractSectionBulletsAny(markdown: string, headings: string[], limit: number): string[] {
+  const bulletPattern = /^(?:[-*]|\d+\.)\s+/;
   const bullets = sectionLinesAny(markdown, headings)
     .map((line) => line.trim())
-    .filter((line) => /^[-*]\s+/.test(line))
-    .map((line) => line.replace(/^[-*]\s+/, "").trim())
+    .filter((line) => bulletPattern.test(line))
+    .map((line) => line.replace(bulletPattern, "").trim())
     .filter(isUsefulText);
   return bullets.length > 0 ? bullets.slice(0, limit) : ["확인 필요"];
 }
@@ -6585,7 +6764,7 @@ function sectionLines(markdown: string, heading: string): string[] {
 function sectionLinesAny(markdown: string, headings: string[]): string[] {
   const lines = markdown.split(/\r?\n/);
   const headingSet = new Set(headings);
-  const start = lines.findIndex((line) => headingSet.has(line.replace(/^#+\s*/, "").trim()));
+  const start = lines.findIndex((line) => headingSet.has(line.replace(/^#+\s*/, "").replace(/^\d+\.\s*/, "").trim()));
   if (start < 0) return [];
   const result: string[] = [];
   for (const line of lines.slice(start + 1)) {

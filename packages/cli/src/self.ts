@@ -20,7 +20,7 @@ import { runCheck } from "./check.js";
 import { runDoctor } from "./doctor.js";
 import { runReview } from "./review.js";
 import { runTaskAI } from "./task-ai.js";
-import { recordQAExecutionResult } from "./runtime-state.js";
+import { recordQAExecutionResult, recordValidationEvidence, type ValidationEvidenceKind } from "./runtime-state.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -82,7 +82,9 @@ export async function runSelfCheck(root: string): Promise<void> {
         startedAt: startedAt.toISOString(),
         completedAt: completedAt.toISOString(),
         durationMs: completedAt.getTime() - startedAt.getTime(),
-        summary: summarizeSelfCheckStep(step.name, output).join("; ")
+        summary: summarizeSelfCheckStep(step.name, output).join("; "),
+        kind: qaResultKind(step.name),
+        source: "self-check"
       });
       for (const line of summarizeSelfCheckStep(step.name, output)) {
         console.log(`  ${line}`);
@@ -99,7 +101,9 @@ export async function runSelfCheck(root: string): Promise<void> {
         startedAt: startedAt.toISOString(),
         completedAt: completedAt.toISOString(),
         durationMs: completedAt.getTime() - startedAt.getTime(),
-        reason
+        reason,
+        kind: qaResultKind(step.name),
+        source: "self-check"
       });
     }
   }
@@ -112,13 +116,15 @@ export async function runSelfCheck(root: string): Promise<void> {
   const failed = results.find((result) => !result.ok);
   await recordQAExecutionResult(root, {
     name: "self-check",
-    command: "pnpm cli self-check",
+    command: "dev-guard self-check",
     status: failed ? "FAIL" : "PASS",
     startedAt: selfStartedAt.toISOString(),
     completedAt: selfCompletedAt.toISOString(),
     durationMs: selfCompletedAt.getTime() - selfStartedAt.getTime(),
     summary: results.map((result) => `${result.ok ? "pass" : "fail"}: ${result.name}`).join("; "),
-    reason: failed?.reason
+    reason: failed?.reason,
+    kind: "CUSTOM",
+    source: "self-check"
   });
   if (results.some((result) => !result.ok)) {
     process.exitCode = 1;
@@ -131,6 +137,55 @@ function qaResultName(command: string): string {
   if (command === "dev-guard review --heuristic") return "review-heuristic";
   if (command === "dev-guard doctor") return "doctor";
   return command;
+}
+
+function qaResultKind(command: string): "BUILD" | "CUSTOM" {
+  return command === "pnpm run build" ? "BUILD" : "CUSTOM";
+}
+
+const VALIDATION_KINDS: ValidationEvidenceKind[] = ["BUILD", "TYPECHECK", "TEST", "LINT", "MANUAL_QA", "RUNTIME_SMOKE", "CUSTOM"];
+const VALIDATION_STATUSES = ["PASS", "FAIL", "UNKNOWN"] as const;
+
+export async function runRecordValidation(root: string, args: string[]): Promise<void> {
+  const options = parseFlags(args);
+  const rawKind = options.get("kind")?.toUpperCase();
+  const rawStatus = options.get("status")?.toUpperCase();
+  const kind = VALIDATION_KINDS.find((candidate) => candidate === rawKind);
+  const status = VALIDATION_STATUSES.find((candidate) => candidate === rawStatus);
+  if (!kind) {
+    throw new Error(`--kind is required and must be one of: ${VALIDATION_KINDS.join(", ")}`);
+  }
+  if (!status) {
+    throw new Error(`--status is required and must be one of: ${VALIDATION_STATUSES.join(", ")}`);
+  }
+  const result = await recordValidationEvidence({
+    root,
+    kind,
+    status,
+    name: options.get("name"),
+    command: options.get("command"),
+    summary: options.get("summary"),
+    reason: options.get("reason")
+  });
+  console.log(`dev-guard record-validation: recorded ${result.kind} "${result.name}" as ${result.status}`);
+  console.log("- next: run dev-guard done to regenerate Quality Report / Handoff with this evidence");
+}
+
+function parseFlags(args: string[]): Map<string, string> {
+  const flags = new Map<string, string>();
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (!arg.startsWith("--")) continue;
+    const key = arg.slice(2);
+    const next = args[index + 1];
+    if (next === undefined || next.startsWith("--")) {
+      flags.set(key, "true");
+      continue;
+    }
+    flags.set(key, next);
+    index += 1;
+  }
+  return flags;
 }
 
 async function runLocalSelfTask(root: string, options: SelfOptions): Promise<void> {

@@ -35,7 +35,8 @@
     "build": "tsc -b",
     "clean": "tsc -b --clean",
     "dev": "tsc -b && node dist/index.js",
-    "cli": "node dist/index.js"
+    "cli": "node dist/index.js",
+    "test": "tsc -b && node --test test/**/*.test.js"
   },
   "dependencies": {
     "@dev-guard/core": "0.7.0",
