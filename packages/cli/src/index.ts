@@ -274,7 +274,7 @@ All commands:
   dev-guard init
   dev-guard "requirement"
   dev-guard done
-  dev-guard handoff [--task "<current task>"]
+  dev-guard handoff [--task "<current task>" [--continue]]
   dev-guard mcp
   dev-guard knowledge
   dev-guard status
@@ -443,7 +443,8 @@ async function runHandoff(root: string): Promise<void> {
     const copy = cliCopy(locale);
     const task = readStringOption(process.argv.slice(3), "--task");
     if (task !== undefined) {
-      const result = await prepareBeforeAgentContext(root, task);
+      const continueCurrentTask = process.argv.slice(3).includes("--continue");
+      const result = await prepareBeforeAgentContext(root, task, continueCurrentTask);
       console.log("dev-guard before-agent context");
       console.log(`task: ${result.task}`);
       console.log(`source: ${result.source}`);

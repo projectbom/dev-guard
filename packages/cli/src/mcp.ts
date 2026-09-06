@@ -9,6 +9,12 @@ import { prepareTaskContext, recordValidationEvidence } from "./runtime-state.js
 
 const toolInputSchema = {
   task: z.string().min(1).describe("Current coding task. Call before searching or reading project source files."),
+  continueCurrentTask: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set true ONLY to re-fetch context for the SAME task you already called this tool for in this conversation (e.g. resuming after an interruption) — this keeps validation evidence and the task goal tied to that same task. Omit or set false (the default) every time you are starting a genuinely new task, even if its wording happens to repeat an earlier one: each new task gets its own clean lineage, so evidence/goals from a previous task never leak into it."
+    ),
   projectRoot: z.string().optional().describe("Optional project root. Defaults to the MCP server working directory.")
 };
 
@@ -39,15 +45,16 @@ export async function runMcpServer(root: string): Promise<void> {
     {
       title: "Prepare DevGuard task context",
       description:
-        "Call this before searching or reading project source files for a new coding task. It uses the local DevGuard Code Index to return relevant files, line ranges, constraints, freshness, coverage, and generated context artifact paths.",
+        "Call this once at the start of every new coding task, before searching or reading project source files — this is DevGuard's only signal that a new task has begun, so a bare call always starts a clean task lineage (see continueCurrentTask for the one exception). It uses the local DevGuard Code Index to return relevant files, line ranges, constraints, freshness, coverage, and generated context artifact paths. After you run a build/test/manual check for this task, report it with record_validation_result so Quality Report/Handoff reflect real evidence.",
       inputSchema: toolInputSchema
     },
-    async ({ task, projectRoot }) => {
+    async ({ task, continueCurrentTask, projectRoot }) => {
       try {
         const project = await resolveMcpProjectRoot(root, projectRoot);
         const result = await prepareTaskContext({
           root: project,
           task,
+          continueCurrentTask,
           persistTask: true
         });
         return {

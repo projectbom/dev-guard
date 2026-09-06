@@ -1,8 +1,22 @@
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import type { ChangeFile, ChangeFileStatus } from "@dev-guard/core";
 
 const execFileAsync = promisify(execFile);
+
+// Kept intentionally independent from runtime-state.ts's isIgnoredWatchPath
+// (importing it here would create a circular dependency, since runtime-state.ts
+// imports this module). These paths are excluded from the content fingerprint
+// below unconditionally — not only via the project's own .gitignore — because
+// .devguard/ specifically is written to by DevGuard itself (e.g. every
+// recorded evidence updates runtime.json); if it were included, recording
+// evidence would immediately change the fingerprint it was just stamped
+// with. Keep this list conceptually in sync with isIgnoredWatchPath.
+const CONTENT_HASH_EXCLUDE_PATHSPECS = [".devguard", "node_modules", ".next", "dist", "build", "coverage", ".turbo", "*.tsbuildinfo"];
 
 export interface GitChanges {
   changedFiles: string[];
@@ -53,6 +67,62 @@ export async function getGitRemoteOrigin(cwd: string): Promise<string> {
 export async function hasGitBaseline(cwd: string): Promise<boolean> {
   await assertGitRepo(cwd);
   return git(cwd, ["rev-parse", "--verify", "HEAD"]).then(() => true).catch(() => false);
+}
+
+/**
+ * A content-addressed fingerprint of the effective current working tree
+ * (HEAD, overlaid with staged, unstaged, and untracked changes — restricted
+ * to non-ignored, non-DevGuard-noise paths), independent of which commit
+ * HEAD happens to be. Two states with byte-identical resulting file content
+ * produce the same hash even if one is a clean commit and the other is the
+ * same content sitting uncommitted in the working tree — history and
+ * content identity are deliberately different questions (see getGitIdentity
+ * for the former).
+ *
+ * Implemented with git's own plumbing rather than reading file contents
+ * ourselves: a disposable temporary index (via GIT_INDEX_FILE) is seeded
+ * from HEAD's tree, then `git add -A` overlays the current working tree
+ * (staged + unstaged + untracked, respecting .gitignore) onto it, noise
+ * paths are unstaged from that temp index with `git rm --cached`, and
+ * `git write-tree` returns the resulting tree object's SHA — a pure content
+ * hash. This never touches the real index or working directory, so it is
+ * safe to call concurrently with other git operations. It does write a
+ * (small, garbage-collectable) tree/blob object into .git/objects, the same
+ * way `git stash` or `git add` normally would.
+ *
+ * Noise exclusion deliberately runs as a separate `git rm --cached` pass
+ * rather than negative pathspecs on `git add` (e.g. `:!.devguard`): git
+ * treats a pathspec that names an already-gitignored path as an error
+ * ("paths are ignored by one of your .gitignore files"), even when the
+ * pathspec is negative — so passing `:!.devguard` to `add` fails outright
+ * on the very common setup where `.devguard/` is itself gitignored.
+ * `git rm --cached` has no such restriction.
+ *
+ * Returns undefined for non-git projects or if git plumbing fails for any
+ * reason — callers must fall back to a weaker signal, never throw.
+ */
+export async function computeWorkingTreeContentHash(cwd: string): Promise<string | undefined> {
+  let hasHead: boolean;
+  try {
+    hasHead = await hasGitBaseline(cwd);
+  } catch {
+    return undefined;
+  }
+  const tempIndexPath = join(tmpdir(), `devguard-idx-${randomUUID()}`);
+  const env = { ...process.env, GIT_INDEX_FILE: tempIndexPath };
+  try {
+    if (hasHead) {
+      await execFileAsync("git", ["read-tree", "HEAD"], { cwd, env });
+    }
+    await execFileAsync("git", ["add", "-A", "--", "."], { cwd, env });
+    await execFileAsync("git", ["rm", "--cached", "-r", "--ignore-unmatch", "-q", "--", ...CONTENT_HASH_EXCLUDE_PATHSPECS], { cwd, env });
+    const { stdout } = await execFileAsync("git", ["write-tree"], { cwd, env });
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  } finally {
+    await rm(tempIndexPath, { force: true }).catch(() => undefined);
+  }
 }
 
 export async function getGitChanges(cwd: string): Promise<GitChanges> {

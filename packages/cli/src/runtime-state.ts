@@ -16,7 +16,7 @@ import {
   type DevGuardConfig
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
-import { getDiffForChangeFiles, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
+import { computeWorkingTreeContentHash, getDiffForChangeFiles, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
 import { ensureProjectKnowledge } from "./knowledge.js";
@@ -90,11 +90,14 @@ export interface QAExecutionResult {
    */
   gitHead?: string;
   /**
-   * Fingerprint of the full working tree state (HEAD + staged + unstaged +
-   * relevant untracked files) at the moment this evidence was recorded. This
-   * is the strongest freshness signal: it changes even when HEAD does not,
-   * so a build verified before an uncommitted edit is correctly treated as
-   * stale for the edited state. See `computeCodeStateHash`.
+   * Content-addressed fingerprint of the effective working tree (HEAD +
+   * staged + unstaged + untracked, excluding ignored/generated noise) at the
+   * moment this evidence was recorded — see `computeWorkingTreeContentHash`
+   * in git.ts. This is the strongest freshness signal: it changes when
+   * source content actually changes, even if HEAD does not (an uncommitted
+   * edit), and stays the same across a commit that introduces no content
+   * change (committing exactly what was already validated). Deliberately
+   * independent of `gitHead`, which only tracks commit/history identity.
    */
   codeStateHash?: string;
   /** Session lineage id at record time; see RuntimeState.sessionId. */
@@ -181,6 +184,17 @@ export interface PrepareTaskContextInput {
   root: string;
   task: string;
   persistTask?: boolean;
+  /**
+   * Task identity contract: a bare `prepare_task_context` call always starts
+   * a new task/session lineage — this is the one explicit signal DevGuard
+   * has for "a task is starting," so it never depends on comparing task
+   * text (two calls with identical text are two distinct tasks unless this
+   * flag says otherwise; two calls with different text can still be the
+   * same task if this flag is set). Pass `continueCurrentTask: true` only
+   * when explicitly re-fetching context for work already in progress (e.g.
+   * resuming after an interruption) — not as a routine default.
+   */
+  continueCurrentTask?: boolean;
 }
 
 export interface PreparedTaskContextResult extends BeforeAgentPreparationResult {
@@ -417,7 +431,8 @@ const defaultRuntime: RuntimeState = {
 export async function readRuntimeState(root: string): Promise<RuntimeState> {
   await ensureDevguardWorkspace(root);
   try {
-    return readJsonFile<RuntimeState>(fromRoot(root, runtimePath), defaultRuntime);
+    const state = await readJsonFile<RuntimeState>(fromRoot(root, runtimePath), defaultRuntime);
+    return { ...state, qaResults: normalizeQaResults(state.qaResults) };
   } catch {
     return defaultRuntime;
   }
@@ -495,60 +510,45 @@ async function gatherCurrentChangeState(root: string, runtime: RuntimeState): Pr
  * content directly; this is safe because it is limited to the same bounded
  * changed-file set.
  */
-async function computeCodeStateHash(root: string, input: { gitHead: string; changeFiles: ChangeFile[]; changedFiles: string[] }): Promise<string> {
-  // `changedFiles` is already filtered through isIgnoredWatchPath/
-  // isDevguardManagedDocPath (excludes .turbo/, *.tsbuildinfo, .devguard/,
-  // node_modules/, etc). `changeFiles` is not — it still contains every raw
-  // git-observed change. Restrict to the intersection so ignored noise can
-  // never reach the diff or the untracked-content hashing below; this is
-  // also why `diffText` computed elsewhere in processDoneEvent (from the
-  // unfiltered `changeFiles`) is not reused here — it can carry a stray
-  // "Untracked file: tsconfig.tsbuildinfo" marker that must not affect the
-  // fingerprint.
-  const relevantChangeFiles = input.changeFiles.filter((file) => input.changedFiles.includes(file.path));
-  const relevantDiffText = relevantChangeFiles.length > 0 ? await getDiffForChangeFiles(root, relevantChangeFiles).catch(() => "") : "";
-  const hash = createHash("sha1");
-  hash.update(input.gitHead);
-  hash.update(" ");
-  hash.update([...input.changedFiles].sort().join("\n"));
-  hash.update(" ");
-  hash.update(relevantDiffText);
-  const untrackedPaths = [
-    ...new Set(relevantChangeFiles.filter((file) => file.source === "untracked").map((file) => file.path))
-  ].sort();
-  for (const path of untrackedPaths) {
-    const content = await readTextFile(fromRoot(root, path)).catch(() => "");
-    hash.update(` ${path} ${content}`);
-  }
-  return hash.digest("hex");
+/**
+ * `gitHead` and `codeStateHash` answer different questions and must not be
+ * conflated: `gitHead` is repository/history provenance (which commit),
+ * while `codeStateHash` is the identity of the actually-validated source
+ * content, independent of commit history — see computeWorkingTreeContentHash
+ * in git.ts. Validating dirty state X at HEAD A and then committing exactly
+ * X (HEAD becomes B, tree clean) yields the SAME codeStateHash even though
+ * gitHead differs, because the underlying content never changed; editing
+ * the source without committing yields a DIFFERENT codeStateHash even
+ * though gitHead stays the same.
+ */
+async function resolveCurrentCodeState(root: string): Promise<{ gitHead: string; codeStateHash?: string }> {
+  const [gitHead, codeStateHash] = await Promise.all([currentGitHead(root), computeWorkingTreeContentHash(root)]);
+  return { gitHead, codeStateHash };
 }
 
-async function resolveCurrentCodeState(root: string, runtime: RuntimeState): Promise<{ gitHead: string; codeStateHash: string }> {
-  const state = await gatherCurrentChangeState(root, runtime);
-  const codeStateHash = await computeCodeStateHash(root, state);
-  return { gitHead: state.gitHead, codeStateHash };
-}
-
-export async function recordQAExecutionResult(root: string, result: QAExecutionResult): Promise<void> {
+export async function recordQAExecutionResult(root: string, result: QAExecutionResult): Promise<QAExecutionResult> {
   const current = await readRuntimeState(root);
   const sessionId = current.sessionId ?? generateSessionId();
-  const { gitHead, codeStateHash } = await resolveCurrentCodeState(root, current);
+  const { gitHead, codeStateHash } = await resolveCurrentCodeState(root);
   const stamped: QAExecutionResult = {
     ...result,
     sessionId: result.sessionId ?? sessionId,
     gitHead: result.gitHead ?? (gitHead || undefined),
     codeStateHash: result.codeStateHash ?? codeStateHash
   };
-  // `qaResults` is keyed by name, so recording a second result under the same
-  // name/kind replaces the first. That replacement must be timestamp-driven,
-  // not insertion-order-driven — otherwise a delayed/out-of-order report
-  // (e.g. two agents reporting concurrently) could let an older result
-  // clobber a newer one. Only replace when the incoming result is not older
-  // than what's already stored for this identity.
-  const existing = current.qaResults?.[stamped.name];
+  // Storage key MUST match the read-side identity (kind + name) — see
+  // validationIdentityKey. Recording a second result under the same identity
+  // replaces the first, and that replacement must be timestamp-driven, not
+  // insertion-order-driven — otherwise a delayed/out-of-order report (e.g.
+  // two agents reporting concurrently) could let an older result clobber a
+  // newer one. Only replace when the incoming result is not older than
+  // what's already stored for this identity.
+  const key = validationIdentityKey(resolveValidationKind(stamped), stamped.name);
+  const existing = current.qaResults?.[key];
   const shouldReplace = !existing || Date.parse(stamped.completedAt) >= Date.parse(existing.completedAt);
-  const qaResults = shouldReplace ? { ...(current.qaResults ?? {}), [stamped.name]: stamped } : current.qaResults ?? {};
+  const qaResults = shouldReplace ? { ...(current.qaResults ?? {}), [key]: stamped } : current.qaResults ?? {};
   await writeRuntimeState(root, { ...current, qaResults, sessionId });
+  return qaResults[key];
 }
 
 function defaultNameForValidationKind(kind: ValidationEvidenceKind): string {
@@ -586,14 +586,54 @@ export async function recordValidationEvidence(input: RecordValidationEvidenceIn
     source: input.source ?? "external",
     exitCode: input.exitCode
   };
-  await recordQAExecutionResult(input.root, result);
-  return result;
+  return recordQAExecutionResult(input.root, result);
 }
 
 function resolveValidationKind(result: QAExecutionResult): ValidationEvidenceKind {
   if (result.kind) return result.kind;
   if (result.name === "build") return "BUILD";
   return "CUSTOM";
+}
+
+/**
+ * Validation identity = kind + name (e.g. BUILD/"ci" and TEST/"ci" are
+ * different scopes; the self-check pipeline's BUILD/"build" and its own
+ * CUSTOM/"self-check" summary are different scopes even though the reader
+ * used to look both up by the bare name "build"/"self-check"). Storage keys
+ * MUST use this same composite identity — a bare `name` key previously let
+ * two different kinds sharing a name silently overwrite each other.
+ */
+function validationIdentityKey(kind: ValidationEvidenceKind, name: string): string {
+  return `${kind}::${name}`;
+}
+
+function findQAEntry(qaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind, name: string): QAExecutionResult | undefined {
+  return qaResults?.[validationIdentityKey(kind, name)];
+}
+
+/**
+ * Migration: older DevGuard versions stored `qaResults` keyed by bare
+ * `name` only, so two entries of different kinds sharing a name could
+ * collide. This normalizes any such legacy map to the current kind+name
+ * keying without dropping data — if two legacy entries do collide onto the
+ * same normalized identity (the original bug), the chronologically later
+ * one wins, consistent with the out-of-order write rule used everywhere
+ * else. Malformed/corrupt entries are skipped defensively rather than
+ * crashing the read path.
+ */
+function normalizeQaResults(qaResults: Record<string, QAExecutionResult> | undefined): Record<string, QAExecutionResult> | undefined {
+  if (!qaResults) return qaResults;
+  const normalized: Record<string, QAExecutionResult> = {};
+  for (const [legacyKey, entry] of Object.entries(qaResults)) {
+    if (!entry || typeof entry !== "object" || typeof entry.completedAt !== "string") continue;
+    const name = typeof entry.name === "string" && entry.name ? entry.name : legacyKey;
+    const key = validationIdentityKey(resolveValidationKind(entry), name);
+    const existing = normalized[key];
+    if (!existing || Date.parse(entry.completedAt) >= Date.parse(existing.completedAt)) {
+      normalized[key] = { ...entry, name };
+    }
+  }
+  return normalized;
 }
 
 /**
@@ -616,7 +656,7 @@ function resolveValidationKind(result: QAExecutionResult): ValidationEvidenceKin
  *    assumed current. It is never deleted from the stored history — only
  *    excluded from being read as current.
  */
-function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; codeStateHash: string; sessionId?: string }): boolean {
+function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; codeStateHash?: string; sessionId?: string }): boolean {
   if (entry.codeStateHash && current.codeStateHash) {
     return entry.codeStateHash === current.codeStateHash;
   }
@@ -629,16 +669,28 @@ function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; c
   return false;
 }
 
-function filterFreshQaResults(
+/**
+ * Internal availability model — kept distinct from the 4-state visible
+ * model (PASS/FAIL/UNKNOWN/NOT_RECORDED). "Stale" evidence is real,
+ * recorded evidence that simply no longer matches the current code state;
+ * it is never deleted (see partitionQaResultsByFreshness), only excluded
+ * from being read as current. It is not shown as a 5th visible status —
+ * it renders as NOT_RECORDED in the main table — but the distinction is
+ * preserved internally so remaining-work/diagnostic text can explain WHY
+ * something isn't recorded, instead of conflating "never ran" with
+ * "ran, but for an old code state."
+ */
+function partitionQaResultsByFreshness(
   qaResults: Record<string, QAExecutionResult> | undefined,
-  current: { gitHead: string; codeStateHash: string; sessionId?: string }
-): Record<string, QAExecutionResult> | undefined {
-  if (!qaResults) return qaResults;
+  current: { gitHead: string; codeStateHash?: string; sessionId?: string }
+): { fresh: Record<string, QAExecutionResult>; stale: Record<string, QAExecutionResult> } {
   const fresh: Record<string, QAExecutionResult> = {};
-  for (const [key, entry] of Object.entries(qaResults)) {
+  const stale: Record<string, QAExecutionResult> = {};
+  for (const [key, entry] of Object.entries(qaResults ?? {})) {
     if (isEvidenceFresh(entry, current)) fresh[key] = entry;
+    else stale[key] = entry;
   }
-  return fresh;
+  return { fresh, stale };
 }
 
 function qaEntriesByKind(qaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind): QAExecutionResult[] {
@@ -858,11 +910,13 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     runtime = { ...runtime, sessionId: generateSessionId() };
     await writeRuntimeState(root, runtime);
   }
-  const currentChangeState = await gatherCurrentChangeState(root, runtime);
+  const [currentChangeState, codeStateHash] = await Promise.all([
+    gatherCurrentChangeState(root, runtime),
+    computeWorkingTreeContentHash(root)
+  ]);
   const { gitHead, changeFiles, changedFiles, diffText, gitChanges, rawChangedFiles } = currentChangeState;
-  const codeStateHash = await computeCodeStateHash(root, currentChangeState);
   const currentGitState = { gitHead, codeStateHash, sessionId: runtime.sessionId };
-  const freshQaResults = filterFreshQaResults(runtime.qaResults, currentGitState);
+  const { fresh: freshQaResults, stale: staleQaResults } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
   const diffStat = await getGitDiffStat(root).catch(() => "git diff stat unavailable");
   const [projectMarkdown, architectureMarkdown, decisionsMarkdown, tasksMarkdown, config, codeGraph] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
@@ -909,7 +963,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     diffStat,
     taskText: [runtime.currentTask?.text ?? "", tasksMarkdown, projectMarkdown].join("\n\n"),
     canonicalGoal: resolvedGoal.goal,
-    qaResults: freshQaResults
+    qaResults: freshQaResults,
+    staleQaResults
   });
   const sessionTaskGoal = resolvedGoal.goal;
   const sessionTaskGoalSource = resolvedGoal.source;
@@ -1063,8 +1118,8 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   };
 }
 
-export async function prepareBeforeAgentContext(root: string, task: string): Promise<BeforeAgentPreparationResult> {
-  const result = await prepareTaskContext({ root, task, persistTask: true });
+export async function prepareBeforeAgentContext(root: string, task: string, continueCurrentTask = false): Promise<BeforeAgentPreparationResult> {
+  const result = await prepareTaskContext({ root, task, persistTask: true, continueCurrentTask });
   return {
     task: result.task,
     source: result.source,
@@ -1078,7 +1133,7 @@ export async function prepareBeforeAgentContext(root: string, task: string): Pro
 }
 
 export async function prepareTaskContext(input: PrepareTaskContextInput): Promise<PreparedTaskContextResult> {
-  const { root, task, persistTask = true } = input;
+  const { root, task, persistTask = true, continueCurrentTask = false } = input;
   await ensureDevguardWorkspace(root);
   const text = task.trim();
   if (!text) throw new Error("--task requires a non-empty task description.");
@@ -1089,17 +1144,14 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     createdAt: new Date().toISOString()
   };
   // Task boundary contract: `prepare_task_context` is the one explicit signal
-  // DevGuard has for "a task is starting" (see CLAUDE.md guidance to call it
-  // for every new task). If the requested task text matches the canonical
-  // goal already recorded for the current lineage, this call is treated as
-  // continuing that same task (e.g. re-fetching context mid-task) and keeps
-  // the existing session id. Any other text — including the very first call,
-  // when there is nothing to compare against — starts a new lineage, so
-  // evidence and goal state from a prior task cannot be silently inherited
-  // by a new one that never went through this boundary.
-  const previousProjectState = await readProjectState(root);
-  const continuesSameTask = Boolean(current.sessionId) && previousProjectState.lastTaskGoal?.trim() === text;
-  const sessionId = continuesSameTask ? current.sessionId! : generateSessionId();
+  // DevGuard has for "a task is starting." A bare call ALWAYS starts a new
+  // task/session lineage, regardless of what the task text says — two calls
+  // with identical text are two distinct tasks unless the caller explicitly
+  // asks to continue. This deliberately does not compare task text: text
+  // equality is neither necessary (the same task's wording can legitimately
+  // change between calls) nor sufficient (two unrelated tasks can share
+  // wording, e.g. "Run milestone verification") to prove task identity.
+  const sessionId = continueCurrentTask && current.sessionId ? current.sessionId : generateSessionId();
   const runtimeWithTask = { ...current, currentTask, sessionId };
   await writeRuntimeState(root, runtimeWithTask);
   try {
@@ -3022,6 +3074,7 @@ function buildDocumentationSummary(input: {
   taskText: string;
   canonicalGoal?: string;
   qaResults?: Record<string, QAExecutionResult>;
+  staleQaResults?: Record<string, QAExecutionResult>;
 }): DocumentationSummary {
   const fileDiffs = splitUnifiedDiffByFile(input.diffText);
   const fileChanges = (input.changedFiles.length > 0 ? input.changedFiles : [...fileDiffs.keys()]).map((file) =>
@@ -3042,7 +3095,7 @@ function buildDocumentationSummary(input: {
     },
     fileChanges,
     qaChecks: documentationQAChecks(fileChanges, changeTypes, input.qaResults),
-    remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults),
+    remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults, input.staleQaResults),
     structure: documentationStructure(changeTypes, fileChanges),
     excludedAreas: unaffectedAreasFromDocumentation(affected)
   };
@@ -3351,25 +3404,45 @@ function documentationQAChecks(files: DocumentationFileChange[], types: ChangeTy
 
   const buildStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "BUILD"));
   if ((types.includes("Build") || types.includes("Logic") || types.includes("QA")) && buildStatus !== "PASS") add("Run `pnpm run build`.");
-  const selfCheckEntry = qaResults?.["self-check"];
+  const selfCheckEntry = findQAEntry(qaResults, "CUSTOM", "self-check");
   if (!selfCheckEntry || selfCheckEntry.status !== "PASS") add("Run `dev-guard self-check`.");
   add("Run `dev-guard done`.");
   return checks.slice(0, 10);
 }
 
-function documentationRemainingWork(files: DocumentationFileChange[], types: ChangeType[], qaResults?: Record<string, QAExecutionResult>): string[] {
+function staleNotRecordedNote(staleQaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind, label: string, name?: string): string | undefined {
+  const staleEntry = name
+    ? findQAEntry(staleQaResults, kind, name)
+    : latestValidationEntry(qaEntriesByKind(staleQaResults, kind));
+  if (!staleEntry) return undefined;
+  return `Previous ${label} ${staleEntry.status} became stale after the code state changed; it is not shown as current.`;
+}
+
+function documentationRemainingWork(
+  files: DocumentationFileChange[],
+  types: ChangeType[],
+  qaResults?: Record<string, QAExecutionResult>,
+  staleQaResults?: Record<string, QAExecutionResult>
+): string[] {
   const remaining = new Set<string>();
   const buildStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "BUILD"));
-  if (buildStatus === "NOT_RECORDED") remaining.add("Build result is not recorded in DevGuard (this does not mean the build was not run, only that no result was recorded).");
-  else if (buildStatus === "FAIL") remaining.add("Recorded Build evidence failed; fix the build before this can be considered complete.");
-  const selfCheckEntry = qaResults?.["self-check"];
-  if (!selfCheckEntry) remaining.add("Self Check result is not recorded in DevGuard.");
-  else if (selfCheckEntry.status === "FAIL") remaining.add(`Recorded Self Check evidence failed${selfCheckEntry.reason ? `: ${selfCheckEntry.reason}` : "."}`);
+  if (buildStatus === "NOT_RECORDED") {
+    remaining.add(
+      staleNotRecordedNote(staleQaResults, "BUILD", "Build") ??
+        "Build result is not recorded in DevGuard (this does not mean the build was not run, only that no result was recorded)."
+    );
+  } else if (buildStatus === "FAIL") remaining.add("Recorded Build evidence failed; fix the build before this can be considered complete.");
+  const selfCheckEntry = findQAEntry(qaResults, "CUSTOM", "self-check");
+  if (!selfCheckEntry) {
+    remaining.add(staleNotRecordedNote(staleQaResults, "CUSTOM", "Self Check", "self-check") ?? "Self Check result is not recorded in DevGuard.");
+  } else if (selfCheckEntry.status === "FAIL") remaining.add(`Recorded Self Check evidence failed${selfCheckEntry.reason ? `: ${selfCheckEntry.reason}` : "."}`);
 
   const manualStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "MANUAL_QA"));
   if (types.includes("UI")) {
     if (manualStatus === "FAIL") remaining.add("Recorded Manual QA evidence failed for this UI change.");
-    else if (manualStatus === "NOT_RECORDED") remaining.add("Manual browser/mobile QA is still needed for UI changes.");
+    else if (manualStatus === "NOT_RECORDED") {
+      remaining.add(staleNotRecordedNote(staleQaResults, "MANUAL_QA", "Manual QA") ?? "Manual browser/mobile QA is still needed for UI changes.");
+    }
   }
   for (const entry of qaEntriesByKind(qaResults, "RUNTIME_SMOKE")) {
     if (entry.status === "FAIL") remaining.add(`Runtime smoke failed: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
@@ -5491,7 +5564,7 @@ function formatQASnapshot(report: QualityReport, locale: DevGuardLocale): string
     ...formatKindRows(report, "BUILD", labels.build, locale),
     ...formatKindRows(report, "TYPECHECK", labels.typecheck, locale),
     ...formatKindRows(report, "TEST", labels.tests, locale),
-    [labels.self, qaLegacyStatus(report, "self-check", locale)],
+    [labels.self, qaLegacyStatus(report, "CUSTOM", "self-check", locale)],
     ...formatKindRows(report, "MANUAL_QA", labels.manual, locale, () => manualQAFallback(report, locale)),
     [labels.regression, regressionRiskLevel(report, locale)]
   ];
@@ -5577,8 +5650,8 @@ function worstStatusAcrossNames(statuses: AggregatedValidationStatus[]): Aggrega
   return "UNKNOWN";
 }
 
-function qaLegacyStatus(report: QualityReport, name: string, locale: DevGuardLocale): string {
-  const result = report.qaResults?.[name];
+function qaLegacyStatus(report: QualityReport, kind: ValidationEvidenceKind, name: string, locale: DevGuardLocale): string {
+  const result = findQAEntry(report.qaResults, kind, name);
   if (result) return formatQAStatus(result, locale);
   return notRecordedLabel(locale);
 }
@@ -5782,10 +5855,17 @@ function formatQAResults(report: QualityReport, locale: DevGuardLocale): string[
   return lines;
 }
 
+const SELF_CHECK_PIPELINE_NAMES: Array<{ name: string; kind: ValidationEvidenceKind }> = [
+  { name: "build", kind: "BUILD" },
+  { name: "self-check", kind: "CUSTOM" },
+  { name: "check-local", kind: "CUSTOM" },
+  { name: "review-heuristic", kind: "CUSTOM" },
+  { name: "doctor", kind: "CUSTOM" }
+];
+
 function orderedQAResults(report: QualityReport): QAExecutionResult[] {
-  const results = report.qaResults ?? {};
-  return ["build", "self-check", "check-local", "review-heuristic", "doctor"]
-    .map((key) => results[key])
+  return SELF_CHECK_PIPELINE_NAMES
+    .map(({ name, kind }) => findQAEntry(report.qaResults, kind, name))
     .filter((result): result is QAExecutionResult => Boolean(result));
 }
 
@@ -5834,11 +5914,11 @@ function unrecordedVerificationLines(report: QualityReport, locale: DevGuardLoca
 }
 
 function hasRecordedCommand(report: QualityReport, command: string): boolean {
-  if (/\bbuild\b/i.test(command) && report.qaResults?.build) return true;
-  if (/self-check/i.test(command) && report.qaResults?.["self-check"]) return true;
-  if (/check --local/i.test(command) && report.qaResults?.["check-local"]) return true;
-  if (/review --heuristic/i.test(command) && report.qaResults?.["review-heuristic"]) return true;
-  if (/doctor/i.test(command) && report.qaResults?.doctor) return true;
+  if (/\bbuild\b/i.test(command) && findQAEntry(report.qaResults, "BUILD", "build")) return true;
+  if (/self-check/i.test(command) && findQAEntry(report.qaResults, "CUSTOM", "self-check")) return true;
+  if (/check --local/i.test(command) && findQAEntry(report.qaResults, "CUSTOM", "check-local")) return true;
+  if (/review --heuristic/i.test(command) && findQAEntry(report.qaResults, "CUSTOM", "review-heuristic")) return true;
+  if (/doctor/i.test(command) && findQAEntry(report.qaResults, "CUSTOM", "doctor")) return true;
   return false;
 }
 
@@ -5882,7 +5962,7 @@ function formatQAConfidence(report: QualityReport, locale: DevGuardLocale): stri
     ...latestStatusesByName(report.qaResults, "BUILD"),
     ...latestStatusesByName(report.qaResults, "TYPECHECK"),
     ...latestStatusesByName(report.qaResults, "TEST"),
-    report.qaResults?.["self-check"]?.status ?? "NOT_RECORDED"
+    findQAEntry(report.qaResults, "CUSTOM", "self-check")?.status ?? "NOT_RECORDED"
   ];
   const coreStatuses = allCoreStatuses.filter((status) => status !== "NOT_RECORDED");
   const anyFailed = coreStatuses.includes("FAIL");
