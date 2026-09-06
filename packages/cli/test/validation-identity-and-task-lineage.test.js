@@ -22,6 +22,17 @@ import {
 } from "../dist/runtime-state.js";
 import { computeWorkingTreeContentHash } from "../dist/git.js";
 
+// These assertions check rendered prose against DevGuard's documented
+// default locale (en-US). DevGuard's locale resolution intentionally reads
+// LC_ALL/LC_MESSAGES/LANG when a project has no explicit `.devguard/config.json`
+// locale (see src/locale.ts) — correct, deliberate behavior for a real ko-KR
+// host, but it left these assertions accidentally dependent on whatever OS
+// locale happens to run the test. Pin it so the suite is deterministic
+// regardless of the host machine's locale.
+process.env.LC_ALL = "en-US";
+process.env.LC_MESSAGES = "en-US";
+process.env.LANG = "en-US";
+
 const execFileAsync = promisify(execFile);
 const cleanupRoots = [];
 
