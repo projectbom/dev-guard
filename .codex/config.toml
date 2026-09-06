@@ -1,0 +1,3 @@
+[mcp_servers.dev-guard]
+command = "npx"
+args = ["--no-install","dev-guard","mcp"]

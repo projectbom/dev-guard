@@ -330,18 +330,39 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     });
   }, 1000);
 
-  process.on("SIGINT", async () => {
-    await closeWatcher(watcher);
-    await dashboard?.close();
+  let shuttingDown = false;
+  const shutdown = async (): Promise<void> => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    // Cleanup is attempted first; if anything hangs (an open dashboard
+    // socket, a watcher backend that never settles), this fallback still
+    // guarantees the process exits instead of leaving the terminal stuck
+    // after Ctrl+C. unref() so it never itself keeps the process alive.
+    const forceExit = setTimeout(() => process.exit(1), 3000);
+    forceExit.unref();
     clearTimeout(stableTimer);
     clearTimeout(autoCompleteTimer);
     clearInterval(refreshTimer);
+    try {
+      await closeWatcher(watcher);
+    } catch (error) {
+      console.error(`watch warning: failed to close file watcher cleanly: ${errorMessage(error)}`);
+    }
+    try {
+      await dashboard?.close();
+    } catch (error) {
+      console.error(`watch warning: failed to close dashboard server cleanly: ${errorMessage(error)}`);
+    }
     console.log("\ndev-guard watch stopped");
+    clearTimeout(forceExit);
     process.exit(0);
-  });
+  };
+
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
 
   await new Promise<void>(() => {
-    // Keep process alive until SIGINT.
+    // Keep process alive until SIGINT/SIGTERM.
   });
 }
 

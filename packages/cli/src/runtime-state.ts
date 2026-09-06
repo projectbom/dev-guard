@@ -15,7 +15,7 @@ import {
   type CodeGraphEntry,
   type DevGuardConfig
 } from "@dev-guard/core";
-import { appendTextFile, fromRoot, readJsonFile, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
+import { appendTextFile, fromRoot, readJsonFile, readTailLines, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
 import { computeWorkingTreeContentHash, getDiffForChangeFiles, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
@@ -789,11 +789,20 @@ export async function writeProjectState(root: string, state: ProjectState): Prom
   await writeAtomicTextFile(fromRoot(root, statePath), `${JSON.stringify(state, null, 2)}\n`);
 }
 
+// history.jsonl is an append-only log that grows for the lifetime of a
+// project under continuous `dev-guard watch` use — one line per `done`
+// cycle, forever. Reading it in full (as this used to do) to return only
+// the last few records is an unbounded-memory hazard on a long-lived
+// project: a multi-hundred-MB history.jsonl would be read, string-split,
+// and JSON.parsed in its entirety just to discard all but `limit` records.
+// Bounding the read to the tail keeps memory use proportional to `limit`,
+// not to the file's total lifetime size.
+const HISTORY_TAIL_READ_BYTES = 4 * 1024 * 1024;
+
 export async function readHistoryRecords(root: string, limit = 20): Promise<HistoryRecord[]> {
   await ensureDevguardWorkspace(root);
-  const text = await readTextFile(fromRoot(root, historyPath));
-  const records = text
-    .split(/\r?\n/)
+  const lines = await readTailLines(fromRoot(root, historyPath), HISTORY_TAIL_READ_BYTES);
+  const records = lines
     .map((line) => line.trim())
     .filter(Boolean)
     .map((line) => {
@@ -1217,12 +1226,15 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
 export async function generateProjectHandoff(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [project, architecture, decisions, tasks, history, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state, projectKnowledge, runtime] = await Promise.all([
+  const [project, architecture, decisions, tasks, records, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state, projectKnowledge, runtime] = await Promise.all([
     readRequiredText(root, devguardPaths.project),
     readRequiredText(root, devguardPaths.architecture),
     readRequiredText(root, devguardPaths.decisions),
     readRequiredText(root, devguardPaths.tasks),
-    readRequiredText(root, historyPath),
+    // Bounded tail read (see readHistoryRecords) — history.jsonl grows
+    // without bound over a long-lived project, so this must never load the
+    // whole file just to keep the last 5 records.
+    readHistoryRecords(root, 5),
     readRequiredText(root, historySummaryPath),
     readRequiredText(root, decisionCandidatesPath),
     readRequiredText(root, qualityReportPath),
@@ -1234,7 +1246,6 @@ export async function generateProjectHandoff(root: string): Promise<string> {
     readRequiredText(root, devguardPaths.projectKnowledge),
     readRuntimeState(root)
   ]);
-  const records = parseHistoryRecords(history.content).slice(-5);
   const handoff = renderProjectHandoff({
     project,
     architecture,
@@ -1290,8 +1301,8 @@ export async function ensureCodeIndex(root: string): Promise<{ path: string; gen
       files: {}
     };
     for (const file of files) {
-      const content = await readTextFile(fromRoot(root, file));
-      if (content.trim()) next.files[file] = buildCodeIndexFile(file, content);
+      const content = await readIndexableFileContent(root, file);
+      if (content?.trim()) next.files[file] = buildCodeIndexFile(file, content);
     }
     await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
     return { path: codeIndexPath, generated: true, filesIndexed: Object.keys(next.files).length };
@@ -3533,8 +3544,8 @@ async function updateCodeIndex(root: string, changedFiles: string[], documentati
       delete next.files[file];
       continue;
     }
-    const content = await readTextFile(fromRoot(root, file));
-    if (!content.trim()) {
+    const content = await readIndexableFileContent(root, file);
+    if (!content?.trim()) {
       delete next.files[file];
       continue;
     }
@@ -3562,6 +3573,26 @@ function isIndexableSourceFile(file: string): boolean {
   if (isIgnoredWatchPath(file) || isDevguardManagedDocPath(file)) return false;
   if (/(^|\/)(node_modules|dist|build|\.next|coverage)\//i.test(file)) return false;
   return /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json)$/i.test(file);
+}
+
+// `isIndexableSourceFile` matches by extension only, including `.json` — a
+// large generated/data JSON file (a fixture, an OpenAPI spec, a bundled
+// locale file) can legitimately sit inside an indexed source directory.
+// Reading and tokenizing such a file as if it were source code has no
+// bounded size otherwise, so every read used for code indexing must be
+// gated on actual file size, not just extension/path.
+const MAX_INDEXABLE_FILE_BYTES = 1_000_000;
+
+async function readIndexableFileContent(root: string, file: string): Promise<string | undefined> {
+  try {
+    const info = await stat(fromRoot(root, file));
+    if (info.size > MAX_INDEXABLE_FILE_BYTES) {
+      return undefined;
+    }
+  } catch {
+    return undefined;
+  }
+  return readTextFile(fromRoot(root, file));
 }
 
 async function listInitialCodeIndexFiles(root: string): Promise<string[]> {
@@ -6920,21 +6951,6 @@ async function readRequiredText(root: string, path: string): Promise<RequiredTex
     content: missing ? "확인 필요" : content,
     missing
   };
-}
-
-function parseHistoryRecords(text: string): HistoryRecord[] {
-  return text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as HistoryRecord;
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((record): record is HistoryRecord => Boolean(record));
 }
 
 function parseQuality(markdown: string): ParsedQuality {

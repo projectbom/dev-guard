@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "dev-guard": {
+      "command": "npx",
+      "args": [
+        "--no-install",
+        "dev-guard",
+        "mcp"
+      ]
+    }
+  }
+}

@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Socket } from "node:net";
 import { spawn } from "node:child_process";
 import { access, stat } from "node:fs/promises";
 import { fromRoot, readTextFile } from "./fs.js";
@@ -145,15 +146,37 @@ export async function runDashboard(root: string, args: string[]): Promise<void> 
   console.log("");
   console.log("Press Ctrl+C to stop.");
 
-  process.on("SIGINT", () => {
-    void dashboard.close().finally(() => process.exit(0));
-  });
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const forceExit = setTimeout(() => process.exit(1), 3000);
+    forceExit.unref();
+    void dashboard
+      .close()
+      .catch(() => undefined)
+      .finally(() => process.exit(0));
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 }
 
 export async function startDashboardServer(root: string, options: { port?: number } = {}): Promise<DashboardServerHandle> {
   const port = options.port ?? DEFAULT_PORT;
   const server = createServer((request, response) => {
     void handleRequest(root, request, response);
+  });
+  // `server.close()`'s callback only fires once every connection has ended —
+  // and Node keeps HTTP/1.1 keep-alive sockets open (including idle ones)
+  // until the client closes them or they time out. A browser tab left open
+  // on the dashboard (which `dev-guard watch` opens automatically) holds
+  // exactly such an idle keep-alive connection, so `close()` alone can hang
+  // indefinitely. Tracking sockets ourselves and destroying them on close
+  // guarantees the callback fires promptly regardless of client behavior.
+  const sockets = new Set<Socket>();
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
   });
   const url = `http://${HOST}:${port}`;
   const started = await new Promise<boolean>((resolve, reject) => {
@@ -177,6 +200,7 @@ export async function startDashboardServer(root: string, options: { port?: numbe
           return;
         }
         server.close(() => resolve());
+        for (const socket of sockets) socket.destroy();
       })
   };
 }
