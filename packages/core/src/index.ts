@@ -30,7 +30,14 @@ export {
   inferredIntentToTaskType
 } from "./diff-intent.js";
 export { analyzeCompletionPostChecks, buildTaskCompletionCriteria, formatCompletionCriteria } from "./completion.js";
-export { filterDevGuardContextFiles, isAlwaysIgnoredContextPath, isDevGuardContextFile, normalizeContextPath } from "./context-files.js";
+export {
+  filterDevGuardContextFiles,
+  isAlwaysIgnoredContextPath,
+  isDevGuardArtifactPath,
+  isDevGuardContextFile,
+  isGeneratedArtifactPath,
+  normalizeContextPath
+} from "./context-files.js";
 export { generateCodexPrompt } from "./prompt.js";
 export { generateCompactReport } from "./report.js";
 export { buildReviewFixPrompt, buildReviewPrompt, generateReviewResult } from "./review.js";

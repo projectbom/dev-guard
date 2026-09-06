@@ -1,5 +1,6 @@
 import { access, readdir, stat } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
+import { isDevGuardArtifactPath, isGeneratedArtifactPath } from "@dev-guard/core";
 import { readJsonFile, readTextFile, writeTextFile, fromRoot } from "./fs.js";
 import { devguardPaths } from "./paths.js";
 
@@ -57,18 +58,18 @@ export interface ProjectKnowledgeRefreshStatus {
   };
 }
 
-const ignoredDirectories = new Set([
-  ".git",
-  ".devguard",
-  "devguard",
-  "node_modules",
-  "dist",
-  "build",
-  ".next",
-  "coverage",
-  ".turbo",
-  ".cache"
-]);
+// Delegates to the shared, cross-package policy (@dev-guard/core) instead of
+// its own list — this also fixes backup/temp copies of DevGuard's own
+// output (e.g. ".devguard.backup-<ts>") leaking into Project Knowledge as
+// if they were project source, which a bare-name Set only matching the
+// exact ".devguard"/"devguard" names could not catch.
+function isIgnoredProjectDirectory(name: string): boolean {
+  return isGeneratedArtifactPath(name) || isDevGuardArtifactPath(name);
+}
+
+// Informational only (reported in the generated ProjectKnowledge.extraction.ignored
+// field) — the actual enforcement is isIgnoredProjectDirectory above.
+const IGNORED_DIRECTORY_LABELS = [".git", ".devguard", ".devguard.*", "devguard", "devguard.*", "node_modules", "dist", "build", ".next", "coverage", ".turbo", ".cache"];
 
 const sourceExtensions = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".mdx", ".sql"]);
 const maxFiles = 2_000;
@@ -129,7 +130,7 @@ export async function generateProjectKnowledge(root: string): Promise<ProjectKno
       language: detectLanguage(files),
       packageManager: await detectPackageManager(root, rootPackage),
       entryPoints: detectEntryPoints(files),
-      sourceRoots: detectSourceRoots(files),
+      sourceRoots: detectSourceRoots(files, workspacePackages),
       filesIndexed: files.length
     },
     pages: detectPages(files),
@@ -143,7 +144,7 @@ export async function generateProjectKnowledge(root: string): Promise<ProjectKno
     },
     extraction: {
       strategy: "static",
-      ignored: [...ignoredDirectories],
+      ignored: IGNORED_DIRECTORY_LABELS,
       futureCompatible: ["dependency graph", "symbol index", "cross-reference graph", "semantic relationships"]
     }
   };
@@ -288,7 +289,7 @@ async function listProjectFiles(root: string): Promise<string[]> {
       if (files.length >= maxFiles) return;
       const rel = dir ? `${dir}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (!ignoredDirectories.has(entry.name)) {
+        if (!isIgnoredProjectDirectory(entry.name)) {
           await walk(rel);
         }
         continue;
@@ -361,9 +362,23 @@ function detectEntryPoints(files: string[]): string[] {
   ].filter((file) => files.includes(file));
 }
 
-function detectSourceRoots(files: string[]): string[] {
-  const roots = ["app", "pages", "src", "packages", "components", "lib", "server", "supabase", "prisma", "docs"];
-  return roots.filter((root) => files.some((file) => file === root || file.startsWith(`${root}/`)));
+function detectSourceRoots(files: string[], workspacePackages: Array<{ path: string; packageJson: PackageJson }>): string[] {
+  const roots = new Set<string>();
+  // Common single-app conventions, kept as before, extended with the
+  // monorepo-shaped ones ("apps", "infra") that a plain top-level-name scan
+  // was previously missing entirely.
+  const knownRoots = ["app", "pages", "src", "packages", "components", "lib", "server", "supabase", "prisma", "docs", "apps", "infra"];
+  for (const candidate of knownRoots) {
+    if (files.some((file) => file === candidate || file.startsWith(`${candidate}/`))) roots.add(candidate);
+  }
+  // Real workspace package directories (e.g. "apps/admin/package.json" ->
+  // "apps/admin") — this is what makes a monorepo's sourceRoots reflect its
+  // actual structure instead of only top-level folder names.
+  for (const pkg of workspacePackages) {
+    const dir = pkg.path.slice(0, pkg.path.length - "/package.json".length);
+    if (dir) roots.add(dir);
+  }
+  return [...roots].sort();
 }
 
 function detectPages(files: string[]): ProjectKnowledge["pages"] {

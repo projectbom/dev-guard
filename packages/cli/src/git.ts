@@ -64,6 +64,22 @@ export async function getGitRemoteOrigin(cwd: string): Promise<string> {
   return (await git(cwd, ["config", "--get", "remote.origin.url"]).catch(() => "")).trim();
 }
 
+/**
+ * Reads a file's content as it existed at `ref` (default HEAD) — used for
+ * semantic (structural) diffing of specific files like package.json,
+ * instead of scanning raw diff hunk text. Returns undefined if the file
+ * didn't exist at that ref (e.g. a newly-added file) or the ref/path
+ * doesn't resolve, so callers can treat "no prior version" as an empty
+ * baseline rather than failing.
+ */
+export async function getFileContentAtRef(cwd: string, path: string, ref = "HEAD"): Promise<string | undefined> {
+  try {
+    return await git(cwd, ["show", `${ref}:${path}`]);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function hasGitBaseline(cwd: string): Promise<boolean> {
   await assertGitRepo(cwd);
   return git(cwd, ["rev-parse", "--verify", "HEAD"]).then(() => true).catch(() => false);

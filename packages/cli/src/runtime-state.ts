@@ -10,16 +10,18 @@ import {
   formatInferredDiffIntentClusters,
   generateUpdateSuggestions,
   inferDiffIntentClusters,
+  isDevGuardArtifactPath,
+  isGeneratedArtifactPath,
   OpenAIProvider,
   type ChangeFile,
   type CodeGraphEntry,
   type DevGuardConfig
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTailLines, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
-import { computeWorkingTreeContentHash, getDiffForChangeFiles, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
+import { computeWorkingTreeContentHash, getDiffForChangeFiles, getFileContentAtRef, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
-import { DEVGUARD_DIR, devguardPaths } from "./paths.js";
-import { ensureProjectKnowledge } from "./knowledge.js";
+import { devguardPaths } from "./paths.js";
+import { ensureProjectKnowledge, readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
 import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 
@@ -862,33 +864,23 @@ export async function markRuntimeStable(root: string, diffHash: string): Promise
   return next;
 }
 
+/**
+ * Delegates generated-output and DevGuard-artifact classification to the
+ * shared, segment-based policy in @dev-guard/core (isGeneratedArtifactPath /
+ * isDevGuardArtifactPath) so this never drifts from Project Knowledge, Code
+ * Index, or changed-files filtering again — see those functions' docs for
+ * why segment matching (not a `path.startsWith(".next/")`-style prefix
+ * check) is required to catch a nested occurrence like
+ * "apps/admin/.next/server/...".
+ */
 export function isIgnoredWatchPath(path: string): boolean {
   const normalized = path.replace(/\\/g, "/").replace(/^\.\//, "");
   return (
-    normalized === DEVGUARD_DIR ||
-    normalized.startsWith(`${DEVGUARD_DIR}/`) ||
-    normalized.startsWith("node_modules/") ||
-    normalized.startsWith(".next/") ||
-    normalized.startsWith("dist/") ||
-    normalized.startsWith("build/") ||
-    normalized.startsWith(".git/") ||
-    normalized.startsWith("coverage/") ||
-    normalized.startsWith(".turbo/") ||
+    isDevGuardArtifactPath(normalized) ||
+    isGeneratedArtifactPath(normalized) ||
     normalized.endsWith(".tsbuildinfo") ||
-    normalized === runtimePath ||
-    normalized === devguardPaths.state ||
-    normalized === devguardPaths.history ||
-    isPathOrChild(normalized, devguardPaths.reportsDir) ||
-    isPathOrChild(normalized, devguardPaths.promptsDir) ||
-    isPathOrChild(normalized, devguardPaths.contextDir) ||
-    isPathOrChild(normalized, devguardPaths.logsDir) ||
-    isPathOrChild(normalized, devguardPaths.hooksDir) ||
     /\.(png|jpe?g|gif|webp|avif|ico|svg|ttf|otf|woff2?|mp4|mov|mp3|wav|pdf|zip|gz)$/i.test(normalized)
   );
-}
-
-function isPathOrChild(path: string, parent: string): boolean {
-  return path === parent || path.startsWith(`${parent}/`);
 }
 
 async function writeAtomicTextFile(path: string, content: string): Promise<void> {
@@ -1407,18 +1399,45 @@ export async function generateWorkingContext(root: string): Promise<string> {
   return workingContextPath;
 }
 
+/**
+ * Project purpose priority (see task spec): (1) an explicit description in
+ * project.md/README/package metadata — handled by the caller's
+ * firstSectionBullet check before this is ever invoked; (2) Project
+ * Knowledge's own structural summary; (3) architecture/module structure;
+ * (4) dominant application structure (this function, using sourceRoots);
+ * (5) unknown. This never invents a business/product purpose — only a
+ * structural description grounded in what was actually indexed (framework,
+ * language, package manager, monorepo app/package layout).
+ */
+function deriveProjectPurposeFromKnowledge(knowledge: ProjectKnowledge | undefined): string | undefined {
+  if (!knowledge || knowledge.summary.filesIndexed === 0) return undefined;
+  const roots = knowledge.summary.sourceRoots;
+  const appNames = [...new Set(roots.filter((root) => root.startsWith("apps/")).map((root) => root.split("/")[1]))];
+  const isMonorepo = appNames.length > 0 || roots.includes("apps");
+  if (isMonorepo) {
+    const parts: string[] = [];
+    if (appNames.length > 0) parts.push(appNames.join(", "));
+    if (roots.some((root) => root === "packages" || root.startsWith("packages/"))) parts.push("shared packages");
+    if (roots.some((root) => root === "infra" || root.startsWith("infra/"))) parts.push("infrastructure");
+    const detail = parts.length > 0 ? ` with ${parts.join(", ")}` : "";
+    return `Multi-app ${knowledge.summary.language} monorepo${detail}.`;
+  }
+  return `${knowledge.summary.framework} ${knowledge.summary.language} project (${knowledge.summary.packageManager}), ${knowledge.summary.filesIndexed} files indexed.`;
+}
+
 export async function generateAgentContext(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
-  const [project, decisions, qualityContent, historyRecords, state, runtime, codeIndex] = await Promise.all([
+  const [project, decisions, qualityContent, historyRecords, state, runtime, codeIndex, projectKnowledge] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
     readTextFile(fromRoot(root, devguardPaths.decisions)),
     readTextFile(fromRoot(root, qualityReportPath)),
     readHistoryRecords(root, 5),
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
     readRuntimeState(root),
-    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
+    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} }),
+    readProjectKnowledge(root)
   ]);
-  const projectPurpose = firstSectionBullet(project, "프로젝트 목적") ?? "확인 필요";
+  const projectPurpose = firstSectionBullet(project, "프로젝트 목적") ?? deriveProjectPurposeFromKnowledge(projectKnowledge) ?? "확인 필요";
   const currentGoal = firstSectionBullet(project, "현재 목표") ?? "확인 필요";
   const quality = parseQuality(qualityContent);
   const importantDecisions = extractDecisionLines(decisions);
@@ -1466,12 +1485,27 @@ function workingContextFiles(state: ProjectState, records: HistoryRecord[]): str
   return [...new Set(files.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)))].sort();
 }
 
+type ContextTaskSource = "explicit-before-agent-input" | "resumed-session-summary" | "history-fallback" | "none";
+
+/**
+ * Task Boundary Contract, applied to Working Context / Agent Context / Read
+ * Map / Code Map generation (not just Handoff — see resolveSessionTaskGoal
+ * for the equivalent used by processDoneEvent/generateProjectHandoff, which
+ * this mirrors). Without an explicit `runtime.currentTask` this round, the
+ * last recorded goal/summary may ONLY be reused if it is provably from the
+ * SAME session lineage (`state.lastTaskGoalSessionId === runtime.sessionId`)
+ * — e.g. a second Working Context regeneration mid-task. A summary left
+ * over from a different (possibly much older) session must never be
+ * promoted as if it were the current task; when there is no session-
+ * verified goal, this returns no goal at all (source "none"), only a plain
+ * recently-touched-files list as background, never a task/goal claim.
+ */
 function resolveBeforeAgentContext(input: {
   state: ProjectState;
   runtime: RuntimeState;
   records: HistoryRecord[];
   codeIndex: CodeIndex;
-}): { summary?: DocumentationSummary; files: string[]; source: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" } {
+}): { summary?: DocumentationSummary; files: string[]; source: ContextTaskSource } {
   const currentTask = input.runtime.currentTask?.text?.trim();
   if (currentTask) {
     const baseSummary = beforeAgentTaskSummary(currentTask, input.codeIndex);
@@ -1484,16 +1518,20 @@ function resolveBeforeAgentContext(input: {
     };
   }
   const files = workingContextFiles(input.state, input.records);
-  if (input.state.lastDocumentationSummary) {
+  const summaryBelongsToCurrentSession =
+    Boolean(input.runtime.sessionId) &&
+    Boolean(input.state.lastTaskGoalSessionId) &&
+    input.state.lastTaskGoalSessionId === input.runtime.sessionId;
+  if (summaryBelongsToCurrentSession && input.state.lastDocumentationSummary) {
     return {
       summary: input.state.lastDocumentationSummary,
       files,
-      source: "last-documentation-summary"
+      source: "resumed-session-summary"
     };
   }
   return {
     files,
-    source: files.length > 0 ? "history-fallback" : "unknown"
+    source: files.length > 0 ? "history-fallback" : "none"
   };
 }
 
@@ -1553,11 +1591,11 @@ function beforeAgentFileChange(file: string, indexed: CodeIndexFile | undefined,
   };
 }
 
-function taskSourceLabel(source: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown", locale: DevGuardLocale): string {
-  if (source === "explicit-before-agent-input") return locale === "ko-KR" ? "Explicit Before-Agent Input" : "Explicit Before-Agent Input";
-  if (source === "last-documentation-summary") return locale === "ko-KR" ? "Last Documentation Summary fallback" : "Last Documentation Summary fallback";
-  if (source === "history-fallback") return locale === "ko-KR" ? "History fallback" : "History fallback";
-  return locale === "ko-KR" ? "Unknown" : "Unknown";
+function taskSourceLabel(source: ContextTaskSource, locale: DevGuardLocale): string {
+  if (source === "explicit-before-agent-input") return "Explicit Before-Agent Input";
+  if (source === "resumed-session-summary") return "Resumed Session Summary (same task lineage)";
+  if (source === "history-fallback") return "History fallback (no active task)";
+  return "None";
 }
 
 function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex, content = ""): PreparedTaskContextFile {
@@ -1648,9 +1686,12 @@ function preparedTaskCoverageGaps(files: PreparedTaskContextFile[], summary: Doc
   return gaps.slice(0, 4);
 }
 
-function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" }): string {
+function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: ContextTaskSource }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
-  const documentationSummary = input.documentationSummary ?? input.state.lastDocumentationSummary;
+  // Trust the caller's session-gated resolution (resolveBeforeAgentContext); do NOT
+  // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
+  // summary would bypass the session-lineage gate and reappear as the active goal.
+  const documentationSummary = input.documentationSummary;
   const files = readableContextFiles(input.files, documentationSummary, input.codeIndex);
   const entryFiles = readMapEntryFiles(files, profile, documentationSummary);
   const readTargets = readMapTargets(documentationSummary, files, input.codeIndex, input.locale);
@@ -1677,7 +1718,7 @@ function renderReadMap(input: { files: string[]; state: ProjectState; projectKno
     "## Task Goal",
     "",
     `- ${localizeSentence(documentationSummary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
-    `- Task Source: ${taskSourceLabel(input.taskSource ?? "unknown", input.locale)}`,
+    `- Task Source: ${taskSourceLabel(input.taskSource ?? "none", input.locale)}`,
     "",
     "## 읽기 순서",
     ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
@@ -1710,7 +1751,10 @@ function renderCodeMap(input: {
   locale: DevGuardLocale;
   documentationSummary?: DocumentationSummary;
 }): string {
-  const documentationSummary = input.documentationSummary ?? input.state.lastDocumentationSummary;
+  // Trust the caller's session-gated resolution (resolveBeforeAgentContext); do NOT
+  // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
+  // summary would bypass the session-lineage gate and reappear as the active goal.
+  const documentationSummary = input.documentationSummary;
   const readableFiles = readableContextFiles(input.files, documentationSummary, input.codeIndex);
   const fileContents = input.fileContents.filter((item) => readableFiles.includes(item.file) && (item.content.trim() || input.codeIndex.files[item.file]));
   const files = fileContents.length > 0 ? fileContents : readableFiles.slice(0, 6).map((file) => ({ file, content: "" }));
@@ -1767,10 +1811,13 @@ function renderAgentBrief(input: {
   codeIndex: CodeIndex;
   locale: DevGuardLocale;
   documentationSummary?: DocumentationSummary;
-  taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown";
+  taskSource?: ContextTaskSource;
 }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
-  const summary = input.documentationSummary ?? input.state.lastDocumentationSummary;
+  // Trust the caller's session-gated resolution (resolveBeforeAgentContext); do NOT
+  // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
+  // summary would bypass the session-lineage gate and reappear as the active goal.
+  const summary = input.documentationSummary;
   const files = readableContextFiles(input.files, summary, input.codeIndex);
   const entryFiles = readMapEntryFiles(files, profile, summary).slice(0, 5);
   const skipTargets = readMapSkips(summary, files, input.locale).slice(0, 8);
@@ -1791,7 +1838,7 @@ function renderAgentBrief(input: {
     "",
     "## 현재 목표",
     `- ${localizeSentence(summary?.goal ?? "Goal needs confirmation because no changed files were detected.", input.locale)}`,
-    `- Task Source: ${taskSourceLabel(input.taskSource ?? "unknown", input.locale)}`,
+    `- Task Source: ${taskSourceLabel(input.taskSource ?? "none", input.locale)}`,
     "",
     "## 작업 초점",
     ...formatBullets(focus),
@@ -2688,10 +2735,13 @@ function codeMapSkipSections(file: string, content: string): string[] {
   return [...skips].slice(0, 6);
 }
 
-function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown" }): string {
+function renderWorkingContext(input: { files: string[]; state: ProjectState; historyRecords: HistoryRecord[]; projectKnowledge: string; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: ContextTaskSource }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   const domains = inferWorkingDomains(input.files);
-  const documentationSummary = input.documentationSummary ?? input.state.lastDocumentationSummary;
+  // Trust the caller's session-gated resolution (resolveBeforeAgentContext); do NOT
+  // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
+  // summary would bypass the session-lineage gate and reappear as the active goal.
+  const documentationSummary = input.documentationSummary;
   const entryFiles = workingEntryFiles(input.files, profile);
   const componentTree = workingComponentTree(domains);
   const excludedAreas = documentationSummary?.excludedAreas.length ? documentationSummary.excludedAreas.map((item) => localizeSentence(item, input.locale)) : workingExcludedAreas(domains);
@@ -2712,7 +2762,7 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
     "",
     "## 현재 작업",
     `- ${currentWork}`,
-    `- Task Source: ${taskSourceLabel(input.taskSource ?? "unknown", input.locale)}`,
+    `- Task Source: ${taskSourceLabel(input.taskSource ?? "none", input.locale)}`,
     "",
     "## 작업 범위",
     "",
@@ -2974,7 +3024,7 @@ function renderAgentContext(input: {
   qualityWhy: string[];
   importantDecisions: string[];
   documentationSummary?: DocumentationSummary;
-  taskSource?: "explicit-before-agent-input" | "last-documentation-summary" | "history-fallback" | "unknown";
+  taskSource?: ContextTaskSource;
 }): string {
   return [
     "# Agent Context",
@@ -3006,7 +3056,7 @@ function renderAgentContext(input: {
     "## Current State",
     `- project purpose: ${input.projectPurpose}`,
     `- current goal: ${input.currentGoal}`,
-    `- task source: ${taskSourceLabel(input.taskSource ?? "unknown", "en-US")}`,
+    `- task source: ${taskSourceLabel(input.taskSource ?? "none", "en-US")}`,
     "",
     "## Session Snapshot",
     `- ${input.lastSummary}`,
@@ -3571,7 +3621,6 @@ async function fileExists(path: string): Promise<boolean> {
 
 function isIndexableSourceFile(file: string): boolean {
   if (isIgnoredWatchPath(file) || isDevguardManagedDocPath(file)) return false;
-  if (/(^|\/)(node_modules|dist|build|\.next|coverage)\//i.test(file)) return false;
   return /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json)$/i.test(file);
 }
 
@@ -4584,6 +4633,52 @@ async function inferTestCandidates(root: string, input: { areas: string[]; chang
   return [...tests];
 }
 
+// package.json fields whose change actually requires a matching lockfile
+// update. Everything else (scripts, description, version, private, engines,
+// metadata, repository, license, ...) can change freely without a lockfile
+// being stale — flagging those as a completion blocker was over-broad.
+const DEPENDENCY_IMPACTING_PACKAGE_FIELDS = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies", "packageManager", "resolutions"];
+
+async function hasDependencyImpactingPackageJsonChange(root: string, packageJsonFiles: string[]): Promise<boolean> {
+  for (const file of packageJsonFiles) {
+    const [oldContent, newContent] = await Promise.all([
+      getFileContentAtRef(root, file),
+      readTextFile(fromRoot(root, file))
+    ]);
+    if (packageJsonDependencyFieldsChanged(oldContent ?? "", newContent)) return true;
+  }
+  return false;
+}
+
+/**
+ * Structural (not line-diff) comparison of a package.json's dependency-
+ * impacting fields — including nested `pnpm.overrides`/workspace dependency
+ * specifiers, which live inside `dependencies`/`devDependencies` and are
+ * therefore covered by comparing those objects as a whole. Unparsable JSON
+ * on either side is treated conservatively (as changed) rather than
+ * silently assumed safe.
+ */
+function packageJsonDependencyFieldsChanged(oldContent: string, newContent: string): boolean {
+  let oldJson: Record<string, unknown>;
+  let newJson: Record<string, unknown>;
+  try {
+    oldJson = oldContent.trim() ? (JSON.parse(oldContent) as Record<string, unknown>) : {};
+  } catch {
+    return true;
+  }
+  try {
+    newJson = newContent.trim() ? (JSON.parse(newContent) as Record<string, unknown>) : {};
+  } catch {
+    return true;
+  }
+  for (const field of DEPENDENCY_IMPACTING_PACKAGE_FIELDS) {
+    if (JSON.stringify(oldJson[field] ?? null) !== JSON.stringify(newJson[field] ?? null)) return true;
+  }
+  const oldOverrides = (oldJson.pnpm as { overrides?: unknown } | undefined)?.overrides;
+  const newOverrides = (newJson.pnpm as { overrides?: unknown } | undefined)?.overrides;
+  return JSON.stringify(oldOverrides ?? null) !== JSON.stringify(newOverrides ?? null);
+}
+
 async function assessCompletionQuality(
   root: string,
   input: {
@@ -4610,12 +4705,18 @@ async function assessCompletionQuality(
     detail: rawGeneratedFiles.length > 0 ? `generated files in git changes: ${rawGeneratedFiles.join(", ")}` : "no generated runtime files in git changes"
   });
 
-  const packageChanged = input.changedFiles.some((file) => /(^|\/)package\.json$/.test(file));
+  const packageJsonFiles = input.changedFiles.filter((file) => /(^|\/)package\.json$/.test(file));
+  const packageChanged = packageJsonFiles.length > 0;
   const lockChanged = input.rawChangedFiles.some((file) => /(^|\/)(pnpm-lock\.yaml|package-lock\.json|yarn\.lock|bun\.lockb?)$/.test(file));
+  const dependencyFieldsChanged = packageChanged && (await hasDependencyImpactingPackageJsonChange(root, packageJsonFiles));
   checklist.push({
     label: "package lock consistency",
-    status: packageChanged && !lockChanged ? "BLOCKED" : "PASS",
-    detail: packageChanged && !lockChanged ? "package.json changed but no lockfile change detected" : "package/lockfile state does not look inconsistent"
+    status: dependencyFieldsChanged && !lockChanged ? "BLOCKED" : "PASS",
+    detail: dependencyFieldsChanged && !lockChanged
+      ? "dependency-impacting fields (dependencies/devDependencies/optionalDependencies/peerDependencies/packageManager/pnpm.overrides/resolutions) changed in package.json but no lockfile change was detected"
+      : packageChanged && !dependencyFieldsChanged
+        ? "package.json changed, but only non-dependency fields (e.g. scripts/description/version) — lockfile is not required"
+        : "package/lockfile state does not look inconsistent"
   });
   checklist.push({
     label: "package manifest changed",
@@ -5597,7 +5698,7 @@ function formatQASnapshot(report: QualityReport, locale: DevGuardLocale): string
     ...formatKindRows(report, "TEST", labels.tests, locale),
     [labels.self, qaLegacyStatus(report, "CUSTOM", "self-check", locale)],
     ...formatKindRows(report, "MANUAL_QA", labels.manual, locale, () => manualQAFallback(report, locale)),
-    [labels.regression, regressionRiskLevel(report, locale)]
+    [labels.regression, resolveRegressionRiskLevel(report)]
   ];
   if (qaEntriesByKind(report.qaResults, "RUNTIME_SMOKE").length > 0) {
     rows.push(...formatKindRows(report, "RUNTIME_SMOKE", "Runtime Smoke", locale, undefined, true));
@@ -5970,7 +6071,7 @@ function formatRegressionRisk(report: QualityReport, locale: DevGuardLocale): st
       ? ["Regression Risk: None", "", "현재 품질 규칙에서 회귀 위험을 높이는 항목은 발견되지 않았습니다."]
       : ["Regression Risk: None", "", "No current quality rule increased regression risk."];
   }
-  const level = regressionRiskLevel(report, locale);
+  const level = regressionRiskLevel(report);
   const lines = [locale === "ko-KR" ? `Regression Risk: ${level}` : `Regression Risk: ${level}`, ""];
   lines.push(locale === "ko-KR" ? "잠재 영향" : "Potential impact");
   for (const item of risks.slice(0, 4)) {
@@ -5980,7 +6081,23 @@ function formatRegressionRisk(report: QualityReport, locale: DevGuardLocale): st
   return lines;
 }
 
-function regressionRiskLevel(report: QualityReport, locale: DevGuardLocale): string {
+/**
+ * Single source of truth for "Regression Risk" — every place that shows
+ * this concept (the QA Summary table, the detailed Regression Risk section,
+ * Handoff) must read from here so they can never disagree, as they
+ * previously could: the table used a checklist-derived heuristic while the
+ * detailed section used documentationSummary's diff-classification-derived
+ * risk, independently, with no shared value. `documentationSummary.impact.risk`
+ * is preferred because it is the richer, diff-specific classification (with
+ * a stated reason and affected areas); the checklist-only heuristic is kept
+ * strictly as a fallback for callers that never had a documentationSummary.
+ */
+function resolveRegressionRiskLevel(report: QualityReport): "None" | "Low" | "Medium" | "High" {
+  if (report.documentationSummary) return report.documentationSummary.impact.risk;
+  return regressionRiskLevel(report);
+}
+
+function regressionRiskLevel(report: QualityReport): "None" | "Low" | "Medium" | "High" {
   if (report.verdict === "BLOCKED") return "High";
   const warnings = report.checklist.filter((item) => item.status === "WARN" && item.affectsVerdict !== false);
   if (warnings.some((item) => /risky areas|package|CLI|watch/i.test(item.label))) return "Medium";
