@@ -216,15 +216,6 @@ export function resolveOpenAIEnv(env: NodeJS.ProcessEnv = process.env): EnvResol
   };
 }
 
-export function readOpenAIApiKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const devGuardKey = env.DEV_GUARD_OPENAI_API_KEY?.trim();
-  if (devGuardKey) {
-    return devGuardKey;
-  }
-  const openAIKey = env.OPENAI_API_KEY?.trim();
-  return openAIKey || undefined;
-}
-
 export async function resolveOpenAIApiKey(root: string, env: NodeJS.ProcessEnv = process.env): Promise<{
   apiKey?: string;
   source: OpenAIKeySource;

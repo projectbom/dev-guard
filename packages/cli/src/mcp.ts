@@ -1,11 +1,31 @@
-import { access, realpath } from "node:fs/promises";
-import { resolve, relative } from "node:path";
+import { access, readFile, realpath } from "node:fs/promises";
+import { resolve, relative, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { fromRoot } from "./fs.js";
 import { devguardPaths } from "./paths.js";
 import { prepareTaskContext, recordValidationEvidence } from "./runtime-state.js";
+
+/**
+ * DevGuard's own installed version — read from the CLI package's own
+ * package.json (next to dist/, resolved from this module's own location,
+ * not the consumer project root `fromRoot` uses) so the MCP server never
+ * reports a version string that drifts from the actual published package.
+ * Falls back to "unknown" rather than crashing the MCP server if this
+ * (non-critical, informational) read ever fails.
+ */
+async function readOwnPackageVersion(): Promise<string> {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const raw = await readFile(join(here, "..", "package.json"), "utf8");
+    const parsed = JSON.parse(raw) as { version?: string };
+    return parsed.version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+}
 
 const toolInputSchema = {
   task: z.string().min(1).describe("Current coding task. Call before searching or reading project source files."),
@@ -37,7 +57,7 @@ const recordValidationInputSchema = {
 export async function runMcpServer(root: string): Promise<void> {
   const server = new McpServer({
     name: "dev-guard",
-    version: "0.7.0"
+    version: await readOwnPackageVersion()
   });
 
   server.registerTool(

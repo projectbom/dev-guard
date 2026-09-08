@@ -219,15 +219,6 @@ export function formatEffectiveTaskContext(prefix: string, context: EffectiveTas
   ];
 }
 
-export function formatEffectiveTaskBlock(title: string, context: EffectiveTaskContext): string[] {
-  return [
-    title,
-    `  - task.md: ${context.anchorStatus}${context.anchorStatus === "absent" ? "" : ` (match score ${context.taskMatchScore})`}`,
-    `  - run: ${context.useRun && context.effectiveRunLog ? `using ${context.effectiveRunLog.id}` : "ignored"} (match score ${context.runMatchScore ?? 0})`,
-    `  - using: ${context.useTaskMarkdown ? "task.md" : "inferred task from current diff"} (${context.mode})`
-  ];
-}
-
 export function formatEffectiveRunSummary(context: EffectiveTaskContext): string {
   return [
     context.useRun && context.effectiveRunLog ? `- using run: ${context.effectiveRunLog.id}` : "- run: ignored",

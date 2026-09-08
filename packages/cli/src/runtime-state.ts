@@ -301,6 +301,16 @@ export interface QualityReport {
    */
   stateIntegrity?: "CONSISTENT" | "TASK_CHANGE_MISMATCH";
   /**
+   * The actual previous goal text that triggered TASK_CHANGE_MISMATCH (read
+   * directly from ProjectState.lastTaskGoal before this round's processing).
+   * Only meaningful when stateIntegrity is "TASK_CHANGE_MISMATCH" — the
+   * fail-closed renderers must quote THIS, not `documentationSummary.goal`:
+   * once a mismatch clears the carried-over goal, documentationSummary.goal
+   * already holds whatever generic fallback the current (unrelated) files
+   * degrade to, which would misreport what the stale goal actually was.
+   */
+  staleGoal?: string;
+  /**
    * Count of qaResults entries recorded with no active DevGuard task (see
    * QAExecutionResult.taskBinding). Real evidence, never silently attached
    * to the current task's PASS/FAIL facts, but surfaced so a user/agent
@@ -1178,6 +1188,11 @@ export async function processDoneEvent(root: string, options: { completionSource
     documentationSummary,
     qaResults: freshQaResults,
     stateIntegrity,
+    // The actual stale goal being overridden — read directly from
+    // ProjectState, not from documentationSummary (which, once the
+    // mismatch clears canonicalGoal, already holds an unrelated
+    // file-based fallback describing the CURRENT files instead).
+    staleGoal: stateIntegrity === "TASK_CHANGE_MISMATCH" ? previousProjectState.lastTaskGoal : undefined,
     unboundEvidenceCount
   });
   // A state-integrity failure must render exactly the deterministic mismatch
@@ -2217,18 +2232,6 @@ function readMapTargets(summary: DocumentationSummary | undefined, files: string
   return files.length > 0 ? files.slice(0, 8).map((file) => `${file}: ${locale === "ko-KR" ? "변경 지점 확인" : "check changed area"}`) : [locale === "ko-KR" ? "수정 대상 확인 필요" : "Targets need confirmation"];
 }
 
-function sortDocumentationFileChanges(
-  changes: DocumentationFileChange[],
-  readableFiles: string[],
-  index: CodeIndex,
-  summary: DocumentationSummary
-): DocumentationFileChange[] {
-  const readable = new Set(readableFiles);
-  return [...changes]
-    .filter((change) => readable.has(change.file))
-    .sort((a, b) => readMapCandidateScore(b.file, summary, index, b) - readMapCandidateScore(a.file, summary, index, a) || a.file.localeCompare(b.file));
-}
-
 function sortReadMapCandidates(files: string[], summary: DocumentationSummary, index: CodeIndex): string[] {
   return [...new Set(files)].sort((a, b) => {
     const aChange = summary.fileChanges.find((change) => change.file === a);
@@ -3163,65 +3166,6 @@ function workingComponentTree(domains: Set<string>): string[] {
   return ["CLI", "├── packages/cli/src/index.ts", "├── command implementation files", "└── generated `.devguard` artifacts"];
 }
 
-function workingChangedFileLine(file: string, domains: Set<string>): string {
-  const reason = workingFileReason(file, domains);
-  return `- \`${file}\`\n  - 변경 이유: ${reason.reason}\n  - 주요 변경: ${reason.change}\n  - 확인 필요: ${reason.check}`;
-}
-
-function workingDocumentationFileLine(file: DocumentationFileChange, locale: DevGuardLocale): string {
-  return `- \`${file.file}\`\n  - 변경 이유: ${localizeSentence(file.purpose, locale)}\n  - 주요 변경: ${localizeSentence(file.changes[0] ?? "feature change needs confirmation", locale)}\n  - 사용자/AI 영향: ${localizeSentence(file.userImpact[0] ?? "impact needs confirmation", locale)}\n  - 확인 필요: ${localizeSentence(file.qa[0] ?? "specific QA point was not inferred", locale)}`;
-}
-
-function workingFileReason(file: string, domains: Set<string>): { reason: string; change: string; check: string } {
-  if (/runtime-state\.ts$/.test(file)) {
-    return {
-      reason: "done 실행 시 생성되는 DevGuard 산출물과 런타임 상태를 조정",
-      change: "Quality Report / Handoff / Agent Context / Working Context 생성 흐름",
-      check: "생성된 `.devguard/reports/*` 산출물이 서로 역할을 침범하지 않는지 확인"
-    };
-  }
-  if (/self\.ts$/.test(file)) {
-    return {
-      reason: "self-check 실행 결과를 QA 산출물에서 재사용하기 위한 흐름",
-      change: "검증 단계 결과 기록",
-      check: "실패한 검증을 PASS로 기록하지 않는지 확인"
-    };
-  }
-  if (/index\.ts$/.test(file)) {
-    return {
-      reason: "CLI 명령 출력 또는 생성 산출물 연결",
-      change: "사용자에게 표시되는 command result",
-      check: "help/command 출력이 실제 생성 파일과 일치하는지 확인"
-    };
-  }
-  if (/paths\.ts$/.test(file)) {
-    return {
-      reason: "DevGuard 내부 산출물 경로 추가",
-      change: "`.devguard` 경로 상수",
-      check: "새 경로가 하드코딩 없이 상수로 사용되는지 확인"
-    };
-  }
-  if (domains.has("dashboard") && /dashboard/.test(file)) {
-    return {
-      reason: "Dashboard 화면 또는 문구 조정",
-      change: "Dashboard client/rendering/i18n",
-      check: "PASS / NEEDS_REVIEW / BLOCKED 상태가 모두 렌더링되는지 확인"
-    };
-  }
-  return {
-    reason: "이번 세션 변경 범위에 포함된 파일",
-    change: "파일별 diff 확인 필요",
-    check: "변경 목적이 현재 작업 목표와 일치하는지 확인"
-  };
-}
-
-function workingNextAreas(domains: Set<string>): string[] {
-  if (domains.has("reports")) return ["Working Context generated output", "Quality Report role separation", "done / handoff command generated file list"];
-  if (domains.has("dashboard")) return ["Status card", "Next Action steps", "Settings / Advanced Details interaction"];
-  if (domains.has("watch")) return ["runtime/state refresh", "pending file filtering", "external done synchronization"];
-  return ["current changed files", "generated artifact output", "build/self-check validation"];
-}
-
 function workingCurrentStructure(domains: Set<string>): string[] {
   if (domains.has("reports")) {
     return [
@@ -3247,16 +3191,6 @@ function workingTips(domains: Set<string>): string[] {
   if (!domains.has("hooks")) tips.push("Hook runtime is not part of the current edit.");
   if (!domains.has("watch")) tips.push("watch auto-finalization behavior is not part of the current edit.");
   return tips;
-}
-
-function workingResumeStart(entryFiles: string[], nextAreas: string[]): string[] {
-  const firstFile = entryFiles[0] ?? "확인 필요";
-  const firstArea = nextAreas[0] ?? "확인 필요";
-  return [
-    `먼저 \`${firstFile}\`를 열고 현재 변경 지점을 확인한다.`,
-    `${firstArea} 범위 안에서만 수정한다.`,
-    "`pnpm run build`, `dev-guard self-check`, `dev-guard done` 순서로 검증하고 Working Context가 갱신되는지 확인한다."
-  ];
 }
 
 function renderAgentContext(input: {
@@ -4807,97 +4741,6 @@ function formatBullets(items: string[]): string[] {
   return items.length > 0 ? items.map((item) => `- ${item}`) : ["- none"];
 }
 
-function summarizeMeaningfulChanges(changedFiles: string[], areas: string[], summary?: string): string[] {
-  const changes = new Set<string>();
-  if (changedFiles.some((file) => /dashboard/i.test(file))) changes.add("Dashboard UX and assistant guidance changed.");
-  if (changedFiles.some((file) => /runtime-state|handoff|prompt/i.test(file))) changes.add("Session continuity and handoff generation changed.");
-  if (changedFiles.some((file) => /knowledge/i.test(file))) changes.add("Project Knowledge generation or usage changed.");
-  if (areas.includes("docs")) changes.add("Documentation updated to match the current workflow.");
-  if (areas.includes("api")) changes.add("API contract or route handling changed.");
-  if (areas.includes("config")) changes.add("Configuration or dependency setup changed.");
-  if (areas.includes("cli") && ![...changes].some((item) => item.includes("Dashboard") || item.includes("handoff"))) {
-    changes.add("CLI behavior changed.");
-  }
-  if (summary && !/확인 필요/i.test(summary)) changes.add(`Latest done summary: ${summary}`);
-  return changes.size > 0 ? [...changes].slice(0, 8) : ["확인 필요: no meaningful change summary could be inferred."];
-}
-
-function outstandingIssuesFromQuality(report: QualityReport, riskHints: string[] = []): string[] {
-  const issues = new Set<string>();
-  for (const item of report.checklist) {
-    if (item.status !== "PASS") issues.add(`${item.status}: ${item.label} - ${item.detail}`);
-  }
-  for (const hint of riskHints) {
-    if (/drift|blocked|warn|risk|확인 필요/i.test(hint)) issues.add(hint);
-  }
-  if (report.verdict === "PASS" && issues.size === 0) return ["none"];
-  return [...issues].slice(0, 8);
-}
-
-function compactOutstanding(items: string[], verdict: string): string[] {
-  if (verdict === "PASS") return ["none"];
-  return items.filter((item) => item !== "none" && item !== "없음").slice(0, verdict === "BLOCKED" ? 5 : 3);
-}
-
-function executableNextSteps(report: QualityReport, nextTask: NextTaskPlan): string[] {
-  if (report.verdict === "BLOCKED") {
-    return [
-      "Review the BLOCKED items in the quality report.",
-      "Fix only the files required for the blocked issue.",
-      "Run the required verification commands.",
-      "Do not introduce new features."
-    ];
-  }
-  if (report.verdict === "NEEDS_REVIEW") {
-    return [
-      `Start with: ${nextTask.goal}`,
-      `Run: ${report.requiredVerification[0] ?? "확인 필요"}`,
-      `Review: ${devguardPaths.qualityReport}`,
-      "Keep changes scoped; do not introduce new features."
-    ];
-  }
-  return [
-    `Continue with: ${nextTask.goal}`,
-    "Keep the change scoped to the current task.",
-    "Run the relevant verification command before finishing."
-  ];
-}
-
-function executableNextStepsFromParsedQuality(quality: { verdict: string; requiredVerification: string[] }, nextTask: string, locale: DevGuardLocale = "en-US"): string[] {
-  if (locale === "ko-KR") {
-    if (quality.verdict === "BLOCKED") {
-      return [
-        "- 품질 보고서의 차단 항목을 먼저 확인하세요.",
-        "- 차단 항목 해결에 필요한 파일만 수정하세요.",
-        `- 실행: ${compactCommandList(quality.requiredVerification)}`
-      ];
-    }
-    if (quality.verdict === "NEEDS_REVIEW") {
-      return [
-        `- 계속 진행: ${localizeSentence(nextTask, locale)}`,
-        `- 실행: ${compactCommandList(quality.requiredVerification)}`,
-        `- 확인: ${devguardPaths.qualityReport}`
-      ];
-    }
-    return [`- 계속 진행: ${localizeSentence(nextTask, locale)}`, `- 실행: ${compactCommandList(quality.requiredVerification)}`];
-  }
-  if (quality.verdict === "BLOCKED") {
-    return [
-      "- Review BLOCKED items in the quality report.",
-      "- Fix only the blocked issue.",
-      `- Run: ${compactCommandList(quality.requiredVerification)}`
-    ];
-  }
-  if (quality.verdict === "NEEDS_REVIEW") {
-    return [
-      `- Continue: ${nextTask}`,
-      `- Run: ${compactCommandList(quality.requiredVerification)}`,
-      `- Review: ${devguardPaths.qualityReport}`
-    ];
-  }
-  return [`- Continue: ${nextTask}`, `- Run: ${compactCommandList(quality.requiredVerification)}`];
-}
-
 function completionStatus(verdict: string, drift?: string): string {
   if (verdict === "PASS" && drift !== "high") return "completed";
   if (verdict === "BLOCKED" || drift === "high") return "blocked";
@@ -4916,51 +4759,11 @@ function compactCommandList(commands: string[], limit = 3): string {
   return commands.length > limit ? `${visible}; +${commands.length - limit}` : visible;
 }
 
-function compactProjectContextLine(projectContext: ProjectContextSummary): string {
-  const parts = [projectContext.techStack, projectContext.structure].filter((item) => item && item !== "확인 필요");
-  return parts.length > 0 ? parts.join("; ") : `see ${devguardPaths.projectKnowledge}`;
-}
-
-function compactQualityLine(quality: { verdict: string; why: string[]; requiredVerification: string[] }, locale: DevGuardLocale = "en-US"): string {
-  const why = quality.why.filter((item) => item !== "확인 필요").slice(0, 2).join(" / ");
-  const verify = compactCommandList(quality.requiredVerification);
-  if (locale === "ko-KR") return `${quality.verdict}${why ? ` - ${why}` : ""}; 검증: ${verify}`;
-  return `${quality.verdict}${why ? ` - ${why}` : ""}; verify: ${verify}`;
-}
-
-function compactKnowledgeLine(content: string): string {
-  try {
-    const parsed = JSON.parse(content) as {
-      summary?: { framework?: string; language?: string; packageManager?: string; filesIndexed?: number; entryPoints?: string[] };
-      architecture?: { modules?: Array<{ name?: string }> };
-    };
-    const modules = parsed.architecture?.modules?.map((module) => module.name).filter(Boolean).slice(0, 5).join(", ");
-    return [
-      parsed.summary?.framework,
-      parsed.summary?.packageManager,
-      typeof parsed.summary?.filesIndexed === "number" ? `${parsed.summary.filesIndexed} files` : undefined,
-      modules ? `modules: ${modules}` : undefined
-    ].filter(Boolean).join("; ") || "확인 필요";
-  } catch {
-    return "확인 필요";
-  }
-}
-
 function handoffQualityScore(input: { missingCount: number; outstandingCount: number; lineCountEstimate: number }): string[] {
   const coverage = input.missingCount === 0 ? "Complete" : `Missing ${input.missingCount}`;
   const redundancy = input.lineCountEstimate <= 55 ? "Low" : input.lineCountEstimate <= 75 ? "Medium" : "High";
   const readability = input.outstandingCount <= 4 && input.lineCountEstimate <= 60 ? "High" : "Medium";
   return [`Coverage: ${coverage}`, `Redundancy: ${redundancy}`, `Readability: ${readability}`];
-}
-
-function handoffSectionOrder(verdict: string): string[] {
-  if (verdict === "BLOCKED") {
-    return ["Outstanding", "Quality", "Goal", "Next", "Changed", "History", "Project", "Decisions", "Workflow", "Missing"];
-  }
-  if (verdict === "PASS") {
-    return ["Goal", "Next", "Changed", "History", "Project", "Quality", "Decisions", "Workflow", "Missing"];
-  }
-  return ["Goal", "Outstanding", "Quality", "Next", "Changed", "History", "Project", "Decisions", "Workflow", "Missing"];
 }
 
 function parseProjectState(stateJson: string): ProjectState {
@@ -4973,51 +4776,6 @@ function parseProjectState(stateJson: string): ProjectState {
 
 function lastHistoryFiles(records: HistoryRecord[]): string[] {
   return records.length > 0 ? records[records.length - 1].changedFiles : [];
-}
-
-function latestHistorySummary(records: HistoryRecord[]): string | undefined {
-  return records.length > 0 ? records[records.length - 1].inferredSummary : undefined;
-}
-
-function formatRecentSessionContext(records: HistoryRecord[]): string[] {
-  const recent = records.slice(-3).reverse();
-  if (recent.length === 0) return ["확인 필요"];
-  return recent.map((record, index) => {
-    const label = index === 0 ? "Last session" : index === 1 ? "Previous" : "Earlier";
-    return `${label}: ${record.inferredSummary} (${record.changedFiles.length} files; quality=${record.qualityVerdict ?? "unknown"})`;
-  });
-}
-
-function projectKnowledgeBullets(content: string): string[] {
-  try {
-    const parsed = JSON.parse(content) as {
-      projectName?: string;
-      summary?: {
-        framework?: string;
-        language?: string;
-        packageManager?: string;
-        filesIndexed?: number;
-        entryPoints?: string[];
-      };
-      architecture?: {
-        modules?: Array<{ name?: string; files?: string[] }>;
-      };
-      apis?: Array<{ route?: string; file?: string }>;
-    };
-    const bullets = new Set<string>();
-    if (parsed.projectName) bullets.add(`project: ${parsed.projectName}`);
-    if (parsed.summary?.framework) bullets.add(`framework: ${parsed.summary.framework}`);
-    if (parsed.summary?.language) bullets.add(`language: ${parsed.summary.language}`);
-    if (parsed.summary?.packageManager) bullets.add(`package manager: ${parsed.summary.packageManager}`);
-    if (typeof parsed.summary?.filesIndexed === "number") bullets.add(`files indexed: ${parsed.summary.filesIndexed}`);
-    if (parsed.summary?.entryPoints?.length) bullets.add(`entry points: ${parsed.summary.entryPoints.slice(0, 5).join(", ")}`);
-    const moduleNames = parsed.architecture?.modules?.map((module) => module.name).filter(Boolean) ?? [];
-    if (moduleNames.length > 0) bullets.add(`architecture modules: ${moduleNames.slice(0, 8).join(", ")}`);
-    if (parsed.apis?.length) bullets.add(`known commands/apis: ${parsed.apis.slice(0, 5).map((api) => api.route ?? api.file).filter(Boolean).join(", ")}`);
-    return bullets.size > 0 ? [...bullets].slice(0, 8) : ["확인 필요"];
-  } catch {
-    return ["확인 필요: project knowledge is missing or invalid JSON."];
-  }
 }
 
 export async function ensureDevguardDirs(root: string): Promise<void> {
@@ -5150,6 +4908,7 @@ async function assessCompletionQuality(
     documentationSummary: DocumentationSummary;
     qaResults?: Record<string, QAExecutionResult>;
     stateIntegrity?: "CONSISTENT" | "TASK_CHANGE_MISMATCH";
+    staleGoal?: string;
     unboundEvidenceCount?: number;
   }
 ): Promise<QualityReport> {
@@ -5281,6 +5040,7 @@ async function assessCompletionQuality(
     documentationSummary: input.documentationSummary,
     qaResults: input.qaResults,
     stateIntegrity: input.stateIntegrity ?? "CONSISTENT",
+    staleGoal: input.staleGoal,
     unboundEvidenceCount: input.unboundEvidenceCount
   };
 }
@@ -6058,7 +5818,7 @@ function renderQualityReport(report: QualityReport, locale: DevGuardLocale): str
 }
 
 function renderStateMismatchQualityReport(report: QualityReport, locale: DevGuardLocale): string {
-  const goalText = report.documentationSummary?.goal;
+  const goalText = report.staleGoal;
   const unbound = report.unboundEvidenceCount ?? 0;
   if (locale === "ko-KR") {
     return [
@@ -6831,78 +6591,6 @@ function formatAIQualityNote(report: QualityReport, locale: DevGuardLocale): str
   ];
 }
 
-function formatActionSteps(report: QualityReport, items: QualityReviewItem[], locale: DevGuardLocale): string[] {
-  const primary = items[0];
-  if (!primary) return [`1. ${localizeSentence(report.nextRecommendedAction, locale)}`];
-  const steps: string[] = [];
-  steps.push(`1. ${localizeReviewTitle(primary.title, locale)}`);
-  if (primary.files.length > 0) {
-    const files = compactFileList(primary.files, 3);
-    steps.push(`2. ${locale === "ko-KR" ? `\`${files}\`에서 변경 이유와 검토 기준을 확인합니다.` : `Confirm the change reason and review criteria in \`${files}\`.`}`);
-  }
-  const primaryCheck = primary.checks.find((check) => /^pnpm|^npm|^yarn/.test(check)) ?? report.requiredVerification[0];
-  if (primaryCheck) {
-    steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "검증 실행" : "Run verification"}: ${primaryCheck}`);
-  }
-  steps.push(`${steps.length + 1}. ${locale === "ko-KR" ? "보고서 첫 화면이 변경 의미와 다음 행동을 바로 안내하는지 확인" : "Confirm the report starts with the change meaning and next action"}`);
-  return steps;
-}
-
-function formatReviewQuestions(items: QualityReviewItem[], locale: DevGuardLocale): string[] {
-  if (items.length === 0) return [`- ${reportCopy[locale].noItems}`];
-  return items.map((item) => `- ${reviewQuestion(item, locale)}`);
-}
-
-function reviewQuestion(item: QualityReviewItem, locale: DevGuardLocale): string {
-  const title = localizeReviewTitle(item.title, locale);
-  const fileText = item.files.length > 0 ? ` (${compactFileList(item.files, 3)})` : "";
-  if (locale === "ko-KR") {
-    if (item.title === "Quality Report output review") return `Quality Report가 첫 화면에서 변경 의미와 다음 행동을 바로 알려주는가?${fileText}`;
-    if (item.title === "OpenAI API key safety and fallback") return `API Key가 없어도 done/status/handoff가 실패하지 않고, Dashboard API가 raw value 없이 configured/source만 반환하는가?${fileText}`;
-    if (item.title === "Report and handoff regeneration") return `done/status/handoff 실행 후 사용자용 보고서가 최신 상태로 재생성되는가?${fileText}`;
-    if (item.title === "Change scope check") return `이번 변경이 Quality Report intelligence 개선에만 집중되어 있는가?${fileText}`;
-    if (item.title === "Change breadth review") return `변경 파일이 하나의 작업 목표로 설명되는가?${fileText}`;
-    if (item.title === "Runtime-sensitive behavior") return `설정과 런타임 흐름이 실제 사용 방식과 일치하는가?${fileText}`;
-    if (item.title === "Documentation update need") return `사용자-facing 동작이 바뀌었다면 README 또는 docs 설명도 맞게 갱신되었는가?${fileText}`;
-    if (item.title === "CLI command and help consistency") return `CLI help/status 출력이 문서와 일치하는가?${fileText}`;
-    return `${title} 항목을 검토했는가?${fileText}`;
-  }
-  if (item.title === "Report and handoff regeneration") return `Do done/status/handoff regenerate the latest user-facing reports?${fileText}`;
-  if (item.title === "OpenAI API key safety and fallback") return `Do missing or invalid API keys fall back safely without exposing raw values?${fileText}`;
-  if (item.title === "Quality Report output review") return `Does the Quality Report immediately tell the user what changed and what to do next?${fileText}`;
-  if (item.title === "Change scope check") return `Is this diff focused only on Quality Report intelligence?${fileText}`;
-  if (item.title === "Change breadth review") return `Do the changed files still belong to one coherent task?${fileText}`;
-  if (item.title === "Runtime-sensitive behavior") return `Does the configuration and runtime flow still match actual use?${fileText}`;
-  if (item.title === "Documentation update need") return `If user-facing behavior changed, do README/docs match it?${fileText}`;
-  if (item.title === "CLI command and help consistency") return `Do CLI help/status output and docs still match?${fileText}`;
-  return `Has ${title} been checked?${fileText}`;
-}
-
-function formatRelatedFiles(files: string[], reviewItems: QualityReviewItem[], locale: DevGuardLocale): string[] {
-  if (files.length === 0) return [`- ${reportCopy[locale].noItems}`];
-  return files.slice(0, 10).map((file) => {
-    const role = relatedFileRole(file, reviewItems, locale);
-    return `- ${file}${role ? ` ${locale === "ko-KR" ? "→" : "-"} ${role}` : ""}`;
-  });
-}
-
-function relatedFileRole(file: string, reviewItems: QualityReviewItem[], locale: DevGuardLocale): string {
-  if (/runtime-state\.ts$/.test(file)) {
-    return locale === "ko-KR" ? "Quality Report 판단 문장, 실행 안내, handoff 파싱 로직" : "Quality Report review copy, action guidance, and handoff parsing logic";
-  }
-  if (/dashboard/i.test(file)) {
-    return locale === "ko-KR" ? "Dashboard 표시와 사용자 상호작용" : "Dashboard display and user interaction";
-  }
-  if (/configure|config/i.test(file)) {
-    return locale === "ko-KR" ? "설정 저장과 CLI 설정 흐름" : "Configuration persistence and CLI config flow";
-  }
-  if (/README|docs\//i.test(file)) {
-    return locale === "ko-KR" ? "사용자 문서와 명령 설명" : "User documentation and command guidance";
-  }
-  const item = reviewItems.find((reviewItem) => reviewItem.files.includes(file));
-  return item ? localizeReviewTitle(item.title, locale) : "";
-}
-
 function reviewItemMatchesQualityItem(reviewItem: QualityReviewItem, item: QualityCheckItem): boolean {
   const title = reviewItem.title.toLowerCase();
   if (item.label === "generated/runtime files") return title.includes("generated") || title.includes("생성");
@@ -6914,22 +6602,6 @@ function reviewItemMatchesQualityItem(reviewItem: QualityReviewItem, item: Quali
   if (item.label === "docs update candidate") return title.includes("documentation") || title.includes("문서");
   if (item.label === "drift clarity") return title.includes("scope") || title.includes("범위");
   return false;
-}
-
-function formatReviewItems(items: QualityReviewItem[], locale: DevGuardLocale): string[] {
-  if (items.length === 0) return [`- ${reportCopy[locale].noItems}`];
-  const lines: string[] = [];
-  for (const item of items) {
-    lines.push(`- ${localizeReviewTitle(item.title, locale)}`);
-    for (const body of item.body) lines.push(`  - ${localizeSentence(body, locale)}`);
-    if (item.files.length > 0) {
-      lines.push(`  - ${locale === "ko-KR" ? "관련 파일" : "Related files"}: ${compactFileList(item.files, 5)}`);
-    }
-    if (item.checks.length > 0) {
-      lines.push(`  - ${locale === "ko-KR" ? "확인 기준" : "Check"}: ${item.checks.slice(0, 4).map((check) => localizeSentence(check, locale)).join("; ")}`);
-    }
-  }
-  return lines;
 }
 
 function localizeReviewTitle(value: string, locale: DevGuardLocale): string {
@@ -6955,10 +6627,6 @@ function formatLocalizedBullets(items: string[], locale: DevGuardLocale): string
   const filtered = items.filter((item) => item && item !== "none" && item !== "확인 필요");
   if (filtered.length === 0) return [`- ${reportCopy[locale].noItems}`];
   return filtered.map((item) => `- ${localizeSentence(item, locale)}`);
-}
-
-function formatQualityItem(item: QualityCheckItem, locale: DevGuardLocale): string {
-  return `${qualityLabel(item.label, locale)} - ${qualityDetail(item, locale)}`;
 }
 
 function qualityLabel(label: string, locale: DevGuardLocale): string {
@@ -7318,7 +6986,7 @@ function renderProjectHandoff(input: {
  * this only reports the mismatch and the one safe recovery action.
  */
 function renderHandoffUnavailable(report: QualityReport, locale: DevGuardLocale): string {
-  const goalText = report.documentationSummary?.goal;
+  const goalText = report.staleGoal;
   const unbound = report.unboundEvidenceCount ?? 0;
   if (locale === "ko-KR") {
     return [
@@ -7760,48 +7428,6 @@ function looksStaleHandoffTask(value: string, files: string[]): boolean {
   return false;
 }
 
-function localizeHandoffLines(lines: string[], locale: DevGuardLocale): string[] {
-  if (locale === "en-US") return lines;
-  return lines.map((line) => {
-    if (!line.startsWith("- ")) return line;
-    return `- ${localizeSentence(localizeHandoffSentence(line.slice(2)), locale)}`;
-  });
-}
-
-function localizeHandoffSentence(value: string): string {
-  return value
-    .replace(/^status: completed$/, "상태: 완료")
-    .replace(/^status: blocked$/, "상태: 차단됨")
-    .replace(/^status: partially completed$/, "상태: 일부 완료")
-    .replace(/^files: none$/, "변경 파일: 없음")
-    .replace(/^files: /, "변경 파일: ")
-    .replace(/^Last session:/, "마지막 세션:")
-    .replace(/^Previous:/, "이전 세션:")
-    .replace(/^Earlier:/, "그 이전 세션:")
-    .replace(/^project:/, "프로젝트:")
-    .replace(/^framework:/, "프레임워크:")
-    .replace(/^language:/, "언어:")
-    .replace(/^package manager:/, "패키지 매니저:")
-    .replace(/^files indexed:/, "색인된 파일:")
-    .replace(/^architecture modules:/, "아키텍처 모듈:")
-    .replace(/^known commands\/apis:/, "알려진 명령/API:")
-    .replace(/^Coverage: Complete$/, "포함 범위: 충분함")
-    .replace(/^Redundancy: Low$/, "중복도: 낮음")
-    .replace(/^Redundancy: Medium$/, "중복도: 보통")
-    .replace(/^Readability: High$/, "가독성: 높음")
-    .replace(/^Readability: Medium$/, "가독성: 보통")
-    .replace("Dashboard UX and assistant guidance changed.", "Dashboard UX와 작업 안내가 변경되었습니다.")
-    .replace("Session continuity and handoff generation changed.", "세션 연속성과 인수인계 생성 흐름이 변경되었습니다.")
-    .replace("Project Knowledge generation or usage changed.", "Project Knowledge 생성 또는 사용 방식이 변경되었습니다.")
-    .replace("Documentation updated to match the current workflow.", "현재 워크플로우에 맞게 문서가 업데이트되었습니다.")
-    .replace("Configuration or dependency setup changed.", "설정 또는 의존성 구성이 변경되었습니다.")
-    .replace("CLI behavior changed.", "CLI 동작이 변경되었습니다.")
-    .replace("Hook status needs verification in the actual Claude/Codex environment.", "실제 Claude/Codex 환경에서 Hook 상태 확인이 필요합니다.")
-    .replace("Codex Stop Hook format is configured; actual Codex runtime trust/execution still needs environment verification.", "Codex Stop Hook 형식은 설정되어 있지만, 실제 Codex 런타임 trust/execution 확인이 필요합니다.")
-    .replace("Do not add polling completion, LLM API calls, git commits, or unrelated UX changes.", "polling 기반 완료 감지, LLM API 호출, git commit, 관련 없는 UX 변경은 추가하지 마세요.")
-    .replace("`dev-guard watch` is the normal entry point; `done` writes reports, prompts, handoff, context, and project knowledge.", "`dev-guard watch`가 기본 시작점입니다. `done`은 보고서, 프롬프트, 인수인계, 컨텍스트, Project Knowledge를 생성합니다.");
-}
-
 async function readRequiredText(root: string, path: string): Promise<RequiredText> {
   const content = await readTextFile(fromRoot(root, path));
   const missing = !content.trim();
@@ -7860,67 +7486,6 @@ function importantDecisions(decisions: string, candidates: string): string[] {
   return [...new Set(merged.filter(isUsefulText))].slice(0, 6);
 }
 
-function openRisks(input: {
-  qualityReport: RequiredText;
-  hookStatus: RequiredText;
-  state: string;
-  project: RequiredText;
-  architecture: RequiredText;
-  decisions: RequiredText;
-  tasks: RequiredText;
-  historySummary: RequiredText;
-  decisionCandidates: RequiredText;
-  nextPrompt: RequiredText;
-}): string[] {
-  const risks = new Set<string>();
-  for (const item of [
-    ...extractSectionBulletsAny(input.qualityReport.content, ["Blocked Items", "먼저 해결해야 할 항목"], 5),
-    ...extractSectionBulletsAny(input.qualityReport.content, ["Warnings", "Review Items", "검토 권장 항목"], 5)
-  ]) {
-    if (item !== "none" && item !== "확인 필요" && item !== "없음") risks.add(item);
-  }
-  if (/NOT_INSTALLED|unknown|no/i.test(input.hookStatus.content)) risks.add("Hook status needs verification in the actual Claude/Codex environment.");
-  if (/Codex CLI: INSTALLED/.test(input.hookStatus.content)) risks.add("Codex Stop Hook format is configured; actual Codex runtime trust/execution still needs environment verification.");
-  if (/lastQualityVerdict":\s*"NEEDS_REVIEW"|lastQualityVerdict":\s*"BLOCKED"/.test(input.state)) {
-    risks.add(`Quality state is ${summarizeFromState(input.state, "lastQualityVerdict")}; review quality-report before commit.`);
-  }
-  for (const doc of [input.project, input.architecture, input.decisions, input.tasks, input.historySummary, input.decisionCandidates, input.nextPrompt]) {
-    if (doc.missing) risks.add(`${doc.path} missing or empty; 확인 필요`);
-  }
-  return risks.size > 0 ? [...risks].slice(0, 8) : ["확인 필요: no open risk was identified from current .devguard/ artifacts."];
-}
-
-function currentStateSummary(input: {
-  project: RequiredText;
-  architecture: RequiredText;
-  tasks: RequiredText;
-  qualityReport: RequiredText;
-  hookStatus: RequiredText;
-  state: string;
-}): string[] {
-  const summary = new Set<string>();
-  summary.add("watch / done / status / reset workflow is implemented.");
-  summary.add("done writes history, quality-report, next-codex-prompt, and project-handoff.");
-  summary.add("install-hooks writes Claude Code and Codex Stop Hook integration files.");
-  summary.add("Claude Code Stop Hook uses .claude/settings.json.");
-  summary.add("Codex Stop Hook uses .codex/hooks.json; turn.completed is treated as codex exec --json JSONL, not as a hook.");
-  if (/Claude Code: INSTALLED/.test(input.hookStatus.content)) summary.add("Claude Code hook status is currently INSTALLED.");
-  if (/Codex CLI: INSTALLED/.test(input.hookStatus.content)) summary.add("Codex CLI hook status is currently INSTALLED.");
-  const quality = parseQuality(input.qualityReport.content);
-  if (quality.verdict !== "확인 필요") summary.add(`latest quality verdict is ${quality.verdict}.`);
-  const stateSummary = summarizeFromState(input.state, "lastSummary");
-  if (stateSummary) summary.add(`latest done summary: ${stateSummary}`);
-  for (const item of [summarizeSection(input.project.content, "현재 목표"), summarizeSection(input.architecture.content, "기술 스택"), summarizeSection(input.tasks.content, "진행 중")]) {
-    if (isUsefulText(item)) summary.add(item);
-  }
-  return [...summary].slice(0, 10);
-}
-
-function summarizeSection(markdown: string, heading: string): string | undefined {
-  const bullet = firstSectionBullet(markdown, heading);
-  return bullet && !/TODO/i.test(bullet) ? bullet : undefined;
-}
-
 function summarizeFromState(stateJson: string, key: keyof ProjectState): string | undefined {
   try {
     const state = JSON.parse(stateJson) as ProjectState;
@@ -7941,16 +7506,6 @@ function extractSectionBulletsAny(markdown: string, headings: string[], limit: n
     .map((line) => line.trim())
     .filter((line) => bulletPattern.test(line))
     .map((line) => line.replace(bulletPattern, "").trim())
-    .filter(isUsefulText);
-  return bullets.length > 0 ? bullets.slice(0, limit) : ["확인 필요"];
-}
-
-function extractBullets(markdown: string, limit: number): string[] {
-  const bullets = markdown
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => /^[-*]\s+/.test(line))
-    .map((line) => line.replace(/^[-*]\s+/, "").trim())
     .filter(isUsefulText);
   return bullets.length > 0 ? bullets.slice(0, limit) : ["확인 필요"];
 }
@@ -8066,10 +7621,6 @@ function firstSectionBulletAny(markdown: string, headings: string[]): string | u
   return bullet?.replace(/^[-*]\s+/, "").trim();
 }
 
-function sectionLines(markdown: string, heading: string): string[] {
-  return sectionLinesAny(markdown, [heading]);
-}
-
 function sectionLinesAny(markdown: string, headings: string[]): string[] {
   const lines = markdown.split(/\r?\n/);
   const headingSet = new Set(headings);
@@ -8149,16 +7700,6 @@ function riskDecisionRule(judgment: string): string {
   if (/high|drift/i.test(judgment)) return "현재 작업 목표와 직접 관련 없으면 수정/분리 후보";
   if (/docs|문서/i.test(judgment)) return "코드 동작 변경이면 update 후보 생성, 직접 원본 문서 수정 금지";
   return "검증 명령 통과와 관련 파일 일치 여부로 판단";
-}
-
-function formatRiskDetails(details: RiskDetail[]): string[] {
-  return details.flatMap((detail, index) => [
-    `- candidate ${index + 1}: ${detail.content}`,
-    `  - related files: ${detail.relatedFiles.length > 0 ? detail.relatedFiles.join(", ") : "none"}`,
-    `  - why check: ${detail.reason}`,
-    `  - how to check: ${detail.checkMethod}`,
-    `  - decision rule: ${detail.decisionRule}`
-  ]);
 }
 
 function chooseNextTask(input: {

@@ -18,7 +18,7 @@ importers:
   packages/cli:
     dependencies:
       '@dev-guard/core':
-        specifier: 0.8.3
+        specifier: 0.8.4
         version: link:../core
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0

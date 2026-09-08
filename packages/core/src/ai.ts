@@ -2448,10 +2448,6 @@ function isResultPageRequest(requirement: string): boolean {
   return /result|결과\s*페이지|결과/.test(requirement.toLowerCase());
 }
 
-function isQuestionRequest(requirement: string): boolean {
-  return /question|choice|질문|문항|선택/.test(requirement.toLowerCase());
-}
-
 function shouldExcludeExplicitCandidate(candidate: string, explicitRoutes: ExplicitRouteTargets): boolean {
   if (/^app\/about\/page\.(tsx|ts|jsx|js)$/i.test(candidate) && explicitRoutes.modifyTargets.some((target) => target.path.startsWith("app/about/service/"))) {
     return true;

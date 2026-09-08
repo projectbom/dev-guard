@@ -26,16 +26,6 @@ export interface GitChanges {
   stagedDiffText: string;
 }
 
-export async function getChangedFiles(cwd: string): Promise<string[]> {
-  const changes = await getGitChanges(cwd);
-  return changes.changedFiles;
-}
-
-export async function getDiff(cwd: string): Promise<string> {
-  const changes = await getGitChanges(cwd);
-  return changes.diffText;
-}
-
 export async function getProjectFiles(cwd: string): Promise<string[]> {
   await assertGitRepo(cwd);
   const output = await git(cwd, ["ls-files", "--cached", "--others", "--exclude-standard"]);

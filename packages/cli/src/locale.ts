@@ -25,7 +25,3 @@ export function normalizeLocale(value?: string): DevGuardLocale | undefined {
   if (normalized === "en" || normalized.startsWith("en-")) return "en-US";
   return undefined;
 }
-
-export function localeLanguage(locale: DevGuardLocale): "en" | "ko" {
-  return locale === "ko-KR" ? "ko" : "en";
-}

@@ -1,5 +1,5 @@
 import { constants, existsSync } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -152,13 +152,4 @@ async function isExecutable(root: string, path: string): Promise<boolean> {
 
 function commandAvailable(command: string): boolean {
   return spawnSync("sh", ["-c", `command -v ${command}`], { encoding: "utf8" }).status === 0;
-}
-
-export async function pathExists(root: string, path: string): Promise<boolean> {
-  try {
-    await stat(fromRoot(root, path));
-    return true;
-  } catch {
-    return false;
-  }
 }

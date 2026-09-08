@@ -52,7 +52,3 @@ export const devguardPaths = {
   codeIndex: `${DEVGUARD_DIR}/memory/code-index.json`,
   changeLog: `${DEVGUARD_DIR}/memory/change-log.jsonl`
 } as const;
-
-export function legacyDevguardPath(path = ""): string {
-  return path ? `${LEGACY_DEVGUARD_DIR}/${path}` : LEGACY_DEVGUARD_DIR;
-}

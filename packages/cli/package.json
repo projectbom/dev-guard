@@ -1,6 +1,6 @@
 {
   "name": "@dev-guard/cli",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "private": false,
   "description": "CLI context guard for AI coding session continuity, handoff, and next-session recovery.",
   "type": "module",
@@ -39,7 +39,7 @@
     "test": "tsc -b && node --test test/**/*.test.js"
   },
   "dependencies": {
-    "@dev-guard/core": "0.8.3",
+    "@dev-guard/core": "0.8.4",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chokidar": "^4.0.3",
     "zod": "3"
