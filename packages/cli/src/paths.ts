@@ -33,6 +33,13 @@ export const devguardPaths = {
   historySummary: `${DEVGUARD_DIR}/reports/history-summary.md`,
   decisionCandidates: `${DEVGUARD_DIR}/reports/decision-candidates.md`,
   qualityReport: `${DEVGUARD_DIR}/reports/quality-report.md`,
+  // Structured sidecar for the same QualityReport object rendered into
+  // quality-report.md. Handoff (and anything else that needs QA facts)
+  // reads this instead of re-parsing the rendered markdown, so QA state has
+  // one authoritative structured source instead of a lossy text round-trip.
+  // Additive/optional: absent on older projects, in which case callers fall
+  // back to parsing the markdown, so this never breaks old .devguard state.
+  qualityReportState: `${DEVGUARD_DIR}/reports/quality-report-state.json`,
   projectHandoff: `${DEVGUARD_DIR}/reports/project-handoff.md`,
   readMap: `${DEVGUARD_DIR}/reports/read-map.md`,
   codeMap: `${DEVGUARD_DIR}/reports/code-map.md`,

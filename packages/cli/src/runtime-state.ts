@@ -233,16 +233,16 @@ export interface PreparedTaskContextRange {
   reason: string;
 }
 
-type QualityVerdict = "PASS" | "NEEDS_REVIEW" | "BLOCKED";
+export type QualityVerdict = "PASS" | "NEEDS_REVIEW" | "BLOCKED";
 
-interface QualityCheckItem {
+export interface QualityCheckItem {
   label: string;
   status: "PASS" | "WARN" | "BLOCKED";
   detail: string;
   affectsVerdict?: boolean;
 }
 
-interface QualityReport {
+export interface QualityReport {
   verdict: QualityVerdict;
   summary: string[];
   why: string[];
@@ -261,14 +261,14 @@ interface QualityReport {
   };
 }
 
-interface QualityReviewItem {
+export interface QualityReviewItem {
   title: string;
   body: string[];
   files: string[];
   checks: string[];
 }
 
-interface DocumentationSummary {
+export interface DocumentationSummary {
   goal: string;
   overview: string[];
   changeTypes: ChangeType[];
@@ -283,9 +283,34 @@ interface DocumentationSummary {
   remainingWork: string[];
   structure: string[];
   excludedAreas: string[];
+  /**
+   * Task constraints extracted from the current task text (e.g. "no
+   * DevGuard CLI", "no full repo build/test", "no commit/push"). This is
+   * the ONE authoritative source of current-task constraints — Quality
+   * Report, Handoff, Next Prompt, and Working/Agent Context all read this
+   * field rather than re-deriving constraints independently. Optional/
+   * absent on documentation summaries loaded from older `.devguard/state.json`
+   * that predate this field (backward compatible; treated as no constraints).
+   */
+  constraints?: TaskConstraint[];
 }
 
-interface DocumentationFileChange {
+/**
+ * Structured task constraint. `CUSTOM` preserves a constraint phrase that
+ * was explicit in the task text but did not match a recognized kind — it is
+ * kept for display (Handoff/Next Prompt) but is not used for command
+ * filtering, per the "don't over-build a parser" instruction: only
+ * constraints DevGuard can act on get a dedicated kind.
+ */
+export type TaskConstraint =
+  | { kind: "NO_DEVGUARD_CLI"; text: string }
+  | { kind: "NO_FULL_REPO_BUILD"; text: string }
+  | { kind: "NO_FULL_REPO_TEST"; text: string }
+  | { kind: "NO_COMMIT"; text: string }
+  | { kind: "NO_PUSH"; text: string }
+  | { kind: "CUSTOM"; text: string };
+
+export interface DocumentationFileChange {
   file: string;
   type: ChangeType[];
   purpose: string;
@@ -294,7 +319,7 @@ interface DocumentationFileChange {
   qa: string[];
 }
 
-type ChangeType = "UI" | "Refactor" | "Logic" | "Data" | "Config" | "Build" | "Release" | "Docs" | "QA" | "i18n";
+export type ChangeType = "UI" | "Refactor" | "Logic" | "Data" | "Config" | "Build" | "Release" | "Docs" | "QA" | "i18n";
 
 interface ParsedQuality {
   verdict: string;
@@ -964,6 +989,11 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     diffStat,
     taskText: [runtime.currentTask?.text ?? "", tasksMarkdown, projectMarkdown].join("\n\n"),
     canonicalGoal: resolvedGoal.goal,
+    // Constraints are extracted from the resolved current-task text (the
+    // explicit task, or the same session's carried-over task), never from
+    // tasks.md/project.md, so an unrelated document can't be misread as a
+    // constraint on the current task.
+    currentTaskText: resolvedGoal.goal,
     qaResults: freshQaResults,
     staleQaResults
   });
@@ -1064,6 +1094,11 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     writeTextFile(fromRoot(root, historySummaryPath), historySummaryMarkdown),
     writeTextFile(fromRoot(root, decisionCandidatesPath), decisionCandidatesMarkdown),
     writeTextFile(fromRoot(root, qualityReportPath), qualityReportMarkdown),
+    // Structured sidecar for the same QualityReport object rendered above —
+    // see devguardPaths.qualityReportState. Handoff reads this instead of
+    // re-parsing qualityReportMarkdown, so the two documents cannot drift
+    // apart from a lossy text round-trip.
+    writeTextFile(fromRoot(root, devguardPaths.qualityReportState), JSON.stringify(qualityReport, null, 2)),
     writeTextFile(fromRoot(root, promptPath), promptMarkdown),
     writeProjectState(root, {
       ...(await readProjectState(root)),
@@ -1088,7 +1123,9 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     judgments.push(`Project Knowledge refresh skipped: ${ensuredProjectKnowledge.warning}`);
   }
   await Promise.all([
-    generateProjectHandoff(root),
+    // This IS the `dev-guard done` run — Handoff may truthfully say
+    // `dev-guard done: pass` here (see handoffVerificationLines).
+    generateProjectHandoff(root, { doneExecutedForThisState: true }),
     generateReadMap(root),
     generateCodeMap(root),
     generateWorkingContext(root),
@@ -1215,10 +1252,10 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   }
 }
 
-export async function generateProjectHandoff(root: string): Promise<string> {
+export async function generateProjectHandoff(root: string, options: { doneExecutedForThisState?: boolean } = {}): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
-  const [project, architecture, decisions, tasks, records, historySummary, decisionCandidates, qualityReport, nextPrompt, hookStatus, state, projectKnowledge, runtime] = await Promise.all([
+  const [project, architecture, decisions, tasks, records, historySummary, decisionCandidates, qualityReport, qualityReportState, nextPrompt, hookStatus, state, projectKnowledge, runtime] = await Promise.all([
     readRequiredText(root, devguardPaths.project),
     readRequiredText(root, devguardPaths.architecture),
     readRequiredText(root, devguardPaths.decisions),
@@ -1230,6 +1267,9 @@ export async function generateProjectHandoff(root: string): Promise<string> {
     readRequiredText(root, historySummaryPath),
     readRequiredText(root, decisionCandidatesPath),
     readRequiredText(root, qualityReportPath),
+    // Structured QualityReport sidecar; absent on older `.devguard` state,
+    // in which case renderProjectHandoff falls back to parsing the markdown.
+    readJsonFile<QualityReport | null>(fromRoot(root, devguardPaths.qualityReportState), null),
     readRequiredText(root, promptPath),
     readRequiredText(root, hookStatusPath),
     readJsonFile<ProjectState>(fromRoot(root, statePath), {})
@@ -1247,13 +1287,15 @@ export async function generateProjectHandoff(root: string): Promise<string> {
     historySummary,
     decisionCandidates,
     qualityReport,
+    qualityReportState: qualityReportState ?? undefined,
     nextPrompt,
     hookStatus,
     state,
     projectKnowledge,
     locale,
     runtimeSessionId: runtime.sessionId,
-    currentTaskText: runtime.currentTask?.text
+    currentTaskText: runtime.currentTask?.text,
+    doneExecutedForThisState: options.doneExecutedForThisState
   });
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
   return projectHandoffPath;
@@ -1427,10 +1469,11 @@ function deriveProjectPurposeFromKnowledge(knowledge: ProjectKnowledge | undefin
 
 export async function generateAgentContext(root: string): Promise<string> {
   await ensureDevguardWorkspace(root);
-  const [project, decisions, qualityContent, historyRecords, state, runtime, codeIndex, projectKnowledge] = await Promise.all([
+  const [project, decisions, qualityContent, qualityReportState, historyRecords, state, runtime, codeIndex, projectKnowledge] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
     readTextFile(fromRoot(root, devguardPaths.decisions)),
     readTextFile(fromRoot(root, qualityReportPath)),
+    readJsonFile<QualityReport | null>(fromRoot(root, devguardPaths.qualityReportState), null),
     readHistoryRecords(root, 5),
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
     readRuntimeState(root),
@@ -1438,12 +1481,21 @@ export async function generateAgentContext(root: string): Promise<string> {
     readProjectKnowledge(root)
   ]);
   const projectPurpose = firstSectionBullet(project, "프로젝트 목적") ?? deriveProjectPurposeFromKnowledge(projectKnowledge) ?? "확인 필요";
-  const currentGoal = firstSectionBullet(project, "현재 목표") ?? "확인 필요";
-  const quality = parseQuality(qualityContent);
+  // Structured QA source first (same object Quality Report/Handoff use), the
+  // markdown-parsing fallback only for `.devguard` state written before the
+  // structured sidecar existed.
+  const quality = qualityReportState ? parsedQualityFromReport(qualityReportState) : parseQuality(qualityContent);
   const importantDecisions = extractDecisionLines(decisions);
   const lastChangedFiles = state.lastChangedFiles ?? [];
   const beforeAgent = resolveBeforeAgentContext({ state, runtime, records: historyRecords, codeIndex });
   const documentationSummary = beforeAgent.summary;
+  // Current goal must come from the SAME canonical task-goal resolution
+  // Working Context/Handoff use (`beforeAgent`/`documentationSummary`), not
+  // from project.md's "현재 목표" template section — that field is a
+  // separate, user-editable document nothing ever populates automatically,
+  // so relying on it as the primary source is what produced "current goal:
+  // 확인 필요" next to a real, current task goal elsewhere.
+  const currentGoal = documentationSummary?.goal ?? firstSectionBullet(project, "현재 목표") ?? "확인 필요";
   const lastSummary = documentationSummary?.overview?.join("; ") ?? state.lastSummary ?? "확인 필요";
   const recentHistory = historyRecords
     .slice(-3)
@@ -1518,11 +1570,17 @@ function resolveBeforeAgentContext(input: {
     };
   }
   const files = workingContextFiles(input.state, input.records);
-  const summaryBelongsToCurrentSession =
-    Boolean(input.runtime.sessionId) &&
-    Boolean(input.state.lastTaskGoalSessionId) &&
-    input.state.lastTaskGoalSessionId === input.runtime.sessionId;
-  if (summaryBelongsToCurrentSession && input.state.lastDocumentationSummary) {
+  // Same-session-lineage decision as Handoff's resolveSessionTaskGoal (this
+  // branch is reached only when there is no explicit runtime.currentTask, so
+  // currentTaskText is intentionally omitted) — one shared gating condition
+  // instead of two independently written boolean expressions that could
+  // silently drift apart.
+  const sessionGoal = resolveSessionTaskGoal({
+    runtimeSessionId: input.runtime.sessionId,
+    previousGoal: input.state.lastTaskGoal,
+    previousGoalSessionId: input.state.lastTaskGoalSessionId
+  });
+  if (sessionGoal.goal && input.state.lastDocumentationSummary) {
     return {
       summary: input.state.lastDocumentationSummary,
       files,
@@ -1552,7 +1610,8 @@ function beforeAgentTaskSummary(task: string, index: CodeIndex, candidates: stri
     qaChecks: ["Use Read Map to choose the first file.", "Use Code Map ranges before opening full files."],
     remainingWork: ["Implement the current task after reading the targeted context."],
     structure: ["Before-Agent task", "↓", "Code Index Task Routing", "↓", "Read Map / Code Map / Agent Brief"],
-    excludedAreas: unaffectedAreasFromDocumentation(affected)
+    excludedAreas: unaffectedAreasFromDocumentation(affected),
+    constraints: extractTaskConstraints(task)
   };
 }
 
@@ -3057,9 +3116,10 @@ function renderAgentContext(input: {
     `- project purpose: ${input.projectPurpose}`,
     `- current goal: ${input.currentGoal}`,
     `- task source: ${taskSourceLabel(input.taskSource ?? "none", "en-US")}`,
+    `- current change summary: ${input.lastSummary}`,
     "",
-    "## Session Snapshot",
-    `- ${input.lastSummary}`,
+    "## Previous Session History",
+    "> Background only — these are past sessions, not the current task. Do not treat any line below as describing current work.",
     ...input.recentHistory
       .map(sanitizeHandoffText)
       .filter(isUsefulHandoffText)
@@ -3136,6 +3196,10 @@ function buildDocumentationSummary(input: {
   canonicalGoal?: string;
   qaResults?: Record<string, QAExecutionResult>;
   staleQaResults?: Record<string, QAExecutionResult>;
+  /** The explicit current task text only (not tasks.md/project.md prose), used
+   *  for constraint extraction so unrelated document text can't be misread
+   *  as a current-task constraint. */
+  currentTaskText?: string;
 }): DocumentationSummary {
   const fileDiffs = splitUnifiedDiffByFile(input.diffText);
   const fileChanges = (input.changedFiles.length > 0 ? input.changedFiles : [...fileDiffs.keys()]).map((file) =>
@@ -3144,6 +3208,7 @@ function buildDocumentationSummary(input: {
   const changeTypes = uniqueChangeTypes(fileChanges.flatMap((file) => file.type));
   const affected = affectedAreasFromDocumentation(fileChanges, changeTypes);
   const risk = documentationRisk(fileChanges, changeTypes);
+  const constraints = extractTaskConstraints(input.currentTaskText);
   return {
     goal: documentationGoal(input.taskText, fileChanges, changeTypes, input.canonicalGoal),
     overview: documentationOverview(fileChanges, changeTypes),
@@ -3155,11 +3220,112 @@ function buildDocumentationSummary(input: {
       riskReason: risk.reason
     },
     fileChanges,
-    qaChecks: documentationQAChecks(fileChanges, changeTypes, input.qaResults),
+    qaChecks: documentationQAChecks(fileChanges, changeTypes, input.qaResults, constraints),
     remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults, input.staleQaResults),
     structure: documentationStructure(changeTypes, fileChanges),
-    excludedAreas: unaffectedAreasFromDocumentation(affected)
+    excludedAreas: unaffectedAreasFromDocumentation(affected),
+    constraints
   };
+}
+
+/**
+ * Extracts structured, actionable constraints from the explicit current
+ * task text. This is intentionally a small fixed-pattern matcher, not a
+ * general NLP parser — only constraint kinds DevGuard can actually act on
+ * (filtering recommended commands) get a dedicated kind; every other
+ * constraint-shaped sentence is kept verbatim as CUSTOM so it still survives
+ * into Handoff/Next Prompt for a human to read, even though DevGuard cannot
+ * enforce it automatically.
+ */
+export function extractTaskConstraints(taskText: string | undefined): TaskConstraint[] {
+  if (!taskText || !taskText.trim()) return [];
+  const constraints: TaskConstraint[] = [];
+  const add = (kind: TaskConstraint["kind"], text: string) => {
+    if (!constraints.some((item) => item.kind === kind)) constraints.push({ kind, text } as TaskConstraint);
+  };
+  if (/\bno\s+devguard\s+cli\b/i.test(taskText) || /devguard\s*cli\S*\s*(를|을)?\s*(사용하지|실행하지)\s*(마|말)/.test(taskText)) {
+    add("NO_DEVGUARD_CLI", "no DevGuard CLI");
+  }
+  if (/\bno\s+full[- ]repo(\s+lint)?(\s*\/?\s*test)?(\s*\/?\s*build)?\b/i.test(taskText) && /build/i.test(taskText)) {
+    add("NO_FULL_REPO_BUILD", "no full repo build");
+  } else if (/전체\s*(레포|repo)?\s*(빌드|build)\s*(는|은)?\s*(금지|하지\s*않|안\s*함|no)/i.test(taskText)) {
+    add("NO_FULL_REPO_BUILD", "no full repo build");
+  }
+  if (/\bno\s+full[- ]repo(\s+lint)?(\s*\/?\s*test)?(\s*\/?\s*build)?\b/i.test(taskText) && /\btest\b/i.test(taskText)) {
+    add("NO_FULL_REPO_TEST", "no full repo test");
+  } else if (/전체\s*(레포|repo)?\s*(테스트|test)\s*(는|은)?\s*(금지|하지\s*않|안\s*함|no)/i.test(taskText)) {
+    add("NO_FULL_REPO_TEST", "no full repo test");
+  }
+  if (/\bno\s+commit\b/i.test(taskText) || /커밋\s*(금지|하지\s*마|안\s*됨)/i.test(taskText) || /commit\s*\/?\s*push\s*forbidden/i.test(taskText)) {
+    add("NO_COMMIT", "no commit");
+  }
+  if (/\bno\s+push\b/i.test(taskText) || /푸시\s*(금지|하지\s*마|안\s*됨)/i.test(taskText) || /commit\s*\/?\s*push\s*forbidden/i.test(taskText)) {
+    add("NO_PUSH", "no push");
+  }
+  return constraints;
+}
+
+interface TaskConstraintFlags {
+  noDevGuardCli: boolean;
+  noFullRepoBuild: boolean;
+  noFullRepoTest: boolean;
+  noCommit: boolean;
+  noPush: boolean;
+}
+
+function taskConstraintFlags(constraints: TaskConstraint[] | undefined): TaskConstraintFlags {
+  const kinds = new Set((constraints ?? []).map((item) => item.kind));
+  return {
+    noDevGuardCli: kinds.has("NO_DEVGUARD_CLI"),
+    noFullRepoBuild: kinds.has("NO_FULL_REPO_BUILD"),
+    noFullRepoTest: kinds.has("NO_FULL_REPO_TEST"),
+    noCommit: kinds.has("NO_COMMIT"),
+    noPush: kinds.has("NO_PUSH")
+  };
+}
+
+/** Whether running `command` would violate one of the given constraints. */
+function commandViolatesConstraints(command: string, flags: TaskConstraintFlags): boolean {
+  const trimmed = command.trim();
+  const isDevGuardCliCommand = /^dev-guard\b/.test(trimmed) || /\bdev-guard\s+(done|self-check|status|handoff|doctor|check|review|reset)\b/.test(trimmed);
+  if (flags.noDevGuardCli && isDevGuardCliCommand) return true;
+  const isScopedCommand = /--filter|--workspace|-w\s/.test(trimmed);
+  if (flags.noFullRepoBuild && !isScopedCommand && /^(pnpm|npm|yarn)\s+(run\s+)?build\b/.test(trimmed)) return true;
+  if (flags.noFullRepoTest && !isScopedCommand && /^(pnpm|npm|yarn)\s+(run\s+)?test\b/.test(trimmed)) return true;
+  if (flags.noCommit && /\bgit\s+commit\b/.test(trimmed)) return true;
+  if (flags.noPush && /\bgit\s+push\b/.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * The one place candidate commands (Next QA actions, Handoff verification
+ * commands, Next Prompt resume steps) are filtered against current-task
+ * constraints. Every renderer that recommends a command must pass its
+ * candidates through this instead of re-deciding per-renderer which
+ * commands are allowed.
+ */
+export function filterCommandsByConstraints(commands: string[], constraints: TaskConstraint[] | undefined): string[] {
+  if (!constraints || constraints.length === 0) return commands;
+  const flags = taskConstraintFlags(constraints);
+  return commands.filter((command) => !commandViolatesConstraints(command, flags));
+}
+
+/**
+ * Same filtering, but for prose lines that mention a command inside
+ * backticks (e.g. "Run `dev-guard done`.") rather than bare command
+ * strings. `documentationSummary.qaChecks` — consumed directly by Read Map,
+ * Quality Report's Next QA Actions, and Handoff's Next Task section — is
+ * exactly this shape, so it needs the same constraint gate as
+ * filterCommandsByConstraints, applied once at the point qaChecks is built
+ * rather than by every renderer that reads it.
+ */
+function filterTextLinesByConstraints(lines: string[], constraints: TaskConstraint[] | undefined): string[] {
+  if (!constraints || constraints.length === 0) return lines;
+  const flags = taskConstraintFlags(constraints);
+  return lines.filter((line) => {
+    const codeSpans = [...line.matchAll(/`([^`]+)`/g)].map((match) => match[1]);
+    return !codeSpans.some((span) => commandViolatesConstraints(span, flags));
+  });
 }
 
 function splitUnifiedDiffByFile(diffText: string): Map<string, string> {
@@ -3349,14 +3515,28 @@ function inferUserImpact(file: string, changes: string[], types: ChangeType[]): 
   return [...impact].slice(0, 4);
 }
 
+/**
+ * Positionally pairs quoted string literals removed vs added and, if
+ * confidence is high enough that BOTH sides look like natural-language
+ * user-facing copy (see looksLikeUserFacingCopy), reports it as a wording
+ * change. Module specifiers, import paths, package names, route paths, CSS
+ * class names, and other identifier-shaped literals never produce this —
+ * per the "if confidence is low, say less" rule, a change whose literal
+ * strings don't look like prose gets no wording claim at all, rather than a
+ * specific-looking but potentially wrong one (e.g. "@partner-flow/contracts"
+ * → "next/link" from an import statement being reported as a UI copy edit).
+ */
 function detectTextReplacements(added: string[], removed: string[]): string[] {
   const additions = extractQuotedTerms(added);
   const removals = extractQuotedTerms(removed);
   const replacements: string[] = [];
   for (let index = 0; index < Math.min(additions.length, removals.length, 6); index += 1) {
-    if (additions[index] && removals[index] && additions[index] !== removals[index]) {
-      if (isGenericReplacementTerm(additions[index]) || isGenericReplacementTerm(removals[index])) continue;
-      replacements.push(`Updates the user-facing wording from "${removals[index]}" to "${additions[index]}".`);
+    const addedTerm = additions[index];
+    const removedTerm = removals[index];
+    if (addedTerm && removedTerm && addedTerm !== removedTerm) {
+      if (isGenericReplacementTerm(addedTerm) || isGenericReplacementTerm(removedTerm)) continue;
+      if (!looksLikeUserFacingCopy(addedTerm) || !looksLikeUserFacingCopy(removedTerm)) continue;
+      replacements.push(`Updates the user-facing wording from "${removedTerm}" to "${addedTerm}".`);
     }
   }
   return replacements;
@@ -3370,9 +3550,36 @@ function isGenericReplacementTerm(value: string): boolean {
   return /^(none|확인 필요|low|medium|high|pass|fail|unknown|needs_review|blocked|en-US|ko-KR|documentationSummary|DocumentationSummary|changeTypes|fileChanges|overview|userImpact)$/i.test(value.trim());
 }
 
+/**
+ * Whether a quoted string literal looks like natural-language user-facing
+ * copy rather than an identifier: module specifier, import/route path,
+ * package name, CSS class name, enum value, or bare symbol name. Those are
+ * excluded per the requirement that import paths/module names/unrelated
+ * identifiers are never reported as user-facing wording changes.
+ */
+function looksLikeUserFacingCopy(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  // Scoped package name or any multi-segment path-like specifier, e.g.
+  // "@partner-flow/contracts", "next/link", "./components/Foo".
+  if (/^\.{0,2}\/?@?[\w.-]+(\/[\w.-]+)+$/.test(trimmed)) return false;
+  // Route/absolute path.
+  if (/^\/[\w\-/:]*$/.test(trimmed)) return false;
+  // A single bare token (no whitespace) with no Korean text reads as an
+  // identifier, enum value, CSS class name, or symbol name, not prose.
+  if (!/\s/.test(trimmed) && !/[가-힣]/.test(trimmed)) return false;
+  return true;
+}
+
 function extractQuotedTerms(lines: string[]): string[] {
   const terms: string[] = [];
   for (const line of lines) {
+    // Import/require/export-from declarations only ever quote module
+    // specifiers, never user-facing copy — exclude them at the source line
+    // level so a specifier can never be scanned as a wording candidate.
+    if (/^\s*(import|export)\b[^"'`]*\bfrom\b/.test(line)) continue;
+    if (/^\s*(const|let|var)\s+.*=\s*require\(/.test(line)) continue;
+    if (/^\s*import\(/.test(line.trim())) continue;
     const matches = [...line.matchAll(/["'`](.{2,80}?)["'`]/g)].map((match) => match[1]);
     for (const match of matches) {
       if (!/[{}()[\]=;]/.test(match) && !/^https?:/.test(match)) terms.push(match);
@@ -3442,7 +3649,12 @@ function unaffectedAreasFromDocumentation(affected: string[]): string[] {
   return candidates.filter((item) => !affected.some((affectedItem) => affectedItem.toLowerCase().includes(item.toLowerCase())));
 }
 
-function documentationQAChecks(files: DocumentationFileChange[], types: ChangeType[], qaResults?: Record<string, QAExecutionResult>): string[] {
+function documentationQAChecks(
+  files: DocumentationFileChange[],
+  types: ChangeType[],
+  qaResults?: Record<string, QAExecutionResult>,
+  constraints?: TaskConstraint[]
+): string[] {
   const checks: string[] = [];
   const seen = new Set<string>();
   const add = (item: string) => {
@@ -3463,12 +3675,19 @@ function documentationQAChecks(files: DocumentationFileChange[], types: ChangeTy
     for (const qa of file.qa) add(qa);
   }
 
+  const flags = taskConstraintFlags(constraints);
   const buildStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "BUILD"));
-  if ((types.includes("Build") || types.includes("Logic") || types.includes("QA")) && buildStatus !== "PASS") add("Run `pnpm run build`.");
-  const selfCheckEntry = findQAEntry(qaResults, "CUSTOM", "self-check");
-  if (!selfCheckEntry || selfCheckEntry.status !== "PASS") add("Run `dev-guard self-check`.");
-  add("Run `dev-guard done`.");
-  return checks.slice(0, 10);
+  if ((types.includes("Build") || types.includes("Logic") || types.includes("QA")) && buildStatus !== "PASS" && !flags.noFullRepoBuild) {
+    add("Run `pnpm run build`.");
+  }
+  if (!flags.noDevGuardCli) {
+    const selfCheckEntry = findQAEntry(qaResults, "CUSTOM", "self-check");
+    if (!selfCheckEntry || selfCheckEntry.status !== "PASS") add("Run `dev-guard self-check`.");
+    add("Run `dev-guard done`.");
+  }
+  // Defense in depth: any other command mention (e.g. from per-file `qa`
+  // hints) still goes through the same text-line filter as everything else.
+  return filterTextLinesByConstraints(checks, constraints).slice(0, 10);
 }
 
 function staleNotRecordedNote(staleQaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind, label: string, name?: string): string | undefined {
@@ -4698,6 +4917,13 @@ async function assessCompletionQuality(
   ]);
   const rootScripts = rootPackage.scripts ?? {};
   const checklist: QualityCheckItem[] = [];
+  const constraintFlags = taskConstraintFlags(input.documentationSummary.constraints);
+  // Candidate verification commands are filtered against current-task
+  // constraints once, here, before they become `requiredVerification` — every
+  // downstream consumer (Quality Report Next QA, Handoff verification
+  // commands/next actions, Next Prompt) reads the already-filtered list
+  // instead of re-deciding per-renderer which commands are allowed.
+  const testCandidates = filterCommandsByConstraints(input.testCandidates, input.documentationSummary.constraints);
   const rawGeneratedFiles = input.rawChangedFiles.filter(isGeneratedRuntimePath);
   checklist.push({
     label: "generated/runtime files",
@@ -4725,11 +4951,17 @@ async function assessCompletionQuality(
   });
 
   const hasBuildScript = Boolean(rootScripts.build);
-  const hasBuildVerification = input.testCandidates.some((command) => /\bbuild\b/.test(command));
+  const hasBuildVerification = testCandidates.some((command) => /\bbuild\b/.test(command));
   checklist.push({
     label: "build verification candidate",
-    status: hasBuildScript && !hasBuildVerification ? "BLOCKED" : "PASS",
-    detail: hasBuildScript ? (hasBuildVerification ? "build verification candidate found" : "build script exists but no build command was suggested") : "no build script found"
+    status: hasBuildScript && !hasBuildVerification && !constraintFlags.noFullRepoBuild ? "BLOCKED" : "PASS",
+    detail: hasBuildScript
+      ? hasBuildVerification
+        ? "build verification candidate found"
+        : constraintFlags.noFullRepoBuild
+          ? "full repo build is out of scope for the current task (no full repo build constraint); not required as a blocker"
+          : "build script exists but no build command was suggested"
+      : "no build script found"
   });
 
   checklist.push({
@@ -4786,7 +5018,7 @@ async function assessCompletionQuality(
   const blocked = verdictItems.filter((item) => item.status === "BLOCKED");
   const warns = verdictItems.filter((item) => item.status === "WARN");
   const verdict: QualityVerdict = blocked.length > 0 ? "BLOCKED" : warns.length > 0 ? "NEEDS_REVIEW" : "PASS";
-  const requiredVerification = input.testCandidates.length > 0 ? input.testCandidates : ["확인 필요: package.json scripts에서 검증 명령을 찾지 못함"];
+  const requiredVerification = testCandidates.length > 0 ? testCandidates : ["확인 필요: package.json scripts에서 검증 명령을 찾지 못함"];
   const issueItems = [...blocked, ...warns];
   const beforeCommit = [
     ...requiredVerification.map((command) => `run ${command}`),
@@ -4860,24 +5092,66 @@ async function enhanceQualityReportWithAI(
     if (!generated) {
       return markQualityReportAIFallback(input.report, "invalid_response");
     }
-    const shouldKeepSeedSummary =
-      isGenericAIQualitySummary(generated) ||
-      (isOpenAIKeyUXChange(input.changedFiles) && !aiReviewMentionsOpenAIKeyFlow(generated));
-    return {
-      ...input.report,
-      summary: !shouldKeepSeedSummary && generated.summary.length > 0 ? generated.summary : input.report.summary,
-      why: generated.why.length > 0 ? generated.why : input.report.why,
-      reviewItems: mergeAIReviewItems(input.report.reviewItems, generated.reviewItems),
-      nextRecommendedAction: generated.nextAction || input.report.nextRecommendedAction,
-      aiSummary: {
-        status: "generated",
-        reason: "openai_quality_review",
-        source: "openai"
-      }
-    };
+    return mergeAIQualityReview(input.report, generated, {
+      changedFiles: input.changedFiles,
+      historicalPhrases: input.previousHistory.map((record) => record.inferredSummary)
+    });
   } catch {
     return markQualityReportAIFallback(input.report, "request_failed");
   }
+}
+
+/**
+ * The one place an AI-generated review is merged into the deterministic
+ * QualityReport. By construction this only ever overwrites `summary`,
+ * `why`, `reviewItems`, and `nextRecommendedAction` — it never touches
+ * `verdict`, `checklist`, `requiredVerification`, `qaResults`, or
+ * `documentationSummary`, so AI prose can improve *how* a fact is explained
+ * but can never change *what* the deterministic facts are (task goal,
+ * constraints, changed files, validation results, blockers, current-vs-
+ * stale distinction all stay exactly as assessCompletionQuality computed
+ * them). Exported so this contract is directly unit-testable without a real
+ * OpenAI call.
+ */
+export function mergeAIQualityReview(
+  report: QualityReport,
+  generated: AIQualityReview,
+  options: { changedFiles: string[]; historicalPhrases?: string[] }
+): QualityReport {
+  const shouldKeepSeedSummary =
+    isGenericAIQualitySummary(generated) ||
+    (isOpenAIKeyUXChange(options.changedFiles) && !aiReviewMentionsOpenAIKeyFlow(generated));
+  // Safety net against the AI restating a previous session's description as
+  // if it were part of the current change (see qualityAISystemPrompt/
+  // qualityAIUserPrompt, which already instruct the model not to do this —
+  // this is the deterministic backstop for when it does anyway).
+  const historicalPhrases = options.historicalPhrases ?? [];
+  const cleanedSummary = generated.summary.length > 0 ? stripHistoricalPhrases(generated.summary, historicalPhrases) : [];
+  const cleanedWhy = generated.why.length > 0 ? stripHistoricalPhrases(generated.why, historicalPhrases) : [];
+  return {
+    ...report,
+    summary: !shouldKeepSeedSummary && cleanedSummary.length > 0 ? cleanedSummary : report.summary,
+    why: cleanedWhy.length > 0 ? cleanedWhy : report.why,
+    reviewItems: mergeAIReviewItems(report.reviewItems, generated.reviewItems),
+    nextRecommendedAction: generated.nextAction || report.nextRecommendedAction,
+    aiSummary: {
+      status: "generated",
+      reason: "openai_quality_review",
+      source: "openai"
+    }
+  };
+}
+
+/**
+ * Drops any line that (after normalizing case/punctuation/whitespace)
+ * verbatim-matches a known historical phrase. Deliberately exact-match only
+ * — no fuzzy/substring matching — so this never strips legitimately current
+ * text that happens to share a word or two with past history.
+ */
+export function stripHistoricalPhrases(lines: string[], historicalPhrases: string[]): string[] {
+  const normalize = (value: string) => value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const historicalSet = new Set(historicalPhrases.map(normalize).filter(Boolean));
+  return lines.filter((line) => !historicalSet.has(normalize(line)));
 }
 
 function markQualityReportAIFallback(report: QualityReport, reason: "missing_key" | "request_failed" | "invalid_response"): QualityReport {
@@ -4911,6 +5185,7 @@ function qualityAISystemPrompt(locale: DevGuardLocale): string {
     "Improve the Quality Report content only. Do not invent problems.",
     "Write as a concise action guide for the user, not as a rule-engine explanation.",
     "Do not expose internal rule names such as scope drift, docs update candidate, runtime candidate, review candidate, or heuristic candidate.",
+    "handoffSummary and recentSessionContext describe PREVIOUS sessions only — never the current change. Do not restate, paraphrase, or reuse their content as if it happened in this change; use them only to avoid contradicting established project context.",
     "If something is uncertain, say it needs confirmation.",
     `Write user-facing text in ${locale === "ko-KR" ? "natural Korean" : "natural English"}.`,
     "Return strict JSON only with keys: summary, why, nextAction, reviewItems.",
@@ -4967,6 +5242,7 @@ function qualityAIUserPrompt(input: {
       "Explain what matters, what the user should do now, and why.",
       "Use seedQualityContext as the minimum concrete meaning to preserve.",
       "Use documentationSummary as the source of truth for what actually changed.",
+      "handoffSummary and recentSessionContext are historical background from previous sessions; never state their content as something that happened in this change.",
       "Do not copy generic verification commands as the main next action unless they are directly relevant.",
       "Do not list files without explaining their role."
     ]
@@ -5011,7 +5287,7 @@ function aiReviewMentionsOpenAIKeyFlow(review: AIQualityReview): boolean {
   return /openai|api key|apikey|configured\/source|fallback|dashboard/.test(text);
 }
 
-interface AIQualityReview {
+export interface AIQualityReview {
   summary: string[];
   why: string[];
   nextAction: string;
@@ -6105,31 +6381,56 @@ function regressionRiskLevel(report: QualityReport): "None" | "Low" | "Medium" |
   return "None";
 }
 
+/**
+ * Builds the QA Confidence line strictly from the structured, per-kind QA
+ * state — never a blanket "Build/Typecheck/Test" claim. Two bugs this
+ * fixes: (1) a kind that was never recorded (e.g. Build) could still be
+ * named as "recorded as PASS" because it was filtered out of the pass/fail
+ * check before the label was built from a fixed string; (2) Runtime Smoke/
+ * Manual QA were reported as "still remains" based on the overall verdict
+ * (which WARN-level checklist items unrelated to QA — e.g. change breadth,
+ * risky areas — can also drive to NEEDS_REVIEW), not on whether they were
+ * actually outstanding.
+ */
 function formatQAConfidence(report: QualityReport, locale: DevGuardLocale): string[] {
-  const allCoreStatuses: AggregatedValidationStatus[] = [
-    ...latestStatusesByName(report.qaResults, "BUILD"),
-    ...latestStatusesByName(report.qaResults, "TYPECHECK"),
-    ...latestStatusesByName(report.qaResults, "TEST"),
-    findQAEntry(report.qaResults, "CUSTOM", "self-check")?.status ?? "NOT_RECORDED"
+  const coreKinds: Array<{ label: string; status: AggregatedValidationStatus }> = [
+    { label: "Build", status: worstStatusAcrossNames(latestStatusesByName(report.qaResults, "BUILD")) },
+    { label: "Typecheck", status: worstStatusAcrossNames(latestStatusesByName(report.qaResults, "TYPECHECK")) },
+    { label: "Tests", status: worstStatusAcrossNames(latestStatusesByName(report.qaResults, "TEST")) },
+    { label: "Self Check", status: findQAEntry(report.qaResults, "CUSTOM", "self-check")?.status ?? "NOT_RECORDED" }
   ];
-  const coreStatuses = allCoreStatuses.filter((status) => status !== "NOT_RECORDED");
-  const anyFailed = coreStatuses.includes("FAIL");
+  const recordedCore = coreKinds.filter((kind) => kind.status !== "NOT_RECORDED");
+  const passedCore = recordedCore.filter((kind) => kind.status === "PASS");
+  const failedCore = recordedCore.filter((kind) => kind.status === "FAIL");
+  const corePassed = recordedCore.length > 0 && recordedCore.every((kind) => kind.status === "PASS");
   const anyRecorded = hasAnyRecordedValidationEvidence(report.qaResults);
-  const corePassed = coreStatuses.length > 0 && coreStatuses.every((status) => status === "PASS");
-  if (anyFailed) {
+
+  const runtimeSmokeStatus = worstStatusAcrossNames(latestStatusesByName(report.qaResults, "RUNTIME_SMOKE"));
+  const manualQaRequired = report.documentationSummary?.changeTypes.includes("UI") ?? false;
+  const manualQaStatus = worstStatusAcrossNames(latestStatusesByName(report.qaResults, "MANUAL_QA"));
+  const runtimeSmokeFailed = runtimeSmokeStatus === "FAIL";
+  const manualQaFailed = manualQaRequired && manualQaStatus === "FAIL";
+  const outstanding: string[] = [];
+  if (runtimeSmokeStatus !== "PASS" && !runtimeSmokeFailed) outstanding.push("Runtime Smoke");
+  if (manualQaRequired && manualQaStatus !== "PASS" && !manualQaFailed) outstanding.push("Manual QA");
+
+  const labelList = (kinds: Array<{ label: string }>) => kinds.map((kind) => kind.label).join("/");
+  const failedLabels = [...failedCore.map((kind) => kind.label), ...(runtimeSmokeFailed ? ["Runtime Smoke"] : []), ...(manualQaFailed ? ["Manual QA"] : [])];
+
+  if (failedLabels.length > 0) {
     return locale === "ko-KR"
-      ? ["Low", "", "Build/Typecheck/Test 중 기록된 실패 evidence가 있어 QA 신뢰도가 낮습니다."]
-      : ["Low", "", "A recorded Build/Typecheck/Test failure exists, so QA confidence is low."];
+      ? ["Low", "", `${failedLabels.join("/")}에 기록된 실패 evidence가 있어 QA 신뢰도가 낮습니다.`]
+      : ["Low", "", `A recorded failure exists for ${failedLabels.join("/")}, so QA confidence is low.`];
   }
-  if (corePassed && report.verdict === "PASS") {
+  if (corePassed && outstanding.length === 0) {
     return locale === "ko-KR"
-      ? ["High", "", "Build/Typecheck/Test가 통과로 기록되었고 현재 품질 규칙에서 추가 QA 요구가 없습니다."]
-      : ["High", "", "Build/Typecheck/Test are recorded as PASS, and current quality rules do not require more QA."];
+      ? ["High", "", `${labelList(passedCore)}가 통과로 기록되었고 현재 남은 필수 QA가 없습니다.`]
+      : ["High", "", `${labelList(passedCore)} are recorded as PASS, and no required QA remains outstanding.`];
   }
   if (corePassed) {
     return locale === "ko-KR"
-      ? ["Medium", "", "Build/Typecheck/Test는 통과로 기록되었지만 Manual QA 또는 Runtime Smoke 확인이 남아 있습니다."]
-      : ["Medium", "", "Build/Typecheck/Test are recorded as PASS, but manual QA or runtime smoke evidence still remains."];
+      ? ["Medium", "", `${labelList(passedCore)}는 통과로 기록되었지만 ${outstanding.join(", ")} 확인이 남아 있습니다.`]
+      : ["Medium", "", `${labelList(passedCore)} ${passedCore.length === 1 ? "is" : "are"} recorded as PASS, but ${outstanding.join(" and ")} evidence still remains.`];
   }
   if (!anyRecorded) {
     return locale === "ko-KR"
@@ -6174,7 +6475,7 @@ function formatNextQAActions(report: QualityReport, items: QualityReviewItem[], 
   commands.forEach((command, index) => {
     actions.push(`${start + index}. ${locale === "ko-KR" ? `${formatCommandObject(command)} 실행 결과를 이 보고서의 QA 상태와 비교합니다.` : `Run \`${command}\` and compare the result with this QA status.`}`);
   });
-  if (report.verdict !== "PASS") {
+  if (report.verdict !== "PASS" && !taskConstraintFlags(report.documentationSummary?.constraints).noDevGuardCli) {
     actions.push(`${actions.length + 1}. ${locale === "ko-KR" ? "필요한 QA가 끝나면 `dev-guard done`으로 보고서를 다시 생성해 판정이 바뀌는지 확인합니다." : "After QA is complete, run `dev-guard done` again and confirm whether the verdict changes."}`);
   }
   return actions.slice(0, 7);
@@ -6620,6 +6921,17 @@ function renderProjectHandoff(input: {
   historySummary: RequiredText;
   decisionCandidates: RequiredText;
   qualityReport: RequiredText;
+  /**
+   * The structured QualityReport object, when available (see
+   * devguardPaths.qualityReportState). When present, this is the
+   * authoritative QA source — Handoff no longer re-derives QA facts by
+   * regex-parsing the rendered Quality Report markdown, which is how the
+   * two documents could silently disagree. Absent on `.devguard` state
+   * written before this field existed, in which case parseQuality's
+   * markdown-parsing fallback is used, preserving compatibility with older
+   * projects.
+   */
+  qualityReportState?: QualityReport;
   nextPrompt: RequiredText;
   hookStatus: RequiredText;
   state: string;
@@ -6627,9 +6939,18 @@ function renderProjectHandoff(input: {
   locale: DevGuardLocale;
   runtimeSessionId?: string;
   currentTaskText?: string;
+  /**
+   * True only when this Handoff is being (re)generated as the direct result
+   * of a `dev-guard done` run in this call (i.e. from inside
+   * processDoneEvent). `dev-guard handoff`/`prepare_task_context` regenerate
+   * Handoff from already-recorded state without running `done`, so Handoff
+   * must not claim `dev-guard done: pass` in that case — no evidence, no
+   * execution claim.
+   */
+  doneExecutedForThisState?: boolean;
 }): string {
   const copy = handoffCopy[input.locale];
-  const quality = parseQuality(input.qualityReport.content);
+  const quality = input.qualityReportState ? parsedQualityFromReport(input.qualityReportState) : parseQuality(input.qualityReport.content);
   const nextTask = extractNextTask(input.nextPrompt.content, input.tasks.content, input.state);
   const state = parseProjectState(input.state);
   const changedFiles = state.lastChangedFiles ?? lastHistoryFiles(input.records);
@@ -6645,8 +6966,8 @@ function renderProjectHandoff(input: {
   const qualityLines = handoffQualityLines(quality, changedFiles, input.locale, documentationSummary);
   const outstanding = handoffOutstandingItems(quality, changedFiles, input.locale, documentationSummary);
   const nextSteps = handoffNextActions(quality, nextTask, changedFiles, input.locale, documentationSummary);
-  const verification = handoffVerificationLines(quality, input.locale, changedFiles);
-  const resumePrompt = handoffResumePrompt(goal, nextSteps, changedFiles, input.locale);
+  const verification = handoffVerificationLines(quality, input.locale, changedFiles, documentationSummary?.constraints, Boolean(input.doneExecutedForThisState));
+  const resumePrompt = handoffResumePrompt(goal, nextSteps, changedFiles, input.locale, documentationSummary?.constraints);
   const missing = missingInputs([input.project, input.architecture, input.tasks, input.qualityReport, input.projectKnowledge, input.historySummary]);
   const body: string[] = [`# ${copy.title}`, ""];
   body.push(
@@ -6689,17 +7010,26 @@ function handoffGoal(nextTask: string, changedFiles: string[], quality: ParsedQu
         ? cleanTask
         : inferred;
   const status = completionStatus(quality.verdict);
+  // Constraints are part of "what the current task is" — they must survive
+  // into Handoff (and, via handoffVerificationCommands/handoffNextActions/
+  // handoffResumePrompt, filter what gets recommended next) rather than
+  // being dropped once the task text is reduced to a goal string.
+  const constraintLines = (documentationSummary?.constraints ?? [])
+    .map((constraint) => constraint.text)
+    .filter(Boolean);
   if (locale === "ko-KR") {
     return [
       `- ${goal}`,
       `- 현재 상태: ${status === "completed" ? "완료" : status === "blocked" ? "차단됨" : "일부 완료"}`,
-      ...(goal === "목표 확인 필요" ? ["- 근거: 변경 파일과 Quality Report만으로는 사용자의 원래 요청을 특정하기 어렵습니다."] : [])
+      ...(goal === "목표 확인 필요" ? ["- 근거: 변경 파일과 Quality Report만으로는 사용자의 원래 요청을 특정하기 어렵습니다."] : []),
+      ...(constraintLines.length > 0 ? [`- 제약: ${constraintLines.join(", ")}`] : [])
     ];
   }
   return [
     `- ${goal}`,
     `- Current status: ${status === "completed" ? "completed" : status === "blocked" ? "blocked" : "partially completed"}`,
-    ...(goal === "Goal needs confirmation" ? ["- Basis: changed files and Quality Report do not identify the original user request clearly."] : [])
+    ...(goal === "Goal needs confirmation" ? ["- Basis: changed files and Quality Report do not identify the original user request clearly."] : []),
+    ...(constraintLines.length > 0 ? [`- Constraints: ${constraintLines.join(", ")}`] : [])
   ];
 }
 
@@ -6893,56 +7223,91 @@ function handoffOutstandingItems(quality: ParsedQuality, files: string[], locale
 }
 
 function handoffNextActions(quality: ParsedQuality, nextTask: string, files: string[], locale: DevGuardLocale, documentationSummary?: DocumentationSummary): string[] {
+  const constraints = documentationSummary?.constraints;
+  const noDevGuardCli = taskConstraintFlags(constraints).noDevGuardCli;
   if (documentationSummary?.qaChecks.length) {
     return documentationSummary.qaChecks.slice(0, 5).map((check, index) => `${index + 1}. ${localizeSentence(check, locale)}`);
   }
   const targetFile = files.find((file) => /runtime-state\.ts$|dashboard\.ts$|dashboard-i18n\.ts$/.test(file)) ?? files[0];
+  const verificationCommands = handoffVerificationCommands(quality, files, constraints);
   if (locale === "ko-KR") {
     const actions = [
       targetFile ? `1. 먼저 \`${targetFile}\` 변경이 현재 요청 범위에만 해당하는지 확인합니다.` : "1. 먼저 변경 파일 목록을 확인하고 현재 요청과 직접 관련된 파일만 남깁니다.",
       quality.verdict === "BLOCKED"
         ? "2. BLOCKED 이유에 해당하는 파일과 실패 원인을 먼저 수정합니다."
         : "2. 문제가 있으면 해당 파일의 Handoff 생성 문구와 필터링 로직만 수정합니다.",
-      `3. 수정 후 ${formatCommandRunList(handoffVerificationCommands(quality, files))}을 실행합니다.`,
-      "4. `dev-guard done`으로 Handoff를 재생성하고 내부 분석값이나 rule id가 노출되지 않는지 직접 엽니다."
+      ...(verificationCommands.length > 0 ? [`3. 수정 후 ${formatCommandRunList(verificationCommands)}을 실행합니다.`] : []),
+      ...(noDevGuardCli ? [] : ["4. `dev-guard done`으로 Handoff를 재생성하고 내부 분석값이나 rule id가 노출되지 않는지 직접 엽니다."])
     ];
     return actions;
   }
   return [
     targetFile ? `1. First confirm \`${targetFile}\` is scoped to the current request.` : "1. First review changed files and keep only files directly tied to the current request.",
     quality.verdict === "BLOCKED" ? "2. Fix the file and cause named by the BLOCKED reason first." : "2. If needed, adjust only the Handoff copy and filtering logic in the related file.",
-    `3. Run ${compactCommandList(handoffVerificationCommands(quality, files))} after changes.`,
-    "4. Run `dev-guard done` to regenerate Handoff, then open it and confirm internal analysis values or rule identifiers are not exposed."
+    ...(verificationCommands.length > 0 ? [`3. Run ${compactCommandList(verificationCommands)} after changes.`] : []),
+    ...(noDevGuardCli ? [] : ["4. Run `dev-guard done` to regenerate Handoff, then open it and confirm internal analysis values or rule identifiers are not exposed."])
   ];
 }
 
-function handoffVerificationLines(quality: ParsedQuality, locale: DevGuardLocale, files: string[] = []): string[] {
-  const planned = handoffVerificationCommands(quality, files);
+function handoffVerificationLines(
+  quality: ParsedQuality,
+  locale: DevGuardLocale,
+  files: string[] = [],
+  constraints?: TaskConstraint[],
+  doneExecutedForThisState = false
+): string[] {
+  const planned = handoffVerificationCommands(quality, files, constraints);
+  // "dev-guard done: pass" is only true when this Handoff was actually
+  // (re)generated by a `dev-guard done` run in this call — `dev-guard
+  // handoff` and `prepare_task_context` regenerate Handoff from already-
+  // recorded state without running `done`, so claiming it passed there
+  // would be reporting an execution that never happened.
+  const doneLine = doneExecutedForThisState
+    ? locale === "ko-KR"
+      ? "- `dev-guard done`: pass. 현재 인수인계 파일이 생성되었습니다."
+      : "- `dev-guard done`: pass. The current Handoff file was generated."
+    : locale === "ko-KR"
+      ? "- `dev-guard done`: 이번 세션에서 실행되지 않음. 기존에 기록된 상태에서 Handoff만 다시 생성했습니다."
+      : "- `dev-guard done`: not run in this session. Handoff was regenerated from already-recorded state.";
   if (locale === "ko-KR") {
     return [
-      "- `dev-guard done`: pass. 현재 인수인계 파일이 생성되었습니다.",
+      doneLine,
       `- 외부 검증 결과: ${handoffCopy[locale].noExecutedVerification}`,
       ...planned.map((command) => `- 다음 세션에서 실행할 검증: \`${command}\``)
     ];
   }
   return [
-    "- `dev-guard done`: pass. The current Handoff file was generated.",
+    doneLine,
     `- External verification result: ${handoffCopy[locale].noExecutedVerification}`,
     ...planned.map((command) => `- Verification to run next: \`${command}\``)
   ];
 }
 
-function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[], locale: DevGuardLocale): string {
+function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[], locale: DevGuardLocale, constraints?: TaskConstraint[]): string {
   const cleanGoal = goal.map((line) => line.replace(/^- /, "")).find(isUsefulHandoffText) ?? (locale === "ko-KR" ? "목표 확인 필요" : "Goal needs confirmation");
   const fileText = files.slice(0, 3).map((file) => `\`${file}\``).join(", ") || (locale === "ko-KR" ? "변경 파일" : "changed files");
   const firstStep = nextSteps[0]?.replace(/^\d+\.\s*/, "").replace(/^먼저\s+/, "") ?? (locale === "ko-KR" ? "현재 Handoff를 확인합니다." : "Review the current Handoff.");
+  // The closing verification line used to hardcode `pnpm run build`,
+  // `dev-guard self-check`, `dev-guard done` unconditionally — exactly the
+  // command recommendation the current task's constraints can forbid. Build
+  // it from the same constraint-filtered command set Handoff's own
+  // verification section uses, instead of a second independent list.
+  const commands = filterCommandsByConstraints(["pnpm run build", "dev-guard self-check", "dev-guard done"], constraints);
+  const verificationLine =
+    commands.length > 0
+      ? locale === "ko-KR"
+        ? `${formatCommandRunList(commands)}을 실행한 뒤 \`.devguard/reports/project-handoff.md\`를 직접 열어 결과를 확인하세요.`
+        : `Run ${formatCommandRunList(commands)}, then open \`.devguard/reports/project-handoff.md\` to verify the result.`
+      : locale === "ko-KR"
+        ? "현재 task 제약상 위 명령을 실행하지 말고 `.devguard/reports/project-handoff.md`를 직접 열어 결과를 확인하세요."
+        : "Current task constraints forbid those commands; open `.devguard/reports/project-handoff.md` directly to verify the result instead.";
   if (locale === "ko-KR") {
     return [
       `이번 세션의 목표는 ${cleanGoal}`,
       `먼저 ${fileText}를 열어 변경 이유와 현재 요청 범위가 일치하는지 확인하세요.`,
       `그다음 ${firstStep}`,
       "문제가 있으면 관련 파일의 Handoff 생성 문구와 내부 분석값 필터링만 수정하세요.",
-      "`pnpm run build`, `dev-guard self-check`, `dev-guard done`을 실행한 뒤 `.devguard/reports/project-handoff.md`를 직접 열어 결과를 확인하세요."
+      verificationLine
     ].join("\n");
   }
   return [
@@ -6950,7 +7315,7 @@ function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[
     `Open ${fileText} first and confirm the change rationale matches the current request.`,
     firstStep,
     "If there is a problem, only adjust the Handoff copy and internal-analysis filtering in the related file.",
-    "Run `pnpm run build`, `dev-guard self-check`, and `dev-guard done`, then open `.devguard/reports/project-handoff.md` to verify the result."
+    verificationLine
   ].join("\n");
 }
 
@@ -6958,17 +7323,18 @@ function formatCommandRunList(commands: string[]): string {
   return commands.map((command) => `\`${command}\``).join(", ");
 }
 
-function handoffVerificationCommands(quality: ParsedQuality, files: string[]): string[] {
+function handoffVerificationCommands(quality: ParsedQuality, files: string[], constraints?: TaskConstraint[]): string[] {
   const commands = new Set<string>();
   if (files.some((file) => /runtime-state\.ts$/.test(file))) {
     commands.add("pnpm run build");
     commands.add("dev-guard self-check");
     commands.add("dev-guard done");
-    return [...commands];
+    return filterCommandsByConstraints([...commands], constraints);
   }
   for (const command of quality.requiredVerification) commands.add(command);
-  if (commands.size === 0) commands.add("pnpm run build");
-  return [...commands];
+  const filtered = filterCommandsByConstraints([...commands], constraints);
+  if (filtered.length === 0 && !taskConstraintFlags(constraints).noFullRepoBuild) filtered.push("pnpm run build");
+  return filtered;
 }
 
 function isRelevantHandoffReviewItem(item: string, files: string[]): boolean {
@@ -7077,6 +7443,26 @@ function parseQuality(markdown: string): ParsedQuality {
     requiredVerification: extractSectionBulletsAny(markdown, ["Required Verification", "필요한 검증", "Verification To Run", "실행할 검증", "Next QA", "다음 QA"], 5),
     reviewItems: extractSectionBulletsAny(markdown, ["Additional Checks", "Review Items", "검토 권장 항목", "추가로 검토하면 좋은 점"], 6),
     blockedItems: extractSectionBulletsAny(markdown, ["Blocked Items", "먼저 해결해야 할 항목"], 6)
+  };
+}
+
+/**
+ * Builds the same ParsedQuality shape Handoff consumes, but directly from
+ * the structured QualityReport object instead of re-parsing rendered
+ * markdown prose. This is the authoritative path — Quality Report and
+ * Handoff read the same QA facts from the same object, so they cannot
+ * disagree the way a "render to text, then regex the text back out" round
+ * trip could silently lose or reword facts. `parseQuality` (text parsing)
+ * remains only as a backward-compatible fallback for a `.devguard/reports/`
+ * state that predates the structured sidecar file.
+ */
+function parsedQualityFromReport(report: QualityReport): ParsedQuality {
+  return {
+    verdict: report.verdict,
+    why: report.why,
+    requiredVerification: report.requiredVerification,
+    reviewItems: report.reviewItems.map((item) => item.title),
+    blockedItems: report.checklist.filter((item) => item.status === "BLOCKED").map((item) => item.detail || item.label)
   };
 }
 
