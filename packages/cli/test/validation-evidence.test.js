@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 
 import {
   ensureDevguardWorkspace,
+  prepareTaskContext,
   processDoneEvent,
   recordValidationEvidence,
   isIgnoredWatchPath
@@ -60,6 +61,9 @@ test("isIgnoredWatchPath does not exclude real source or migration files", () =>
 test("build FAIL evidence is reported distinctly from not-recorded", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  // Evidence must be recorded while a task is active — see Task Binding
+  // Contract — or it is UNBOUND and excluded from current-task QA facts.
+  await prepareTaskContext({ root, task: "Fix the build." });
   await recordValidationEvidence({ root, kind: "BUILD", status: "FAIL", reason: "type error in route.ts" });
   await processDoneEvent(root);
   const quality = await readFile(join(root, ".devguard/reports/quality-report.md"), "utf8");
@@ -79,6 +83,7 @@ test("no recorded evidence at all yields Unknown confidence, not Low", async () 
 test("recorded PASS evidence is not shown as not-recorded", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Fix the build." });
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS" });
   await processDoneEvent(root);
   const quality = await readFile(join(root, ".devguard/reports/quality-report.md"), "utf8");

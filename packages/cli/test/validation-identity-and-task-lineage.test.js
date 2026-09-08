@@ -71,6 +71,7 @@ async function readHandoff(root) {
 test("Test A: BUILD/ci and TEST/ci do not collide — both are stored and reported", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Fix build and test failures." });
   await recordValidationEvidence({ root, kind: "BUILD", name: "ci", status: "PASS", command: "pnpm build" });
   await recordValidationEvidence({ root, kind: "TEST", name: "ci", status: "FAIL", reason: "3 tests failed" });
 
@@ -89,6 +90,7 @@ test("Test A: BUILD/ci and TEST/ci do not collide — both are stored and report
 test("Test B: BUILD/frontend and BUILD/backend are independent (same kind, different name)", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Fix the frontend and backend build." });
   await recordValidationEvidence({ root, kind: "BUILD", name: "frontend", status: "FAIL", reason: "type error" });
   await recordValidationEvidence({ root, kind: "BUILD", name: "backend", status: "PASS" });
 
@@ -101,6 +103,7 @@ test("Test B: BUILD/frontend and BUILD/backend are independent (same kind, diffe
 test("Test C: within the same identity, the latest-by-timestamp result wins", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Fix the frontend build." });
   await recordQAExecutionResult(root, {
     name: "frontend",
     kind: "BUILD",
@@ -127,6 +130,7 @@ test("Test C: within the same identity, the latest-by-timestamp result wins", as
 test("Test D: out-of-order arrival — an older write cannot clobber a newer result", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Fix the build." });
   // Written first, with the LATER timestamp.
   await recordQAExecutionResult(root, {
     name: "build",
@@ -218,6 +222,7 @@ test("Test E: same HEAD, source content changed -> stale (Case A)", async () => 
 test("Test F: validated dirty content, then committed UNCHANGED -> remains current (Case B)", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Validate app.js." });
   await writeFile(join(root, "app.js"), "console.log('validated content X');\n");
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
 
@@ -269,6 +274,7 @@ test("Test I: ignored generated noise does not move the fingerprint", async () =
 test("Test I (control): recording evidence itself (which writes .devguard/runtime.json) does not invalidate itself", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Verify the build." });
   const result = await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
   assert.ok(result.codeStateHash, "the stored evidence must carry a codeStateHash in a git repo");
   await processDoneEvent(root);
@@ -294,8 +300,8 @@ test("Test K: explicit Task A -> Task B (different text) — B has a clean linea
 test("Test L: identical task text across two explicit (non-continuation) calls are distinct tasks", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
-  await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
   await prepareTaskContext({ root, task: "Verify milestone" });
+  await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
   await processDoneEvent(root);
   const quality1 = await readQuality(root);
   assert.match(quality1, /Build\s*\|\s*✅ PASS/);
@@ -325,18 +331,25 @@ test("Test M: explicit continuation (continueCurrentTask) keeps the same task's 
   assert.match(handoff, /Implement ad report pipeline/);
 });
 
-test("Test N: no-boundary limitation — without prepare_task_context or reset, DevGuard keeps the old goal (documented contract)", async () => {
+test("Test N: no-boundary limitation — without prepare_task_context or reset, DevGuard no longer confidently keeps the old goal once code state has moved on", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
   await prepareTaskContext({ root, task: "Implement ad report pipeline" });
   await processDoneEvent(root);
 
   // No prepare_task_context, no reset — DevGuard has no boundary signal.
+  // Revised contract: DevGuard still does not guess a NEW task from the diff
+  // shape (no heuristic new-task inference), but it also no longer keeps
+  // confidently labeling this as the old goal once the code state has
+  // demonstrably moved past what that goal was recorded against — it
+  // degrades to a file-based goal instead. See evidence-freshness-and-
+  // session.test.js Test H for the same contract with unbound evidence
+  // present (which DOES fail closed) vs this case (no evidence at all).
   await writeFile(join(root, "unrelated3.js"), "export const d = 1;\n");
   await processDoneEvent(root);
 
   const handoff = await readHandoff(root);
-  assert.match(handoff, /Implement ad report pipeline/, "documented limitation: DevGuard cannot infer a new task without an explicit signal");
+  assert.doesNotMatch(handoff, /Implement ad report pipeline/, "a stale goal must not be confidently kept once code state has moved on");
 });
 
 // --- Stale vs never-recorded: internally distinguishable --------------------
@@ -351,6 +364,7 @@ test("Test O: stale evidence and never-recorded evidence are both NOT_RECORDED v
 
   const staleRoot = await makeRepo();
   await ensureDevguardWorkspace(staleRoot);
+  await prepareTaskContext({ root: staleRoot, task: "Verify the build." });
   await recordValidationEvidence({ root: staleRoot, kind: "BUILD", status: "PASS", command: "pnpm build" });
   await writeFile(join(staleRoot, "README.md"), "# sample\nEdited after the build was verified.\n");
   await processDoneEvent(staleRoot);
@@ -431,6 +445,7 @@ test("Compatibility: a non-git project does not crash and falls back to session-
   cleanupRoots.push(root);
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "nogit", scripts: { build: "true" } }, null, 2));
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Verify the build." });
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
   await processDoneEvent(root);
   const quality = await readQuality(root);

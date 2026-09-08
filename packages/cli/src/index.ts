@@ -385,7 +385,7 @@ async function runDone(root: string): Promise<void> {
   try {
     const locale = await refreshRuntimeLocale(root);
     const copy = cliCopy(locale);
-    const result = await processDoneEvent(root);
+    const result = await processDoneEvent(root, { completionSource: "cli-done" });
     console.log("dev-guard done (manual finalization)");
     console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");

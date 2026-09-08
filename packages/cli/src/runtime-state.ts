@@ -104,6 +104,22 @@ export interface QAExecutionResult {
   codeStateHash?: string;
   /** Session lineage id at record time; see RuntimeState.sessionId. */
   sessionId?: string;
+  /**
+   * Whether an explicit DevGuard task (`runtime.currentTask`, set by
+   * `prepare_task_context`) was active at the moment this evidence was
+   * recorded. `sessionId` alone is not enough to answer "does this evidence
+   * belong to a real, declared task" — a session id persists across a
+   * `done` cycle even after its task is cleared, so evidence recorded into
+   * that lingering session (with no task ever (re-)declared for it) must
+   * not be silently treated as verification for whatever task happens to
+   * be displayed later. "BOUND" evidence was recorded while a task was
+   * explicitly active; "UNBOUND" evidence was not — it is real, retained,
+   * and diagnosably visible, but it must never be presented as current-task
+   * PASS/FAIL evidence (see partitionQaResultsByFreshness). Absent on
+   * evidence recorded before this field existed; treated as legacy/UNBOUND
+   * for safety (a false PASS is worse than an honest "not attributable").
+   */
+  taskBinding?: "BOUND" | "UNBOUND";
 }
 
 export interface RecordValidationEvidenceInput {
@@ -147,6 +163,15 @@ export interface ProjectState {
   lastTaskGoalSource?: "explicit-task" | "diff-inferred";
   /** Session lineage the recorded lastTaskGoal belongs to; see RuntimeState.sessionId. */
   lastTaskGoalSessionId?: string;
+  /**
+   * codeStateHash at the moment lastTaskGoal was recorded — i.e. what
+   * change the goal actually describes. Compared against the current code
+   * state (see resolveSessionTaskGoal) so a same-session goal carryover can
+   * be recognized as stale relative to the ACTUAL current diff, instead of
+   * being presented next to unrelated fresh changes/evidence as if it still
+   * describes them.
+   */
+  lastTaskGoalCodeStateHash?: string;
 }
 
 export interface DoneProcessingResult {
@@ -259,6 +284,30 @@ export interface QualityReport {
     reason: string;
     source: "openai" | "rule-based";
   };
+  /**
+   * State Integrity Rule: computed once in processDoneEvent, before the
+   * verdict-based rendering paths, and read by BOTH Quality Report and
+   * Handoff (Handoff reads it from this same object via the
+   * quality-report-state.json sidecar — see generateProjectHandoff) so they
+   * agree on whether it is even safe to render a normal report. Absent /
+   * "CONSISTENT" means the same-session task goal (if any) describes the
+   * same code state currently being processed. "TASK_CHANGE_MISMATCH" means
+   * a same-session goal was carried over but its recorded code state no
+   * longer matches the current one — i.e. the goal describes different,
+   * older work than what actually changed — so task identity and change
+   * state cannot be safely merged into one Quality Report/Handoff. Per the
+   * fail-closed policy, this must produce an explicit integrity failure
+   * instead of a best-effort blended report.
+   */
+  stateIntegrity?: "CONSISTENT" | "TASK_CHANGE_MISMATCH";
+  /**
+   * Count of qaResults entries recorded with no active DevGuard task (see
+   * QAExecutionResult.taskBinding). Real evidence, never silently attached
+   * to the current task's PASS/FAIL facts, but surfaced so a user/agent
+   * knows unattributed verification exists and can re-attribute it with
+   * prepare_task_context.
+   */
+  unboundEvidenceCount?: number;
 }
 
 export interface QualityReviewItem {
@@ -556,10 +605,21 @@ async function resolveCurrentCodeState(root: string): Promise<{ gitHead: string;
 export async function recordQAExecutionResult(root: string, result: QAExecutionResult): Promise<QAExecutionResult> {
   const current = await readRuntimeState(root);
   const sessionId = current.sessionId ?? generateSessionId();
+  // Task Binding Contract: evidence is only "BOUND" — eligible to ever be
+  // shown as current-task PASS/FAIL — when an explicit task was active
+  // (`prepare_task_context`) at record time. `sessionId` alone cannot answer
+  // this: it survives the done-triggered partial reset even after the task
+  // that created it is cleared, so an agent that skips prepare_task_context
+  // and calls record_validation_result into that lingering session must not
+  // have its evidence silently attributed to whatever task/goal is later
+  // displayed. See partitionQaResultsByFreshness for how BOUND/UNBOUND is
+  // consumed.
+  const hasActiveTask = Boolean(current.currentTask?.text?.trim());
   const { gitHead, codeStateHash } = await resolveCurrentCodeState(root);
   const stamped: QAExecutionResult = {
     ...result,
     sessionId: result.sessionId ?? sessionId,
+    taskBinding: result.taskBinding ?? (hasActiveTask ? "BOUND" : "UNBOUND"),
     gitHead: result.gitHead ?? (gitHead || undefined),
     codeStateHash: result.codeStateHash ?? codeStateHash
   };
@@ -701,23 +761,40 @@ function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; c
  * model (PASS/FAIL/UNKNOWN/NOT_RECORDED). "Stale" evidence is real,
  * recorded evidence that simply no longer matches the current code state;
  * it is never deleted (see partitionQaResultsByFreshness), only excluded
- * from being read as current. It is not shown as a 5th visible status —
- * it renders as NOT_RECORDED in the main table — but the distinction is
- * preserved internally so remaining-work/diagnostic text can explain WHY
- * something isn't recorded, instead of conflating "never ran" with
- * "ran, but for an old code state."
+ * from being read as current. "Unbound" evidence is real, recorded evidence
+ * that was never attached to an explicit task (see QAExecutionResult.
+ * taskBinding) — also never deleted, but never eligible to be read as
+ * current-task verification regardless of how well its code state matches,
+ * per the fail-closed contract (implicit binding-by-code-match is exactly
+ * the kind of heuristic this must not do). Two dimensions, checked in
+ * order — task binding first, then code-state freshness — matching:
+ *   Task match? no -> unbound | yes -> Code state fresh? no -> stale | yes -> fresh
+ * None of these are shown as extra visible statuses — they still render as
+ * NOT_RECORDED in the main table — but the distinction is preserved
+ * internally so remaining-work/diagnostic text can explain WHY something
+ * isn't recorded, instead of conflating "never ran", "ran for an old code
+ * state", and "ran with no active task to attribute it to".
  */
 function partitionQaResultsByFreshness(
   qaResults: Record<string, QAExecutionResult> | undefined,
   current: { gitHead: string; codeStateHash?: string; sessionId?: string }
-): { fresh: Record<string, QAExecutionResult>; stale: Record<string, QAExecutionResult> } {
+): { fresh: Record<string, QAExecutionResult>; stale: Record<string, QAExecutionResult>; unbound: Record<string, QAExecutionResult> } {
   const fresh: Record<string, QAExecutionResult> = {};
   const stale: Record<string, QAExecutionResult> = {};
+  const unbound: Record<string, QAExecutionResult> = {};
   for (const [key, entry] of Object.entries(qaResults ?? {})) {
-    if (isEvidenceFresh(entry, current)) fresh[key] = entry;
-    else stale[key] = entry;
+    // Legacy evidence recorded before taskBinding existed has no signal
+    // either way; treated as UNBOUND (never assumed current) rather than
+    // crashing or silently defaulting to BOUND.
+    if (entry.taskBinding === "UNBOUND" || !entry.taskBinding) {
+      unbound[key] = entry;
+    } else if (isEvidenceFresh(entry, current)) {
+      fresh[key] = entry;
+    } else {
+      stale[key] = entry;
+    }
   }
-  return { fresh, stale };
+  return { fresh, stale, unbound };
 }
 
 function qaEntriesByKind(qaResults: Record<string, QAExecutionResult> | undefined, kind: ValidationEvidenceKind): QAExecutionResult[] {
@@ -747,6 +824,17 @@ interface ResolvedSessionTaskGoal {
   goal?: string;
   source?: "explicit-task";
   sessionId?: string;
+  /**
+   * True when the session lineage matches (so the goal would otherwise be
+   * carried over) but the code state recorded alongside that goal no longer
+   * matches the current code state — i.e. real, different work has
+   * happened since this goal was captured, so it describes a DIFFERENT
+   * change than whatever is being processed now. Callers must not use
+   * `goal` when this is true (it is intentionally left undefined) and
+   * should surface this as a state-integrity condition instead of silently
+   * blending a stale task label with fresh changes/evidence.
+   */
+  codeStateMismatch?: boolean;
 }
 
 /**
@@ -766,21 +854,35 @@ function resolveSessionTaskGoal(input: {
   runtimeSessionId?: string;
   previousGoal?: string;
   previousGoalSessionId?: string;
+  /** codeStateHash recorded alongside previousGoal, if any (see
+   *  ProjectState.lastTaskGoalCodeStateHash). */
+  previousGoalCodeStateHash?: string;
+  /** The FRESH code state at resolution time. Only passed by callers that
+   *  can cheaply/correctly sample it "right now" (processDoneEvent, which
+   *  always computes it anyway; resolveBeforeAgentContext's batch
+   *  generators). Omitted entirely elsewhere (e.g. standalone Handoff
+   *  regeneration, whose job is to redisplay the last recorded state, not
+   *  to react to intervening edits) — in which case this check is a no-op
+   *  and behavior is unchanged from before this field existed. */
+  currentCodeStateHash?: string;
 }): ResolvedSessionTaskGoal {
   const explicit = input.currentTaskText?.trim();
   if (explicit) {
     return { goal: explicit, source: "explicit-task", sessionId: input.runtimeSessionId };
   }
   const previousGoal = input.previousGoal?.trim();
-  if (
+  const sameSession = Boolean(
     previousGoal &&
     input.runtimeSessionId &&
     input.previousGoalSessionId &&
     input.previousGoalSessionId === input.runtimeSessionId
-  ) {
-    return { goal: previousGoal, source: "explicit-task", sessionId: input.runtimeSessionId };
+  );
+  if (!sameSession) return {};
+  const hasComparableCodeState = Boolean(input.previousGoalCodeStateHash && input.currentCodeStateHash);
+  if (hasComparableCodeState && input.previousGoalCodeStateHash !== input.currentCodeStateHash) {
+    return { sessionId: input.runtimeSessionId, codeStateMismatch: true };
   }
-  return {};
+  return { goal: previousGoal, source: "explicit-task", sessionId: input.runtimeSessionId };
 }
 
 export async function refreshRuntimeLocale(root: string): Promise<DevGuardLocale> {
@@ -928,7 +1030,23 @@ async function writeAtomicTextFile(path: string, content: string): Promise<void>
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-export async function processDoneEvent(root: string): Promise<DoneProcessingResult> {
+/**
+ * Completion Provenance: which real trigger actually produced this
+ * completion event, so Handoff can say what really happened instead of
+ * unconditionally claiming the `dev-guard done` CLI command ran. Callers:
+ * `index.ts` runDone -> "cli-done" (the literal CLI command, and what an
+ * installed agent Stop Hook shells out to — see hooks.ts); `watch.ts`'s
+ * idle-based auto-finalization -> "watch-auto-finalize" (processDoneEvent
+ * called directly, no `done` command); `dashboard.ts`'s review-complete
+ * endpoint -> "dashboard-review-complete". Defaults to "cli-done" for
+ * backward compatibility with any existing caller (including this file's
+ * own tests) that does not pass one — the previously-unconditional
+ * "dev-guard done: pass" wording was already only correct for that case.
+ */
+export type CompletionSource = "cli-done" | "watch-auto-finalize" | "dashboard-review-complete";
+
+export async function processDoneEvent(root: string, options: { completionSource?: CompletionSource } = {}): Promise<DoneProcessingResult> {
+  const completionSource: CompletionSource = options.completionSource ?? "cli-done";
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
   let runtime = await readRuntimeState(root);
@@ -942,7 +1060,7 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
   ]);
   const { gitHead, changeFiles, changedFiles, diffText, gitChanges, rawChangedFiles } = currentChangeState;
   const currentGitState = { gitHead, codeStateHash, sessionId: runtime.sessionId };
-  const { fresh: freshQaResults, stale: staleQaResults } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
+  const { fresh: freshQaResults, stale: staleQaResults, unbound: unboundQaResults } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
   const diffStat = await getGitDiffStat(root).catch(() => "git diff stat unavailable");
   const [projectMarkdown, architectureMarkdown, decisionsMarkdown, tasksMarkdown, config, codeGraph] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
@@ -981,8 +1099,17 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     currentTaskText: canonicalTaskGoal,
     runtimeSessionId: runtime.sessionId,
     previousGoal: previousProjectState.lastTaskGoal,
-    previousGoalSessionId: previousProjectState.lastTaskGoalSessionId
+    previousGoalSessionId: previousProjectState.lastTaskGoalSessionId,
+    previousGoalCodeStateHash: previousProjectState.lastTaskGoalCodeStateHash,
+    currentCodeStateHash: codeStateHash
   });
+  // Fail-closed contract: a same-session goal whose recorded code state no
+  // longer matches the current one describes DIFFERENT, older work than
+  // what is actually changed right now — resolvedGoal.goal is intentionally
+  // undefined in that case, so it can never be blended into this
+  // documentationSummary (which is otherwise always built from the CURRENT
+  // actual diff) as if it still described these changes. See
+  // stateIntegrity below for how Quality Report/Handoff surface this.
   const documentationSummary = buildDocumentationSummary({
     changedFiles,
     diffText,
@@ -995,11 +1122,28 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     // constraint on the current task.
     currentTaskText: resolvedGoal.goal,
     qaResults: freshQaResults,
-    staleQaResults
+    staleQaResults,
+    unboundQaResults
   });
   const sessionTaskGoal = resolvedGoal.goal;
   const sessionTaskGoalSource = resolvedGoal.source;
   const sessionTaskGoalSessionId = resolvedGoal.sessionId;
+  // A code-state mismatch on its own only means "this done cycle followed
+  // an earlier one without an explicit task re-declaration" — harmless and
+  // common (see the Task Boundary Contract's documented no-boundary
+  // limitation); resolvedGoal.goal is already cleared above so a stale
+  // label is never shown, and buildDocumentationSummary falls back to its
+  // normal file-based goal inference. It only escalates to a full
+  // fail-closed report when there is ALSO real, code-state-fresh evidence
+  // that was recorded with no active task (taskBinding "UNBOUND") — i.e.
+  // real verification work happened that could otherwise be silently
+  // misattributed to whatever task/goal ends up displayed. That specific
+  // combination is exactly the reported failure mode (unrelated evidence
+  // blended into a stale task's report), not "done was called twice".
+  const hasFreshUnboundEvidence = Object.values(unboundQaResults).some((entry) => isEvidenceFresh(entry, currentGitState));
+  const stateIntegrity: "CONSISTENT" | "TASK_CHANGE_MISMATCH" =
+    resolvedGoal.codeStateMismatch && hasFreshUnboundEvidence ? "TASK_CHANGE_MISMATCH" : "CONSISTENT";
+  const unboundEvidenceCount = Object.keys(unboundQaResults).length;
   const codeIndex = await updateCodeIndex(root, changedFiles, documentationSummary);
   const timestamp = new Date().toISOString();
   const majorChanges = inferMajorChanges({ summary, changedFiles, areas, diffText });
@@ -1032,20 +1176,27 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     testCandidates,
     nextTaskTitle: nextTask.title,
     documentationSummary,
-    qaResults: freshQaResults
+    qaResults: freshQaResults,
+    stateIntegrity,
+    unboundEvidenceCount
   });
-  qualityReport = await enhanceQualityReportWithAI(root, {
-    locale,
-    report: qualityReport,
-    changedFiles,
-    areas,
-    judgments,
-    summary,
-    nextTaskTitle: nextTask.title,
-    projectContext,
-    previousHistory,
-    documentationSummary
-  });
+  // A state-integrity failure must render exactly the deterministic mismatch
+  // explanation — never AI-polished prose that could paper over it with
+  // plausible-sounding text describing facts that don't actually cohere.
+  if (stateIntegrity === "CONSISTENT") {
+    qualityReport = await enhanceQualityReportWithAI(root, {
+      locale,
+      report: qualityReport,
+      changedFiles,
+      areas,
+      judgments,
+      summary,
+      nextTaskTitle: nextTask.title,
+      projectContext,
+      previousHistory,
+      documentationSummary
+    });
+  }
   historyRecord.qualityVerdict = qualityReport.verdict;
   await appendChangeLog(root, {
     timestamp,
@@ -1112,6 +1263,12 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
       lastTaskGoal: sessionTaskGoal,
       lastTaskGoalSource: sessionTaskGoalSource,
       lastTaskGoalSessionId: sessionTaskGoalSessionId,
+      // What code state sessionTaskGoal actually describes, so a future
+      // same-session carryover can detect when real work has moved on past
+      // it (see resolveSessionTaskGoal). Stamped even when the goal itself
+      // was cleared by a mismatch, so the cleared state is itself a clean,
+      // consistent baseline for the next round.
+      lastTaskGoalCodeStateHash: codeStateHash,
       lastReportPath: reportPath,
       lastPromptPath: promptPath,
       lastHandoffPath: projectHandoffPath
@@ -1123,9 +1280,9 @@ export async function processDoneEvent(root: string): Promise<DoneProcessingResu
     judgments.push(`Project Knowledge refresh skipped: ${ensuredProjectKnowledge.warning}`);
   }
   await Promise.all([
-    // This IS the `dev-guard done` run — Handoff may truthfully say
-    // `dev-guard done: pass` here (see handoffVerificationLines).
-    generateProjectHandoff(root, { doneExecutedForThisState: true }),
+    // This IS the completion event — Handoff reports which real trigger
+    // produced it (see handoffVerificationLines / CompletionSource).
+    generateProjectHandoff(root, { completionSource }),
     generateReadMap(root),
     generateCodeMap(root),
     generateWorkingContext(root),
@@ -1252,7 +1409,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   }
 }
 
-export async function generateProjectHandoff(root: string, options: { doneExecutedForThisState?: boolean } = {}): Promise<string> {
+export async function generateProjectHandoff(root: string, options: { completionSource?: CompletionSource } = {}): Promise<string> {
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
   const [project, architecture, decisions, tasks, records, historySummary, decisionCandidates, qualityReport, qualityReportState, nextPrompt, hookStatus, state, projectKnowledge, runtime] = await Promise.all([
@@ -1295,7 +1452,7 @@ export async function generateProjectHandoff(root: string, options: { doneExecut
     locale,
     runtimeSessionId: runtime.sessionId,
     currentTaskText: runtime.currentTask?.text,
-    doneExecutedForThisState: options.doneExecutedForThisState
+    completionSource: options.completionSource
   });
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
   return projectHandoffPath;
@@ -1657,6 +1814,19 @@ function taskSourceLabel(source: ContextTaskSource, locale: DevGuardLocale): str
   return "None";
 }
 
+/**
+ * Whether `taskSource` reflects an actual current task DevGuard can route
+ * entry files/reading order for. "history-fallback"/"none" are background-
+ * only (see resolveBeforeAgentContext) — recommending recently-touched
+ * files (README, package.json, old handoff-adjacent files, ...) as if they
+ * were the current task's entry points is exactly the stale routing this
+ * must not produce; callers should show an explicit no-routing message
+ * instead.
+ */
+function hasTaskSpecificRouting(source: ContextTaskSource | undefined): boolean {
+  return source === "explicit-before-agent-input" || source === "resumed-session-summary";
+}
+
 function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex, content = ""): PreparedTaskContextFile {
   const indexed = index.files[file];
   const trust = contextTrustForFile(file, indexed, undefined, "en-US");
@@ -1780,7 +1950,9 @@ function renderReadMap(input: { files: string[]; state: ProjectState; projectKno
     `- Task Source: ${taskSourceLabel(input.taskSource ?? "none", input.locale)}`,
     "",
     "## 읽기 순서",
-    ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
+    ...(hasTaskSpecificRouting(input.taskSource)
+      ? entryFiles.map((file, index) => `${index + 1}. \`${file}\``)
+      : [input.locale === "ko-KR" ? "현재 task 기준 파일 우선순위를 제공할 수 없습니다. `prepare_task_context`를 호출하세요." : "No current task-specific routing available. Call `prepare_task_context`."]),
     "",
     "## 우선 읽을 영역",
     ...formatBullets(readTargets),
@@ -1906,7 +2078,9 @@ function renderAgentBrief(input: {
     ...formatBullets(skipTargets),
     "",
     "## 진입 파일",
-    ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
+    ...(hasTaskSpecificRouting(input.taskSource)
+      ? entryFiles.map((file, index) => `${index + 1}. \`${file}\``)
+      : ["현재 task 기준 진입 파일을 제공할 수 없습니다. `prepare_task_context`를 호출하세요."]),
     "",
     "## 읽기 규칙",
     `1. \`${devguardPaths.readMap}\`에서 읽을 파일을 고른다.`,
@@ -2804,7 +2978,17 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
   const entryFiles = workingEntryFiles(input.files, profile);
   const componentTree = workingComponentTree(domains);
   const excludedAreas = documentationSummary?.excludedAreas.length ? documentationSummary.excludedAreas.map((item) => localizeSentence(item, input.locale)) : workingExcludedAreas(domains);
-  const currentWork = documentationSummary?.goal ? localizeSentence(documentationSummary.goal, input.locale) : workingCurrentWork(input.state, domains);
+  // With no active task (documentationSummary undefined here means
+  // taskSource is "history-fallback"/"none" — see resolveBeforeAgentContext),
+  // workingCurrentWork's own fallback would otherwise infer a "current
+  // work" description from recently-touched files/domains (history) or
+  // state.lastSummary — exactly the "history promoted as current task"
+  // pattern this must not do. Say plainly that there is no active task.
+  const currentWork = documentationSummary?.goal
+    ? localizeSentence(documentationSummary.goal, input.locale)
+    : input.locale === "ko-KR"
+      ? "현재 활성화된 DevGuard task가 없습니다. `prepare_task_context`를 호출하세요."
+      : "No active DevGuard task. Call `prepare_task_context` for the current request.";
   const structure = documentationSummary?.structure.length ? documentationSummary.structure.map((item) => localizeSentence(item, input.locale)) : workingCurrentStructure(domains);
   const tips = workingTips(domains);
 
@@ -2832,7 +3016,9 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
     ...formatBullets(excludedAreas),
     "",
     "## 진입 파일",
-    ...entryFiles.map((file, index) => `${index + 1}. \`${file}\``),
+    ...(hasTaskSpecificRouting(input.taskSource)
+      ? entryFiles.map((file, index) => `${index + 1}. \`${file}\``)
+      : ["현재 task 기준 진입 파일을 제공할 수 없습니다. `prepare_task_context`를 호출하세요."]),
     "",
     "## 컴포넌트 관계",
     ...componentTree,
@@ -3196,6 +3382,10 @@ function buildDocumentationSummary(input: {
   canonicalGoal?: string;
   qaResults?: Record<string, QAExecutionResult>;
   staleQaResults?: Record<string, QAExecutionResult>;
+  /** Evidence recorded with no active DevGuard task (see Task Binding
+   *  Contract) — real, never silently attached to current-task QA facts,
+   *  but surfaced diagnostically in remainingWork. */
+  unboundQaResults?: Record<string, QAExecutionResult>;
   /** The explicit current task text only (not tasks.md/project.md prose), used
    *  for constraint extraction so unrelated document text can't be misread
    *  as a current-task constraint. */
@@ -3221,7 +3411,7 @@ function buildDocumentationSummary(input: {
     },
     fileChanges,
     qaChecks: documentationQAChecks(fileChanges, changeTypes, input.qaResults, constraints),
-    remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults, input.staleQaResults),
+    remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults, input.staleQaResults, input.unboundQaResults),
     structure: documentationStructure(changeTypes, fileChanges),
     excludedAreas: unaffectedAreasFromDocumentation(affected),
     constraints
@@ -3399,13 +3589,36 @@ function inferDocumentationFilePurpose(file: string, types: ChangeType[]): strin
   if (/paths\.ts$/.test(file)) return "DevGuard managed artifact path constants";
   if (/README|docs\//i.test(file)) return "user-facing documentation";
   if (/package\.json|pnpm-lock\.yaml/i.test(file)) return "release and package metadata";
+  if (/\.sql$/i.test(file) || /(^|\/)migrations?\//i.test(file)) return "database schema migration";
   if (types.includes("UI")) return "user interface behavior";
   if (types.includes("Docs")) return "documentation";
   return "implementation logic";
 }
 
+// Minimal, deterministic DDL keyword detection for .sql migration files —
+// not a SQL parser. Only reports what's literally present in added lines,
+// so it never fabricates schema detail; a file with no recognizable DDL
+// keyword still correctly falls through to "no diff detail available"
+// rather than guessing.
+function inferSqlMigrationChanges(file: string, added: string[]): string[] {
+  if (!/\.sql$/i.test(file)) return [];
+  const changes: string[] = [];
+  const text = added.join("\n");
+  const tableMatches = [...text.matchAll(/create\s+table\s+(?:if\s+not\s+exists\s+)?["`]?([\w.]+)["`]?/gi)].map((m) => m[1]);
+  const alterMatches = [...text.matchAll(/alter\s+table\s+["`]?([\w.]+)["`]?/gi)].map((m) => m[1]);
+  const indexMatches = [...text.matchAll(/create\s+(?:unique\s+)?index\s+(?:if\s+not\s+exists\s+)?["`]?([\w.]+)["`]?/gi)].map((m) => m[1]);
+  const dropMatches = [...text.matchAll(/drop\s+table\s+(?:if\s+exists\s+)?["`]?([\w.]+)["`]?/gi)].map((m) => m[1]);
+  if (tableMatches.length > 0) changes.push(`Creates table(s): ${[...new Set(tableMatches)].slice(0, 5).join(", ")}.`);
+  if (alterMatches.length > 0) changes.push(`Alters table(s): ${[...new Set(alterMatches)].slice(0, 5).join(", ")}.`);
+  if (indexMatches.length > 0) changes.push(`Creates index(es): ${[...new Set(indexMatches)].slice(0, 5).join(", ")}.`);
+  if (dropMatches.length > 0) changes.push(`Drops table(s): ${[...new Set(dropMatches)].slice(0, 5).join(", ")}.`);
+  if (changes.length === 0 && /\S/.test(text)) changes.push("Modifies a database migration file (specific DDL statements were not recognized from the diff).");
+  return changes.slice(0, 4);
+}
+
 function inferConcreteChanges(file: string, added: string[], removed: string[], types: ChangeType[]): string[] {
   const changes = new Set<string>();
+  for (const change of inferSqlMigrationChanges(file, added)) changes.add(change);
   const fileSpecificChanges = inferFileSpecificPipelineChanges(file, added, removed);
   for (const change of fileSpecificChanges) changes.add(change);
   for (const change of inferFeatureLevelChanges(file, added, removed)) changes.add(change);
@@ -3632,6 +3845,18 @@ function documentationOverview(files: DocumentationFileChange[], types: ChangeTy
   return ["Specific change content could not be summarized automatically — check the diff directly."];
 }
 
+/**
+ * Domain Consistency Rule: this is the ONE place `documentationSummary.
+ * impact.affected/unaffected` (consumed by Quality Report's Impact section,
+ * Handoff, Agent Context's Do Not Touch list, and Working Context's
+ * excluded-areas list) decides which domains a change touches. For
+ * auth/database/api specifically, it reuses `classifyAreas` — the exact
+ * same path-based classifier `processDoneEvent` uses for the "risky areas"
+ * checklist WARN item — instead of a second, independently-maintained
+ * check. A migration file under a database package can therefore never be
+ * "Database" in one section and "Database unaffected" in another: both
+ * come from calling classifyAreas on the same file list.
+ */
 function affectedAreasFromDocumentation(files: DocumentationFileChange[], types: ChangeType[]): string[] {
   const areas = new Set<string>();
   if (types.includes("UI")) areas.add("Dashboard/UI");
@@ -3641,6 +3866,10 @@ function affectedAreasFromDocumentation(files: DocumentationFileChange[], types:
   if (types.includes("Release")) areas.add("Release metadata");
   if (types.includes("i18n")) areas.add("Locale/UI copy");
   if (files.some((file) => /AGENTS|CLAUDE|install-agent-instructions/.test(file.file))) areas.add("Agent startup instructions");
+  const domainAreas = classifyAreas(files.map((file) => file.file));
+  if (domainAreas.includes("auth")) areas.add("Auth");
+  if (domainAreas.includes("database")) areas.add("Database");
+  if (domainAreas.includes("api")) areas.add("API");
   return areas.size > 0 ? [...areas] : ["Implementation"];
 }
 
@@ -3702,7 +3931,8 @@ function documentationRemainingWork(
   files: DocumentationFileChange[],
   types: ChangeType[],
   qaResults?: Record<string, QAExecutionResult>,
-  staleQaResults?: Record<string, QAExecutionResult>
+  staleQaResults?: Record<string, QAExecutionResult>,
+  unboundQaResults?: Record<string, QAExecutionResult>
 ): string[] {
   const remaining = new Set<string>();
   const buildStatus = worstStatusAcrossNames(latestStatusesByName(qaResults, "BUILD"));
@@ -3731,6 +3961,16 @@ function documentationRemainingWork(
   if (types.includes("Docs")) remaining.add("Read changed docs and confirm examples match current CLI output.");
   if (types.includes("QA")) remaining.add("Read regenerated artifacts and confirm they describe feature-level changes instead of code-token changes.");
   if (files.length === 0) remaining.add("No changed files were available; rerun after a real diff if this is unexpected.");
+  // Evidence Binding diagnostic: real evidence exists but was recorded with
+  // no active task, so it was excluded from the QA facts above — surfaced
+  // so it isn't silently lost, distinct from "not recorded" (see
+  // partitionQaResultsByFreshness / Task Binding Contract).
+  const unboundCount = Object.keys(unboundQaResults ?? {}).length;
+  if (unboundCount > 0) {
+    remaining.add(
+      `${unboundCount} validation result(s) were recorded with no active DevGuard task and are not used as current-task verification. Call prepare_task_context, then record_validation_result again to attribute them.`
+    );
+  }
   return [...remaining].slice(0, 8);
 }
 
@@ -4909,6 +5149,8 @@ async function assessCompletionQuality(
     nextTaskTitle: string;
     documentationSummary: DocumentationSummary;
     qaResults?: Record<string, QAExecutionResult>;
+    stateIntegrity?: "CONSISTENT" | "TASK_CHANGE_MISMATCH";
+    unboundEvidenceCount?: number;
   }
 ): Promise<QualityReport> {
   const [rootPackage, cliPackage] = await Promise.all([
@@ -5037,7 +5279,9 @@ async function assessCompletionQuality(
     beforeCommit,
     nextRecommendedAction: buildQualityNextAction({ verdict, changedFiles: input.changedFiles, areas: input.areas, issueItems, requiredVerification }),
     documentationSummary: input.documentationSummary,
-    qaResults: input.qaResults
+    qaResults: input.qaResults,
+    stateIntegrity: input.stateIntegrity ?? "CONSISTENT",
+    unboundEvidenceCount: input.unboundEvidenceCount
   };
 }
 
@@ -5801,9 +6045,69 @@ const handoffCopy = {
 } as const;
 
 function renderQualityReport(report: QualityReport, locale: DevGuardLocale): string {
+  // Fail-Closed Policy: a state integrity failure takes priority over the
+  // verdict-based rendering entirely. Task/change/evidence facts that
+  // cannot be safely linked must never be blended into a normal-looking
+  // Quality Report just because a verdict was still computable from the
+  // (possibly mismatched) checklist — a false PASS-looking report is more
+  // dangerous than an honest "cannot verify" one.
+  if (report.stateIntegrity === "TASK_CHANGE_MISMATCH") return renderStateMismatchQualityReport(report, locale);
   if (report.verdict === "PASS") return renderPassQualityReport(report, locale);
   if (report.verdict === "BLOCKED") return renderBlockedQualityReport(report, locale);
   return renderNeedsReviewQualityReport(report, locale);
+}
+
+function renderStateMismatchQualityReport(report: QualityReport, locale: DevGuardLocale): string {
+  const goalText = report.documentationSummary?.goal;
+  const unbound = report.unboundEvidenceCount ?? 0;
+  if (locale === "ko-KR") {
+    return [
+      "# 완료 품질 보고서",
+      "",
+      "## 1. 판정",
+      "",
+      "⚠ STATE_MISMATCH",
+      "",
+      "현재 task 상태와 검증 evidence를 안전하게 연결할 수 없습니다.",
+      "",
+      "## 2. 이유",
+      "",
+      `- 이전에 기록된 작업 목표${goalText ? ` ("${goalText}")` : ""}는 지금 실제로 변경된 코드 상태와 일치하지 않습니다.`,
+      "- 이 상태에서는 Task, Changed Files, Validation Evidence를 하나의 정상 보고서로 합치지 않습니다.",
+      ...(unbound > 0 ? [`- 참고: active task 없이 기록된 검증 evidence ${unbound}건이 있습니다. 이 evidence는 현재 task의 PASS/FAIL로 사용되지 않았습니다.`] : []),
+      "",
+      "## 3. 권장 조치",
+      "",
+      "1. 현재 작업에 대해 `prepare_task_context`를 호출하세요.",
+      "2. 필요하면 새 검증(record_validation_result)을 다시 기록하세요.",
+      "3. 그 다음 `dev-guard done`을 실행해 다시 생성하세요.",
+      "",
+      "이 보고서는 의도적으로 최소한의 정보만 담고 있습니다. 서로 다른 작업의 데이터를 하나의 그럴듯한 보고서로 합치지 않기 위해서입니다."
+    ].join("\n") + "\n";
+  }
+  return [
+    "# Completion Quality Report",
+    "",
+    "## 1. Verdict",
+    "",
+    "⚠ STATE_MISMATCH",
+    "",
+    "Current task state and validation evidence could not be safely linked.",
+    "",
+    "## 2. Reason",
+    "",
+    `- The previously recorded task goal${goalText ? ` ("${goalText}")` : ""} does not match the code state that actually changed just now.`,
+    "- In this state, Task, Changed Files, and Validation Evidence are not merged into one normal report.",
+    ...(unbound > 0 ? [`- Note: ${unbound} validation result(s) were recorded with no active task. That evidence was not used as PASS/FAIL for the current task.`] : []),
+    "",
+    "## 3. Recommended Action",
+    "",
+    "1. Call `prepare_task_context` for the current task.",
+    "2. Record fresh validation evidence (`record_validation_result`) if needed.",
+    "3. Run `dev-guard done` to regenerate this report.",
+    "",
+    "This report is intentionally minimal — DevGuard does not merge different tasks' data into one plausible-looking report."
+  ].join("\n") + "\n";
 }
 
 function renderPassQualityReport(report: QualityReport, locale: DevGuardLocale): string {
@@ -6940,15 +7244,23 @@ function renderProjectHandoff(input: {
   runtimeSessionId?: string;
   currentTaskText?: string;
   /**
-   * True only when this Handoff is being (re)generated as the direct result
-   * of a `dev-guard done` run in this call (i.e. from inside
-   * processDoneEvent). `dev-guard handoff`/`prepare_task_context` regenerate
-   * Handoff from already-recorded state without running `done`, so Handoff
-   * must not claim `dev-guard done: pass` in that case — no evidence, no
-   * execution claim.
+   * Set only when this Handoff is being (re)generated as the direct result
+   * of a real completion event in this call (i.e. from inside
+   * processDoneEvent) — see CompletionSource. `dev-guard handoff`/
+   * `prepare_task_context` regenerate Handoff from already-recorded state
+   * without a completion event, so Handoff must not claim any command or
+   * event "executed" in that case — no evidence, no execution claim.
    */
-  doneExecutedForThisState?: boolean;
+  completionSource?: CompletionSource;
 }): string {
+  // Fail-Closed Policy: if the structured QA state (written once, in
+  // processDoneEvent) already determined the task/change state cannot be
+  // safely linked, Handoff reads that SAME decision rather than
+  // re-deriving its own — it must never render a normal-looking resume
+  // document blending a stale task label with unrelated fresh evidence.
+  if (input.qualityReportState?.stateIntegrity === "TASK_CHANGE_MISMATCH") {
+    return renderHandoffUnavailable(input.qualityReportState, input.locale);
+  }
   const copy = handoffCopy[input.locale];
   const quality = input.qualityReportState ? parsedQualityFromReport(input.qualityReportState) : parseQuality(input.qualityReport.content);
   const nextTask = extractNextTask(input.nextPrompt.content, input.tasks.content, input.state);
@@ -6966,7 +7278,7 @@ function renderProjectHandoff(input: {
   const qualityLines = handoffQualityLines(quality, changedFiles, input.locale, documentationSummary);
   const outstanding = handoffOutstandingItems(quality, changedFiles, input.locale, documentationSummary);
   const nextSteps = handoffNextActions(quality, nextTask, changedFiles, input.locale, documentationSummary);
-  const verification = handoffVerificationLines(quality, input.locale, changedFiles, documentationSummary?.constraints, Boolean(input.doneExecutedForThisState));
+  const verification = handoffVerificationLines(quality, input.locale, changedFiles, documentationSummary?.constraints, input.completionSource);
   const resumePrompt = handoffResumePrompt(goal, nextSteps, changedFiles, input.locale, documentationSummary?.constraints);
   const missing = missingInputs([input.project, input.architecture, input.tasks, input.qualityReport, input.projectKnowledge, input.historySummary]);
   const body: string[] = [`# ${copy.title}`, ""];
@@ -6995,6 +7307,59 @@ function renderProjectHandoff(input: {
     ...formatLocalizedBullets(score, input.locale)
   );
   return body.join("\n") + "\n";
+}
+
+/**
+ * Fail-Closed Handoff: rendered instead of the normal 7-section Handoff
+ * whenever task/change/evidence state could not be safely linked (see
+ * QualityReport.stateIntegrity). Deliberately does NOT restate the stale
+ * goal, the possibly-unrelated changed files, or any evidence — those are
+ * exactly the facts that cannot be trusted to describe the same work, so
+ * this only reports the mismatch and the one safe recovery action.
+ */
+function renderHandoffUnavailable(report: QualityReport, locale: DevGuardLocale): string {
+  const goalText = report.documentationSummary?.goal;
+  const unbound = report.unboundEvidenceCount ?? 0;
+  if (locale === "ko-KR") {
+    return [
+      "# 프로젝트 인수인계",
+      "",
+      "## 현재 상태에서는 인수인계를 생성할 수 없습니다.",
+      "",
+      "### 이유",
+      "",
+      `이전에 기록된 작업 목표${goalText ? ` ("${goalText}")` : ""}가 지금 실제로 변경된 코드 상태와 일치하지 않습니다.`,
+      "검증 evidence가 서로 다른(또는 연결되지 않은) 작업 lineage에 속해 있을 수 있습니다.",
+      ...(unbound > 0 ? [`\nactive task 없이 기록된 검증 evidence ${unbound}건이 있습니다. 안전하게 attribution할 수 없어 이 인수인계에 포함하지 않았습니다.`] : []),
+      "",
+      "### 권장 조치",
+      "",
+      "1. 현재 작업으로 `prepare_task_context`를 호출하세요.",
+      "2. 필요하면 검증(record_validation_result)을 다시 기록하세요.",
+      "3. 그 다음 `dev-guard done`을 실행해 인수인계를 다시 생성하세요.",
+      "",
+      "이 문서는 의도적으로 서로 다른 작업의 데이터를 하나의 그럴듯한 인수인계로 합치지 않습니다."
+    ].join("\n") + "\n";
+  }
+  return [
+    "# Project Handoff",
+    "",
+    "## Handoff unavailable for current state.",
+    "",
+    "### Reason",
+    "",
+    `The previously recorded task goal${goalText ? ` ("${goalText}")` : ""} does not match the code state that actually changed just now.`,
+    "Validation evidence may belong to a different, or unbound, task lineage.",
+    ...(unbound > 0 ? [`\n${unbound} validation result(s) were recorded with no active task. They could not be safely attributed, so they are not included in this handoff.`] : []),
+    "",
+    "### Recommended action",
+    "",
+    "1. Start/restore the task using `prepare_task_context`.",
+    "2. Record fresh validation evidence (`record_validation_result`) if needed.",
+    "3. Run `dev-guard done` to regenerate this handoff.",
+    "",
+    "This document deliberately does not merge different tasks' data into one plausible-looking handoff."
+  ].join("\n") + "\n";
 }
 
 function handoffGoal(nextTask: string, changedFiles: string[], quality: ParsedQuality, locale: DevGuardLocale, documentationSummary?: DocumentationSummary, canonicalTaskGoal?: string): string[] {
@@ -7254,21 +7619,32 @@ function handoffVerificationLines(
   locale: DevGuardLocale,
   files: string[] = [],
   constraints?: TaskConstraint[],
-  doneExecutedForThisState = false
+  completionSource?: CompletionSource
 ): string[] {
   const planned = handoffVerificationCommands(quality, files, constraints);
-  // "dev-guard done: pass" is only true when this Handoff was actually
-  // (re)generated by a `dev-guard done` run in this call — `dev-guard
-  // handoff` and `prepare_task_context` regenerate Handoff from already-
-  // recorded state without running `done`, so claiming it passed there
-  // would be reporting an execution that never happened.
-  const doneLine = doneExecutedForThisState
-    ? locale === "ko-KR"
-      ? "- `dev-guard done`: pass. 현재 인수인계 파일이 생성되었습니다."
-      : "- `dev-guard done`: pass. The current Handoff file was generated."
-    : locale === "ko-KR"
-      ? "- `dev-guard done`: 이번 세션에서 실행되지 않음. 기존에 기록된 상태에서 Handoff만 다시 생성했습니다."
-      : "- `dev-guard done`: not run in this session. Handoff was regenerated from already-recorded state.";
+  // Completion Provenance: report exactly which real trigger produced this
+  // Handoff, not an unconditional "dev-guard done: pass" — `dev-guard
+  // handoff`/`prepare_task_context` regenerate Handoff from already-
+  // recorded state with no completion event at all, and `dev-guard watch`'s
+  // idle-based auto-finalization completes the session without the `done`
+  // CLI command ever running, so claiming "command executed" there would
+  // misreport what actually happened (see CompletionSource).
+  const doneLine =
+    completionSource === "cli-done"
+      ? locale === "ko-KR"
+        ? "- `dev-guard done`: pass. 현재 인수인계 파일이 생성되었습니다."
+        : "- `dev-guard done`: pass. The current Handoff file was generated."
+      : completionSource === "watch-auto-finalize"
+        ? locale === "ko-KR"
+          ? "- 완료 이벤트가 `dev-guard watch`에 의해 자동으로 처리되었습니다 (`dev-guard done` CLI 명령이 실행된 것은 아닙니다)."
+          : "- Completion event processed automatically by `dev-guard watch` (the `dev-guard done` CLI command itself was not run)."
+        : completionSource === "dashboard-review-complete"
+          ? locale === "ko-KR"
+            ? "- 완료 이벤트가 Dashboard에서 자동으로 처리되었습니다 (`dev-guard done` CLI 명령이 실행된 것은 아닙니다)."
+            : "- Completion event processed automatically from the Dashboard (the `dev-guard done` CLI command itself was not run)."
+          : locale === "ko-KR"
+            ? "- `dev-guard done`: 이번 세션에서 실행되지 않음. 기존에 기록된 상태에서 Handoff만 다시 생성했습니다."
+            : "- `dev-guard done`: not run in this session. Handoff was regenerated from already-recorded state.";
   if (locale === "ko-KR") {
     return [
       doneLine,

@@ -91,11 +91,12 @@ test("Test A: Quality Report and Handoff show identical QA facts (typecheck/test
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
   await writeFile(join(root, "src.js"), "export const x = 1;\n");
+  // Evidence must be recorded while a task is active (Task Binding
+  // Contract) or it is UNBOUND and excluded from current-task QA facts.
+  await prepareTaskContext({ root, task: "Fix admin dashboard filter." });
   await recordValidationEvidence({ root, kind: "TYPECHECK", status: "PASS", command: "tsc --noEmit" });
   await recordValidationEvidence({ root, kind: "TEST", status: "PASS", command: "vitest run" });
   await recordValidationEvidence({ root, kind: "RUNTIME_SMOKE", name: "http", status: "PASS", command: "curl http://localhost" });
-
-  await prepareTaskContext({ root, task: "Fix admin dashboard filter." });
   await processDoneEvent(root);
 
   const quality = await readQuality(root);
@@ -370,14 +371,15 @@ test("PartnerFlow fixture: Admin UI Audit Phase 2 produces internally consistent
   await writeFile(join(root, "apps/admin/templates/[id]/page.tsx"), "export default function Page(){ return null; }\n");
   await writeFile(join(root, "apps/admin/templates/[id]/ad-template-version-form.tsx"), "export function Form(){ return null; }\n");
 
-  await recordValidationEvidence({ root, kind: "TYPECHECK", status: "PASS", command: "pnpm --filter admin typecheck" });
-  await recordValidationEvidence({ root, kind: "TEST", name: "targeted", status: "PASS", command: "pnpm --filter admin test" });
-  await recordValidationEvidence({ root, kind: "RUNTIME_SMOKE", name: "http", status: "PASS", command: "curl http://localhost:3000" });
-
+  // Evidence must be recorded while a task is active (Task Binding
+  // Contract) or it is UNBOUND and excluded from current-task QA facts.
   await prepareTaskContext({
     root,
     task: "Admin UI Audit Phase 2: template source viewer + version editor improvement. Constraints: no DevGuard CLI, no full repo build, no full repo test, no commit, no push."
   });
+  await recordValidationEvidence({ root, kind: "TYPECHECK", status: "PASS", command: "pnpm --filter admin typecheck" });
+  await recordValidationEvidence({ root, kind: "TEST", name: "targeted", status: "PASS", command: "pnpm --filter admin test" });
+  await recordValidationEvidence({ root, kind: "RUNTIME_SMOKE", name: "http", status: "PASS", command: "curl http://localhost:3000" });
   await processDoneEvent(root);
 
   const quality = await readQuality(root);

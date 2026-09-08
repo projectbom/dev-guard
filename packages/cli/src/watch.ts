@@ -185,7 +185,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 
     let finalizeError: unknown;
     try {
-      const result = await processDoneEvent(root);
+      const result = await processDoneEvent(root, { completionSource: "watch-auto-finalize" });
       if (!options.compact) {
         console.log(`auto: done — ${result.changedFiles.length} file(s); quality=${result.qualityVerdict}`);
         if (result.qualityVerdict !== "PASS") {

@@ -86,6 +86,7 @@ test("Test A: BUILD PASS recorded at HEAD A becomes stale after an uncommitted e
 test("Test B (control): BUILD PASS remains fresh when the working tree does not change at all", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Verify the build." });
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
   await processDoneEvent(root);
   const quality = await readQuality(root);
@@ -113,6 +114,7 @@ test("Test C: a staged (but uncommitted) change invalidates previously recorded 
 test("Test D: a new untracked source file invalidates evidence, but ignored generated noise does not", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Verify the build." });
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
 
   // Generated/ignored noise must not move the fingerprint.
@@ -191,7 +193,7 @@ test("Test F: an explicit new prepare_task_context call starts a clean task line
 
 // --- Test G: same-task persistence ------------------------------------------
 
-test("Test G: the same task's goal persists across additional done calls without recalling prepare_task_context", async () => {
+test("Test G: the same task's goal persists across additional done calls when continued explicitly (continueCurrentTask)", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
 
@@ -199,35 +201,44 @@ test("Test G: the same task's goal persists across additional done calls without
   await processDoneEvent(root);
 
   await writeFile(join(root, "more.js"), "export const more = 1;\n");
+  // The supported way to continue the SAME task across additional done
+  // cycles is to re-declare it explicitly with continueCurrentTask — this
+  // is the "existing mechanism" for task continuation (see
+  // prepareTaskContext), not silent carryover with no signal at all.
+  await prepareTaskContext({ root, task: "Implement ad report pipeline", continueCurrentTask: true });
   await processDoneEvent(root);
 
   const handoff = await readHandoff(root);
   assert.match(handoff, /Implement ad report pipeline/);
 });
 
-// --- Test H: no-boundary limitation (documented contract, not inferred) ----
+// --- Test H: no-boundary limitation, revised for the Fail-Closed contract --
 
-test("Test H: without prepare_task_context or reset, DevGuard cannot tell a new task started and keeps the old goal", async () => {
+test("Test H: without prepare_task_context or reset, DevGuard does not keep confidently showing the old goal once the code state has moved on", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
 
   await prepareTaskContext({ root, task: "Implement ad report pipeline", persistTask: true });
   await processDoneEvent(root);
 
-  // The user mentally moves on to a materially different, larger piece of
-  // work — but never calls prepare_task_context or dev-guard reset. DevGuard
-  // has no contractual signal that a new task began, so per the documented
-  // Task Boundary Contract it must keep showing the previous goal rather
-  // than guessing from the diff shape. This is a known limitation, not a bug:
-  // large/different-area diffs are deliberately NOT used as a "new task"
-  // heuristic.
+  // The user mentally moves on to a materially different piece of work —
+  // but never calls prepare_task_context or dev-guard reset. DevGuard has
+  // no contractual signal that a new task began, so it does NOT guess a new
+  // task from the diff shape (no heuristic new-task inference) — but it
+  // also must not keep confidently labeling this as "Implement ad report
+  // pipeline" once the code state has clearly diverged from what that goal
+  // was recorded against. No validation evidence is at risk of being
+  // misattributed here (none was recorded in this gap), so this is not
+  // escalated to a full STATE_MISMATCH failure — it degrades gracefully to
+  // a file-based goal instead of a stale, confidently-wrong one.
   await mkdir(join(root, "billing"), { recursive: true });
   await writeFile(join(root, "billing", "invoice.js"), "export function generateInvoice() { return {}; }\n");
   await writeFile(join(root, "billing", "invoice.test.js"), "test('invoice', () => {});\n");
   await processDoneEvent(root);
 
   const handoff = await readHandoff(root);
-  assert.match(handoff, /Implement ad report pipeline/);
+  assert.doesNotMatch(handoff, /Implement ad report pipeline/, "a stale goal must not be shown once the code state has clearly moved on");
+  assert.doesNotMatch(handoff, /Handoff unavailable for current state/, "no evidence is at risk of misattribution, so this must not fail closed either");
 });
 
 // A real `dev-guard reset` is still the one supported way to explicitly end
@@ -252,6 +263,7 @@ test("dev-guard reset still ends the session lineage (supplementary to Test H)",
 test("Test I: BUILD/frontend-build and BUILD/backend-build are independent validation scopes", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Fix the frontend and backend build." });
   await recordValidationEvidence({ root, kind: "BUILD", name: "frontend-build", status: "FAIL", reason: "type error" });
   await recordValidationEvidence({ root, kind: "BUILD", name: "backend-build", status: "PASS" });
 
@@ -266,6 +278,7 @@ test("Test I: BUILD/frontend-build and BUILD/backend-build are independent valid
 test("Test J: within the same BUILD/frontend-build identity, the latest-by-timestamp result wins regardless of insertion order", async () => {
   const root = await makeRepo();
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Fix the frontend build." });
 
   // Inserted first, but chronologically LATER (completedAt).
   await recordQAExecutionResult(root, {
@@ -344,6 +357,7 @@ test("Compatibility: a non-git project does not crash and falls back to session-
   cleanupRoots.push(root);
   await writeFile(join(root, "package.json"), JSON.stringify({ name: "nogit", scripts: { build: "true" } }, null, 2));
   await ensureDevguardWorkspace(root);
+  await prepareTaskContext({ root, task: "Verify the build." });
   await recordValidationEvidence({ root, kind: "BUILD", status: "PASS", command: "pnpm build" });
   await processDoneEvent(root);
   const quality = await readQuality(root);

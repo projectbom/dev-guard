@@ -209,7 +209,7 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
   const url = new URL(request.url ?? "/", `http://${HOST}`);
   if (request.method === "POST" && url.pathname === "/api/review-complete") {
     try {
-      const result = await processDoneEvent(root);
+      const result = await processDoneEvent(root, { completionSource: "dashboard-review-complete" });
       sendJson(response, {
         ok: true,
         qualityVerdict: result.qualityVerdict,
