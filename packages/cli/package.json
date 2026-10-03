@@ -35,11 +35,12 @@
     "build": "tsc -b",
     "clean": "tsc -b --clean",
     "dev": "tsc -b && node dist/index.js",
+    "watch": "tsc -b -w",
     "cli": "node dist/index.js",
     "test": "tsc -b && node --test test/**/*.test.js"
   },
   "dependencies": {
-    "@dev-guard/core": "0.8.4",
+    "@dev-guard/core": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "chokidar": "^4.0.3",
     "zod": "3"

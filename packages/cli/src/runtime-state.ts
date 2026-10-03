@@ -21,9 +21,10 @@ import { appendTextFile, fromRoot, readJsonFile, readTailLines, readTextFile, wr
 import { computeWorkingTreeContentHash, getDiffForChangeFiles, getFileContentAtRef, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
-import { ensureProjectKnowledge, readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
+import { discoverWorkspaceSourceRoots, ensureProjectKnowledge, readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
 import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
+import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -233,6 +234,14 @@ export interface PreparedTaskContextResult extends BeforeAgentPreparationResult 
   files: PreparedTaskContextFile[];
   constraints: string[];
   warnings: string[];
+  /**
+   * Current validation evidence, partitioned by the same freshness rule
+   * Quality Report/Handoff use (see isEvidenceFresh/partitionQaResultsByFreshness) —
+   * so an agent can see "does passing evidence already exist for this code
+   * state" without opening Quality Report. `fresh` is capped to the 10 most
+   * recent entries; `freshCount`/`staleCount`/`unboundCount` cover all of them.
+   */
+  validation: PreparedTaskValidationSummary;
   contextFiles: {
     agentBrief: string;
     readMap: string;
@@ -241,6 +250,21 @@ export interface PreparedTaskContextResult extends BeforeAgentPreparationResult 
     agentContext: string;
     nextClaudePrompt: string;
   };
+  /**
+   * Approximate size of the "before-agent" markdown bundle this call just
+   * (re)generated — the cost an agent pays if it falls back to reading those
+   * files instead of relying on `files`/`constraints` above. Always an
+   * estimate (see context-cost.ts); never a provider-billed token count.
+   */
+  resumeCost: ResumeBundleCost;
+  /**
+   * DevGuard-owned Context Rollover signal (see rollover.ts) — NOT a reading
+   * of the AI provider's actual context window usage, which DevGuard has no
+   * access to. A recommendation for a human to consider starting a new AI
+   * session and calling `prepare_task_context` again there, not an
+   * automatic action DevGuard takes on its own.
+   */
+  rollover: RolloverAssessment;
 }
 
 export interface PreparedTaskContextFile {
@@ -256,6 +280,31 @@ export interface PreparedTaskContextRange {
   label: string;
   confidence: ContextConfidence;
   reason: string;
+}
+
+export interface PreparedTaskValidationEntry {
+  name: string;
+  kind?: ValidationEvidenceKind;
+  status: "PASS" | "FAIL" | "UNKNOWN";
+  summary?: string;
+}
+
+export interface PreparedTaskValidationSummary {
+  /** Bound evidence, code state matches now, AND recorded under the current task/session lineage. */
+  freshCount: number;
+  /** Bound evidence whose code state no longer matches (the code changed since it was recorded), regardless of which task recorded it. */
+  staleCount: number;
+  /**
+   * Bound evidence, code state matches now, but recorded under a
+   * DIFFERENT task/session lineage (see DG-02) — kept distinct from
+   * `staleCount` on purpose: the code is fine, but this evidence does not
+   * verify the CURRENT task.
+   */
+  otherTaskCount: number;
+  /** Evidence recorded with no active DevGuard task. */
+  unboundCount: number;
+  /** Most recent fresh (current-task) entries first, capped to 10. */
+  fresh: PreparedTaskValidationEntry[];
 }
 
 export type QualityVerdict = "PASS" | "NEEDS_REVIEW" | "BLOCKED";
@@ -1366,33 +1415,45 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   await writeRuntimeState(root, runtimeWithTask);
   try {
     await hydrateCodeIndexForTask(root, text);
+    // Single Resolution Path: load the shared raw inputs and resolve the
+    // task/file context ONCE for this call, instead of each of the four
+    // before-agent renderers (and this function, again, afterward)
+    // independently re-reading state.json/runtime.json/history/code-index
+    // and re-running resolveBeforeAgentContext. generateAgentContext and
+    // generateNextClaudePrompt keep their own extra reads (quality report,
+    // decisions, project.md) — those aren't part of this shared bag.
+    const raw = await loadResumeRawInputs(root, runtimeWithTask);
+    const context = resolveResumeContext(raw);
     const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
-      generateReadMap(root),
-      generateCodeMap(root),
-      generateWorkingContext(root),
-      generateAgentBrief(root),
+      generateReadMap(root, raw),
+      generateCodeMap(root, raw),
+      generateWorkingContext(root, raw),
+      generateAgentBrief(root, raw),
       generateAgentContext(root),
       generateNextClaudePrompt(root)
     ]);
-    const [state, records, codeIndex] = await Promise.all([
-      readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
-      readHistoryRecords(root, 5),
-      readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
-    ]);
-    const context = resolveBeforeAgentContext({
-      state,
-      runtime: runtimeWithTask,
-      records,
-      codeIndex
-    });
-    const files = readableContextFiles(context.files, context.summary, codeIndex).slice(0, 8);
+    const codeIndex = raw.codeIndex;
+    // DG-01 explicit path hint: a real, existing file the task text names
+    // directly must survive even if the Code Index does not know it yet —
+    // placed first so it is never pushed out by the slice(0, 8) cutoff.
+    const pathHints = await resolveExplicitTaskPathHints(text, root);
+    const rankedFiles = readableContextFiles(context.files, context.summary, codeIndex).filter((file) => !pathHints.includes(file));
+    const files = [...pathHints, ...rankedFiles].slice(0, 8);
     const structuredFiles = await Promise.all(files.map(async (file) => {
       const content = await readTextFile(fromRoot(root, file)).catch(() => "");
-      return preparedTaskContextFile(file, context.summary, codeIndex, content);
+      return preparedTaskContextFile(file, context.summary, codeIndex, content, pathHints.includes(file));
     }));
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
     const coverageGaps = preparedTaskCoverageGaps(structuredFiles, context.summary);
     const warnings = preparedTaskWarnings(structuredFiles, codeIndex);
+    const resumeCost = await measureResumeBundleCost(root);
+    const rollover = computeRolloverAssessment({
+      changedFileCount: runtimeWithTask.pendingChangedFiles.length,
+      qaResultCount: Object.keys(runtimeWithTask.qaResults ?? {}).length,
+      taskCreatedAt: runtimeWithTask.currentTask?.createdAt,
+      contextBundleEstimatedTokens: resumeCost.totalEstimatedTokens
+    });
+    const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask);
     return {
       task: text,
       source: currentTask.source,
@@ -1404,6 +1465,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       files: structuredFiles,
       constraints: readMapSkips(context.summary, files, "en-US"),
       warnings: [...warnings, ...coverageGaps],
+      validation,
       contextFiles: {
         agentBrief: devguardPaths.agentBrief,
         readMap: readMapPath,
@@ -1412,6 +1474,8 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
         agentContext: devguardPaths.agentContext,
         nextClaudePrompt: nextClaudePromptPath
       },
+      resumeCost,
+      rollover,
       readMapPath,
       codeMapPath,
       workingContextPath,
@@ -1422,6 +1486,56 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   } finally {
     if (!persistTask) await writeRuntimeState(root, current);
   }
+}
+
+/**
+ * Compact validation status for the default `prepare_task_context` return —
+ * reuses the SAME freshness partitioning Quality Report/Handoff use
+ * (`partitionQaResultsByFreshness`/`isEvidenceFresh`), not a re-derived
+ * notion of "current", so a fresh agent sees real recorded evidence instead
+ * of needing to open Quality Report just to learn whether any exists.
+ */
+/**
+ * DG-02: `partitionQaResultsByFreshness`'s "fresh" bucket only proves the
+ * CODE state still matches (codeStateHash/gitHead take precedence over
+ * sessionId in `isEvidenceFresh` — see that function) — it does not prove
+ * the evidence belongs to the CURRENT task. Two different tasks started
+ * back-to-back with no code change in between share the same
+ * codeStateHash, so without this extra split, Task A's evidence would
+ * read as "fresh" for Task B too. `runtime.sessionId` is already DevGuard's
+ * existing task/session-lineage identity (regenerated on every new,
+ * non-continuing `prepare_task_context` call; preserved by
+ * `continueCurrentTask`; already stamped on every recorded
+ * QAExecutionResult — see recordQAExecutionResult) — reused here rather
+ * than inventing a second identity concept. Legacy evidence with no
+ * `sessionId` at all safely falls to "other task" (never promoted to
+ * current-task-fresh), per the same fail-closed default used elsewhere in
+ * this file for missing provenance.
+ */
+async function buildPreparedTaskValidationSummary(root: string, runtime: RuntimeState): Promise<PreparedTaskValidationSummary> {
+  const [gitIdentity, codeStateHash] = await Promise.all([
+    getGitIdentity(root).catch(() => ({ gitHead: "", gitBranch: "" })),
+    computeWorkingTreeContentHash(root).catch(() => undefined)
+  ]);
+  const currentGitState = { gitHead: gitIdentity.gitHead, codeStateHash, sessionId: runtime.sessionId };
+  const { fresh, stale, unbound } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
+  const taskFresh: Record<string, QAExecutionResult> = {};
+  const otherTask: Record<string, QAExecutionResult> = {};
+  for (const [key, entry] of Object.entries(fresh)) {
+    if (entry.sessionId && runtime.sessionId && entry.sessionId === runtime.sessionId) taskFresh[key] = entry;
+    else otherTask[key] = entry;
+  }
+  const freshEntries = Object.values(taskFresh)
+    .sort((a, b) => Date.parse(b.completedAt) - Date.parse(a.completedAt))
+    .slice(0, 10)
+    .map((entry) => ({ name: entry.name, kind: entry.kind, status: entry.status, summary: entry.summary }));
+  return {
+    freshCount: Object.keys(taskFresh).length,
+    staleCount: Object.keys(stale).length,
+    otherTaskCount: Object.keys(otherTask).length,
+    unboundCount: Object.keys(unbound).length,
+    fresh: freshEntries
+  };
 }
 
 export async function generateProjectHandoff(root: string, options: { completionSource?: CompletionSource } = {}): Promise<string> {
@@ -1473,18 +1587,11 @@ export async function generateProjectHandoff(root: string, options: { completion
   return projectHandoffPath;
 }
 
-export async function generateReadMap(root: string): Promise<string> {
+export async function generateReadMap(root: string, preloaded?: ResumeRawInputs): Promise<string> {
   await ensureDevguardWorkspace(root);
-  const locale = await refreshRuntimeLocale(root);
-  const [state, runtime, records, projectKnowledge, codeIndex] = await Promise.all([
-    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
-    readRuntimeState(root),
-    readHistoryRecords(root, 5),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
-    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
-  ]);
-  const context = resolveBeforeAgentContext({ state, runtime, records, codeIndex });
-  const markdown = renderReadMap({ files: context.files, state, projectKnowledge, codeIndex, locale, documentationSummary: context.summary, taskSource: context.source });
+  const raw = preloaded ?? (await loadResumeRawInputs(root));
+  const context = resolveResumeContext(raw);
+  const markdown = renderReadMap({ files: context.files, state: raw.state, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary, taskSource: context.source });
   await writeTextFile(fromRoot(root, readMapPath), markdown);
   return readMapPath;
 }
@@ -1557,58 +1664,39 @@ async function hydrateCodeIndexForTask(root: string, task: string): Promise<void
   if (changed) await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
 }
 
-export async function generateCodeMap(root: string): Promise<string> {
+export async function generateCodeMap(root: string, preloaded?: ResumeRawInputs): Promise<string> {
   await ensureDevguardWorkspace(root);
-  const locale = await refreshRuntimeLocale(root);
-  const [state, runtime, records, projectKnowledge, codeIndex] = await Promise.all([
-    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
-    readRuntimeState(root),
-    readHistoryRecords(root, 5),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
-    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
-  ]);
-  const context = resolveBeforeAgentContext({ state, runtime, records, codeIndex });
-  const files = readableContextFiles(context.files, context.summary, codeIndex);
+  const raw = preloaded ?? (await loadResumeRawInputs(root));
+  const context = resolveResumeContext(raw);
+  const files = readableContextFiles(context.files, context.summary, raw.codeIndex);
   const fileContents = await Promise.all(files.slice(0, 6).map(async (file) => ({
     file,
     content: await readTextFile(fromRoot(root, file)).catch(() => "")
   })));
-  const markdown = renderCodeMap({ files, fileContents, state, projectKnowledge, codeIndex, locale, documentationSummary: context.summary });
+  const markdown = renderCodeMap({ files, fileContents, state: raw.state, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary });
   await writeTextFile(fromRoot(root, codeMapPath), markdown);
   return codeMapPath;
 }
 
-export async function generateAgentBrief(root: string): Promise<string> {
+export async function generateAgentBrief(root: string, preloaded?: ResumeRawInputs): Promise<string> {
   await ensureDevguardWorkspace(root);
-  const locale = await refreshRuntimeLocale(root);
-  const [state, runtime, records, qualityContent, projectKnowledge, codeIndex] = await Promise.all([
-    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
-    readRuntimeState(root),
-    readHistoryRecords(root, 5),
-    readTextFile(fromRoot(root, qualityReportPath)),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
-    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
+  const [raw, qualityContent] = await Promise.all([
+    preloaded ? Promise.resolve(preloaded) : loadResumeRawInputs(root),
+    readTextFile(fromRoot(root, qualityReportPath))
   ]);
-  const context = resolveBeforeAgentContext({ state, runtime, records, codeIndex });
+  const context = resolveResumeContext(raw);
   const quality = parseQuality(qualityContent);
-  const markdown = renderAgentBrief({ files: context.files, state, quality, projectKnowledge, codeIndex, locale, documentationSummary: context.summary, taskSource: context.source });
+  const markdown = renderAgentBrief({ files: context.files, state: raw.state, quality, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary, taskSource: context.source });
   await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
   await writeTextFile(fromRoot(root, devguardPaths.agentBrief), markdown);
   return devguardPaths.agentBrief;
 }
 
-export async function generateWorkingContext(root: string): Promise<string> {
+export async function generateWorkingContext(root: string, preloaded?: ResumeRawInputs): Promise<string> {
   await ensureDevguardWorkspace(root);
-  const locale = await refreshRuntimeLocale(root);
-  const [state, runtime, historyRecords, projectKnowledge, codeIndex] = await Promise.all([
-    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
-    readRuntimeState(root),
-    readHistoryRecords(root, 5),
-    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
-    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
-  ]);
-  const beforeAgent = resolveBeforeAgentContext({ state, runtime, records: historyRecords, codeIndex });
-  const context = renderWorkingContext({ files: beforeAgent.files, state, historyRecords, projectKnowledge, locale, documentationSummary: beforeAgent.summary, taskSource: beforeAgent.source });
+  const raw = preloaded ?? (await loadResumeRawInputs(root));
+  const beforeAgent = resolveResumeContext(raw);
+  const context = renderWorkingContext({ files: beforeAgent.files, state: raw.state, historyRecords: raw.records, projectKnowledge: raw.projectKnowledge, locale: raw.locale, documentationSummary: beforeAgent.summary, taskSource: beforeAgent.source });
   await writeTextFile(fromRoot(root, workingContextPath), context);
   return workingContextPath;
 }
@@ -1707,6 +1795,41 @@ export async function generateNextClaudePrompt(root: string): Promise<string> {
 function workingContextFiles(state: ProjectState, records: HistoryRecord[]): string[] {
   const files = state.lastChangedFiles?.length ? state.lastChangedFiles : lastHistoryFiles(records);
   return [...new Set(files.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)))].sort();
+}
+
+/**
+ * Single Resolution Path: the raw inputs shared by every before-agent
+ * renderer that routes file/task context off current runtime/project state
+ * (Read Map, Code Map, Working Context, Agent Brief). Each of those used to
+ * independently re-read these same five sources inside its own `generate*`
+ * wrapper (and `prepareTaskContext` read them again afterward on top of
+ * that) — this is purely an opt-in shared cache a caller may pass as
+ * `preloaded`; every `generate*` export still works standalone with no
+ * behavior change for any existing caller that does not pass one.
+ */
+export interface ResumeRawInputs {
+  locale: DevGuardLocale;
+  state: ProjectState;
+  runtime: RuntimeState;
+  records: HistoryRecord[];
+  projectKnowledge: string;
+  codeIndex: CodeIndex;
+}
+
+export async function loadResumeRawInputs(root: string, runtimeOverride?: RuntimeState): Promise<ResumeRawInputs> {
+  const locale = await refreshRuntimeLocale(root);
+  const [state, runtime, records, projectKnowledge, codeIndex] = await Promise.all([
+    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
+    runtimeOverride ?? readRuntimeState(root),
+    readHistoryRecords(root, 5),
+    readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
+    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
+  ]);
+  return { locale, state, runtime, records, projectKnowledge, codeIndex };
+}
+
+function resolveResumeContext(raw: ResumeRawInputs): ReturnType<typeof resolveBeforeAgentContext> {
+  return resolveBeforeAgentContext({ state: raw.state, runtime: raw.runtime, records: raw.records, codeIndex: raw.codeIndex });
 }
 
 type ContextTaskSource = "explicit-before-agent-input" | "resumed-session-summary" | "history-fallback" | "none";
@@ -1842,11 +1965,11 @@ function hasTaskSpecificRouting(source: ContextTaskSource | undefined): boolean 
   return source === "explicit-before-agent-input" || source === "resumed-session-summary";
 }
 
-function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex, content = ""): PreparedTaskContextFile {
+function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex, content = "", isExplicitPathHint = false): PreparedTaskContextFile {
   const indexed = index.files[file];
   const trust = contextTrustForFile(file, indexed, undefined, "en-US");
   const fileSummary = summary?.fileChanges.find((change) => change.file === file);
-  const ranges = indexedReadCandidates(indexed ?? emptyCodeIndexFile(file), summary, fileSummary, content)
+  let ranges = indexedReadCandidates(indexed ?? emptyCodeIndexFile(file), summary, fileSummary, content)
     .slice(0, 5)
     .map((range) => ({
       startLine: range.startLine,
@@ -1855,10 +1978,25 @@ function preparedTaskContextFile(file: string, summary: DocumentationSummary | u
       confidence: range.priority === 0 && /localStorage|state|guard|hydration|persistence|exact/i.test(`${range.name} ${range.editPoint}`) ? "High" : trust.confidence,
       reason: range.editPoint ?? range.summary
     }));
+  // DG-01 explicit path hint: the task named this exact file, so it must
+  // never come back with zero ranges just because it is not (yet) in the
+  // Code Index — fall back to the top of the file rather than nothing.
+  if (isExplicitPathHint && ranges.length === 0 && content.trim()) {
+    const lineCount = content.split(/\r?\n/).length;
+    ranges = [{
+      startLine: 1,
+      endLine: Math.min(60, lineCount),
+      label: "top of file",
+      confidence: "Medium",
+      reason: "Task named this file directly; it is not yet in the Code Index, so no symbol-level range is available — start from the top."
+    }];
+  }
   return {
     path: file,
-    relevance: ranges.some((range) => range.confidence === "High") ? "Targeted" : trust.relevance,
-    reason: taskSpecificFileReason(file, indexed, summary, ranges) ?? indexed?.summary ?? fileSummary?.purpose ?? "Code Index candidate matched the current task.",
+    relevance: isExplicitPathHint ? "Targeted" : ranges.some((range) => range.confidence === "High") ? "Targeted" : trust.relevance,
+    reason: isExplicitPathHint && !indexed
+      ? "Task explicitly named this file by its repository path; it is not yet in the Code Index."
+      : taskSpecificFileReason(file, indexed, summary, ranges) ?? indexed?.summary ?? fileSummary?.purpose ?? "Code Index candidate matched the current task.",
     ranges
   };
 }
@@ -1903,6 +2041,41 @@ function aggregateCoverage(trusts: ContextTrust[]): ContextCoverage {
   if (trusts.every((trust) => trust.coverage === "Focused")) return "Focused";
   if (trusts.some((trust) => trust.coverage === "Partial" || trust.coverage === "Focused")) return "Partial";
   return "Unknown";
+}
+
+/**
+ * DG-01 defense-in-depth (explicit path hint): a Code Index bootstrap —
+ * even a generically correct one (see discoverWorkspaceSourceRoots) — can
+ * still be momentarily incomplete or stale (a fresh project before the
+ * first full index, a per-directory cap, a file created after the last
+ * index run). If the task text names a real, existing repository-relative
+ * file path, that file must still surface as a candidate instead of
+ * silently disappearing because ranking never saw it in the Code Index.
+ * Deliberately conservative: only path-shaped tokens (a slash plus a
+ * recognized extension) that resolve to a real file inside the project
+ * root, with no traversal and not excluded by the canonical generated/
+ * build-artifact policy, are used — a plain word or phrase is never
+ * mistaken for a path.
+ */
+const PATH_LIKE_TOKEN_PATTERN = /[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.[A-Za-z0-9]+/g;
+
+function extractPathLikeTokens(text: string): string[] {
+  const matches = text.match(PATH_LIKE_TOKEN_PATTERN) ?? [];
+  return [...new Set(matches.map((token) => token.replace(/^[`'"]+|[`'",.;:)]+$/g, "")))];
+}
+
+async function resolveExplicitTaskPathHints(task: string, root: string): Promise<string[]> {
+  const resolved: string[] = [];
+  for (const candidate of extractPathLikeTokens(task)) {
+    const normalized = candidate.replace(/\\/g, "/").replace(/^\.\//, "");
+    if (!normalized || normalized.startsWith("/") || normalized.split("/").includes("..")) continue;
+    if (isIgnoredWatchPath(normalized)) continue;
+    const absolute = fromRoot(root, normalized);
+    const stats = await stat(absolute).catch(() => undefined);
+    if (!stats?.isFile()) continue;
+    resolved.push(normalized);
+  }
+  return [...new Set(resolved)];
 }
 
 function preparedTaskWarnings(files: PreparedTaskContextFile[], index: CodeIndex): string[] {
@@ -3026,9 +3199,6 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
     "## 컴포넌트 관계",
     ...componentTree,
     "",
-    "## 수정하지 말아야 하는 영역",
-    ...formatBullets(excludedAreas),
-    "",
     "## 현재 구조",
     ...structure,
     "",
@@ -4037,8 +4207,21 @@ async function readIndexableFileContent(root: string, file: string): Promise<str
   return readTextFile(fromRoot(root, file));
 }
 
+/**
+ * Conservative fallback root names (DG-01 priority 5) — kept so a plain
+ * single-app repo (root-level `src`/`lib`, no nested package.json at all)
+ * indexes exactly as before. For a workspace/monorepo, these are UNIONED
+ * with `discoverWorkspaceSourceRoots` (DG-01 priority 1-3: reuses the same
+ * real workspace-package discovery Project Knowledge already does — not a
+ * second, duplicate workspace parser, and not an `apps`-only special case),
+ * so `apps/admin`, `services/api`, `modules/auth`, or any other real
+ * workspace package directory gets its own indexing pass regardless of
+ * what its parent folder happens to be named.
+ */
 async function listInitialCodeIndexFiles(root: string): Promise<string[]> {
-  const roots = ["app", "pages", "components", "src", "lib", "hooks", "utils", "packages", "docs"];
+  const staticRoots = ["app", "pages", "components", "src", "lib", "hooks", "utils", "packages", "docs"];
+  const discoveredRoots = await discoverWorkspaceSourceRoots(root).catch(() => [] as string[]);
+  const roots = [...new Set([...staticRoots, ...discoveredRoots])];
   const rootFiles = ["README.md", "README.ko.md", "package.json", "AGENTS.md", "CLAUDE.md"];
   const files = new Set<string>();
   for (const file of rootFiles) {
@@ -4056,7 +4239,11 @@ async function listIndexableFiles(root: string, dir: string, limit: number): Pro
   const out: string[] = [];
   async function visit(relativeDir: string): Promise<void> {
     if (out.length >= limit) return;
-    if (/(^|\/)(node_modules|dist|build|\.next|coverage|\.git|\.devguard|devguard)\b/i.test(relativeDir)) return;
+    // Canonical exclusion policy (@dev-guard/core), not a second ad-hoc list
+    // — this now also covers `.turbo`/`.cache`, which matters once this
+    // walk runs inside discovered workspace package directories (DG-01)
+    // and not just a handful of well-known root-level names.
+    if (isIgnoredWatchPath(relativeDir)) return;
     let entries: Array<{ name: string; isDirectory: () => boolean; isFile: () => boolean }>;
     try {
       entries = await readdir(fromRoot(root, relativeDir), { withFileTypes: true });

@@ -23,6 +23,7 @@ import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
 import { generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
+import { computeRolloverAssessment, measureResumeBundleCost } from "./rollover.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
@@ -583,6 +584,24 @@ async function runStatus(root: string): Promise<void> {
   console.log("");
   console.log(copy.resumePrompt);
   console.log(`  Read ${devguardPaths.agentContext} and continue.`);
+  if (initialized) {
+    const resumeCost = await measureResumeBundleCost(root);
+    const rollover = computeRolloverAssessment({
+      changedFileCount: runtime.pendingChangedFiles.length,
+      qaResultCount: Object.keys(runtime.qaResults ?? {}).length,
+      taskCreatedAt: runtime.currentTask?.createdAt,
+      contextBundleEstimatedTokens: resumeCost.totalEstimatedTokens
+    });
+    console.log("");
+    console.log(`Context Rollover: ${rollover.status}`);
+    console.log(`Estimated resume context: ~${resumeCost.totalEstimatedTokens} tokens (approximate; before-agent markdown bundle)`);
+    if (rollover.dominantSignal) {
+      console.log(`Dominant signal: ${rollover.dominantSignal.label} ${Math.round(rollover.dominantSignal.value)}/${rollover.dominantSignal.budget}`);
+    }
+    if (rollover.status !== "SAFE") {
+      console.log("Next: Start a new AI session and call prepare_task_context(...) there to resume with a small, focused context.");
+    }
+  }
   if (!initialized) {
     console.log("");
     console.log("Setup:");

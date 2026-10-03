@@ -116,6 +116,22 @@ export async function runKnowledge(root: string): Promise<void> {
   console.log(`Written: ${devguardPaths.projectKnowledge}`);
 }
 
+/**
+ * Generic workspace/monorepo source-root discovery, reused by the Code
+ * Index bootstrap (see `listInitialCodeIndexFiles` in runtime-state.ts) so
+ * it is not limited to a fixed, single-app-shaped root list. Delegates
+ * entirely to the same `detectSourceRoots`/`readWorkspacePackages` logic
+ * Project Knowledge already uses — real workspace package directories
+ * (anywhere a `package.json` is found, under any name: `apps/admin`,
+ * `services/api`, `modules/auth`, ...) come from `readWorkspacePackages`,
+ * not from guessing a directory-name convention.
+ */
+export async function discoverWorkspaceSourceRoots(root: string): Promise<string[]> {
+  const files = await listProjectFiles(root);
+  const workspacePackages = await readWorkspacePackages(root, files);
+  return detectSourceRoots(files, workspacePackages);
+}
+
 export async function generateProjectKnowledge(root: string): Promise<ProjectKnowledge> {
   const files = await listProjectFiles(root);
   const rootPackage = await readJsonFile<PackageJson>(fromRoot(root, "package.json"), {});

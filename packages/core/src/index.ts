@@ -39,6 +39,8 @@ export {
   normalizeContextPath
 } from "./context-files.js";
 export { generateCodexPrompt } from "./prompt.js";
+export { estimateTokens, measureArtifactText, summarizeArtifactCosts } from "./context-cost.js";
+export type { ArtifactCostMetrics, ArtifactCostSummary } from "./context-cost.js";
 export { generateCompactReport } from "./report.js";
 export { buildReviewFixPrompt, buildReviewPrompt, generateReviewResult } from "./review.js";
 export {

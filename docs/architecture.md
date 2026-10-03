@@ -110,6 +110,30 @@ These files are generated or project-local. Existing markdown files are not over
 
 One information source should be generated once and then reused. Change Intelligence is the shared source for Quality Report, Handoff, Working Context, Agent Context, Read Map, Code Map, and Agent Brief.
 
+### Single Resolution Path (prepare_task_context)
+
+Read Map, Code Map, Working Context, and Agent Brief all route file/task
+context off the same five inputs (project state, runtime state, recent
+history, Project Knowledge, Code Index). `prepare_task_context` loads these
+once per call (`loadResumeRawInputs`/`ResumeRawInputs` in `runtime-state.ts`)
+and passes that one snapshot to all four renderers, instead of each one
+independently re-reading and re-resolving it. Any other caller of an
+individual `generate*` function (e.g. `dev-guard handoff` with no `--task`)
+is unaffected — the shared snapshot is an opt-in parameter, not a required
+one.
+
+`prepare_task_context`'s MCP result is the primary entry point for a new AI
+session. It returns machine-oriented, progressively-loadable data only —
+task, constraints, candidate files with specific line ranges, a compact
+validation summary (fresh/stale/unbound evidence counts, reusing the same
+freshness rule as Quality Report), `resumeCost` (approximate size of the
+markdown fallback bundle), and `rollover` (DevGuard-owned Context Rollover
+signal — see [context-rollover.md](./context-rollover.md)). The six
+before-agent markdown artifacts remain available as a documented fallback
+(see `CLAUDE.md`/`AGENTS.md`'s MCP fallback order) for when MCP is
+unavailable or its result is insufficient — they are not meant to be read by
+default on every new task.
+
 ## Feature Classification
 
 Core:
