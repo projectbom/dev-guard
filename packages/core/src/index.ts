@@ -1,5 +1,6 @@
 export { analyzeDiff } from "./analyze.js";
 export {
+  buildOpenAIResponsesRequestBody,
   buildTaskAIPrompt,
   analyzeFileRelevance,
   detectRequirementMismatch,
@@ -10,6 +11,7 @@ export {
   NoneAIProvider,
   OpenAIProvider
 } from "./ai.js";
+export type { OpenAIResponsesRequestOptions } from "./ai.js";
 export { defaultConfig, mergeConfig } from "./defaults.js";
 export {
   analyzeGeneratedDiffDrift,

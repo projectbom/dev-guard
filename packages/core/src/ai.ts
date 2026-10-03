@@ -33,6 +33,38 @@ export class NoneAIProvider implements AIProvider {
   }
 }
 
+export interface OpenAIResponsesRequestOptions {
+  model: string;
+  system?: string;
+  prompt: string;
+  temperature?: number;
+  maxTokens?: number;
+  reasoningEffort?: string;
+}
+
+/**
+ * Builds the OpenAI Responses API request body with a capability rule
+ * verified against OpenAI's own documentation (the "Using GPT-6" migration
+ * guide): "When reasoning effort is not `none`, remove `temperature`,
+ * `top_p`, and `top_logprobs`." This is parameter-based, not a per-model
+ * name allowlist/regex — it applies whenever reasoning is actually active
+ * (a `reasoningEffort` configured as anything other than `"none"`),
+ * regardless of which model is configured. A non-reasoning model (e.g.
+ * gpt-4o-mini) that is never given a `reasoningEffort` is unaffected and
+ * keeps sending `temperature` exactly as before.
+ */
+export function buildOpenAIResponsesRequestBody(options: OpenAIResponsesRequestOptions): Record<string, unknown> {
+  const reasoningActive = Boolean(options.reasoningEffort) && options.reasoningEffort !== "none";
+  return {
+    model: options.model,
+    instructions: options.system,
+    input: options.prompt,
+    temperature: reasoningActive ? undefined : options.temperature,
+    max_output_tokens: options.maxTokens,
+    reasoning: options.reasoningEffort ? { effort: options.reasoningEffort } : undefined
+  };
+}
+
 export class OpenAIProvider implements AIProvider {
   name = "openai" as const;
 
@@ -54,16 +86,16 @@ export class OpenAIProvider implements AIProvider {
         Authorization: `Bearer ${this.options.apiKey}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        model: input.model ?? this.options.model,
-        instructions: input.system,
-        input: input.prompt,
-        temperature: input.temperature ?? this.options.temperature,
-        max_output_tokens: input.maxTokens ?? this.options.maxTokens,
-        reasoning: (input.reasoningEffort ?? this.options.reasoningEffort)
-          ? { effort: input.reasoningEffort ?? this.options.reasoningEffort }
-          : undefined
-      })
+      body: JSON.stringify(
+        buildOpenAIResponsesRequestBody({
+          model: input.model ?? this.options.model,
+          system: input.system,
+          prompt: input.prompt,
+          temperature: input.temperature ?? this.options.temperature,
+          maxTokens: input.maxTokens ?? this.options.maxTokens,
+          reasoningEffort: input.reasoningEffort ?? this.options.reasoningEffort
+        })
+      )
     });
     const json = (await response.json()) as OpenAIResponsesResult;
 
