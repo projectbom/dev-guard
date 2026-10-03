@@ -3,6 +3,7 @@ import {
   analyzeFileRelevance,
   analyzeSemanticDrift,
   buildImpactHints,
+  buildTaskAIPromptWithBudget,
   buildTaskCompletionCriteria,
   classifyTaskType,
   detectRequirementMismatch,
@@ -23,6 +24,7 @@ import {
   type ProjectIdentity,
   type TaskAICodeContext,
   type TaskAIFileCandidate,
+  type TaskAIPromptBudgetReport,
   type TaskTypeResult
 } from "@dev-guard/core";
 import { buildAIContextPreamble, writeAIContext } from "./ai-context.js";
@@ -115,6 +117,25 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
       })
     : [];
 
+  const taskAIContext = {
+    requirement: options.requirement,
+    rulesMarkdown: filteredRules.filteredMarkdown,
+    mistakesMarkdown: filteredMistakes.filteredMarkdown,
+    projectStateMarkdown: [filteredProjectState.filteredMarkdown, projectMemory.projectMapMarkdown].filter(Boolean).join("\n\n"),
+    decisionsMarkdown: filteredDecisions.filteredMarkdown,
+    changedFiles: taskChangedFiles,
+    changeFiles: taskChangeFiles,
+    diffText: buildFilteredDiffSummary(gitChanges.diffText, taskChangedFiles),
+    projectFiles: projectMemory.projectFiles,
+    relatedFileCandidates,
+    fileCandidates: scoredCandidates,
+    codeGraph: projectMemory.codeGraph,
+    impactHints,
+    codeContexts,
+    taskType,
+    completionCriteria
+  };
+
   if (options.debugContext) {
     printDebugContext({
       fromCache: projectMemory.fromCache,
@@ -148,6 +169,10 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
       rulesFilter: filteredRules,
       mistakesFilter: filteredMistakes
     });
+    // DG-07: computed here (pure, no API call) so the budget is visible
+    // even if the actual provider call below fails (credits, network,
+    // context-window rejection) or is never reached.
+    printPromptBudget(buildTaskAIPromptWithBudget(taskAIContext).report);
   }
 
   if (providerName === "none") {
@@ -169,28 +194,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
           baseURL: config.ai?.baseURL
         })
       : new NoneAIProvider();
-  const taskResult = await generateTaskMarkdownResult(
-    provider,
-    {
-      requirement: options.requirement,
-      rulesMarkdown: filteredRules.filteredMarkdown,
-      mistakesMarkdown: filteredMistakes.filteredMarkdown,
-      projectStateMarkdown: [filteredProjectState.filteredMarkdown, projectMemory.projectMapMarkdown].filter(Boolean).join("\n\n"),
-      decisionsMarkdown: filteredDecisions.filteredMarkdown,
-      changedFiles: taskChangedFiles,
-      changeFiles: taskChangeFiles,
-      diffText: buildFilteredDiffSummary(gitChanges.diffText, taskChangedFiles),
-      projectFiles: projectMemory.projectFiles,
-      relatedFileCandidates,
-      fileCandidates: scoredCandidates,
-      codeGraph: projectMemory.codeGraph,
-      impactHints,
-      codeContexts,
-      taskType,
-      completionCriteria
-    },
-    model
-  );
+  const taskResult = await generateTaskMarkdownResult(provider, taskAIContext, model);
   const taskMarkdown = taskResult.markdown;
   if (taskResult.scopeFilledFromCandidates) {
     console.error("dev-guard task-ai: scope filled from related file candidates");
@@ -357,6 +361,28 @@ function memoryDecay(createdAt: string): number {
     return 0.25;
   }
   return 0.1;
+}
+
+/**
+ * DG-07 budget transparency (debug mode only — never printed on a normal
+ * run). `estimatedTokens`/`budget` are the same char-based approximation
+ * used throughout DevGuard (context-cost.ts) — never a provider-billed
+ * token count.
+ */
+function printPromptBudget(budget: TaskAIPromptBudgetReport): void {
+  console.error("");
+  console.error("Task AI Prompt Budget (approximate)");
+  console.error(`Estimated total (after trimming): ~${budget.estimatedTotalTokens} tokens`);
+  console.error(`Budget: ${budget.budget} tokens`);
+  for (const section of [...budget.sections].sort((a, b) => b.estimatedTokens - a.estimatedTokens)) {
+    const mark = section.trimmed ? " [TRIMMED]" : "";
+    console.error(`  ${section.label}: ~${section.estimatedTokens} tokens (priority ${section.priority})${mark}`);
+  }
+  if (budget.trimmedSections.length > 0) {
+    console.error(`Trimmed sections (lowest priority first, in removal order): ${budget.trimmedSections.join(", ")}`);
+  } else {
+    console.error("Trimmed sections: none");
+  }
 }
 
 function printDebugContext(debug: {
@@ -562,7 +588,7 @@ function routeCandidateFiles(
     const relatedFileCandidates = inferI18nCandidateFiles(projectFiles);
     return {
       relatedFileCandidates,
-      scoredCandidates: scoreTaskTypeCandidates(taskType, relatedFileCandidates, projectFiles)
+      scoredCandidates: scoreTaskTypeCandidates(taskType, relatedFileCandidates, projectFiles, requirement)
     };
   }
 
@@ -570,7 +596,7 @@ function routeCandidateFiles(
     const relatedFileCandidates = inferTaskTypeCandidateFiles(taskType, projectFiles, genericCandidates);
     return {
       relatedFileCandidates,
-      scoredCandidates: scoreTaskTypeCandidates(taskType, relatedFileCandidates, projectFiles)
+      scoredCandidates: scoreTaskTypeCandidates(taskType, relatedFileCandidates, projectFiles, requirement)
     };
   }
 
@@ -647,19 +673,41 @@ function inferTaskTypeCandidateFiles(taskType: TaskTypeResult, projectFiles: str
   return filterCandidateFiles(fallback);
 }
 
-function scoreTaskTypeCandidates(taskType: TaskTypeResult, candidates: string[], projectFiles: string[]): TaskAIFileCandidate[] {
+/**
+ * DG-06: this used to assign role="edit" to the first 5 candidates
+ * unconditionally for every non-i18n/non-product_strategy task type
+ * (docs/infra_config/architecture/migration) — a blanket promotion that
+ * completely bypassed the DG-05 strong-reason-gate contract in
+ * analyzeFileRelevance/scoreFileRelevance. Combined with a task-type
+ * misclassification (a plain identifier like "IncidentListSchema"
+ * matching infra_config's old bare "ci" pattern — see task-router.ts),
+ * this is exactly how an unrelated file ended up as a confident "edit"
+ * target on a real downstream repo. Same contract now applies here too:
+ * "edit" requires the file's exact repository-relative path to appear
+ * verbatim in the requirement text, not merely "it was in the top 5 of
+ * some candidate list."
+ */
+export function scoreTaskTypeCandidates(taskType: TaskTypeResult, candidates: string[], projectFiles: string[], requirement: string): TaskAIFileCandidate[] {
   const fileSet = new Set(projectFiles);
   return candidates.map((path, index) => {
     const isStructure = /(^|\/)(i18n|locale|locales|messages|translations|dictionaries)(\/|\.|-|_)/i.test(path);
     const isLayout = /(^|\/)(layout|_app)\.(tsx|jsx|ts|js)$/i.test(path);
     const isDocs = taskType.type === "docs";
     const isInfra = taskType.type === "infra_config";
+    const explicitlyMentioned = path.length >= 4 && requirement.includes(path);
     const role: TaskAIFileCandidate["role"] =
-      taskType.type === "i18n" ? (isStructure || isLayout ? "edit" : "reference") : taskType.type === "product_strategy" ? "reference" : index < 5 ? "edit" : "reference";
+      taskType.type === "i18n"
+        ? (isStructure || isLayout ? "edit" : "reference")
+        : taskType.type === "product_strategy"
+          ? "reference"
+          : explicitlyMentioned
+            ? "edit"
+            : "reference";
     const reasons = [
       taskType.type === "i18n" && isStructure ? "i18n structure candidate" : "",
       taskType.type === "i18n" && isLayout ? "provider/wiring candidate" : "",
       taskType.type === "product_strategy" ? "product discovery reference only" : "",
+      explicitlyMentioned ? "explicit file path mentioned in requirement" : "",
       isDocs ? "docs strategy candidate" : "",
       isInfra ? "infra/config strategy candidate" : "",
       taskType.type === "architecture" || taskType.type === "migration" ? "phased structure candidate" : "",

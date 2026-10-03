@@ -21,14 +21,29 @@ const rules: TypeRule[] = [
     strategy: "config-first",
     riskLevel: "high",
     requiresPhasing: false,
-    patterns: [/환경\s*변수|env|deploy|배포|config|설정\s*파일|build\s*설정|ci|workflow|docker|vercel|netlify|supabase.*배포|배포.*supabase/i]
+    // DG-06: "env" and "ci" are short enough to appear as a bare substring
+    // inside an ordinary identifier/word with no technical meaning at all
+    // ("IncidentListSchema", "specificity", "efficient", "decision",
+    // "capacity" all contain "ci"; "environment" is fine but so is any
+    // other word containing "env"). \b requires an actual word boundary,
+    // so "CI", "CI/CD", ".env", ".env.local", "env var" still match (all
+    // already have punctuation/space/start-of-string next to the token),
+    // while "Incident"/"specificity"/... do not, since those letters sit
+    // inside one unbroken identifier with no boundary mid-word.
+    // \b on "config" too — "configurationView"/"ConfigureButton" are
+    // ordinary UI identifiers, not infra tasks, while a bare "config"
+    // word ("deployment config", "next.config.ts") still has real word
+    // boundaries around it either way.
+    patterns: [/환경\s*변수|\benv\b|deploy|배포|\bconfig\b|설정\s*파일|build\s*설정|\bci\b|workflow|docker|vercel|netlify|supabase.*배포|배포.*supabase/i]
   },
   {
     type: "migration",
     strategy: "phased-migration",
     riskLevel: "high",
     requiresPhasing: true,
-    patterns: [/migration|마이그레이션|전환|업그레이드|버전\s*업|교체|이관|backward compatibility|호환/i]
+    // \b on "migration" so "immigration" (a real English word, not a
+    // migration-engineering task) does not match.
+    patterns: [/\bmigration\b|마이그레이션|전환|업그레이드|버전\s*업|교체|이관|backward compatibility|호환/i]
   },
   {
     type: "architecture",
@@ -56,7 +71,8 @@ const rules: TypeRule[] = [
     strategy: "docs-only",
     riskLevel: "low",
     requiresPhasing: false,
-    patterns: [/readme|문서|docs?|가이드|사용법|설명서|changelog|릴리즈\s*노트/i]
+    // \b on "docs?" so "docker" (doc + ker, no boundary after "doc") does not match.
+    patterns: [/readme|문서|\bdocs?\b|가이드|사용법|설명서|changelog|릴리즈\s*노트/i]
   },
   {
     type: "refactor",
@@ -87,8 +103,10 @@ const rules: TypeRule[] = [
     strategy: "minimal-ui-polish",
     riskLevel: "low",
     requiresPhasing: false,
+    // \b on "ux"/"ui" so "build", "guide", "require", "suite", "fluid",
+    // "liquid", etc. (which all contain "ui" as a bare substring) do not match.
     patterns: [
-      /자연스럽|부자연|어색|뜬금|위화감|시각적\s*위계|배치|더\s*매끄럽|다듬|polish|ux|ui/i,
+      /자연스럽|부자연|어색|뜬금|위화감|시각적\s*위계|배치|더\s*매끄럽|다듬|polish|\bux\b|\bui\b/i,
       /(명령|command).*(출력|output|요약|summary)|출력.*(명확|요약|정리)|요약.*(명확|보여)|더\s*명확|명확하게|help|status|done|preview/i
     ]
   },
@@ -275,7 +293,9 @@ function inferSubtype(type: TaskType, requirement: string): string | undefined {
     if (/(문구|텍스트|단어|표현|copy|wording)/i.test(requirement)) {
       return "bugfix.text_content";
     }
-    if (/(api|fetch|request|response|서버|요청|응답|네트워크|network)/i.test(requirement)) {
+    // \b on "api" — "rapid"/"capital"/"mapimage"-style words contain "api"
+    // as a bare substring with no API meaning at all.
+    if (/(\bapi\b|fetch|request|response|서버|요청|응답|네트워크|network)/i.test(requirement)) {
       return "bugfix.api_error";
     }
     if (/(build|빌드|compile|컴파일|type error|타입 에러|lint)/i.test(requirement)) {
@@ -346,8 +366,11 @@ function extractDomainKeywords(requirement: string): string[] {
     [/(카드|card|누르면|클릭|전체 보기|목록|상세|모달|바텀시트|펼치|열리|열기)/i, ["ui-interaction"]],
     [/(재미|유행|바이럴|공유하고\s*싶|다시\s*하고\s*싶|차별화|후킹|리텐션|매력|컨셉|포지셔닝|밈)/i, ["product", "engagement", "positioning"]],
     [/(영어|영문|다국어|i18n|locale|translation|언어)/i, ["i18n", "locale"]],
-    [/(auth|login|로그인|인증)/i, ["auth"]],
-    [/(api|fetch|서버|요청|응답)/i, ["api"]]
+    // \b on "auth"/"api" — "authenticationCard" (its own literal domain
+    // name) and "rapid"/"capital"-style words contain these as a bare
+    // substring with no auth/API meaning.
+    [/(\bauth\b|login|로그인|인증)/i, ["auth"]],
+    [/(\bapi\b|fetch|서버|요청|응답)/i, ["api"]]
   ];
   const keywords = new Set<string>();
   for (const [pattern, values] of mappings) {

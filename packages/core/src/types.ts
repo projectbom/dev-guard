@@ -144,6 +144,37 @@ export interface TaskAIContext {
 export interface TaskMarkdownResult {
   markdown: string;
   scopeFilledFromCandidates: boolean;
+  /** Present when the task-ai prompt was built with budget trimming (see buildTaskAIPromptWithBudget). */
+  promptBudget?: TaskAIPromptBudgetReport;
+}
+
+/**
+ * DG-07 priority tiers for task-ai prompt budget trimming — 1 = never
+ * dropped (requirement, explicit targets/routes, task type, completion
+ * criteria, the role-tagged candidate list, generation rules); 2 = high
+ * priority (rules, decisions, changed files, focused code context); 3 =
+ * shrunk/dropped first under pressure (mistakes history, project-state
+ * prose, impact hints, diff body); 4 = bulk/raw listings that mostly
+ * duplicate information already in the Priority-1 candidate list.
+ */
+export type TaskAIPromptPriority = 1 | 2 | 3 | 4;
+
+export interface TaskAIPromptSectionReport {
+  label: string;
+  priority: TaskAIPromptPriority;
+  /** Approximate — see context-cost.ts. Never a provider-billed token count. */
+  estimatedTokens: number;
+  /** True if this section was removed to fit the budget; its size above is still the original (pre-trim) measurement. */
+  trimmed: boolean;
+}
+
+export interface TaskAIPromptBudgetReport {
+  sections: TaskAIPromptSectionReport[];
+  /** Approximate — see context-cost.ts. */
+  estimatedTotalTokens: number;
+  budget: number;
+  /** Labels of sections removed to fit the budget, in removal order. Empty when nothing needed trimming. */
+  trimmedSections: string[];
 }
 
 export interface TaskAICodeContext {

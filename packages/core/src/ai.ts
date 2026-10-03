@@ -1,6 +1,7 @@
 import { classifyTaskType, taskTypeStrategyNotes } from "./task-router.js";
 import { buildTaskCompletionCriteria, formatCompletionCriteria } from "./completion.js";
 import { analyzeSemanticDrift, defaultContextPriority } from "./drift.js";
+import { estimateTokens } from "./context-cost.js";
 import type {
   AIProvider,
   CodeGraphEntry,
@@ -9,6 +10,9 @@ import type {
   ProjectIndexEntry,
   TaskAIContext,
   TaskAIFileCandidate,
+  TaskAIFileCandidateRole,
+  TaskAIPromptBudgetReport,
+  TaskAIPromptPriority,
   TaskMarkdownResult,
   TaskTypeResult
 } from "./types.js";
@@ -113,11 +117,25 @@ export async function generateTaskMarkdown(provider: AIProvider, context: TaskAI
 
 export async function generateTaskMarkdownResult(provider: AIProvider, context: TaskAIContext, model?: string): Promise<TaskMarkdownResult> {
   const fileCandidates = context.fileCandidates ?? analyzeFileRelevance(context.requirement, context.projectFiles ?? []);
-  const relatedFileCandidates = context.relatedFileCandidates ?? fileCandidates.filter((candidate) => candidate.role !== "ignored").map((candidate) => candidate.path);
+  // Deliberately edit-role-only (not "role !== ignored") — this list feeds
+  // postProcessTaskMarkdown's deterministic scope-filling/injection
+  // (fillScopeFromCandidates/applyUiFeaturePolishSections/
+  // applyProductStrategySections), which writes into "수정 범위"/"수정
+  // 대상". A "reference"/"protected" candidate must never be auto-injected
+  // there just because the AI's own output was weak — see DG-05.
+  // buildTaskAIPrompt (below, via the unmodified `context`) still shows the
+  // AI the broader "role !== ignored" list as informational context; only
+  // the deterministic injection path is narrowed here.
+  const editRoleFileCandidates = fileCandidates.filter((candidate) => candidate.role === "edit").map((candidate) => candidate.path);
+  // DG-07: bounded to a safe input-token budget before it ever reaches the
+  // provider — see buildTaskAIPromptWithBudget. Computed once and reused
+  // for the retry below (same contract as before: both calls see the same
+  // prompt).
+  const { prompt: taskAIPrompt, report: promptBudget } = buildTaskAIPromptWithBudget(context);
   const firstText = await provider.generateText({
     model,
     system: taskAISystemPrompt(),
-    prompt: buildTaskAIPrompt(context)
+    prompt: taskAIPrompt
   });
   let taskMarkdown = ensureTaskMarkdownSections(firstText);
 
@@ -125,7 +143,7 @@ export async function generateTaskMarkdownResult(provider: AIProvider, context: 
     const retryText = await provider.generateText({
       model,
       system: taskAISystemPrompt(),
-      prompt: `${buildTaskAIPrompt(context)}
+      prompt: `${taskAIPrompt}
 
 이전 응답에는 사용자 요구사항에 없는 이메일/비밀번호 추측이 포함되었습니다.
 카카오 로그인 요구사항을 이메일/비밀번호 문제로 바꾸지 말고 다시 생성하세요.
@@ -138,7 +156,8 @@ export async function generateTaskMarkdownResult(provider: AIProvider, context: 
     throw new Error("AI output included unsupported email/password speculation for a Kakao login requirement. No file was written.");
   }
 
-  return postProcessTaskMarkdown(taskMarkdown, context, relatedFileCandidates);
+  const result = postProcessTaskMarkdown(taskMarkdown, context, editRoleFileCandidates);
+  return { ...result, promptBudget };
 }
 
 export function inferRelatedFileCandidates(requirement: string, projectFiles: string[]): string[] {
@@ -159,6 +178,7 @@ export function analyzeFileRelevance(
 ): TaskAIFileCandidate[] {
   const explicitRoutes = inferExplicitRouteTargets(requirement);
   const tokens = extractRelevanceTokens(requirement);
+  const negatedConcepts = detectNegatedConcepts(requirement);
   const indexByPath = new Map((metadata.index ?? []).map((entry) => [entry.path, entry]));
   const summaryByPath = new Map((metadata.summaries ?? []).map((summary) => [summary.path, summary]));
   const graphByPath = new Map((metadata.codeGraph ?? []).map((entry) => [entry.file, entry]));
@@ -176,7 +196,7 @@ export function analyzeFileRelevance(
     const index = indexByPath.get(file);
     const summary = summaryByPath.get(file);
     const graph = graphByPath.get(file);
-    const scored = scoreFileRelevance(file, requirement, tokens, explicitRoutes, { index, summary, runTargets, graph });
+    const scored = scoreFileRelevance(file, requirement, tokens, explicitRoutes, negatedConcepts, { index, summary, runTargets, graph });
 
     candidateByPath.set(file, scored);
   }
@@ -186,6 +206,83 @@ export function analyzeFileRelevance(
   return [...candidateByPath.values()]
     .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
     .slice(0, 30);
+}
+
+/**
+ * Generic concept vocabulary used only to detect when the CURRENT
+ * requirement explicitly excludes an area ("do not touch auth", "건드리지
+ * 마세요 DB") — these are plain software-engineering terms, not any
+ * downstream project's file/feature names, and the set it produces is
+ * scoped to this one requirement string, never persisted or hardcoded to
+ * a path.
+ */
+const GENERIC_PROTECTABLE_CONCEPTS: Array<{ concept: string; keywords: string[] }> = [
+  { concept: "authentication", keywords: ["auth", "인증", "login", "로그인", "session", "세션"] },
+  { concept: "database", keywords: ["database", "데이터베이스", "db", "schema", "스키마", "persistence", "저장소"] },
+  { concept: "api", keywords: ["api", "endpoint", "엔드포인트", "backend", "백엔드"] },
+  { concept: "routing", keywords: ["routing", "라우팅"] },
+  { concept: "payment", keywords: ["payment", "결제", "billing", "청구"] }
+];
+
+const NEGATION_TRIGGER_PATTERNS = [
+  /\bdo\s*not\b/i,
+  /\bdon'?t\b/i,
+  /\bwithout\s+changing\b/i,
+  /\bno\s+changes?\s+to\b/i,
+  /\bnever\s+(?:change|modify|touch)\b/i,
+  /건드리지\s*마/,
+  /수정하지\s*않/,
+  /변경하지\s*않/,
+  /바꾸지\s*마/
+];
+
+/**
+ * Finds concepts the CURRENT requirement explicitly asks to leave alone
+ * (e.g. "Do not change auth, API, or persistence logic"). A naive token
+ * extractor would otherwise pull "auth"/"api" out of that very sentence as
+ * POSITIVE relevance signals — exactly backwards from the user's intent.
+ * Clause-scoped (split on sentence boundaries) so an unrelated negation
+ * elsewhere in a long requirement does not protect an unrelated concept.
+ */
+function detectNegatedConcepts(requirement: string): Set<string> {
+  const negated = new Set<string>();
+  const clauses = requirement.split(/[.!?\n]+/);
+  for (const clause of clauses) {
+    if (!NEGATION_TRIGGER_PATTERNS.some((pattern) => pattern.test(clause))) continue;
+    const lower = clause.toLowerCase();
+    for (const { concept, keywords } of GENERIC_PROTECTABLE_CONCEPTS) {
+      if (keywords.some((keyword) => lower.includes(keyword.toLowerCase()))) {
+        negated.add(concept);
+      }
+    }
+  }
+  return negated;
+}
+
+function matchedNegatedConcept(
+  negatedConcepts: Set<string>,
+  tokenSets: Array<Set<string>>
+): string | undefined {
+  if (negatedConcepts.size === 0) return undefined;
+  for (const { concept, keywords } of GENERIC_PROTECTABLE_CONCEPTS) {
+    if (!negatedConcepts.has(concept)) continue;
+    const normalizedKeywords = keywords.map((keyword) => keyword.toLowerCase());
+    const matches = tokenSets.some((set) => normalizedKeywords.some((keyword) => set.has(keyword)));
+    if (matches) return concept;
+  }
+  return undefined;
+}
+
+/**
+ * A candidate file's exact repository-relative path appearing verbatim in
+ * the requirement text ("Fix src/client/api-client.ts") is treated as an
+ * explicit, strong signal — independent of (and additive to) the older
+ * `inferExplicitRouteTargets` hardcoded route patterns. Length-guarded so a
+ * one- or two-character path never counts as a meaningful match.
+ */
+function isExplicitlyMentionedPath(file: string, requirement: string): boolean {
+  if (file.length < 4) return false;
+  return requirement.includes(file);
 }
 
 export function extractTaskAIKeywords(requirement: string): string[] {
@@ -227,69 +324,15 @@ export function extractTaskAIKeywords(requirement: string): string[] {
   return [...keywords].slice(0, 20);
 }
 
-export function buildTaskAIPrompt(context: TaskAIContext): string {
-  const taskType = context.taskType ?? classifyTaskType(context.requirement);
-  const completionCriteria = context.completionCriteria ?? buildTaskCompletionCriteria(taskType);
-  const fileCandidates = context.fileCandidates ?? analyzeFileRelevance(context.requirement, context.projectFiles ?? []);
-  const relatedFileCandidates = context.relatedFileCandidates ?? fileCandidates.filter((candidate) => candidate.role !== "ignored").map((candidate) => candidate.path);
-  return `사용자 요구사항:
-${context.requirement}
-
-Context Priority:
-${formatContextPriority()}
-
-Requirement Anchor:
-- 원문 requirement를 최상위 기준으로 고정하세요.
+const REQUIREMENT_ANCHOR_BODY = `- 원문 requirement를 최상위 기준으로 고정하세요.
 - 목표, 현재 문제, 완료 조건은 반드시 이 원문과 같은 주제를 말해야 합니다.
 - 아래 프로젝트 상태, 결정, cache, 후보 파일은 참고 자료일 뿐이며 requirement를 덮어쓸 수 없습니다.
 - 이전 run/task/docs에 있는 목표나 문장을 현재 requirement와 직접 관련 없으면 사용하지 마세요.
 - navigation/back/previous/question/state 문제를 text cleanup/result wording 작업으로 바꾸지 마세요.
-- text/result wording 요청을 navigation/state bugfix로 바꾸지 마세요.
+- text/result wording 요청을 navigation/state bugfix로 바꾸지 마세요.`;
 
-프로젝트 규칙:
-${context.rulesMarkdown || "(비어 있음)"}
-
-반복하면 안 되는 실수:
-${context.mistakesMarkdown || "(비어 있음)"}
-
-프로젝트 상태:
-${context.projectStateMarkdown || "(비어 있음)"}
-
-최근 결정:
-${context.decisionsMarkdown || "(비어 있음)"}
-
-작업 유형:
-${formatTaskType(taskType)}
-
-완료 기준/리뷰 기준:
-${formatCompletionCriteria(completionCriteria)}
-
-현재 변경 파일:
-${formatChangedFiles(context)}
-
-프로젝트 파일 목록 요약:
-${formatProjectFiles(context.projectFiles ?? [])}
-
-키워드 기반 관련 파일 후보:
-${formatListOrNeedsCheck(relatedFileCandidates)}
-
-점수 기반 후보 분리:
-${formatScoredCandidates(fileCandidates)}
-
-영향도 힌트:
-${formatTaskImpactHints(context.impactHints ?? [])}
-
-관련 코드 컨텍스트:
-${formatCodeContexts(context.codeContexts ?? [])}
-
-diff 요약:
-${context.diffText || "(diff 본문 없음)"}
-
-명시 route 기반 대상 분리:
-${formatExplicitRouteGuidance(context.requirement, relatedFileCandidates)}
-
-task.md 생성 규칙:
-- "사용자 요구사항 해석" 섹션을 반드시 포함하세요.
+function taskGenerationRulesBody(taskType: TaskTypeResult): string {
+  return `- "사용자 요구사항 해석" 섹션을 반드시 포함하세요.
 - "사용자 요구사항 해석"에는 원문, 해석, 작업 유형, 이 작업이 아닌 것을 짧게 쓰세요.
 - "이 작업이 아닌 것"에는 현재 requirement와 혼동하기 쉬운 이전 문맥/다른 작업을 배제하세요.
 - "작업 유형" 섹션을 반드시 포함하고, 아래 task type strategy를 파일 후보보다 우선하세요.
@@ -347,9 +390,119 @@ ${taskTypeStrategyNotes(taskType).map((note) => `- ${note}`).join("\n")}
 - product_strategy 작업에서는 관련 파일을 "참고 대상"으로만 두고, "수정 대상"은 승인 전까지 없음으로 표시하세요.
 - product_strategy 작업에는 "구현 전 정의해야 할 것" 섹션을 포함하고, 왜 써야 하는지/공유 이유/재미 요소/검증 기준/최소 구현 범위를 정의하게 하세요.
 - product_strategy 작업에는 "추천 실험 방향" 섹션을 포함하고, implementation 이전 단계의 lightweight experiment proposal을 3~5개 compact하게 제안하세요.
-- "추천 실험 방향"은 feature spec, UI redesign, 코드 수정 지시가 아닌 user reaction 중심의 실험 단위여야 합니다. "왜 공유하고 싶어지는지", "왜 다시 해보고 싶어지는지" 기준으로 작성하세요.
+- "추천 실험 방향"은 feature spec, UI redesign, 코드 수정 지시가 아닌 user reaction 중심의 실험 단위여야 합니다. "왜 공유하고 싶어지는지", "왜 다시 해보고 싶어지는지" 기준으로 작성하세요.`;
+}
 
-위 정보를 바탕으로 .devguard/task.md에 바로 저장할 Markdown만 생성하세요.`;
+/** Working shape while assembling the prompt; see TaskAIPromptPriority for the tier semantics. */
+export interface TaskAIPromptSection {
+  label: string;
+  body: string;
+  priority: TaskAIPromptPriority;
+}
+
+export function buildTaskAIPromptSections(context: TaskAIContext): TaskAIPromptSection[] {
+  const taskType = context.taskType ?? classifyTaskType(context.requirement);
+  const completionCriteria = context.completionCriteria ?? buildTaskCompletionCriteria(taskType);
+  const fileCandidates = context.fileCandidates ?? analyzeFileRelevance(context.requirement, context.projectFiles ?? []);
+  const relatedFileCandidates = context.relatedFileCandidates ?? fileCandidates.filter((candidate) => candidate.role !== "ignored").map((candidate) => candidate.path);
+  return [
+    { label: "사용자 요구사항", body: context.requirement, priority: 1 },
+    { label: "Context Priority", body: formatContextPriority(), priority: 1 },
+    { label: "Requirement Anchor", body: REQUIREMENT_ANCHOR_BODY, priority: 1 },
+    { label: "프로젝트 규칙", body: context.rulesMarkdown || "(비어 있음)", priority: 2 },
+    { label: "반복하면 안 되는 실수", body: context.mistakesMarkdown || "(비어 있음)", priority: 3 },
+    { label: "프로젝트 상태", body: context.projectStateMarkdown || "(비어 있음)", priority: 3 },
+    { label: "최근 결정", body: context.decisionsMarkdown || "(비어 있음)", priority: 2 },
+    { label: "작업 유형", body: formatTaskType(taskType), priority: 1 },
+    { label: "완료 기준/리뷰 기준", body: formatCompletionCriteria(completionCriteria), priority: 1 },
+    { label: "현재 변경 파일", body: formatChangedFiles(context), priority: 2 },
+    { label: "프로젝트 파일 목록 요약", body: formatProjectFiles(context.projectFiles ?? []), priority: 4 },
+    { label: "키워드 기반 관련 파일 후보", body: formatListOrNeedsCheck(relatedFileCandidates), priority: 4 },
+    { label: "점수 기반 후보 분리", body: formatScoredCandidates(fileCandidates), priority: 1 },
+    { label: "영향도 힌트", body: formatTaskImpactHints(context.impactHints ?? []), priority: 3 },
+    { label: "관련 코드 컨텍스트", body: formatCodeContexts(context.codeContexts ?? []), priority: 2 },
+    { label: "diff 요약", body: context.diffText || "(diff 본문 없음)", priority: 3 },
+    { label: "명시 route 기반 대상 분리", body: formatExplicitRouteGuidance(context.requirement, relatedFileCandidates), priority: 1 },
+    { label: "task.md 생성 규칙", body: taskGenerationRulesBody(taskType), priority: 1 }
+  ];
+}
+
+function renderTaskAIPromptSections(sections: TaskAIPromptSection[]): string {
+  const body = sections.map((section) => `${section.label}:\n${section.body}`).join("\n\n");
+  return `${body}\n\n위 정보를 바탕으로 .devguard/task.md에 바로 저장할 Markdown만 생성하세요.`;
+}
+
+export function buildTaskAIPrompt(context: TaskAIContext): string {
+  return renderTaskAIPromptSections(buildTaskAIPromptSections(context));
+}
+
+/**
+ * DG-07 hard budget. Deliberately generous relative to gpt-4o-mini's input
+ * window — this is a safety net for pathological inputs (a huge monorepo's
+ * rules/mistakes/decisions docs, an enormous diff), not a tuning knob for
+ * normal-sized projects. The source-level reductions in formatProjectFiles
+ * and the existing per-section caps (formatScoredCandidates, formatCodeContexts,
+ * formatTaskImpactHints, mergeCandidates's 30-item cap) are what keep a
+ * normal prompt well under this in the first place.
+ */
+const DEFAULT_TASK_AI_PROMPT_TOKEN_BUDGET = 20_000;
+
+/**
+ * Priority-ordered, whole-section trimming — the same established pattern
+ * `prompt.ts`'s renderBudgetedPrompt/renderBudgetedUltraPrompt already use
+ * for the Codex handoff prompt (iteratively drop the lowest-priority
+ * remaining section and re-measure), not a new budgeting subsystem. Never
+ * removes a Priority-1 section (requirement, explicit targets/routes, task
+ * type, completion criteria, the role-tagged candidate list, generation
+ * rules) — if those alone exceed the budget, the budget is reported as
+ * exceeded rather than silently cutting a guardrail-critical section.
+ */
+export function trimTaskAIPromptSections(
+  sections: TaskAIPromptSection[],
+  maxPromptTokens: number = DEFAULT_TASK_AI_PROMPT_TOKEN_BUDGET
+): { sections: TaskAIPromptSection[]; report: TaskAIPromptBudgetReport } {
+  // Every original section's size is measured up front — the report shows
+  // all of them (kept and trimmed), not just the survivors, so "what was
+  // actually large before trimming" is visible even when the result is
+  // small after.
+  const originalSizes = new Map(sections.map((section) => [section.label, estimateTokens(section.body)]));
+  const active = [...sections];
+  const trimmedSections: string[] = [];
+  let text = renderTaskAIPromptSections(active);
+
+  while (estimateTokens(text) > maxPromptTokens) {
+    const removableTiers = active.filter((section) => section.priority > 1).map((section) => section.priority);
+    if (removableTiers.length === 0) break;
+    const lowestPriorityTier = Math.max(...removableTiers);
+    const removeIndex = active.findIndex((section) => section.priority === lowestPriorityTier);
+    trimmedSections.push(active[removeIndex].label);
+    active.splice(removeIndex, 1);
+    text = renderTaskAIPromptSections(active);
+  }
+
+  const activeLabels = new Set(active.map((section) => section.label));
+  return {
+    sections: active,
+    report: {
+      sections: sections.map((section) => ({
+        label: section.label,
+        priority: section.priority,
+        estimatedTokens: originalSizes.get(section.label) ?? 0,
+        trimmed: !activeLabels.has(section.label)
+      })),
+      estimatedTotalTokens: estimateTokens(text),
+      budget: maxPromptTokens,
+      trimmedSections
+    }
+  };
+}
+
+export function buildTaskAIPromptWithBudget(
+  context: TaskAIContext,
+  maxPromptTokens: number = DEFAULT_TASK_AI_PROMPT_TOKEN_BUDGET
+): { prompt: string; report: TaskAIPromptBudgetReport } {
+  const { sections, report } = trimTaskAIPromptSections(buildTaskAIPromptSections(context), maxPromptTokens);
+  return { prompt: renderTaskAIPromptSections(sections), report };
 }
 
 function taskAISystemPrompt(): string {
@@ -445,12 +598,42 @@ function extractResponseText(json: OpenAIResponsesResult): string {
   return text;
 }
 
+/**
+ * DG-07: a raw dump of up to 200 full paths duplicated most of what
+ * "점수 기반 후보 분리" (the role-tagged candidate list) already tells the
+ * AI, while costing far more tokens — on a large monorepo (PartnerFlow:
+ * ~800 indexed files) this alone was a multi-thousand-token section. A
+ * structural digest (per-directory file counts + a small sample) gives
+ * the same "sense of the project" at a fraction of the size — source-level
+ * reduction, not post-hoc truncation, so it is not skipped even when the
+ * prompt is nowhere near the budget.
+ */
 function formatProjectFiles(projectFiles: string[]): string {
   if (projectFiles.length === 0) {
     return "- 프로젝트 파일 목록 없음";
   }
 
-  return projectFiles.slice(0, 200).map((file) => `- ${file}`).join("\n");
+  const countByTopDirs = new Map<string, number>();
+  for (const file of projectFiles) {
+    const segments = file.split("/");
+    const key = segments.length > 1 ? segments.slice(0, 2).join("/") : segments[0];
+    countByTopDirs.set(key, (countByTopDirs.get(key) ?? 0) + 1);
+  }
+  const directorySummary = [...countByTopDirs.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 20)
+    .map(([dir, count]) => `- ${dir} (${count}개 파일)`);
+  const sample = projectFiles.slice(0, 20).map((file) => `- ${file}`);
+
+  return [
+    `총 ${projectFiles.length}개 파일. 구체적인 관련 파일은 "점수 기반 후보 분리"와 "명시 route 기반 대상 분리"를 사용하세요.`,
+    "",
+    "디렉터리별 파일 수:",
+    ...directorySummary,
+    "",
+    "대표 파일 예시(최대 20개, 전체 목록 아님):",
+    ...sample
+  ].join("\n");
 }
 
 function formatListOrNeedsCheck(items: string[]): string {
@@ -519,27 +702,36 @@ function extractRequirementTokens(requirement: string): string[] {
   return [...new Set(requirement.toLowerCase().match(/[a-z0-9가-힣]{3,}/g) ?? [])].slice(0, 12);
 }
 
+/**
+ * Broad concept/synonym groups used to WIDEN discovery (e.g. a requirement
+ * mentioning "로그인" should also surface files tagged "login"/"auth").
+ * These are intentionally generic, high-recall words — exactly why a match
+ * on one of them alone must never count as strong, specific evidence that
+ * a file needs editing (see GENERIC_LOW_SPECIFICITY_WORDS below, which
+ * reuses this same list rather than duplicating it).
+ */
+const RELEVANCE_SYNONYM_GROUPS = [
+  ["result", "결과"],
+  ["question", "질문", "문항"],
+  ["choice", "선택"],
+  ["previous", "prev", "back", "이전", "뒤로"],
+  ["navigation", "navigate", "이동", "경로"],
+  ["state", "상태", "유지"],
+  ["auth", "인증", "로그인", "login"],
+  ["settings", "설정"],
+  ["admin", "관리자"],
+  ["feedback", "피드백", "의견"],
+  ["theme", "테마", "다크", "dark", "light"],
+  ["dashboard", "대시보드"],
+  ["home", "홈"],
+  ["tree", "트리"]
+];
+
 function extractRelevanceTokens(requirement: string): string[] {
   const tokens = new Set(extractRequirementTokens(requirement));
-  const groups = [
-    ["result", "결과"],
-    ["question", "질문", "문항"],
-    ["choice", "선택"],
-    ["previous", "prev", "back", "이전", "뒤로"],
-    ["navigation", "navigate", "이동", "경로"],
-    ["state", "상태", "유지"],
-    ["auth", "인증", "로그인", "login"],
-    ["settings", "설정"],
-    ["admin", "관리자"],
-    ["feedback", "피드백", "의견"],
-    ["theme", "테마", "다크", "dark", "light"],
-    ["dashboard", "대시보드"],
-    ["home", "홈"],
-    ["tree", "트리"]
-  ];
   const lower = requirement.toLowerCase();
 
-  for (const group of groups) {
+  for (const group of RELEVANCE_SYNONYM_GROUPS) {
     if (group.some((token) => lower.includes(token.toLowerCase()))) {
       for (const token of group) {
         tokens.add(token.toLowerCase());
@@ -550,11 +742,40 @@ function extractRelevanceTokens(requirement: string): string[] {
   return [...tokens].filter((token) => token.length >= 2).slice(0, 24);
 }
 
+/**
+ * Words too generic/structural on their own to count as STRONG evidence
+ * that a specific file must be edited (see the strong-reason gate in
+ * scoreFileRelevance) — common directory/layer names plus the broad
+ * synonym vocabulary above and the negation-concept vocabulary below.
+ * Reused, not redefined, wherever "is this token specific enough" matters.
+ */
+const GENERIC_LOW_SPECIFICITY_WORDS = new Set<string>([
+  ...RELEVANCE_SYNONYM_GROUPS.flat().map((word) => word.toLowerCase()),
+  "src", "lib", "libs", "app", "apps", "pages", "page", "components", "component", "utils", "util",
+  "services", "service", "api", "apis", "routes", "route", "hooks", "hook", "package", "packages",
+  "styles", "style", "assets", "config", "types", "type", "test", "tests", "index"
+]);
+
+/**
+ * Matches both the word and its simple plural/singular counterpart (e.g.
+ * "app"/"apps", "package"/"packages") against GENERIC_LOW_SPECIFICITY_WORDS
+ * — a structural directory-naming word should not become "specific enough
+ * to be strong evidence" just because a project happens to use the
+ * plural form (`apps/admin/...`) instead of the singular one.
+ */
+function isGenericLowSpecificityWord(token: string): boolean {
+  if (GENERIC_LOW_SPECIFICITY_WORDS.has(token)) return true;
+  if (token.endsWith("s") && token.length > 3 && GENERIC_LOW_SPECIFICITY_WORDS.has(token.slice(0, -1))) return true;
+  if (GENERIC_LOW_SPECIFICITY_WORDS.has(`${token}s`)) return true;
+  return false;
+}
+
 function scoreFileRelevance(
   file: string,
   requirement: string,
   tokens: string[],
   explicitRoutes: ExplicitRouteTargets,
+  negatedConcepts: Set<string>,
   metadata: {
     index?: ProjectIndexEntry;
     summary?: FileSummary;
@@ -564,9 +785,24 @@ function scoreFileRelevance(
 ): TaskAIFileCandidate {
   const reasons: string[] = [];
   const negativeReasons: string[] = [];
+  // "relevant" and "must be edited" are different claims (see the role
+  // gate below) — score still accumulates from every weak signal exactly
+  // as before (it drives ordering and the reference/ignored cutoff), but
+  // only a signal added here with hasStrongReason=true can ever produce
+  // role "edit". Weak, accumulative signals (generic path/keyword/category
+  // overlap, graph adjacency — see applyGraphImpactScoring) cap out at
+  // "reference" no matter how high their summed score climbs.
+  let hasStrongReason = false;
   let score = scoreExplicitCandidate(file, explicitRoutes);
   if (score > 0) {
     reasons.push("explicit route match");
+    hasStrongReason = true;
+  }
+
+  if (isExplicitlyMentionedPath(file, requirement)) {
+    score += 100;
+    reasons.push("explicit file path mentioned in requirement");
+    hasStrongReason = true;
   }
 
   const pathTokens = tokenizePath(file);
@@ -578,9 +814,18 @@ function scoreFileRelevance(
   const usageTokens = new Set((metadata.graph?.usageHints ?? []).flatMap(tokenizeText));
 
   for (const token of tokens) {
+    const specific = !isGenericLowSpecificityWord(token) && token.length >= 4;
     if (pathTokens.has(token)) {
       score += 12;
       reasons.push(`path token:${token}`);
+      // Deliberately NOT a strong signal, even when the token is specific:
+      // a real codebase commonly has sibling files sharing one meaningful
+      // path segment (api-client.ts / api-client.server.ts /
+      // api-client.test.ts all contain "client") — promoting every sibling
+      // to "edit" from that shared word alone contradicts an explicit
+      // "do not change any other file" instruction. Explicit path mention,
+      // explicit route match, a run-target match, or an exact exported
+      // symbol match are the only signals specific enough to gate "edit".
     } else if ([...pathTokens].some((pathToken) => pathToken.includes(token) || token.includes(pathToken))) {
       score += 5;
       reasons.push(`path partial:${token}`);
@@ -609,6 +854,7 @@ function scoreFileRelevance(
     if (exportTokens.has(token)) {
       score += 7;
       reasons.push(`export:${token}`);
+      if (specific) hasStrongReason = true;
     }
 
     if (usageTokens.has(token)) {
@@ -620,6 +866,7 @@ function scoreFileRelevance(
   if (metadata.runTargets.has(file)) {
     score += 6;
     reasons.push("matching saved run target");
+    hasStrongReason = true;
   }
 
   for (const conflict of conflictingConcepts(requirement)) {
@@ -634,7 +881,26 @@ function scoreFileRelevance(
     negativeReasons.push("excluded by explicit route intent");
   }
 
-  const role = score >= 12 ? "edit" : score >= 5 ? "reference" : score <= -20 ? "ignored" : "ignored";
+  // Protection is generic and requirement-scoped (detectNegatedConcepts),
+  // never a hardcoded path list — but an explicit, strong signal for THIS
+  // exact file always wins over a broad concept exclusion (a direct
+  // instruction is more specific than a general one).
+  const protectedConcept = hasStrongReason ? undefined : matchedNegatedConcept(negatedConcepts, [pathTokens, categoryTokens, keywordTokens]);
+  if (protectedConcept) {
+    negativeReasons.push(`protected: requirement explicitly excludes ${protectedConcept}`);
+  }
+
+  let role: TaskAIFileCandidateRole;
+  if (hasStrongReason) {
+    role = "edit";
+  } else if (protectedConcept) {
+    role = "protected";
+  } else if (score >= 5) {
+    role = "reference";
+  } else {
+    role = "ignored";
+  }
+
   return {
     path: file,
     score,
@@ -649,7 +915,7 @@ function applyGraphImpactScoring(
   graphByPath: Map<string, CodeGraphEntry>,
   tokens: string[]
 ): void {
-  const directMatches = [...candidates.values()].filter((candidate) => candidate.score >= 12);
+  const directMatches = [...candidates.values()].filter((candidate) => candidate.role === "edit");
   for (const candidate of directMatches) {
     const graph = graphByPath.get(candidate.path);
     if (!graph) {
@@ -670,7 +936,7 @@ function applyGraphImpactScoring(
     }
     const sameCluster = [...candidates.values()].some((candidate) => {
       const candidateGraph = graphByPath.get(candidate.path);
-      return candidate.score >= 12 && candidateGraph?.category === graph.category;
+      return candidate.role === "edit" && candidateGraph?.category === graph.category;
     });
     if (sameCluster) {
       bumpGraphCandidate(candidates, path, 2, `same feature cluster:${graph.category}`);
@@ -690,9 +956,12 @@ function bumpGraphCandidate(candidates: Map<string, TaskAIFileCandidate>, path: 
     } satisfies TaskAIFileCandidate);
   current.score += delta;
   current.reasons = [...new Set([...current.reasons, reason])].slice(0, 8);
-  if (current.score >= 12) {
-    current.role = "edit";
-  } else if (current.score >= 5 && current.role !== "edit") {
+  // Graph adjacency alone (reverse/forward dependency, same feature
+  // cluster) is indirect, accumulative evidence — never strong enough on
+  // its own to promote to "edit" (see the strong-reason gate in
+  // scoreFileRelevance) or to override an existing "edit"/"protected"
+  // verdict for this file.
+  if (current.score >= 5 && current.role === "ignored") {
     current.role = "reference";
   }
   candidates.set(path, current);
