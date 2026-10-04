@@ -38,3 +38,15 @@ export function perfFlush(): void {
   }
   records.length = 0;
 }
+
+// Self-contained structured summary (e.g. Code Index hydration counters) —
+// printed immediately rather than buffered through perfFlush, since it is
+// logged once after its own measurement window closes and so cannot distort
+// a duration the way a mid-span log could (see perfFlush's note above).
+export function perfReport(title: string, fields: Record<string, number | string>): void {
+  if (!enabled) return;
+  console.error(`[perf-debug] ${title}`);
+  for (const [key, value] of Object.entries(fields)) {
+    console.error(`[perf-debug]   ${key}: ${value}`);
+  }
+}

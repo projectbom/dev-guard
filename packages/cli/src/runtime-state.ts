@@ -26,7 +26,7 @@ import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
 import { recordTaskTelemetry } from "./task-telemetry.js";
-import { perfFlush, perfMark, perfSpan } from "./perf-debug.js";
+import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1743,8 +1743,8 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   await writeRuntimeState(root, runtimeWithTask);
   perfMark("prepare:writeRuntimeState-done");
   try {
-    await hydrateCodeIndexForTask(root, text);
-    perfMark("prepare:hydrateCodeIndexForTask-done");
+    await hydrateCodeIndex(root);
+    perfMark("prepare:hydrateCodeIndex-done");
     // Single Resolution Path: load the shared raw inputs and resolve the
     // task/file context ONCE for this call, instead of each of the four
     // before-agent renderers (and this function, again, afterward)
@@ -1756,27 +1756,37 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     perfMark("prepare:loadResumeRawInputs-done");
     const context = resolveResumeContext(raw);
     perfMark("prepare:resolveResumeContext-done");
-    const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
-      generateReadMap(root, raw, context),
-      generateCodeMap(root, raw, context),
-      generateWorkingContext(root, raw, context),
-      generateAgentBrief(root, raw, context),
-      generateAgentContext(root, raw, context),
-      generateNextClaudePrompt(root)
-    ]);
-    perfMark("prepare:fallbackArtifacts-generated");
     const codeIndex = raw.codeIndex;
     // DG-01 explicit path hint: a real, existing file the task text names
     // directly must survive even if the Code Index does not know it yet —
     // placed first so it is never pushed out by the slice(0, 8) cutoff.
-    const pathHints = await resolveExplicitTaskPathHints(text, root);
+    // Resolved here (before the artifact Promise.all) since it has no
+    // dependency on that step's output — only on text/root, already
+    // available — so it can run concurrently with artifact generation
+    // instead of serially after it.
+    const pathHintsPromise = resolveExplicitTaskPathHints(text, root);
+    // Call-scope memo (see indexedReadCandidates) shared by generateCodeMap
+    // and the structuredFiles step below: both independently rank the same
+    // overlapping files' read ranges from the same (context.summary,
+    // per-file content) — this avoids redoing that ranking twice per file.
+    const readCandidatesCache = new Map<string, CodeIndexSymbol[]>();
+    const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath, pathHints] = await Promise.all([
+      generateReadMap(root, raw, context),
+      generateCodeMap(root, raw, context, readCandidatesCache),
+      generateWorkingContext(root, raw, context),
+      generateAgentBrief(root, raw, context),
+      generateAgentContext(root, raw, context),
+      generateNextClaudePrompt(root),
+      pathHintsPromise
+    ]);
+    perfMark("prepare:fallbackArtifacts-generated");
     perfMark("prepare:pathHints-resolved");
     const rankedFiles = readableContextFiles(context.files, context.summary, codeIndex, context.filesResolved).filter((file) => !pathHints.includes(file));
     perfMark("prepare:readableContextFiles-ranked");
     const files = [...pathHints, ...rankedFiles].slice(0, 8);
     const structuredFiles = await Promise.all(files.map(async (file) => {
       const content = await readTextFile(fromRoot(root, file)).catch(() => "");
-      return preparedTaskContextFile(file, context.summary, codeIndex, content, pathHints.includes(file));
+      return preparedTaskContextFile(file, context.summary, codeIndex, content, pathHints.includes(file), readCandidatesCache);
     }));
     perfMark("prepare:structuredFiles-built");
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
@@ -1997,42 +2007,95 @@ export async function ensureCodeIndex(root: string): Promise<{ path: string; gen
   }
 }
 
-async function hydrateCodeIndexForTask(root: string, task: string): Promise<void> {
+// Bounded-concurrency map — each item's own I/O (fileExists/readTextFile
+// below) is independent of every other item, so running them fully
+// sequentially (one await at a time) pays pure event-loop round-trip
+// latency per file for no reason; running all of them via a single
+// unbounded Promise.all risks an fd/memory spike on a large Code Index.
+// `limit` bounds how many run concurrently at once.
+async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await fn(items[index]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+  return results;
+}
+
+// Invalidation Contract: a stored Code Index entry is reused as-is when its
+// file path's CURRENT content hash still matches `entry.hash` AND it already
+// has derived metadata (`entry.tokens`). It is rehydrated only when the file
+// is new, its content changed (hash mismatch), it was removed, or its
+// derived metadata is missing (e.g. an older index entry written before
+// `tokens` existed). A new task, a different task keyword, a different
+// `prepare_task_context` call, or a different sessionId are NEVER reasons to
+// invalidate a file's own entry — none of them describe the file itself.
+// This function used to take the task's text and treat "none of this task's
+// vocabulary appears in the file's cached tokens" as if it meant "this
+// file's cache is stale," which is almost always true for almost every file
+// (a file that genuinely never mentions e.g. "localStorage" never will,
+// however many times its tokens are recomputed) — so nearly every indexed
+// file was fully re-tokenized via extractSearchTokens/buildCodeIndexFile on
+// every single call, regardless of whether its content had actually
+// changed. The task string is no longer read here at all.
+async function hydrateCodeIndex(root: string): Promise<void> {
+  const hydrateStart = performance.now();
   const current = await readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     files: {}
   });
+  const stats = { indexEntries: 0, entriesReused: 0, entriesRehydrated: 0, filesRead: 0, bytesRead: 0, tokenExtractions: 0 };
   if (Object.keys(current.files).length === 0) return;
-  const codeTokens = explicitCodeTokens(task);
+  const entries = Object.values(current.files).slice(0, 1200).filter((entry) => isIndexableSourceFile(entry.path));
+  stats.indexEntries = entries.length;
   const next: CodeIndex = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     files: { ...current.files }
   };
   let changed = false;
-  for (const entry of Object.values(current.files).slice(0, 1200)) {
-    if (!isIndexableSourceFile(entry.path)) continue;
-    const shouldRefreshTokens =
-      !entry.tokens?.length ||
-      [...codeTokens].some((token) => !entry.tokens?.some((existing) => normalizeCodeToken(existing) === normalizeCodeToken(token)));
-    if (!shouldRefreshTokens) continue;
+  await mapWithConcurrency(entries, 8, async (entry) => {
     const path = fromRoot(root, entry.path);
     if (!(await fileExists(path))) {
       delete next.files[entry.path];
       changed = true;
-      continue;
+      stats.entriesRehydrated += 1;
+      return;
     }
     const content = await readTextFile(path).catch(() => "");
-    if (!content.trim()) continue;
+    stats.filesRead += 1;
+    stats.bytesRead += content.length;
+    if (!content.trim()) return;
     const hash = hashText(content);
-    next.files[entry.path] = entry.hash === hash ? { ...entry, tokens: extractSearchTokens(content) } : buildCodeIndexFile(entry.path, content);
+    if (entry.hash === hash && entry.tokens?.length) {
+      stats.entriesReused += 1;
+      return;
+    }
+    next.files[entry.path] = buildCodeIndexFile(entry.path, content, undefined, hash);
+    stats.tokenExtractions += 1;
+    stats.entriesRehydrated += 1;
     changed = true;
-  }
+  });
   if (changed) await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
+  perfReport("Code Index Hydration", {
+    entries: stats.indexEntries,
+    reused: stats.entriesReused,
+    rehydrated: stats.entriesRehydrated,
+    filesRead: stats.filesRead,
+    bytesRead: stats.bytesRead,
+    tokenExtractions: stats.tokenExtractions,
+    duration: `${(performance.now() - hydrateStart).toFixed(1)}ms`
+  });
 }
 
-export async function generateCodeMap(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext): Promise<string> {
+export async function generateCodeMap(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext, readCandidatesCache?: Map<string, CodeIndexSymbol[]>): Promise<string> {
   perfMark("generateCodeMap:entry");
   await ensureDevguardWorkspace(root);
   perfMark("generateCodeMap:ensureWorkspace-done");
@@ -2045,7 +2108,7 @@ export async function generateCodeMap(root: string, preloaded?: ResumeRawInputs,
     content: await readTextFile(fromRoot(root, file)).catch(() => "")
   })));
   perfMark("generateCodeMap:fileContents-read");
-  const markdown = renderCodeMap({ files, fileContents, state: raw.state, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary });
+  const markdown = renderCodeMap({ files, fileContents, state: raw.state, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary, readCandidatesCache });
   perfMark("generateCodeMap:render-done");
   await writeTextFile(fromRoot(root, codeMapPath), markdown);
   perfMark("generateCodeMap:write-done");
@@ -2364,11 +2427,11 @@ function hasTaskSpecificRouting(source: ContextTaskSource | undefined): boolean 
   return source === "explicit-before-agent-input" || source === "resumed-session-summary";
 }
 
-function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex, content = "", isExplicitPathHint = false): PreparedTaskContextFile {
+function preparedTaskContextFile(file: string, summary: DocumentationSummary | undefined, index: CodeIndex, content = "", isExplicitPathHint = false, readCandidatesCache?: Map<string, CodeIndexSymbol[]>): PreparedTaskContextFile {
   const indexed = index.files[file];
   const trust = contextTrustForFile(file, indexed, undefined, "en-US");
   const fileSummary = summary?.fileChanges.find((change) => change.file === file);
-  let ranges = indexedReadCandidates(indexed ?? emptyCodeIndexFile(file), summary, fileSummary, content)
+  let ranges = indexedReadCandidates(indexed ?? emptyCodeIndexFile(file), summary, fileSummary, content, readCandidatesCache)
     .slice(0, 5)
     .map((range) => ({
       startLine: range.startLine,
@@ -2568,6 +2631,7 @@ function renderCodeMap(input: {
   codeIndex: CodeIndex;
   locale: DevGuardLocale;
   documentationSummary?: DocumentationSummary;
+  readCandidatesCache?: Map<string, CodeIndexSymbol[]>;
 }): string {
   // Trust the caller's session-gated resolution (resolveBeforeAgentContext); do NOT
   // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
@@ -2612,7 +2676,7 @@ function renderCodeMap(input: {
       for (const impact of indexed.developerImpact.slice(0, 2)) lines.push(`- ${localizeSentence(impact, input.locale)}`);
     }
     lines.push("", "먼저 읽을 영역");
-    for (const section of codeMapReadRanges(indexed, sections.readFirst, documentationSummary, summary, item.content).slice(0, 8)) lines.push(`- ${section}`);
+    for (const section of codeMapReadRanges(indexed, sections.readFirst, documentationSummary, summary, item.content, input.readCandidatesCache).slice(0, 8)) lines.push(`- ${section}`);
     lines.push("", "수정 후보");
     for (const section of codeMapEditTargets(summary, sections.readFirst, input.locale)) lines.push(`- ${section}`);
     lines.push("", "읽지 않아도 되는 영역");
@@ -2718,18 +2782,51 @@ function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; ar
   return [...new Set(profile.entryPoints)].filter((file) => !isDevguardManagedDocPath(file)).slice(0, 8);
 }
 
+// Cheap, lossless prefilter for taskRelevantIndexCandidates: every path to a
+// nonzero taskIndexCandidateScore requires at least one of exactUsageOverlap,
+// exactSymbolOverlap, pathOverlap, symbolOverlap, tokenOverlap, routeScore,
+// or profileFlowSignal to be non-zero/true (see that function's own early
+// `return 0` gates). exactUsageOverlap and routeScore/profileFlowSignal are
+// already cheap to compute exactly (file.tokens is precomputed; routeScore
+// and profileFlowSignal only test small path/array fields, not full
+// tokenization). For the rest (*Overlap via meaningfulRankingTokens), this
+// checks plain substring membership against the SAME untokenized source
+// text instead of running the regex-heavy tokenizer: camelCase-splitting and
+// punctuation-to-space conversion only ever insert separators, they never
+// reorder or delete characters, so any token meaningfulRankingTokens could
+// produce from this text is necessarily a contiguous substring of its
+// lowercase, unsplit form. A file can therefore only be skipped here if NONE
+// of those signals could possibly fire — false positives (filtered-in files
+// that still score 0) are fine; false negatives are not possible by this
+// argument. `taskWords`/`codeTokenSquashed` are precomputed ONCE per
+// taskRelevantIndexCandidates call, not per file.
+function cheapCandidatePrefilterPasses(file: CodeIndexFile, taskWords: string[], codeTokenSquashed: string[], codeTokens: Set<string>, summary: DocumentationSummary): boolean {
+  const usageTokens = new Set((file.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
+  if ([...codeTokens].some((token) => usageTokens.has(normalizeCodeToken(token)))) return true;
+  if (routePathMatchScore(file.path, summary) !== 0) return true;
+  const flowText = `${file.exports.join("\n")}\n${file.symbols.map((symbol) => symbol.name).join("\n")}\n${file.tokens?.join("\n") ?? ""}`;
+  if (/profile|shared|owner|viewer|visitor|readOnly/i.test(flowText)) return true;
+  const raw = indexedCandidateText(file).toLowerCase();
+  if (taskWords.some((word) => raw.includes(word))) return true;
+  const squashed = raw.replace(/[^a-z0-9가-힣]/g, "");
+  return codeTokenSquashed.some((token) => squashed.includes(token));
+}
+
 function taskRelevantIndexCandidates(summary: DocumentationSummary, index: CodeIndex, existing: Set<string>): string[] {
   const taskTokens = meaningfulRankingTokens(taskRoutingText(summary));
   const codeTokens = explicitCodeTokens(taskRoutingText(summary));
   if (taskTokens.size === 0 && codeTokens.size === 0) return [];
+  const taskWords = [...taskTokens];
+  const codeTokenSquashed = [...codeTokens].map((token) => normalizeCodeToken(token)).filter(Boolean);
   const scored = Object.values(index.files)
+    .filter((file) => !existing.has(file.path))
+    .filter((file) => !isIgnoredWatchPath(file.path) && !isDevguardManagedDocPath(file.path))
+    .filter((file) => !shouldExcludeContextCandidate(file.path, summary))
+    .filter((file) => cheapCandidatePrefilterPasses(file, taskWords, codeTokenSquashed, codeTokens, summary))
     .map((file) => ({
       file: file.path,
       score: taskIndexCandidateScore(file, taskTokens, codeTokens, summary)
     }))
-    .filter((candidate) => !existing.has(candidate.file))
-    .filter((candidate) => !isIgnoredWatchPath(candidate.file) && !isDevguardManagedDocPath(candidate.file))
-    .filter((candidate) => !shouldExcludeContextCandidate(candidate.file, summary))
     .filter((candidate) => runtimePageBugCandidateAllowed(index.files[candidate.file], summary, codeTokens))
     .filter((candidate) => candidate.score >= 8);
   const relationScores = relatedCandidateScores(scored, index);
@@ -3238,9 +3335,9 @@ function contextTrustBadge(trust: ContextTrust): string {
   return `[${trust.priority} · ${trust.freshness} index · ${trust.relevance} relevance · ${trust.confidence} range]`;
 }
 
-function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[], taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = ""): string[] {
+function codeMapReadRanges(file: CodeIndexFile | undefined, fallback: string[], taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = "", cache?: Map<string, CodeIndexSymbol[]>): string[] {
   if (!file) return fallback;
-  const candidates = indexedReadCandidates(file, taskSummary, fileSummary, content);
+  const candidates = indexedReadCandidates(file, taskSummary, fileSummary, content, cache);
   const ranges = candidates.slice(0, 8).map((symbol, index) =>
     [
       `${index + 1}. ${symbol.name} (${symbol.kind}) lines ${symbol.startLine}-${symbol.endLine}`,
@@ -3257,7 +3354,18 @@ function primaryIndexedSymbol(file?: CodeIndexFile): CodeIndexSymbol | undefined
   return indexedReadCandidates(file)[0];
 }
 
-function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = ""): CodeIndexSymbol[] {
+// Call-scope memo only — NOT a persistent/cross-call cache. `generateCodeMap`
+// and `preparedTaskContextFile` (via prepareTaskContext's `structuredFiles`
+// step) independently compute indexedReadCandidates for a heavily
+// overlapping file set, from the SAME taskSummary/fileSummary/content within
+// one prepare_task_context call. A caller only passes `cache` when it can
+// guarantee that identical (taskSummary, fileSummary, content) invariant —
+// see its two call sites. Callers with no task context (e.g.
+// primaryIndexedSymbol) never pass one, so they always compute fresh and
+// can't collide with a cached with-task-context result for the same path.
+function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = "", cache?: Map<string, CodeIndexSymbol[]>): CodeIndexSymbol[] {
+  const cached = cache?.get(file.path);
+  if (cached) return cached;
   const taskSpecific = extractTaskSpecificRanges(file.path, content, taskSummary);
   // taskSummary/fileSummary are fixed for this whole sort — compute their
   // (regex-heavy) token derivation ONCE instead of inside codeMapRangeScore,
@@ -3269,7 +3377,9 @@ function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationS
     const priority = codeMapSymbolPriority(file.path, a) - codeMapSymbolPriority(file.path, b);
     return priority !== 0 ? priority : a.startLine - b.startLine;
   });
-  return dedupeOverlappingRanges(sorted);
+  const result = dedupeOverlappingRanges(sorted);
+  cache?.set(file.path, result);
+  return result;
 }
 
 function extractTaskSpecificRanges(file: string, content: string, taskSummary?: DocumentationSummary): CodeIndexSymbol[] {
@@ -4600,7 +4710,7 @@ async function updateCodeIndex(root: string, changedFiles: string[], documentati
     const summary = documentationSummary.fileChanges.find((item) => item.file === file);
     const expectedSummary = functionalCodeIndexSummary(file, summary);
     if (next.files[file]?.hash === hash && next.files[file]?.summary === expectedSummary) continue;
-    next.files[file] = buildCodeIndexFile(file, content, summary);
+    next.files[file] = buildCodeIndexFile(file, content, summary, hash);
   }
   await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
   return next;
@@ -4702,10 +4812,10 @@ function hashText(content: string): string {
   return createHash("sha1").update(content).digest("hex");
 }
 
-function buildCodeIndexFile(file: string, content: string, summary?: DocumentationFileChange): CodeIndexFile {
+function buildCodeIndexFile(file: string, content: string, summary?: DocumentationFileChange, precomputedHash?: string): CodeIndexFile {
   return {
     path: file,
-    hash: hashText(content),
+    hash: precomputedHash ?? hashText(content),
     role: summary?.purpose ?? codeMapFilePurpose(file),
     summary: functionalCodeIndexSummary(file, summary),
     userImpact: summary?.userImpact ?? [],
