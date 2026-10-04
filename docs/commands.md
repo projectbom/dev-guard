@@ -23,7 +23,7 @@ dev-guard doctor --agents
 ```
 
 - `init`: create initial `.devguard` guard files. Existing files are not overwritten.
-- `watch`: recommended watcher; watches changes and waits for a runtime-verified agent completion strategy.
+- `watch`: recommended watcher; finalizes via a runtime-verified Claude/Codex Stop hook once one exists, and falls back to its own inactivity-based auto-finalize until then — either way, finalization itself is idempotent, so a hook firing repeatedly (or racing a manual `done`) for the same unchanged code state never produces more than one real completion.
 - `install-hooks`: install Claude/Codex completion strategy scripts and supported config.
 - `done`: manually process pending changes and generate history, reports, quality verdict, and handoff prompt.
 - `handoff`: regenerate only `.devguard/reports/project-handoff.md` from current `.devguard/` artifacts.
@@ -43,7 +43,7 @@ dev-guard watch --include-lockfiles
 dev-guard watch --compact
 ```
 
-`watch` is event-driven. It does not run periodic refresh jobs, idle-time completion, build/test, or git commit.
+`watch` is event-driven for file tracking. It never runs build/test or git commit itself. Completion is idle-time (inactivity-based) ONLY until a Claude/Codex Stop hook is runtime-verified for this project — after that, the hook owns completion and `watch` no longer finalizes from idle state. `--manual`/`--no-auto-complete` disable the idle-time fallback outright, for debugging; they are not required for normal use.
 
 ## Usage Modes
 

@@ -1,6 +1,6 @@
 import { existsSync, watch as fsWatch } from "node:fs";
 import { stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import {
   ensureDevguardWorkspace,
   hashRuntimeFiles,
@@ -87,7 +87,33 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   const autoMode = !options.manual && autoStrategyInstalled;
   await startWatchSession(root);
 
-  const autoCompleteEnabled = options.autoCompleteDelayMs > 0;
+  // Completion Ownership: when a Claude/Codex Stop hook has PROVEN it
+  // actually fires in this project (runtimeVerified — the hook's own log
+  // shows a past successful run, not just that it's configured), that hook
+  // is the authoritative completion signal. It reflects the agent's own
+  // belief that a turn/task really ended; watch's file-inactivity timer is
+  // only ever a guess about that ("20s stable + 8s delay" means "nothing
+  // changed for a while", not "the AI is done" — see the hardening task
+  // this implements). The inactivity-based auto-complete below is the
+  // FALLBACK used only while no verified hook exists yet (a pure
+  // manual-editing workflow has no better signal), so a brand-new project
+  // keeps today's zero-flag automatic behavior until a hook proves itself,
+  // and a project with a working hook stops double-guessing completion.
+  // An explicit --manual/--no-auto-complete/config override still always
+  // wins over both of these (checked below via options.autoCompleteDelayMs,
+  // which parseWatchOptions already zeroed out for those cases).
+  const completionOwner: "hook" | "inactivity-fallback" = runtimeVerified ? "hook" : "inactivity-fallback";
+  const autoCompleteEnabled = completionOwner === "inactivity-fallback" && options.autoCompleteDelayMs > 0;
+  if (!options.compact) {
+    console.log("");
+    console.log(
+      completionOwner === "hook"
+        ? "Completion owner: verified Claude/Codex Stop hook — file-inactivity auto-finalize is disabled; the hook finalizes each turn."
+        : options.autoCompleteDelayMs > 0
+          ? "Completion owner: file-inactivity fallback (no verified Claude/Codex hook yet) — install one for turn-accurate completion, or run `dev-guard done` yourself anytime."
+          : "Completion owner: manual — run `dev-guard done` when a task finishes."
+    );
+  }
 
   let status: WatchStatus = "idle";
   let stableTimer: NodeJS.Timeout | undefined;
@@ -502,8 +528,23 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
   if (chokidar?.watch) {
     const watcher = chokidar.watch(paths, {
       ignoreInitial: true,
+      // relative(root, path), not a string-prefix replace: chokidar calls
+      // `ignored` for the watch ROOT itself too (and that path has no
+      // trailing "root/" to strip), so a naive `path.replace(\`${root}/\`,
+      // "")` leaves the FULL ABSOLUTE path — including every ancestor
+      // directory segment OUTSIDE the project — unstripped. isIgnoredWatchPath
+      // matches by path SEGMENT, so an ancestor directory that happens to
+      // start with "devguard-" (a sibling checkout, a parent folder named
+      // after a generated-dir pattern, etc.) silently classified the ROOT
+      // itself as an ignored DevGuard artifact, which made chokidar watch
+      // nothing at all — no files, no changes, ever, with zero error
+      // output. Reproduced directly: a project at
+      // /tmp/devguard-whatever-test/ never saw a single file change.
+      // relative() always returns "" for the root itself (never matches
+      // any ignore pattern) and the correct project-relative path for
+      // everything else, regardless of trailing slashes.
       ignored: (path: string) => {
-        const normalized = path.replace(`${root}/`, "");
+        const normalized = relative(root, path);
         return (!isWatchUiRefreshPath(normalized) && isIgnoredWatchPath(normalized)) || isLockfilePath(normalized, options);
       },
       depth: options.depth,
@@ -513,7 +554,7 @@ async function createWatcher(root: string, onChange: (path: string) => Promise<v
       awaitWriteFinish: { stabilityThreshold: 800, pollInterval: 100 }
     });
     watcher.on("all", (_event: string, path: string) => {
-      void onChange(path.replace(`${root}/`, ""));
+      void onChange(relative(root, path));
     });
     watcher.on("error", (error: Error) => {
       console.error(`watch warning: ${error.message}`);

@@ -9,7 +9,7 @@ dev-guard install-hooks
 dev-guard watch
 ```
 
-It watches file changes, accumulates pending paths, and waits for a verified completion strategy to run `dev-guard done` when the agent turn ends.
+It watches file changes, accumulates pending paths, and waits for completion. Once a Claude/Codex Stop hook is runtime-verified in this project, that hook is the completion signal (see Behavior below); until then, `watch` finalizes automatically itself after changes go quiet, so the default command below works with zero flags either way.
 
 Manual fallback:
 
@@ -23,11 +23,13 @@ dev-guard done
 - Uses chokidar when available.
 - Accumulates changed files in `.devguard/runtime.json`.
 - Prints a stable state after changes settle.
-- Auto Mode waits for an agent-specific completion strategy.
-- `watch` never runs `done` by itself; agent hook/notify or a manual `done` remains the completion actor.
-- When another process runs `done`, `watch` refreshes from `.devguard/runtime.json`, `.devguard/state.json`, and `.devguard/history.jsonl`, then moves through processed/idle display state.
+- **Completion ownership is decided automatically, per project, with no flag required:**
+  - If a Claude/Codex Stop hook has a *runtime-verified* success in this project's hook logs, that hook is the completion signal. `watch` itself never guesses completion from file inactivity in this mode — it only tracks files and displays whatever the hook (via `dev-guard done`) actually finalizes. This is deliberate: file inactivity means "nothing changed for a while," not "the agent believes the task is done," so it is never used as a substitute for a real signal once one exists.
+  - If no strategy has a runtime-verified success yet (a brand-new project, or a pure manual-editing workflow with no agent hook installed), `watch` falls back to its own inactivity-based auto-finalize (stable after `watch.stableAfter` seconds of no changes, then `watch.autoCompleteDelay` seconds grace, then it runs the same finalization a hook would trigger). This fallback exists so a project with no agent integration still gets automatic completion with zero extra flags. The choice between hook-owned and fallback is made once, at `watch` startup — a hook that becomes verified for the first time *during* a long-running `watch` session will still finalize correctly (idempotent finalization makes any overlap with the fallback harmless either way), but `watch` will only print "Completion owner: verified Claude/Codex Stop hook" and fully stop using the fallback timer after its *next* restart.
+  - `--manual` / `--no-auto-complete` / `watch.autoComplete: false` always disable the inactivity fallback regardless of hook state — useful for debugging, not the recommended default.
+- Regardless of which path produced it, finalization itself (`processDoneEvent`) is an **idempotent boundary**: a duplicate completion request for the same session and the same code state (a hook firing again with no new edits, a hook and a manual `dev-guard done` racing, a hook delivered twice) is a no-op — no new history entry, no new Handoff/Quality Report, no repeated "Completion processed" display. Only a genuinely new code state (or a new task/session) produces a new completion.
+- When another process runs `done`, `watch` refreshes from `.devguard/runtime.json`, `.devguard/state.json`, and `.devguard/history.jsonl`, then moves through processed/idle display state exactly once per real completion.
 - Manual Mode only accumulates changes until the user runs `dev-guard done`.
-- Does not use idle timeout or polling-based completion guessing.
 - Does not run `update --write`.
 - Does not run build/test.
 - Does not edit source files.

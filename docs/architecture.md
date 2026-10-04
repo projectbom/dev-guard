@@ -62,7 +62,9 @@ reset
   -> clear runtime pending state only
 ```
 
-In Auto Mode, `watch` itself does not guess completion from time or idle state. Claude Code uses Stop Hook. Codex prefers user-level notify when available; Codex Stop Hook is an advanced option that requires `/hooks` trust. In Manual Mode, the user runs `dev-guard done` explicitly.
+Completion ownership is decided per project, automatically, at `watch` startup: once a Claude/Codex Stop hook has a *runtime-verified* success in this project (its own hook log shows a past successful run, not just that it's configured), that hook is the completion signal and `watch` itself no longer guesses completion from idle state at all. Until a hook is verified — a brand-new project, or a deliberate manual-only workflow — `watch` finalizes itself after changes go quiet (inactivity fallback), so completion still works with zero flags while the hook proves itself. Claude Code uses Stop Hook. Codex prefers user-level notify when available; Codex Stop Hook is an advanced option that requires `/hooks` trust. In Manual Mode (`--manual`), the user runs `dev-guard done` explicitly and neither the hook nor the inactivity fallback ever fires.
+
+Whichever path triggers it, `processDoneEvent` (the `done` finalizer) is an idempotent boundary keyed on (session id, working-tree content hash): a repeated completion request for the same session and the same code state — a hook firing on every agent turn even without edits, a hook racing a manual `done`, a duplicate hook delivery — is a no-op. It still records that the signal arrived (`COMPLETION_SIGNAL_RECEIVED` in `.devguard/telemetry.jsonl`), but performs none of the mutating work (history append, Quality Report/Handoff regeneration, `lastProcessedAt` update) a second time. This is enforced with a filesystem exclusive-create lock (`.devguard/finalize.lock`), not a race-prone read-then-write check.
 
 ## Runtime Files
 

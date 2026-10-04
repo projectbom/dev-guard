@@ -13,6 +13,9 @@ export const devguardPaths = {
   runtime: `${DEVGUARD_DIR}/runtime.json`,
   state: `${DEVGUARD_DIR}/state.json`,
   history: `${DEVGUARD_DIR}/history.jsonl`,
+  taskTelemetry: `${DEVGUARD_DIR}/telemetry.jsonl`,
+  /** Exclusive-create finalization lock — see acquireFinalizeLock in runtime-state.ts. */
+  finalizeLock: `${DEVGUARD_DIR}/finalize.lock`,
   hooksDir: `${DEVGUARD_DIR}/hooks`,
   logsDir: `${DEVGUARD_DIR}/logs`,
   reportsDir: `${DEVGUARD_DIR}/reports`,

@@ -22,7 +22,7 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
-import { generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState } from "./runtime-state.js";
+import { generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState, type CompletionSource } from "./runtime-state.js";
 import { computeRolloverAssessment, measureResumeBundleCost } from "./rollover.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
@@ -382,11 +382,26 @@ function cliCopy(locale: string): {
   };
 }
 
+const HOOK_COMPLETION_SOURCES: readonly CompletionSource[] = ["hook-claude-stop", "hook-codex-stop", "hook-codex-notify"];
+
+/**
+ * A Claude/Codex Stop hook and a human typing `dev-guard done` both reach
+ * this exact function — completionSource could not otherwise tell them
+ * apart (see shellHook/codexNotifyHook in hooks.ts, which export this
+ * before invoking `dev-guard done`). Any unset/unrecognized value falls
+ * back to the original "cli-done" behavior unchanged.
+ */
+function resolveDoneCompletionSource(): CompletionSource {
+  const raw = process.env.DEV_GUARD_COMPLETION_SOURCE;
+  const match = HOOK_COMPLETION_SOURCES.find((source) => source === raw);
+  return match ?? "cli-done";
+}
+
 async function runDone(root: string): Promise<void> {
   try {
     const locale = await refreshRuntimeLocale(root);
     const copy = cliCopy(locale);
-    const result = await processDoneEvent(root, { completionSource: "cli-done" });
+    const result = await processDoneEvent(root, { completionSource: resolveDoneCompletionSource() });
     console.log("dev-guard done (manual finalization)");
     console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");

@@ -472,9 +472,9 @@ dev-guard watch
 
 Auto Mode is the default recommendation only after a strategy is installed and runtime verified. Claude Code uses Stop Hook. Codex should prefer notify when the user-level Codex config is available; Codex Stop Hook is an advanced option requiring `/hooks` trust. `done` then writes `quality-report.md`, `next-codex-prompt.md`, and `project-handoff.md`.
 
-Auto Mode does not use idle timeout, polling-based completion guessing, automatic build/test, or automatic git commit.
+Once a hook is **runtime verified** (not just installed), it becomes the completion signal and `watch` stops guessing from idle state — it only tracks files and observes whatever the hook finalizes. Before that point (hook installed but not yet verified, or no hook at all), `watch` finalizes itself after changes go quiet, so completion still works automatically with zero flags while you set the hook up. Finalization itself is idempotent either way: a hook firing again (or racing with a manual `dev-guard done`) with no new changes since the last completion is a no-op, not a repeated completion.
 
-If `watch` appears to stay at `ready_for_done`, run `dev-guard status` to confirm whether pending files are already cleared. The watcher observes external `done` results but never triggers `done` by itself.
+If `watch` appears to stay at `ready_for_done` with a verified hook installed, run `dev-guard status` to confirm whether pending files are already cleared, then check that the hook actually ran (`.devguard/reports/hook-status.md`) before falling back to a manual `dev-guard done`.
 
 ### Manual Mode Fallback
 

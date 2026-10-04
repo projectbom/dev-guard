@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { dirname, join, relative } from "node:path";
-import { mkdir, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import {
   analyzeDiff,
@@ -25,6 +25,7 @@ import { discoverWorkspaceSourceRoots, ensureProjectKnowledge, readProjectKnowle
 import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
+import { recordTaskTelemetry } from "./task-telemetry.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -65,6 +66,27 @@ export interface BeforeAgentTask {
   text: string;
   source: "explicit-before-agent-input";
   createdAt: string;
+  /**
+   * Task Boundary baseline: the set of files already dirty (changed-but-
+   * uncommitted) at the moment THIS task/session lineage began — i.e.
+   * "what was already here before this task touched anything." Captured
+   * once on the `prepare_task_context` call that starts a NEW lineage
+   * (continueCurrentTask falsy) and carried over unchanged by
+   * `continueCurrentTask: true` calls, so the baseline always describes
+   * the start of the lineage, not the start of the most recent call.
+   *
+   * Used by `processDoneEvent` to split the current full changed-file set
+   * into "attributable to this task" vs "carried over from before it
+   * started" — see taskScopedChangedFiles/carriedOverChangedFiles on
+   * DoneProcessingResult. This is additive/observational only: it never
+   * removes files from the full changedFiles view Quality Report/Handoff
+   * already render, because silently hiding a real change is worse than
+   * noting it was pre-existing (see this file's broader fail-closed
+   * philosophy — a missed regression is worse than an unflattering note).
+   */
+  changedFilesAtCreation?: string[];
+  /** codeStateHash at the moment this lineage began — see computeWorkingTreeContentHash. */
+  codeStateHashAtCreation?: string;
 }
 
 export type ValidationEvidenceKind = "BUILD" | "TYPECHECK" | "TEST" | "LINT" | "MANUAL_QA" | "RUNTIME_SMOKE" | "CUSTOM";
@@ -173,10 +195,45 @@ export interface ProjectState {
    * describes them.
    */
   lastTaskGoalCodeStateHash?: string;
+  /**
+   * Idempotent Finalization Boundary marker: the (sessionId, codeStateHash)
+   * pair that the MOST RECENT successful (non-duplicate) `processDoneEvent`
+   * run actually finalized. A later call observing the SAME pair is a
+   * duplicate completion request for already-finalized work — a Claude/
+   * Codex Stop hook firing on every agent turn even when no file changed,
+   * two completion actors racing, or a hook delivered more than once — and
+   * must be a no-op (see processDoneEvent). Reuses the two identity
+   * concepts this file already has (RuntimeState.sessionId,
+   * computeWorkingTreeContentHash) instead of a new identity subsystem.
+   */
+  lastFinalizedSessionId?: string;
+  lastFinalizedCodeStateHash?: string;
 }
 
 export interface DoneProcessingResult {
+  /**
+   * True when this call was a duplicate completion request for already-
+   * finalized work (same session + same code state as the last successful
+   * finalization) and was therefore a NO-OP: no history append, no
+   * TASK_DONE telemetry, no handoff/quality regeneration, no
+   * lastProcessedAt mutation. The other fields below echo the LAST real
+   * finalization's results so existing callers (CLI output, watch) that
+   * read `changedFiles.length`/`qualityVerdict`/etc. keep working, but
+   * callers that care about "did a new completion actually just happen"
+   * must check this flag rather than assuming every call did one.
+   */
+  alreadyProcessed: boolean;
   changedFiles: string[];
+  /**
+   * Task Boundary split of `changedFiles` against the active task's
+   * `changedFilesAtCreation` baseline (see BeforeAgentTask). Undefined
+   * when no task was active this round — there is then no baseline to
+   * split against, and `changedFiles` already describes everything
+   * current, same as before this field existed.
+   */
+  taskScopedChangedFiles?: string[];
+  /** The complement of taskScopedChangedFiles — see its doc comment. */
+  carriedOverChangedFiles?: string[];
   areas: string[];
   judgments: string[];
   reportPath: string;
@@ -450,6 +507,10 @@ export interface HistoryRecord {
   generatedPromptPath: string;
   reportPath: string;
   qualityVerdict?: string;
+  /** See DoneProcessingResult.taskScopedChangedFiles. */
+  taskScopedChangedFiles?: string[];
+  /** See DoneProcessingResult.carriedOverChangedFiles. */
+  carriedOverChangedFiles?: string[];
 }
 
 interface PackageJson {
@@ -694,6 +755,14 @@ export async function recordQAExecutionResult(root: string, result: QAExecutionR
   const shouldReplace = !existing || Date.parse(stamped.completedAt) >= Date.parse(existing.completedAt);
   const qaResults = shouldReplace ? { ...(current.qaResults ?? {}), [key]: stamped } : current.qaResults ?? {};
   await writeRuntimeState(root, { ...current, qaResults, sessionId });
+  if (shouldReplace) {
+    await recordTaskTelemetry(root, {
+      event: "VALIDATION_RECORDED",
+      sessionId: stamped.sessionId,
+      validationKind: resolveValidationKind(stamped),
+      validationStatus: stamped.status
+    });
+  }
   return qaResults[key];
 }
 
@@ -1102,7 +1171,127 @@ async function writeAtomicTextFile(path: string, content: string): Promise<void>
  * own tests) that does not pass one — the previously-unconditional
  * "dev-guard done: pass" wording was already only correct for that case.
  */
-export type CompletionSource = "cli-done" | "watch-auto-finalize" | "dashboard-review-complete";
+/**
+ * "cli-done" originally meant only "the `dev-guard done` CLI command ran,"
+ * covering both a human typing it directly and a Claude/Codex Stop hook
+ * shelling out to it — those two are different provenance (one a person
+ * explicitly ran a command, the other an agent's session end triggered it
+ * automatically) and audits could not tell them apart from completionSource
+ * alone (see hook-wiring in hooks.ts: DEV_GUARD_COMPLETION_SOURCE). The
+ * hook-* variants are still "the CLI command really ran" — Handoff's
+ * `dev-guard done`: pass claim is still accurate for them — just attributed
+ * to the real trigger instead of collapsing to "cli-done".
+ */
+export type CompletionSource =
+  | "cli-done"
+  | "hook-claude-stop"
+  | "hook-codex-stop"
+  | "hook-codex-notify"
+  | "watch-auto-finalize"
+  | "dashboard-review-complete";
+
+/**
+ * A crashed/killed process can leave the finalize lock behind forever.
+ * Real finalization (diff analysis, AI enhancement, writing ~10 files)
+ * takes at most a few seconds in practice; this is a generous multiple of
+ * that, not a tuned budget — its only job is distinguishing "a process is
+ * genuinely still finalizing" from "a process died mid-finalization."
+ */
+const FINALIZE_LOCK_STALE_MS = 2 * 60 * 1000;
+
+interface FinalizeLockPayload {
+  pid: number;
+  startedAt: string;
+}
+
+/**
+ * Filesystem-based mutex for the Idempotent Finalization Boundary (see
+ * ProjectState.lastFinalizedCodeStateHash). `writeFileIfMissing` already
+ * uses the OS-atomic exclusive-create flag ("wx") — the same primitive
+ * `git`, `flock`-free tools, and most lock-file implementations use — so
+ * two processes racing to create this file can never both "win": exactly
+ * one gets "created", the other gets "exists". No daemon, no DB, no new
+ * identity concept.
+ */
+async function acquireFinalizeLock(root: string): Promise<boolean> {
+  const lockPath = fromRoot(root, devguardPaths.finalizeLock);
+  const payload: FinalizeLockPayload = { pid: process.pid, startedAt: new Date().toISOString() };
+  const content = JSON.stringify(payload);
+  const result = await writeFileIfMissing(lockPath, content);
+  if (result === "created") return true;
+  // Someone else holds the lock — but if it's old enough to be abandoned
+  // (the holder crashed instead of reaching the `finally` that releases
+  // it), reclaim it rather than wedging finalization forever.
+  const existing = await readJsonFile<FinalizeLockPayload | null>(lockPath, null);
+  const ageMs = existing?.startedAt ? Date.now() - Date.parse(existing.startedAt) : Number.POSITIVE_INFINITY;
+  if (!Number.isFinite(ageMs) || ageMs <= FINALIZE_LOCK_STALE_MS) {
+    return false;
+  }
+  await unlink(lockPath).catch(() => undefined);
+  const retry = await writeFileIfMissing(lockPath, content);
+  return retry === "created";
+}
+
+async function releaseFinalizeLock(root: string): Promise<void> {
+  await unlink(fromRoot(root, devguardPaths.finalizeLock)).catch(() => undefined);
+}
+
+/**
+ * True when `sessionId`/`codeStateHash` exactly match the last successful
+ * finalization recorded in ProjectState — i.e. this completion request
+ * describes nothing new. Deliberately requires BOTH identities to match
+ * (not codeStateHash alone): a brand new task/session reaching the exact
+ * same code state by coincidence is a real, separate completion (see
+ * Scenario H in task-boundary-and-telemetry.test.js — Task A and Task B
+ * must never be merged into one). Deliberately requires `codeStateHash` to
+ * be a real (non-undefined) value on both sides — a non-git project, where
+ * computeWorkingTreeContentHash always returns undefined, must never treat
+ * `undefined === undefined` as "unchanged": there is no comparable
+ * fingerprint there, so every call proceeds, same as before this existed.
+ */
+function isDuplicateFinalization(codeStateHash: string | undefined, sessionId: string | undefined, previous: ProjectState): boolean {
+  return Boolean(
+    codeStateHash &&
+    sessionId &&
+    previous.lastFinalizedCodeStateHash === codeStateHash &&
+    previous.lastFinalizedSessionId === sessionId
+  );
+}
+
+/**
+ * Result for a duplicate/no-op completion request — echoes the LAST real
+ * finalization's facts (so existing callers reading `changedFiles.length`/
+ * `qualityVerdict`/etc. keep working unchanged) but performs none of the
+ * mutating side effects a real finalization does (see
+ * DoneProcessingResult.alreadyProcessed).
+ */
+function buildAlreadyProcessedResult(previous: ProjectState): DoneProcessingResult {
+  const changedFiles = previous.lastChangedFiles ?? [];
+  return {
+    alreadyProcessed: true,
+    changedFiles,
+    taskScopedChangedFiles: undefined,
+    carriedOverChangedFiles: undefined,
+    areas: classifyAreas(changedFiles),
+    judgments: ["No new changes since the last finalization for this task/session — duplicate completion request skipped."],
+    reportPath,
+    promptPath,
+    historySummaryPath,
+    decisionCandidatesPath,
+    qualityReportPath,
+    projectHandoffPath,
+    readMapPath,
+    codeMapPath,
+    workingContextPath,
+    agentBriefPath: devguardPaths.agentBrief,
+    agentContextPath: devguardPaths.agentContext,
+    nextClaudePromptPath: devguardPaths.nextClaudePrompt,
+    projectKnowledgePath: devguardPaths.projectKnowledge,
+    qualityVerdict: previous.lastQualityVerdict ?? "NEEDS_REVIEW",
+    summary: previous.lastSummary ?? "",
+    drift: previous.lastDrift ?? "low"
+  };
+}
 
 export async function processDoneEvent(root: string, options: { completionSource?: CompletionSource } = {}): Promise<DoneProcessingResult> {
   const completionSource: CompletionSource = options.completionSource ?? "cli-done";
@@ -1119,6 +1308,57 @@ export async function processDoneEvent(root: string, options: { completionSource
   ]);
   const { gitHead, changeFiles, changedFiles, diffText, gitChanges, rawChangedFiles } = currentChangeState;
   const currentGitState = { gitHead, codeStateHash, sessionId: runtime.sessionId };
+  // Raw signal, recorded regardless of what happens next — this is how a
+  // soak/regression test (or a real audit) tells "the Stop hook fired 12
+  // times this session" apart from "12 effective finalizations happened".
+  await recordTaskTelemetry(root, { event: "COMPLETION_SIGNAL_RECEIVED", sessionId: runtime.sessionId, completionSource });
+  // Idempotent Finalization Boundary (cheap path): a completion actor —
+  // most commonly a Claude/Codex Stop hook firing on every agent turn even
+  // when no file changed — can call this many times for the exact same
+  // underlying work. Before paying for any of the diff/AI pipeline below,
+  // check whether the (session, code state) this call would finalize was
+  // already finalized by the last successful run. See
+  // isDuplicateFinalization for why both identities must match.
+  const preLockProjectState = await readProjectState(root);
+  if (isDuplicateFinalization(codeStateHash, runtime.sessionId, preLockProjectState)) {
+    return buildAlreadyProcessedResult(preLockProjectState);
+  }
+  // Compare-and-set boundary: two completion actors (a Stop hook and a
+  // concurrent manual `dev-guard done`, or a duplicate hook delivery) can
+  // both reach this point having both seen "not yet finalized" above. The
+  // lock makes the actual decide-and-write critical section exclusive —
+  // only the winner proceeds; the loser treats this exactly like the cheap
+  // duplicate case above, re-reading ProjectState (which the winner may
+  // have just updated) rather than assuming it's a duplicate.
+  if (!(await acquireFinalizeLock(root))) {
+    return buildAlreadyProcessedResult(await readProjectState(root));
+  }
+  try {
+    const postLockProjectState = await readProjectState(root);
+    if (isDuplicateFinalization(codeStateHash, runtime.sessionId, postLockProjectState)) {
+      return buildAlreadyProcessedResult(postLockProjectState);
+    }
+    return await finalizeOnce();
+  } finally {
+    await releaseFinalizeLock(root);
+  }
+
+  // The real finalization pipeline — unchanged from before except for the
+  // lastFinalized*/alreadyProcessed bookkeeping at its edges. Kept as an
+  // inner closure (rather than inlined) so the lock/duplicate-check
+  // scaffolding above reads as the actual entry-point logic, not buried
+  // ahead of a 300-line function body.
+  async function finalizeOnce(): Promise<DoneProcessingResult> {
+  // Task Boundary split: files already dirty before the active task's
+  // lineage began (see BeforeAgentTask.changedFilesAtCreation) are kept
+  // VISIBLE in `changedFiles` everywhere below — nothing is hidden from
+  // Quality Report/Handoff — but are also called out separately so a task
+  // started in an already-dirty tree does not silently read as if it
+  // produced files it never touched. Undefined (not computed) when no task
+  // was active this round: there is then no baseline to split against.
+  const taskBaseline = runtime.currentTask?.changedFilesAtCreation;
+  const taskScopedChangedFiles = taskBaseline ? changedFiles.filter((file) => !taskBaseline.includes(file)) : undefined;
+  const carriedOverChangedFiles = taskBaseline ? changedFiles.filter((file) => taskBaseline.includes(file)) : undefined;
   const { fresh: freshQaResults, stale: staleQaResults, unbound: unboundQaResults } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
   const diffStat = await getGitDiffStat(root).catch(() => "git diff stat unavailable");
   const [projectMarkdown, architectureMarkdown, decisionsMarkdown, tasksMarkdown, config, codeGraph] = await Promise.all([
@@ -1150,6 +1390,13 @@ export async function processDoneEvent(root: string, options: { completionSource
   });
   const areas = classifyAreas(changedFiles);
   const judgments = buildJudgments({ areas, clusters, checkFindings: checkReport.findings.map((finding) => finding.message), architectureMarkdown, decisionsMarkdown });
+  if (carriedOverChangedFiles && carriedOverChangedFiles.length > 0) {
+    const shown = carriedOverChangedFiles.slice(0, 5).join(", ");
+    const more = carriedOverChangedFiles.length > 5 ? ` (+${carriedOverChangedFiles.length - 5} more)` : "";
+    judgments.push(
+      `${carriedOverChangedFiles.length} file(s) were already dirty before this task's prepare_task_context call: ${shown}${more}. Confirm they belong to this task or are leftover from earlier, unfinished work.`
+    );
+  }
   const drift = clusters.mixedRisk;
   const summary = formatInferredDiffIntentClusters(clusters);
   const previousProjectState = await readProjectState(root);
@@ -1220,7 +1467,9 @@ export async function processDoneEvent(root: string, options: { completionSource
     docUpdateCandidates,
     testCandidates,
     generatedPromptPath: promptPath,
-    reportPath
+    reportPath,
+    taskScopedChangedFiles,
+    carriedOverChangedFiles
   };
   const previousHistory = await readHistoryRecords(root, 20);
   const nextHistory = [...previousHistory, historyRecord];
@@ -1335,7 +1584,15 @@ export async function processDoneEvent(root: string, options: { completionSource
       lastTaskGoalCodeStateHash: codeStateHash,
       lastReportPath: reportPath,
       lastPromptPath: promptPath,
-      lastHandoffPath: projectHandoffPath
+      lastHandoffPath: projectHandoffPath,
+      // Idempotent Finalization Boundary marker — see
+      // isDuplicateFinalization. Stamped as part of the SAME ProjectState
+      // write as everything else above, so a concurrent reader (another
+      // process racing for the finalize lock) never observes a state where
+      // history/handoff/quality already reflect this run but this marker
+      // does not yet (or vice versa).
+      lastFinalizedSessionId: runtime.sessionId,
+      lastFinalizedCodeStateHash: codeStateHash
     }),
     resetRuntimeState(root, { preserveQaResults: true })
   ]);
@@ -1354,8 +1611,23 @@ export async function processDoneEvent(root: string, options: { completionSource
     generateAgentContext(root),
     generateNextClaudePrompt(root)
   ]);
+  await recordTaskTelemetry(root, {
+    event: "TASK_DONE",
+    sessionId: runtime.sessionId,
+    completionSource,
+    changedFileDeltaCount: taskScopedChangedFiles?.length,
+    carriedOverFileCount: carriedOverChangedFiles?.length,
+    taskPreparedAt: runtime.currentTask?.createdAt,
+    firstChangeObservedAt: runtime.firstChangedAt
+  });
+  if (completionSource === "hook-claude-stop" || completionSource === "hook-codex-stop" || completionSource === "hook-codex-notify") {
+    await recordTaskTelemetry(root, { event: "HOOK_DONE_TRIGGERED", sessionId: runtime.sessionId, completionSource });
+  }
   return {
+    alreadyProcessed: false,
     changedFiles,
+    taskScopedChangedFiles,
+    carriedOverChangedFiles,
     areas,
     judgments,
     reportPath,
@@ -1375,6 +1647,7 @@ export async function processDoneEvent(root: string, options: { completionSource
     summary,
     drift
   };
+  } // end finalizeOnce
 }
 
 export async function prepareBeforeAgentContext(root: string, task: string, continueCurrentTask = false): Promise<BeforeAgentPreparationResult> {
@@ -1397,11 +1670,6 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   const text = task.trim();
   if (!text) throw new Error("--task requires a non-empty task description.");
   const current = await readRuntimeState(root);
-  const currentTask: BeforeAgentTask = {
-    text,
-    source: "explicit-before-agent-input",
-    createdAt: new Date().toISOString()
-  };
   // Task boundary contract: `prepare_task_context` is the one explicit signal
   // DevGuard has for "a task is starting." A bare call ALWAYS starts a new
   // task/session lineage, regardless of what the task text says — two calls
@@ -1410,7 +1678,33 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   // equality is neither necessary (the same task's wording can legitimately
   // change between calls) nor sufficient (two unrelated tasks can share
   // wording, e.g. "Run milestone verification") to prove task identity.
-  const sessionId = continueCurrentTask && current.sessionId ? current.sessionId : generateSessionId();
+  const isContinuing = continueCurrentTask && Boolean(current.sessionId);
+  // Task Boundary Baseline: snapshot "what was already dirty before this
+  // task touched anything," so a LATER task started in the same dirty
+  // working tree doesn't silently inherit files left over from earlier,
+  // already-finished work as if they belonged to it too (see
+  // DoneProcessingResult.carriedOverChangedFiles). A continuing call keeps
+  // the lineage's ORIGINAL baseline — recapturing it on every continue
+  // would make the baseline creep forward and hide the task's own earlier
+  // files as "carried over" from itself.
+  const baseline = isContinuing && current.currentTask
+    ? { changedFilesAtCreation: current.currentTask.changedFilesAtCreation, codeStateHashAtCreation: current.currentTask.codeStateHashAtCreation }
+    : await (async () => {
+        const [{ changedFiles: baselineChangedFiles }, { codeStateHash: baselineCodeStateHash }] = await Promise.all([
+          gatherCurrentChangeState(root, current),
+          resolveCurrentCodeState(root)
+        ]);
+        return { changedFilesAtCreation: baselineChangedFiles, codeStateHashAtCreation: baselineCodeStateHash };
+      })();
+  const currentTask: BeforeAgentTask = {
+    text,
+    source: "explicit-before-agent-input",
+    createdAt: new Date().toISOString(),
+    changedFilesAtCreation: baseline.changedFilesAtCreation,
+    codeStateHashAtCreation: baseline.codeStateHashAtCreation
+  };
+  const taskTransition: "new" | "continued" | "replaced" = isContinuing ? "continued" : current.currentTask ? "replaced" : "new";
+  const sessionId = isContinuing && current.sessionId ? current.sessionId : generateSessionId();
   const runtimeWithTask = { ...current, currentTask, sessionId };
   await writeRuntimeState(root, runtimeWithTask);
   try {
@@ -1454,6 +1748,13 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       contextBundleEstimatedTokens: resumeCost.totalEstimatedTokens
     });
     const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask);
+    await recordTaskTelemetry(root, {
+      event: taskTransition === "continued" ? "TASK_CONTINUED" : taskTransition === "replaced" ? "TASK_REPLACED" : "TASK_PREPARED",
+      sessionId,
+      candidateFileCount: structuredFiles.length,
+      estimatedResumeTokens: resumeCost.totalEstimatedTokens,
+      rolloverStatus: rollover.status
+    });
     return {
       task: text,
       source: currentTask.source,
@@ -1484,7 +1785,19 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       nextClaudePromptPath
     };
   } finally {
-    if (!persistTask) await writeRuntimeState(root, current);
+    // persistTask:false revert bug (found via a real PartnerFlow smoke
+    // check, not a synthetic test): writeRuntimeState's default write path
+    // merges onto whatever is CURRENTLY on disk via `{...onDisk, ...state}`
+    // (see mergeRuntimeStateForWrite) — plain object spread only overwrites
+    // a key when the incoming object actually HAS that key, even with an
+    // undefined value. `current` here was read back when it may have had
+    // no `currentTask`/`sessionId` property at all (a brand new project, or
+    // simply no task active yet), so spreading it as-is left the on-disk
+    // `currentTask`/`sessionId` this call just wrote completely unmerged
+    // and therefore un-reverted — the "non-persisting" call persisted
+    // anyway. Spelling both out as explicit own keys (even when undefined)
+    // forces the merge to actually clear them back to the pre-call state.
+    if (!persistTask) await writeRuntimeState(root, { ...current, currentTask: current.currentTask, sessionId: current.sessionId });
   }
 }
 
@@ -4108,7 +4421,18 @@ function documentationGoal(taskText: string, files: DocumentationFileChange[], t
     .map((line) => line.replace(/^[-#*\s]+/, "").trim())
     .find((line) => /목표|goal|이번|작업|improve|fix|update/i.test(line) && line.length > 8 && line.length < 160);
   if (explicit) return explicit;
-  if (types.includes("QA")) return "Improve generated DevGuard documentation so it explains feature-level changes from the current session.";
+  // NOTE: this branch used to hardcode "Improve generated DevGuard
+  // documentation so it explains feature-level changes from the current
+  // session." — correct wording ONLY when the changed project IS DevGuard
+  // itself (where "QA"-typed changes really are about its own doc
+  // generation). As a generic fallback for ANY downstream project with
+  // QA-typed changes (e.g. test files), that sentence is simply wrong and,
+  // worse, reads as a specific, confident claim about unrelated work — a
+  // real PartnerFlow Handoff showed this exact sentence next to 100+ files
+  // of unrelated ad-serving changes. Kept generic like the UI/Docs branches
+  // below; see handoffGoal for why any goal reaching this fallback is also
+  // marked low-confidence rather than presented as settled fact.
+  if (types.includes("QA")) return "Update QA/test-related files and verify the associated behavior still passes.";
   if (types.includes("UI")) return "Update the user-facing UI behavior and verify the changed interaction.";
   if (types.includes("Docs")) return "Update documentation to match the current DevGuard workflow.";
   if (files.length > 0) return `Update ${files.slice(0, 3).map((file) => file.file).join(", ")}.`;
@@ -6954,6 +7278,7 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "The changed files may include work outside the current request. Confirm each changed file supports the same task before finishing.": "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.",
     "Improve generated DevGuard documentation so it reflects concrete diff-based changes.": "DevGuard 생성 문서가 실제 diff 기반 변경 내용을 반영하도록 개선합니다.",
     "Improve generated DevGuard documentation so it explains feature-level changes from the current session.": "DevGuard 생성 문서가 이번 세션의 기능 단위 변경을 설명하도록 개선합니다.",
+    "Update QA/test-related files and verify the associated behavior still passes.": "QA/테스트 관련 파일을 업데이트하고 관련 동작이 여전히 통과하는지 확인하세요.",
     "Adds a shared Documentation Summary generated from git diff before artifacts render.": "문서 산출물을 렌더링하기 전에 git diff 기반 공통 Documentation Summary를 생성합니다.",
     "Builds a shared Change Intelligence summary before generated artifacts are rendered.": "문서 산출물을 렌더링하기 전에 공통 Change Intelligence 요약을 생성합니다.",
     "Routes the same summary into Quality Report, Handoff, Working Context, and Agent Context.": "같은 요약을 Quality Report, Handoff, Working Context, Agent Context에 전달합니다.",
@@ -7222,14 +7547,31 @@ function handoffGoal(nextTask: string, changedFiles: string[], quality: ParsedQu
   const inferred = inferGoalFromFiles(changedFiles, locale);
   const canonicalGoal = canonicalTaskGoal?.trim();
   const summaryGoal = documentationSummary?.goal ? localizeSentence(documentationSummary.goal, locale) : undefined;
-  const goal = canonicalGoal && isUsefulHandoffText(canonicalGoal)
-    ? canonicalGoal
+  const isCanonical = Boolean(canonicalGoal && isUsefulHandoffText(canonicalGoal));
+  const goal = isCanonical
+    ? canonicalGoal!
     : summaryGoal && isUsefulHandoffText(summaryGoal)
       ? summaryGoal
       : isUsefulHandoffText(cleanTask) && !looksStaleHandoffTask(cleanTask, changedFiles)
         ? cleanTask
         : inferred;
   const status = completionStatus(quality.verdict);
+  // Confidence Contract: only a canonicalGoal (an explicit prepare_task_context
+  // task, or a same-session carryover that already passed the codeStateHash
+  // freshness check in resolveSessionTaskGoal) is presented as settled fact.
+  // Every other source here — the diff-type heuristic in documentationGoal,
+  // the next-task text, or the bare file-list fallback — is a GUESS, and a
+  // confident-sounding guess is exactly how a real PartnerFlow Handoff ended
+  // up presenting an unrelated, DevGuard-specific sentence as this session's
+  // goal next to 100+ files of unrelated work. Every non-canonical goal gets
+  // the same "needs confirmation" qualifier, not just the fully-unknown
+  // literal fallback, so a confident-sounding inferred sentence can never be
+  // mistaken for a real declared task.
+  const basisLine = isCanonical
+    ? []
+    : locale === "ko-KR"
+      ? ["- 근거: 이 목표는 추론된 값입니다(명시적으로 선언된 task 아님). 변경 파일과 Quality Report만으로 추정했으니 사용 전에 확인하세요."]
+      : ["- Basis: inferred, not an explicitly declared task — guessed from changed files and Quality Report only. Confirm before treating this as the real goal."];
   // Constraints are part of "what the current task is" — they must survive
   // into Handoff (and, via handoffVerificationCommands/handoffNextActions/
   // handoffResumePrompt, filter what gets recommended next) rather than
@@ -7241,35 +7583,38 @@ function handoffGoal(nextTask: string, changedFiles: string[], quality: ParsedQu
     return [
       `- ${goal}`,
       `- 현재 상태: ${status === "completed" ? "완료" : status === "blocked" ? "차단됨" : "일부 완료"}`,
-      ...(goal === "목표 확인 필요" ? ["- 근거: 변경 파일과 Quality Report만으로는 사용자의 원래 요청을 특정하기 어렵습니다."] : []),
+      ...basisLine,
       ...(constraintLines.length > 0 ? [`- 제약: ${constraintLines.join(", ")}`] : [])
     ];
   }
   return [
     `- ${goal}`,
     `- Current status: ${status === "completed" ? "completed" : status === "blocked" ? "blocked" : "partially completed"}`,
-    ...(goal === "Goal needs confirmation" ? ["- Basis: changed files and Quality Report do not identify the original user request clearly."] : []),
+    ...basisLine,
     ...(constraintLines.length > 0 ? [`- Constraints: ${constraintLines.join(", ")}`] : [])
   ];
 }
 
+/**
+ * Last-resort goal guess when there is no canonical task, no documentation-
+ * summary goal, and no usable next-task text — just the bare changed-file
+ * list. This used to special-case file names from DevGuard's OWN source
+ * tree ("runtime-state.ts" -> "Improve Smart Handoff...", "dashboard" ->
+ * "Fix Dashboard UI QA issues around spacing...") as if those patterns were
+ * universal. They are not: PartnerFlow's own admin routes live under
+ * `apps/admin/app/(dashboard)/...`, so the "dashboard" branch would have
+ * confidently mis-described an unrelated admin page change as a DevGuard
+ * Dashboard spacing/PASS-Next-Action fix. Kept intentionally generic — see
+ * handoffGoal's basisLine, which marks every result from this function as
+ * an unconfirmed guess regardless of wording.
+ */
 function inferGoalFromFiles(files: string[], locale: DevGuardLocale): string {
-  if (files.some((file) => /runtime-state\.ts$/.test(file))) {
-    return locale === "ko-KR"
-      ? "Smart Handoff가 다음 작업자가 바로 이어서 작업할 수 있는 인수인계 문서를 생성하도록 개선하는 작업입니다."
-      : "Improve Smart Handoff so the next worker can continue from an actionable handoff document.";
+  if (files.length === 0) {
+    return locale === "ko-KR" ? "목표 확인 필요" : "Goal needs confirmation";
   }
-  if (files.some((file) => /dashboard/i.test(file))) {
-    return locale === "ko-KR"
-      ? "Dashboard UI QA에서 발견된 spacing, details open state, PASS Next Action 표시 문제를 수정하는 작업입니다."
-      : "Fix Dashboard UI QA issues around spacing, details open state, and the PASS Next Action display.";
-  }
-  if (files.some((file) => /quality|report/i.test(file))) {
-    return locale === "ko-KR"
-      ? "Quality Report가 사용자의 다음 행동을 더 구체적으로 안내하도록 개선하는 작업입니다."
-      : "Improve Quality Report guidance so it tells the user the concrete next action.";
-  }
-  return locale === "ko-KR" ? "목표 확인 필요" : "Goal needs confirmation";
+  const shown = files.slice(0, 3).map((file) => `\`${file}\``).join(", ");
+  const more = files.length > 3 ? (locale === "ko-KR" ? ` 외 ${files.length - 3}개` : ` and ${files.length - 3} more`) : "";
+  return locale === "ko-KR" ? `${shown}${more} 파일 변경에 대응하는 작업으로 추정됩니다.` : `Likely addresses changes in ${shown}${more}.`;
 }
 
 function handoffFileChanges(files: string[], quality: ParsedQuality, locale: DevGuardLocale, documentationSummary?: DocumentationSummary): string[] {
@@ -7469,6 +7814,12 @@ function handoffNextActions(quality: ParsedQuality, nextTask: string, files: str
   ];
 }
 
+function hookTriggerLabel(source: "hook-claude-stop" | "hook-codex-stop" | "hook-codex-notify", locale: DevGuardLocale): string {
+  if (source === "hook-claude-stop") return locale === "ko-KR" ? "Claude Code Stop hook" : "the Claude Code Stop hook";
+  if (source === "hook-codex-stop") return locale === "ko-KR" ? "Codex CLI Stop hook" : "the Codex CLI Stop hook";
+  return locale === "ko-KR" ? "Codex notify hook" : "the Codex notify hook";
+}
+
 function handoffVerificationLines(
   quality: ParsedQuality,
   locale: DevGuardLocale,
@@ -7489,7 +7840,11 @@ function handoffVerificationLines(
       ? locale === "ko-KR"
         ? "- `dev-guard done`: pass. 현재 인수인계 파일이 생성되었습니다."
         : "- `dev-guard done`: pass. The current Handoff file was generated."
-      : completionSource === "watch-auto-finalize"
+      : completionSource === "hook-claude-stop" || completionSource === "hook-codex-stop" || completionSource === "hook-codex-notify"
+        ? locale === "ko-KR"
+          ? `- \`dev-guard done\`: pass (${hookTriggerLabel(completionSource, locale)}가 자동으로 실행함). 현재 인수인계 파일이 생성되었습니다.`
+          : `- \`dev-guard done\`: pass (triggered automatically by ${hookTriggerLabel(completionSource, locale)}). The current Handoff file was generated.`
+        : completionSource === "watch-auto-finalize"
         ? locale === "ko-KR"
           ? "- 완료 이벤트가 `dev-guard watch`에 의해 자동으로 처리되었습니다 (`dev-guard done` CLI 명령이 실행된 것은 아닙니다)."
           : "- Completion event processed automatically by `dev-guard watch` (the `dev-guard done` CLI command itself was not run)."

@@ -10,7 +10,16 @@ interface PackageJsonConfig {
 // All fields are optional; unset fields use hardcoded defaults.
 export interface WatchConfig {
   dashboard?: boolean;         // default: true  — open the browser dashboard
-  autoComplete?: boolean;      // default: true  — auto-finalize after filesystem settles
+  // default: true — allows inactivity-based auto-finalize. Only actually
+  // USED as the completion signal while no Claude/Codex Stop hook is
+  // runtime-verified for the project (see watch.ts's completionOwner) —
+  // once one is, the hook owns completion and this setting has no effect
+  // until a restart of `watch`. Explicit `false` (or --manual/
+  // --no-auto-complete) always disables the fallback outright, hook or
+  // not. Existing projects that already had this at its default `true`
+  // get the safer hook-priority behavior automatically — nothing to
+  // migrate, since no stored value needs to change for that.
+  autoComplete?: boolean;
   autoCompleteDelay?: number;  // default: 8     — grace period in seconds before auto-finalize
   stableAfter?: number;        // default: 20    — seconds of inactivity before "settled"
   poll?: boolean;              // default: false — use polling instead of fs events

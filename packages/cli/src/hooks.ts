@@ -178,6 +178,8 @@ fi
 
 timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 hook_source="\${DEV_GUARD_HOOK_SOURCE:-agent_runtime}"
+# See shellHook's identical export for why this exists.
+export DEV_GUARD_COMPLETION_SOURCE="hook-codex-notify"
 event_type="$(printf '%s\\n' "$payload" | sed -n 's/.*"type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1)"
 if [ -z "$event_type" ]; then
   event_type="$(printf '%s\\n' "$payload" | sed -n 's/.*"event"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1)"
@@ -287,6 +289,11 @@ else
 fi
 timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 hook_source="\${DEV_GUARD_HOOK_SOURCE:-agent_runtime}"
+# Lets \`dev-guard done\` (invoked below) record which real trigger produced
+# this completion — a human running \`dev-guard done\` by hand and this hook
+# both land on the same CLI call, and completionSource could not otherwise
+# tell them apart (see CompletionSource in runtime-state.ts).
+export DEV_GUARD_COMPLETION_SOURCE="hook-${kind}-stop"
 {
   echo "timestamp=$timestamp hook=${kind}.stop status=start source=$hook_source"
   if [ "$hook_input_state" = "empty_or_timeout" ]; then
