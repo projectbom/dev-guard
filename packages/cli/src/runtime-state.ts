@@ -26,6 +26,7 @@ import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
 import { recordTaskTelemetry } from "./task-telemetry.js";
+import { perfFlush, perfMark, perfSpan } from "./perf-debug.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1139,14 +1140,19 @@ export function isIgnoredWatchPath(path: string): boolean {
 }
 
 async function writeAtomicTextFile(path: string, content: string): Promise<void> {
+  perfMark(`atomicWrite:${path}:mkdir-start`);
   await mkdir(dirname(path), { recursive: true });
+  perfMark(`atomicWrite:${path}:mkdir-done`);
   let lastError: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const tempPath = `${path}.${process.pid}.${Date.now()}.${randomSuffix()}.tmp`;
     try {
       await writeFile(tempPath, content, "utf8");
+      perfMark(`atomicWrite:${path}:writeFile-done:attempt${attempt}`);
       await stat(tempPath);
+      perfMark(`atomicWrite:${path}:stat-done:attempt${attempt}`);
       await rename(tempPath, path);
+      perfMark(`atomicWrite:${path}:rename-done:attempt${attempt}`);
       return;
     } catch (error) {
       lastError = error;
@@ -1294,6 +1300,7 @@ function buildAlreadyProcessedResult(previous: ProjectState): DoneProcessingResu
 }
 
 export async function processDoneEvent(root: string, options: { completionSource?: CompletionSource } = {}): Promise<DoneProcessingResult> {
+  perfMark("done:start");
   const completionSource: CompletionSource = options.completionSource ?? "cli-done";
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
@@ -1306,6 +1313,7 @@ export async function processDoneEvent(root: string, options: { completionSource
     gatherCurrentChangeState(root, runtime),
     computeWorkingTreeContentHash(root)
   ]);
+  perfMark("done:git+hash-complete");
   const { gitHead, changeFiles, changedFiles, diffText, gitChanges, rawChangedFiles } = currentChangeState;
   const currentGitState = { gitHead, codeStateHash, sessionId: runtime.sessionId };
   // Raw signal, recorded regardless of what happens next — this is how a
@@ -1338,9 +1346,13 @@ export async function processDoneEvent(root: string, options: { completionSource
     if (isDuplicateFinalization(codeStateHash, runtime.sessionId, postLockProjectState)) {
       return buildAlreadyProcessedResult(postLockProjectState);
     }
-    return await finalizeOnce();
+    perfMark("done:lock-acquired,finalizeOnce-start");
+    const result = await finalizeOnce();
+    perfMark("done:finalizeOnce-complete");
+    return result;
   } finally {
     await releaseFinalizeLock(root);
+    perfFlush();
   }
 
   // The real finalization pipeline — unchanged from before except for the
@@ -1369,6 +1381,7 @@ export async function processDoneEvent(root: string, options: { completionSource
     readJsonFile<DevGuardConfig>(fromRoot(root, ".devguard/config.json"), defaultConfig),
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
+  perfMark("done:diffStat+markdown-reads-complete");
   const clusters = inferDiffIntentClusters({ changedFiles, changeFiles, diffText, codeGraph });
   const checkReport = analyzeDiff({
     changedFiles,
@@ -1450,7 +1463,9 @@ export async function processDoneEvent(root: string, options: { completionSource
   const stateIntegrity: "CONSISTENT" | "TASK_CHANGE_MISMATCH" =
     resolvedGoal.codeStateMismatch && hasFreshUnboundEvidence ? "TASK_CHANGE_MISMATCH" : "CONSISTENT";
   const unboundEvidenceCount = Object.keys(unboundQaResults).length;
+  perfMark("done:documentationSummary+diffIntent-complete");
   const codeIndex = await updateCodeIndex(root, changedFiles, documentationSummary);
+  perfMark("done:codeIndex-update-complete");
   const timestamp = new Date().toISOString();
   const majorChanges = inferMajorChanges({ summary, changedFiles, areas, diffText });
   const testCandidates = await inferTestCandidates(root, { areas, changedFiles });
@@ -1493,6 +1508,7 @@ export async function processDoneEvent(root: string, options: { completionSource
     staleGoal: stateIntegrity === "TASK_CHANGE_MISMATCH" ? previousProjectState.lastTaskGoal : undefined,
     unboundEvidenceCount
   });
+  perfMark("done:assessCompletionQuality-complete");
   // A state-integrity failure must render exactly the deterministic mismatch
   // explanation — never AI-polished prose that could paper over it with
   // plausible-sounding text describing facts that don't actually cohere.
@@ -1553,18 +1569,18 @@ export async function processDoneEvent(root: string, options: { completionSource
     qualityReport
   });
   await Promise.all([
-    appendTextFile(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`),
-    writeTextFile(fromRoot(root, reportPath), reportMarkdown),
-    writeTextFile(fromRoot(root, historySummaryPath), historySummaryMarkdown),
-    writeTextFile(fromRoot(root, decisionCandidatesPath), decisionCandidatesMarkdown),
-    writeTextFile(fromRoot(root, qualityReportPath), qualityReportMarkdown),
+    perfSpan("done:write:history", () => appendTextFile(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`)),
+    perfSpan("done:write:lastRunReport", () => writeTextFile(fromRoot(root, reportPath), reportMarkdown)),
+    perfSpan("done:write:historySummary", () => writeTextFile(fromRoot(root, historySummaryPath), historySummaryMarkdown)),
+    perfSpan("done:write:decisionCandidates", () => writeTextFile(fromRoot(root, decisionCandidatesPath), decisionCandidatesMarkdown)),
+    perfSpan("done:write:qualityReportMd", () => writeTextFile(fromRoot(root, qualityReportPath), qualityReportMarkdown)),
     // Structured sidecar for the same QualityReport object rendered above —
     // see devguardPaths.qualityReportState. Handoff reads this instead of
     // re-parsing qualityReportMarkdown, so the two documents cannot drift
     // apart from a lossy text round-trip.
-    writeTextFile(fromRoot(root, devguardPaths.qualityReportState), JSON.stringify(qualityReport, null, 2)),
-    writeTextFile(fromRoot(root, promptPath), promptMarkdown),
-    writeProjectState(root, {
+    perfSpan("done:write:qualityReportState", () => writeTextFile(fromRoot(root, devguardPaths.qualityReportState), JSON.stringify(qualityReport, null, 2))),
+    perfSpan("done:write:promptMd", () => writeTextFile(fromRoot(root, promptPath), promptMarkdown)),
+    perfSpan("done:write:projectState", async () => writeProjectState(root, {
       ...(await readProjectState(root)),
       lastProcessedAt: new Date().toISOString(),
       lastSummary: summary,
@@ -1593,24 +1609,38 @@ export async function processDoneEvent(root: string, options: { completionSource
       // does not yet (or vice versa).
       lastFinalizedSessionId: runtime.sessionId,
       lastFinalizedCodeStateHash: codeStateHash
-    }),
-    resetRuntimeState(root, { preserveQaResults: true })
+    })),
+    perfSpan("done:write:resetRuntimeState", () => resetRuntimeState(root, { preserveQaResults: true }))
   ]);
+  perfMark("done:history+reports+projectState-write-complete");
   const ensuredProjectKnowledge = await ensureProjectKnowledge(root);
+  perfMark("done:ensureProjectKnowledge-complete");
   if (ensuredProjectKnowledge.warning) {
     judgments.push(`Project Knowledge refresh skipped: ${ensuredProjectKnowledge.warning}`);
   }
+  // Single Resolution Path (mirrors prepareTaskContext above): load the
+  // shared raw inputs and resolve the task/file context ONCE here, instead
+  // of letting readMap/codeMap/workingContext/agentBrief each independently
+  // reload state.json/runtime.json/history/code-index and re-run
+  // resolveBeforeAgentContext's full Code Index ranking. Read AFTER the
+  // history/projectState/runtime writes above (not before), so this still
+  // observes the same post-reset runtime/state these generators have always
+  // read — only the redundant re-computation is removed, not the ordering.
+  const resumeRaw = await loadResumeRawInputs(root);
+  const resumeContext = resolveResumeContext(resumeRaw);
+  perfMark("done:resumeContext-resolved");
   await Promise.all([
     // This IS the completion event — Handoff reports which real trigger
     // produced it (see handoffVerificationLines / CompletionSource).
     generateProjectHandoff(root, { completionSource }),
-    generateReadMap(root),
-    generateCodeMap(root),
-    generateWorkingContext(root),
-    generateAgentBrief(root),
-    generateAgentContext(root),
+    generateReadMap(root, resumeRaw, resumeContext),
+    generateCodeMap(root, resumeRaw, resumeContext),
+    generateWorkingContext(root, resumeRaw, resumeContext),
+    generateAgentBrief(root, resumeRaw, resumeContext),
+    generateAgentContext(root, resumeRaw, resumeContext),
     generateNextClaudePrompt(root)
   ]);
+  perfMark("done:artifact-generation-complete");
   await recordTaskTelemetry(root, {
     event: "TASK_DONE",
     sessionId: runtime.sessionId,
@@ -1665,11 +1695,14 @@ export async function prepareBeforeAgentContext(root: string, task: string, cont
 }
 
 export async function prepareTaskContext(input: PrepareTaskContextInput): Promise<PreparedTaskContextResult> {
+  perfMark("prepare:start");
   const { root, task, persistTask = true, continueCurrentTask = false } = input;
   await ensureDevguardWorkspace(root);
+  perfMark("prepare:ensureWorkspace-done");
   const text = task.trim();
   if (!text) throw new Error("--task requires a non-empty task description.");
   const current = await readRuntimeState(root);
+  perfMark("prepare:readRuntimeState-done");
   // Task boundary contract: `prepare_task_context` is the one explicit signal
   // DevGuard has for "a task is starting." A bare call ALWAYS starts a new
   // task/session lineage, regardless of what the task text says — two calls
@@ -1703,12 +1736,15 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     changedFilesAtCreation: baseline.changedFilesAtCreation,
     codeStateHashAtCreation: baseline.codeStateHashAtCreation
   };
+  perfMark("prepare:baseline-computed");
   const taskTransition: "new" | "continued" | "replaced" = isContinuing ? "continued" : current.currentTask ? "replaced" : "new";
   const sessionId = isContinuing && current.sessionId ? current.sessionId : generateSessionId();
   const runtimeWithTask = { ...current, currentTask, sessionId };
   await writeRuntimeState(root, runtimeWithTask);
+  perfMark("prepare:writeRuntimeState-done");
   try {
     await hydrateCodeIndexForTask(root, text);
+    perfMark("prepare:hydrateCodeIndexForTask-done");
     // Single Resolution Path: load the shared raw inputs and resolve the
     // task/file context ONCE for this call, instead of each of the four
     // before-agent renderers (and this function, again, afterward)
@@ -1717,30 +1753,37 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     // generateNextClaudePrompt keep their own extra reads (quality report,
     // decisions, project.md) — those aren't part of this shared bag.
     const raw = await loadResumeRawInputs(root, runtimeWithTask);
+    perfMark("prepare:loadResumeRawInputs-done");
     const context = resolveResumeContext(raw);
+    perfMark("prepare:resolveResumeContext-done");
     const [readMapPath, codeMapPath, workingContextPath, agentBriefPath, agentContextPath, nextClaudePromptPath] = await Promise.all([
-      generateReadMap(root, raw),
-      generateCodeMap(root, raw),
-      generateWorkingContext(root, raw),
-      generateAgentBrief(root, raw),
-      generateAgentContext(root),
+      generateReadMap(root, raw, context),
+      generateCodeMap(root, raw, context),
+      generateWorkingContext(root, raw, context),
+      generateAgentBrief(root, raw, context),
+      generateAgentContext(root, raw, context),
       generateNextClaudePrompt(root)
     ]);
+    perfMark("prepare:fallbackArtifacts-generated");
     const codeIndex = raw.codeIndex;
     // DG-01 explicit path hint: a real, existing file the task text names
     // directly must survive even if the Code Index does not know it yet —
     // placed first so it is never pushed out by the slice(0, 8) cutoff.
     const pathHints = await resolveExplicitTaskPathHints(text, root);
-    const rankedFiles = readableContextFiles(context.files, context.summary, codeIndex).filter((file) => !pathHints.includes(file));
+    perfMark("prepare:pathHints-resolved");
+    const rankedFiles = readableContextFiles(context.files, context.summary, codeIndex, context.filesResolved).filter((file) => !pathHints.includes(file));
+    perfMark("prepare:readableContextFiles-ranked");
     const files = [...pathHints, ...rankedFiles].slice(0, 8);
     const structuredFiles = await Promise.all(files.map(async (file) => {
       const content = await readTextFile(fromRoot(root, file)).catch(() => "");
       return preparedTaskContextFile(file, context.summary, codeIndex, content, pathHints.includes(file));
     }));
+    perfMark("prepare:structuredFiles-built");
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
     const coverageGaps = preparedTaskCoverageGaps(structuredFiles, context.summary);
     const warnings = preparedTaskWarnings(structuredFiles, codeIndex);
     const resumeCost = await measureResumeBundleCost(root);
+    perfMark("prepare:measureResumeBundleCost-done");
     const rollover = computeRolloverAssessment({
       changedFileCount: runtimeWithTask.pendingChangedFiles.length,
       qaResultCount: Object.keys(runtimeWithTask.qaResults ?? {}).length,
@@ -1748,6 +1791,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       contextBundleEstimatedTokens: resumeCost.totalEstimatedTokens
     });
     const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask);
+    perfMark("prepare:validationSummary-done");
     await recordTaskTelemetry(root, {
       event: taskTransition === "continued" ? "TASK_CONTINUED" : taskTransition === "replaced" ? "TASK_REPLACED" : "TASK_PREPARED",
       sessionId,
@@ -1798,6 +1842,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     // anyway. Spelling both out as explicit own keys (even when undefined)
     // forces the merge to actually clear them back to the pre-call state.
     if (!persistTask) await writeRuntimeState(root, { ...current, currentTask: current.currentTask, sessionId: current.sessionId });
+    perfFlush();
   }
 }
 
@@ -1852,8 +1897,10 @@ async function buildPreparedTaskValidationSummary(root: string, runtime: Runtime
 }
 
 export async function generateProjectHandoff(root: string, options: { completionSource?: CompletionSource } = {}): Promise<string> {
+  perfMark("generateProjectHandoff:entry");
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
+  perfMark("generateProjectHandoff:locale-done");
   const [project, architecture, decisions, tasks, records, historySummary, decisionCandidates, qualityReport, qualityReportState, nextPrompt, hookStatus, state, projectKnowledge, runtime] = await Promise.all([
     readRequiredText(root, devguardPaths.project),
     readRequiredText(root, devguardPaths.architecture),
@@ -1877,6 +1924,7 @@ export async function generateProjectHandoff(root: string, options: { completion
     readRequiredText(root, devguardPaths.projectKnowledge),
     readRuntimeState(root)
   ]);
+  perfMark("generateProjectHandoff:reads-done");
   const handoff = renderProjectHandoff({
     project,
     architecture,
@@ -1896,16 +1944,23 @@ export async function generateProjectHandoff(root: string, options: { completion
     currentTaskText: runtime.currentTask?.text,
     completionSource: options.completionSource
   });
+  perfMark("generateProjectHandoff:render-done");
   await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
+  perfMark("generateProjectHandoff:write-done");
   return projectHandoffPath;
 }
 
-export async function generateReadMap(root: string, preloaded?: ResumeRawInputs): Promise<string> {
+export async function generateReadMap(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext): Promise<string> {
+  perfMark("generateReadMap:entry");
   await ensureDevguardWorkspace(root);
+  perfMark("generateReadMap:ensureWorkspace-done");
   const raw = preloaded ?? (await loadResumeRawInputs(root));
-  const context = resolveResumeContext(raw);
-  const markdown = renderReadMap({ files: context.files, state: raw.state, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary, taskSource: context.source });
+  const context = preloadedContext ?? resolveResumeContext(raw);
+  perfMark("generateReadMap:context-ready");
+  const markdown = renderReadMap({ files: context.files, state: raw.state, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary, taskSource: context.source, filesResolved: context.filesResolved });
+  perfMark("generateReadMap:render-done");
   await writeTextFile(fromRoot(root, readMapPath), markdown);
+  perfMark("generateReadMap:write-done");
   return readMapPath;
 }
 
@@ -1977,40 +2032,56 @@ async function hydrateCodeIndexForTask(root: string, task: string): Promise<void
   if (changed) await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
 }
 
-export async function generateCodeMap(root: string, preloaded?: ResumeRawInputs): Promise<string> {
+export async function generateCodeMap(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext): Promise<string> {
+  perfMark("generateCodeMap:entry");
   await ensureDevguardWorkspace(root);
+  perfMark("generateCodeMap:ensureWorkspace-done");
   const raw = preloaded ?? (await loadResumeRawInputs(root));
-  const context = resolveResumeContext(raw);
-  const files = readableContextFiles(context.files, context.summary, raw.codeIndex);
+  const context = preloadedContext ?? resolveResumeContext(raw);
+  perfMark("generateCodeMap:context-ready");
+  const files = readableContextFiles(context.files, context.summary, raw.codeIndex, context.filesResolved);
   const fileContents = await Promise.all(files.slice(0, 6).map(async (file) => ({
     file,
     content: await readTextFile(fromRoot(root, file)).catch(() => "")
   })));
+  perfMark("generateCodeMap:fileContents-read");
   const markdown = renderCodeMap({ files, fileContents, state: raw.state, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary });
+  perfMark("generateCodeMap:render-done");
   await writeTextFile(fromRoot(root, codeMapPath), markdown);
+  perfMark("generateCodeMap:write-done");
   return codeMapPath;
 }
 
-export async function generateAgentBrief(root: string, preloaded?: ResumeRawInputs): Promise<string> {
+export async function generateAgentBrief(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext): Promise<string> {
+  perfMark("generateAgentBrief:entry");
   await ensureDevguardWorkspace(root);
+  perfMark("generateAgentBrief:ensureWorkspace-done");
   const [raw, qualityContent] = await Promise.all([
     preloaded ? Promise.resolve(preloaded) : loadResumeRawInputs(root),
     readTextFile(fromRoot(root, qualityReportPath))
   ]);
-  const context = resolveResumeContext(raw);
+  const context = preloadedContext ?? resolveResumeContext(raw);
+  perfMark("generateAgentBrief:context-ready");
   const quality = parseQuality(qualityContent);
-  const markdown = renderAgentBrief({ files: context.files, state: raw.state, quality, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary, taskSource: context.source });
+  const markdown = renderAgentBrief({ files: context.files, state: raw.state, quality, projectKnowledge: raw.projectKnowledge, codeIndex: raw.codeIndex, locale: raw.locale, documentationSummary: context.summary, taskSource: context.source, filesResolved: context.filesResolved });
+  perfMark("generateAgentBrief:render-done");
   await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
   await writeTextFile(fromRoot(root, devguardPaths.agentBrief), markdown);
+  perfMark("generateAgentBrief:write-done");
   return devguardPaths.agentBrief;
 }
 
-export async function generateWorkingContext(root: string, preloaded?: ResumeRawInputs): Promise<string> {
+export async function generateWorkingContext(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext): Promise<string> {
+  perfMark("generateWorkingContext:entry");
   await ensureDevguardWorkspace(root);
+  perfMark("generateWorkingContext:ensureWorkspace-done");
   const raw = preloaded ?? (await loadResumeRawInputs(root));
-  const beforeAgent = resolveResumeContext(raw);
+  const beforeAgent = preloadedContext ?? resolveResumeContext(raw);
+  perfMark("generateWorkingContext:context-ready");
   const context = renderWorkingContext({ files: beforeAgent.files, state: raw.state, historyRecords: raw.records, projectKnowledge: raw.projectKnowledge, locale: raw.locale, documentationSummary: beforeAgent.summary, taskSource: beforeAgent.source });
+  perfMark("generateWorkingContext:render-done");
   await writeTextFile(fromRoot(root, workingContextPath), context);
+  perfMark("generateWorkingContext:write-done");
   return workingContextPath;
 }
 
@@ -2040,19 +2111,19 @@ function deriveProjectPurposeFromKnowledge(knowledge: ProjectKnowledge | undefin
   return `${knowledge.summary.framework} ${knowledge.summary.language} project (${knowledge.summary.packageManager}), ${knowledge.summary.filesIndexed} files indexed.`;
 }
 
-export async function generateAgentContext(root: string): Promise<string> {
+export async function generateAgentContext(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext): Promise<string> {
+  perfMark("generateAgentContext:entry");
   await ensureDevguardWorkspace(root);
-  const [project, decisions, qualityContent, qualityReportState, historyRecords, state, runtime, codeIndex, projectKnowledge] = await Promise.all([
+  perfMark("generateAgentContext:ensureWorkspace-done");
+  const [project, decisions, qualityContent, qualityReportState, projectKnowledge, raw] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
     readTextFile(fromRoot(root, devguardPaths.decisions)),
     readTextFile(fromRoot(root, qualityReportPath)),
     readJsonFile<QualityReport | null>(fromRoot(root, devguardPaths.qualityReportState), null),
-    readHistoryRecords(root, 5),
-    readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
-    readRuntimeState(root),
-    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} }),
-    readProjectKnowledge(root)
+    readProjectKnowledge(root),
+    preloaded ? Promise.resolve(preloaded) : loadResumeRawInputs(root)
   ]);
+  const { state, runtime, records: historyRecords, codeIndex } = raw;
   const projectPurpose = firstSectionBullet(project, "프로젝트 목적") ?? deriveProjectPurposeFromKnowledge(projectKnowledge) ?? "확인 필요";
   // Structured QA source first (same object Quality Report/Handoff use), the
   // markdown-parsing fallback only for `.devguard` state written before the
@@ -2060,7 +2131,9 @@ export async function generateAgentContext(root: string): Promise<string> {
   const quality = qualityReportState ? parsedQualityFromReport(qualityReportState) : parseQuality(qualityContent);
   const importantDecisions = extractDecisionLines(decisions);
   const lastChangedFiles = state.lastChangedFiles ?? [];
-  const beforeAgent = resolveBeforeAgentContext({ state, runtime, records: historyRecords, codeIndex });
+  perfMark("generateAgentContext:raw-ready");
+  const beforeAgent = preloadedContext ?? resolveBeforeAgentContext({ state, runtime, records: historyRecords, codeIndex });
+  perfMark("generateAgentContext:context-ready");
   const documentationSummary = beforeAgent.summary;
   // Current goal must come from the SAME canonical task-goal resolution
   // Working Context/Handoff use (`beforeAgent`/`documentationSummary`), not
@@ -2086,8 +2159,10 @@ export async function generateAgentContext(root: string): Promise<string> {
     documentationSummary,
     taskSource: beforeAgent.source
   });
+  perfMark("generateAgentContext:render-done");
   await mkdir(fromRoot(root, devguardPaths.contextDir), { recursive: true });
   await writeTextFile(fromRoot(root, devguardPaths.agentContext), markdown);
+  perfMark("generateAgentContext:write-done");
   return devguardPaths.agentContext;
 }
 
@@ -2141,7 +2216,9 @@ export async function loadResumeRawInputs(root: string, runtimeOverride?: Runtim
   return { locale, state, runtime, records, projectKnowledge, codeIndex };
 }
 
-function resolveResumeContext(raw: ResumeRawInputs): ReturnType<typeof resolveBeforeAgentContext> {
+type ResumeContext = ReturnType<typeof resolveBeforeAgentContext>;
+
+function resolveResumeContext(raw: ResumeRawInputs): ResumeContext {
   return resolveBeforeAgentContext({ state: raw.state, runtime: raw.runtime, records: raw.records, codeIndex: raw.codeIndex });
 }
 
@@ -2165,7 +2242,7 @@ function resolveBeforeAgentContext(input: {
   runtime: RuntimeState;
   records: HistoryRecord[];
   codeIndex: CodeIndex;
-}): { summary?: DocumentationSummary; files: string[]; source: ContextTaskSource } {
+}): { summary?: DocumentationSummary; files: string[]; source: ContextTaskSource; filesResolved: boolean } {
   const currentTask = input.runtime.currentTask?.text?.trim();
   if (currentTask) {
     const baseSummary = beforeAgentTaskSummary(currentTask, input.codeIndex);
@@ -2173,8 +2250,15 @@ function resolveBeforeAgentContext(input: {
     const summary = beforeAgentTaskSummary(currentTask, input.codeIndex, candidateFiles);
     return {
       summary,
+      // This IS the one, full readableContextFiles resolution for this call
+      // (it scans the whole Code Index via taskRelevantIndexCandidates).
+      // filesResolved: true tells every downstream render function (Read
+      // Map/Code Map/Agent Brief) this list is already final, so they don't
+      // each re-run that same full-index scan on files that can't change —
+      // see readableContextFiles's `alreadyResolved` fast path.
       files: readableContextFiles(candidateFiles, summary, input.codeIndex),
-      source: "explicit-before-agent-input"
+      source: "explicit-before-agent-input",
+      filesResolved: true
     };
   }
   const files = workingContextFiles(input.state, input.records);
@@ -2192,12 +2276,14 @@ function resolveBeforeAgentContext(input: {
     return {
       summary: input.state.lastDocumentationSummary,
       files,
-      source: "resumed-session-summary"
+      source: "resumed-session-summary",
+      filesResolved: false
     };
   }
   return {
     files,
-    source: files.length > 0 ? "history-fallback" : "none"
+    source: files.length > 0 ? "history-fallback" : "none",
+    filesResolved: false
   };
 }
 
@@ -2416,13 +2502,13 @@ function preparedTaskCoverageGaps(files: PreparedTaskContextFile[], summary: Doc
   return gaps.slice(0, 4);
 }
 
-function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: ContextTaskSource }): string {
+function renderReadMap(input: { files: string[]; state: ProjectState; projectKnowledge: string; codeIndex: CodeIndex; locale: DevGuardLocale; documentationSummary?: DocumentationSummary; taskSource?: ContextTaskSource; filesResolved?: boolean }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   // Trust the caller's session-gated resolution (resolveBeforeAgentContext); do NOT
   // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
   // summary would bypass the session-lineage gate and reappear as the active goal.
   const documentationSummary = input.documentationSummary;
-  const files = readableContextFiles(input.files, documentationSummary, input.codeIndex);
+  const files = readableContextFiles(input.files, documentationSummary, input.codeIndex, input.filesResolved);
   const entryFiles = readMapEntryFiles(files, profile, documentationSummary);
   const readTargets = readMapTargets(documentationSummary, files, input.codeIndex, input.locale);
   const trustSummary = contextTrustSummary(files, input.codeIndex, input.locale);
@@ -2487,7 +2573,10 @@ function renderCodeMap(input: {
   // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
   // summary would bypass the session-lineage gate and reappear as the active goal.
   const documentationSummary = input.documentationSummary;
-  const readableFiles = readableContextFiles(input.files, documentationSummary, input.codeIndex);
+  // generateCodeMap always passes a `files` list that already went through
+  // readableContextFiles itself, so this can always use the cheap fast path
+  // (see readableContextFiles's `alreadyResolved` doc comment).
+  const readableFiles = readableContextFiles(input.files, documentationSummary, input.codeIndex, true);
   const fileContents = input.fileContents.filter((item) => readableFiles.includes(item.file) && (item.content.trim() || input.codeIndex.files[item.file]));
   const files = fileContents.length > 0 ? fileContents : readableFiles.slice(0, 6).map((file) => ({ file, content: "" }));
   const lines: string[] = [
@@ -2544,13 +2633,14 @@ function renderAgentBrief(input: {
   locale: DevGuardLocale;
   documentationSummary?: DocumentationSummary;
   taskSource?: ContextTaskSource;
+  filesResolved?: boolean;
 }): string {
   const profile = parseWorkingProjectKnowledge(input.projectKnowledge);
   // Trust the caller's session-gated resolution (resolveBeforeAgentContext); do NOT
   // fall back to raw state.lastDocumentationSummary here, or a stale cross-session
   // summary would bypass the session-lineage gate and reappear as the active goal.
   const summary = input.documentationSummary;
-  const files = readableContextFiles(input.files, summary, input.codeIndex);
+  const files = readableContextFiles(input.files, summary, input.codeIndex, input.filesResolved);
   const entryFiles = readMapEntryFiles(files, profile, summary).slice(0, 5);
   const skipTargets = readMapSkips(summary, files, input.locale).slice(0, 8);
   const qa = (summary?.qaChecks ?? input.quality.requiredVerification).slice(0, 4).map((item) => localizeSentence(item, input.locale));
@@ -2594,8 +2684,19 @@ function renderAgentBrief(input: {
   ].join("\n") + "\n";
 }
 
-function readableContextFiles(files: string[], summary: DocumentationSummary | undefined, index: CodeIndex): string[] {
+// `alreadyResolved` is a fast path for callers that already received this
+// exact `files` list FROM a prior readableContextFiles call for the same
+// (summary, index) pair — see resolveBeforeAgentContext's filesResolved
+// flag. Re-running the full computation on an already-resolved list is a
+// no-op (taskRelevantIndexCandidates's `existing` filter excludes every
+// candidate it would otherwise re-discover, since they're already in
+// `files`), but it still pays the full Code Index scan to prove that;
+// skipping straight to the cheap re-sort avoids paying that scan again for
+// the same result. Only safe when `files` truly came from a prior call —
+// never pass true for a caller-supplied/raw file list.
+function readableContextFiles(files: string[], summary: DocumentationSummary | undefined, index: CodeIndex, alreadyResolved = false): string[] {
   if (!summary?.fileChanges.length) return files;
+  if (alreadyResolved) return sortReadMapCandidates([...new Set(files)], summary, index);
   const changeContext = [...new Set([
     ...files,
     ...summary.fileChanges.map((file) => file.file)
@@ -3158,8 +3259,12 @@ function primaryIndexedSymbol(file?: CodeIndexFile): CodeIndexSymbol | undefined
 
 function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = ""): CodeIndexSymbol[] {
   const taskSpecific = extractTaskSpecificRanges(file.path, content, taskSummary);
+  // taskSummary/fileSummary are fixed for this whole sort — compute their
+  // (regex-heavy) token derivation ONCE instead of inside codeMapRangeScore,
+  // which this comparator calls O(n log n) times per file.
+  const taskCtx = codeMapRangeTaskContext(taskSummary, fileSummary);
   const sorted = [...taskSpecific, ...file.blocks, ...file.symbols].sort((a, b) => {
-    const score = codeMapRangeScore(file, b, taskSummary, fileSummary) - codeMapRangeScore(file, a, taskSummary, fileSummary);
+    const score = codeMapRangeScore(file, b, taskCtx) - codeMapRangeScore(file, a, taskCtx);
     if (score !== 0) return score;
     const priority = codeMapSymbolPriority(file.path, a) - codeMapSymbolPriority(file.path, b);
     return priority !== 0 ? priority : a.startLine - b.startLine;
@@ -3275,7 +3380,7 @@ function taskSpecificRangePriority(range: CodeIndexSymbol): number {
   return 4;
 }
 
-function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): number {
+function codeMapRangeTaskContext(taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange): { taskText: string; taskTokens: Set<string>; codeTokens: Set<string>; isUiTask: boolean } {
   const taskText = [
     taskSummary ? taskRoutingText(taskSummary) : "",
     fileSummary?.purpose ?? "",
@@ -3287,6 +3392,12 @@ function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSum
     taskText
   ].join("\n"));
   const codeTokens = explicitCodeTokens(taskText);
+  const isUiTask = Boolean(taskSummary?.changeTypes.includes("UI") || /ui|layout|interaction|card|section|screen|view|front|back|cta|button|form/i.test(taskText));
+  return { taskText, taskTokens, codeTokens, isUiTask };
+}
+
+function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskCtx: { taskText: string; taskTokens: Set<string>; codeTokens: Set<string>; isUiTask: boolean }): number {
+  const { taskText, taskTokens, codeTokens, isUiTask } = taskCtx;
   const rangeText = [
     symbol.name,
     symbol.kind,
@@ -3306,7 +3417,6 @@ function codeMapRangeScore(file: CodeIndexFile, symbol: CodeIndexSymbol, taskSum
   const exactCodeOverlap = [...codeTokens].filter((token) => normalizeCodeToken(rangeText).includes(normalizeCodeToken(token))).length;
   const lineCount = Math.max(1, symbol.endLine - symbol.startLine + 1);
   const fileMaxLine = Math.max(...[...file.blocks, ...file.symbols].map((candidate) => candidate.endLine), lineCount);
-  const isUiTask = taskSummary?.changeTypes.includes("UI") || /ui|layout|interaction|card|section|screen|view|front|back|cta|button|form/i.test(taskText);
   const uiRange = /visible|user-facing|layout|interaction|cta|form|button|section|card|page|screen|view|front|back|hero|footer/i.test(rangeText);
   const behaviorRange = /handler|route|response|login|auth|submit|click|toggle|open|close|show|hide/i.test(rangeText);
   let score = 0;

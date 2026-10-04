@@ -2,7 +2,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { Socket } from "node:net";
 import { spawn } from "node:child_process";
 import { access, stat } from "node:fs/promises";
-import { fromRoot, readTextFile } from "./fs.js";
+import { fromRoot, readTextFile, readTextFileCapped, readTextFilePrefix } from "./fs.js";
+import { logMemSnapshot, memDebugEnabled } from "./mem-debug.js";
 import { devguardPaths } from "./paths.js";
 import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
 import { readProjectKnowledge } from "./knowledge.js";
@@ -456,11 +457,18 @@ function buildTimeline(history: HistoryRecord[], runtime: RuntimeState): Timelin
 }
 
 async function readReportState(root: string): Promise<DashboardState["reports"]> {
+  // Polled every second by the dashboard's own tick() — only quality
+  // actually needs full content (summarizeQualityReport scans for ##
+  // headings that can appear anywhere in the document); the other three
+  // only ever display a short preview, so reading their full content on
+  // every poll just to immediately slice(0, 1800) it was pure waste that
+  // scales with report size for no benefit. See readKnownPreview /
+  // readPreviewOnly below.
   const [handoff, quality, working, context, nextClaude, nextCodex] = await Promise.all([
-    readKnownPreview(root, devguardPaths.projectHandoff),
+    readPreviewOnly(root, devguardPaths.projectHandoff),
     readKnownPreview(root, devguardPaths.qualityReport),
-    readKnownPreview(root, devguardPaths.workingContext),
-    readKnownPreview(root, devguardPaths.agentContext),
+    readPreviewOnly(root, devguardPaths.workingContext),
+    readPreviewOnly(root, devguardPaths.agentContext),
     checkFileInfo(root, devguardPaths.nextClaudePrompt),
     checkFileInfo(root, devguardPaths.nextCodexPrompt)
   ]);
@@ -516,8 +524,29 @@ async function readKnownPreview(root: string, path: string): Promise<{ exists: b
   if (!(await fileExists(absolute))) {
     return { exists: false };
   }
-  const [text, info] = await Promise.all([readTextFile(absolute), stat(absolute)]);
+  // Capped, not plain readTextFile: this file is re-read on every 1s
+  // dashboard poll for the lifetime of the `watch` session, so a future
+  // generator bug producing a runaway quality-report.md must not turn
+  // "every second, forever" into "every second, forever, at unbounded
+  // size" — see readTextFileCapped.
+  const [text, info] = await Promise.all([readTextFileCapped(absolute), stat(absolute)]);
   return { exists: true, updatedAt: info.mtime.toISOString(), preview: text.slice(0, 1800), text };
+}
+
+/**
+ * Same exists/updatedAt/preview shape as readKnownPreview, for the three
+ * callers that only ever show the preview and never read `.text` — reads
+ * only the first ~4KB (comfortably more than the 1800-char preview, so a
+ * heading or marker landing just past byte 1800 isn't cut mid-preview)
+ * regardless of how large the underlying file actually is.
+ */
+async function readPreviewOnly(root: string, path: string): Promise<{ exists: boolean; updatedAt?: string; preview?: string }> {
+  const absolute = fromRoot(root, path);
+  if (!(await fileExists(absolute))) {
+    return { exists: false };
+  }
+  const [prefix, info] = await Promise.all([readTextFilePrefix(absolute, 4096), stat(absolute)]);
+  return { exists: true, updatedAt: info.mtime.toISOString(), preview: prefix?.slice(0, 1800) };
 }
 
 async function checkFileInfo(root: string, path: string): Promise<FileInfo> {
@@ -616,12 +645,27 @@ export async function openDashboardBrowser(url: string): Promise<boolean> {
   });
 }
 
+let dashboardRequestCount = 0;
+let dashboardResponseBytes = 0;
+
 function sendJson(response: ServerResponse, data: unknown, statusCode = 200): void {
+  const body = `${JSON.stringify(data, null, 2)}\n`;
+  if (memDebugEnabled()) {
+    dashboardRequestCount += 1;
+    dashboardResponseBytes += Buffer.byteLength(body, "utf8");
+    if (dashboardRequestCount % 5 === 0) {
+      logMemSnapshot("dashboard:sendJson", {
+        dashboardRequestCount,
+        dashboardResponseBytes,
+        lastResponseBytes: Buffer.byteLength(body, "utf8")
+      });
+    }
+  }
   response.writeHead(statusCode, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store"
   });
-  response.end(`${JSON.stringify(data, null, 2)}\n`);
+  response.end(body);
 }
 
 function sendHtml(response: ServerResponse, html: string): void {

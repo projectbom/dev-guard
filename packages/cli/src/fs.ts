@@ -1,9 +1,13 @@
 import { appendFile, mkdir, open, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { recordFileRead } from "./mem-debug.js";
+import { perfMark } from "./perf-debug.js";
 
 export async function readTextFile(path: string, fallback = ""): Promise<string> {
   try {
-    return await readFile(path, "utf8");
+    const text = await readFile(path, "utf8");
+    recordFileRead(path, Buffer.byteLength(text, "utf8"));
+    return text;
   } catch (error) {
     if (isMissingFileError(error)) {
       return fallback;
@@ -84,6 +88,63 @@ export async function readTailLines(path: string, maxBytes: number): Promise<str
   }
 }
 
+// Generous default for a single generated markdown/text artifact
+// (quality-report.md, handoff, etc.) — these are structured, template-
+// generated documents with their own internal bounds (fixed-size lists,
+// slice(0, N) caps), never user-uploaded or externally-sourced content, so
+// this is a safety ceiling against a future generator bug producing a
+// runaway document, not a tuned "typical size" budget.
+const DEFAULT_MAX_TEXT_FILE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Like readTextFile, but refuses to load a pathologically oversized file
+ * into memory at all — returns `fallback` instead (mirrors readJsonFile's
+ * existing size-guard policy, so text and JSON artifacts fail the same
+ * way). Use this for any `.devguard`-generated text artifact a *polling*
+ * code path (dashboard, watch refresh) re-reads on every tick; a one-off
+ * CLI read of a file the user explicitly asked to see can keep using the
+ * unbounded readTextFile.
+ */
+export async function readTextFileCapped(path: string, fallback = "", options: { maxBytes?: number } = {}): Promise<string> {
+  const maxBytes = options.maxBytes ?? DEFAULT_MAX_TEXT_FILE_BYTES;
+  try {
+    const info = await stat(path);
+    if (info.size > maxBytes) {
+      logOversizedFileWarning(path, info.size, maxBytes);
+      return fallback;
+    }
+  } catch (error) {
+    if (isMissingFileError(error)) return fallback;
+  }
+  return readTextFile(path, fallback);
+}
+
+/**
+ * Reads only the first `maxBytes` of a file — for callers that only ever
+ * display a short preview (e.g. a dashboard card showing the first ~1800
+ * characters of a generated report) and have no legitimate reason to pull
+ * the whole file into memory just to slice it afterward. Unlike
+ * readTextFileCapped, this never refuses to read a large file — it simply
+ * never reads past the prefix, so cost is bounded by `maxBytes` regardless
+ * of actual file size.
+ */
+export async function readTextFilePrefix(path: string, maxBytes: number): Promise<string | undefined> {
+  let handle;
+  try {
+    handle = await open(path, "r");
+    const length = Math.min(maxBytes, (await handle.stat()).size);
+    if (length <= 0) return "";
+    const buffer = Buffer.alloc(length);
+    await handle.read(buffer, 0, length, 0);
+    return buffer.toString("utf8");
+  } catch (error) {
+    if (isMissingFileError(error)) return undefined;
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
 export async function writeFileIfMissing(path: string, content: string): Promise<"created" | "exists"> {
   await mkdir(dirname(path), { recursive: true });
 
@@ -100,13 +161,19 @@ export async function writeFileIfMissing(path: string, content: string): Promise
 }
 
 export async function appendTextFile(path: string, content: string): Promise<void> {
+  perfMark(`appendTextFile:${path}:mkdir-start`);
   await mkdir(dirname(path), { recursive: true });
+  perfMark(`appendTextFile:${path}:mkdir-done`);
   await appendFile(path, content, "utf8");
+  perfMark(`appendTextFile:${path}:append-done`);
 }
 
 export async function writeTextFile(path: string, content: string): Promise<void> {
+  perfMark(`writeTextFile:${path}:mkdir-start`);
   await mkdir(dirname(path), { recursive: true });
+  perfMark(`writeTextFile:${path}:mkdir-done`);
   await writeFile(path, content, "utf8");
+  perfMark(`writeTextFile:${path}:write-done`);
 }
 
 export async function fileMetadata(path: string): Promise<{ size: number; lastModified: string }> {

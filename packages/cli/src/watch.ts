@@ -20,6 +20,7 @@ import { formatWatchDashboard, formatWatchDashboardKey } from "./watch-format.js
 import { openDashboardBrowser, startDashboardServer, type DashboardServerHandle } from "./dashboard.js";
 import { defaultWatchConfig, loadWatchConfig, type WatchConfig } from "./config.js";
 import { prepareWatchProject } from "./prepare.js";
+import { logMemSnapshot, logTopReads, memDebugEnabled } from "./mem-debug.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done" | "finalizing" | "processed";
 
@@ -38,6 +39,7 @@ const watchRoots = [".", "app", "components", "lib", "hooks", "utils", "constant
 const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, coverage/**, ${DEVGUARD_DIR}/**`;
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
+  logMemSnapshot("runWatch:start");
   const watchConfig = await loadWatchConfig(root);
   const options = parseWatchOptions(args, watchConfig);
   const locale = await refreshRuntimeLocale(root);
@@ -52,6 +54,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       dashboardWarning = errorMessage(error);
     }
   }
+  logMemSnapshot("runWatch:after-dashboard-start");
 
   let preparationStreamStarted = false;
   const prepareResult = await prepareWatchProject(root, {
@@ -80,8 +83,10 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     dashboardEnabled: options.dashboard
   });
 
+  logMemSnapshot("runWatch:after-prepare-and-printStartup");
   await ensureDevguardWorkspace(root);
   const strategyReport = await getAgentStrategyReport(root);
+  logMemSnapshot("runWatch:after-getAgentStrategyReport");
   const runtimeVerified = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.runtimeVerified);
   const autoStrategyInstalled = strategyReport.strategies.some((strategy) => strategy.name !== "manual" && strategy.installed);
   const autoMode = !options.manual && autoStrategyInstalled;
@@ -323,7 +328,11 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   };
 
   let eventQueue = Promise.resolve();
+  let watcherEventCount = 0;
+  const eventCountByPath = new Map<string, number>();
   const enqueueChange = (path: string) => {
+    watcherEventCount += 1;
+    if (memDebugEnabled()) eventCountByPath.set(path, (eventCountByPath.get(path) ?? 0) + 1);
     eventQueue = eventQueue
       .then(() => handleChange(path))
       .catch((error) => {
@@ -332,9 +341,22 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   };
 
   const watcher = await createWatcher(root, enqueueChange, options);
+  logMemSnapshot("runWatch:after-createWatcher");
   if (!options.dashboard) {
     await printState(status);
   }
+  let debugTickCount = 0;
+  const debugTimer: NodeJS.Timeout | undefined = memDebugEnabled()
+    ? setInterval(() => {
+        debugTickCount += 1;
+        logMemSnapshot(`runWatch:tick#${debugTickCount}`, { watcherEventCount, isAutoFinalizing, status });
+        if (debugTickCount % 5 === 0) {
+          const top = [...eventCountByPath.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+          console.error(`[mem-debug] top event paths: ${JSON.stringify(top)}`);
+          logTopReads();
+        }
+      }, 2000)
+    : undefined;
   refreshTimer = setInterval(() => {
     void (async () => {
       if (!isAutoFinalizing) {
@@ -369,6 +391,7 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
     clearTimeout(stableTimer);
     clearTimeout(autoCompleteTimer);
     clearInterval(refreshTimer);
+    if (debugTimer) clearInterval(debugTimer);
     try {
       await closeWatcher(watcher);
     } catch (error) {

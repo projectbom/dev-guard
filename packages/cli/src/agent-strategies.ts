@@ -3,7 +3,7 @@ import { access } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fromRoot, readTextFile } from "./fs.js";
+import { fromRoot, readTextFile, readTextFileCapped } from "./fs.js";
 import { getHookStatus, hookConfigPaths } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
 import { getCodexNotifyConfigStatus } from "./codex-notify.js";
@@ -136,8 +136,18 @@ async function isCodexNotifyConfigured(root: string): Promise<boolean> {
   return text.includes(fromRoot(root, devguardPaths.codexNotifyHook)) || text.includes(devguardPaths.codexNotifyHook);
 }
 
+// Checks whether the hook EVER succeeded, anywhere in its lifetime log —
+// not just the most recent run (see getHookStatus's latestFinalHookLine
+// for that) — so this intentionally scans the whole file, not just a
+// tail. These are append-only logs with no rotation, growing for the
+// project's entire lifetime, and getAgentStrategyReport (hence this) is
+// called on every 1s dashboard poll, so a capped read is still required:
+// readTextFileCapped refuses to load a pathological multi-GB log into
+// memory rather than scanning it, which only matters as a safety ceiling
+// — any realistically-sized hook log (even years of continuous use) stays
+// far under the cap.
 async function hasFinalLogLine(root: string, path: string, pattern: RegExp): Promise<boolean> {
-  const text = await readTextFile(fromRoot(root, path));
+  const text = await readTextFileCapped(fromRoot(root, path));
   return text.split(/\r?\n/).some((line) => pattern.test(line));
 }
 
