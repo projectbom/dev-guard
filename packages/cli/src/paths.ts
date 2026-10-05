@@ -31,6 +31,11 @@ export const devguardPaths = {
   codexLog: `${DEVGUARD_DIR}/logs/codex-hook.log`,
   codexNotifyLog: `${DEVGUARD_DIR}/logs/codex-notify.log`,
   watchLog: `${DEVGUARD_DIR}/logs/watch.log`,
+  // Hook verification state — one tiny file per hook/kind written by the
+  // hook scripts themselves (see readHookStates in hooks.ts). The hook
+  // logs above are diagnostic-only and rotated; runtime verification
+  // reads only these bounded single-line files, never the logs.
+  hookStateDir: `${DEVGUARD_DIR}/hook-state`,
   hookStatus: `${DEVGUARD_DIR}/reports/hook-status.md`,
   lastRunReport: `${DEVGUARD_DIR}/reports/last-run.md`,
   historySummary: `${DEVGUARD_DIR}/reports/history-summary.md`,

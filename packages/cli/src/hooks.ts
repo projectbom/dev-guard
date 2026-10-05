@@ -1,10 +1,11 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, stat } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { fromRoot, readTextFile, writeTextFile } from "./fs.js";
+import { fromRoot, readTailLines, readTextFile, readTextFilePrefix, writeTextFile } from "./fs.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
+import { HOOK_LOG_GENERATIONS, HOOK_LOG_ROTATE_BYTES } from "./hook-log-policy.js";
 import { formatNotifyCommand, getCodexNotifyConfigStatus, installCodexNotifyDispatcher } from "./codex-notify.js";
 
 interface InstallHooksResult {
@@ -134,17 +135,12 @@ export async function installHooks(root: string, options: { force?: boolean; age
   return { created, skipped, reportPath: hookStatusPath };
 }
 
-export async function getHookStatus(root: string): Promise<HookStatus> {
-  const [claudeLog, codexLog, codexNotifyLog] = await Promise.all([
-    readTextFile(fromRoot(root, claudeLogPath)),
-    readTextFile(fromRoot(root, codexLogPath)),
-    readTextFile(fromRoot(root, codexNotifyLogPath))
-  ]);
-  const logLines = [...claudeLog.split(/\r?\n/), ...codexLog.split(/\r?\n/), ...codexNotifyLog.split(/\r?\n/)].filter(Boolean);
-  const claudeLastLine = latestFinalHookLine(claudeLog.split(/\r?\n/).filter(Boolean));
-  const codexLastLine = latestFinalHookLine([...codexLog.split(/\r?\n/), ...codexNotifyLog.split(/\r?\n/)].filter(Boolean));
-  const finalLines = logLines.filter(isFinalHookLine);
-  const lastLine = latestTimestampedLine(finalLines) ?? latestTimestampedLine(logLines);
+export async function getHookStatus(root: string, preloadedStates?: HookStates): Promise<HookStatus> {
+  const states = preloadedStates ?? (await readHookStates(root));
+  const claudeLastLine = states["claude.stop"].last;
+  const codexLastLine = latestTimestampedLine(definedLines([states["codex.stop"].last, states["codex.notify"].last]));
+  const finalLines = definedLines(hookStateNames.filter((name) => name !== "codex.turn.completed").map((name) => states[name].last));
+  const lastLine = latestTimestampedLine(finalLines) ?? latestTimestampedLine(definedLines(hookStateNames.map((name) => states[name].trigger)));
   return {
     claudeInstalled: existsSync(fromRoot(root, claudeSettingsPath)),
     codexInstalled: existsSync(fromRoot(root, codexHooksPath)),
@@ -159,81 +155,110 @@ export async function getHookStatus(root: string): Promise<HookStatus> {
   };
 }
 
-function codexNotifyHook(): string {
-  return `#!/usr/bin/env bash
-set +e
+// --- Hook verification state -------------------------------------------
+//
+// Hook logs (.devguard/logs/*.log) are DIAGNOSTIC ONLY: rotated, and never
+// read by any polling path. Whether a hook ran / ever succeeded is instead
+// recorded by the hook scripts themselves as one-line files under
+// .devguard/hook-state/ (written atomically via tmp + mv):
+//
+//   <hook>.trigger          latest "status=start" line
+//   <hook>.last             latest final line (status=success|failed)
+//   <hook>.success          latest success line, any source
+//   <hook>.runtime-success  latest success line with source=agent_runtime
+//                           (kept separate so a `doctor --hooks` direct_test
+//                           run can never overwrite real-runtime evidence)
+//
+// So verification cost is a few bounded (<=4KB) reads regardless of how
+// large or old the logs are. A real PartnerFlow codex-notify.log reached
+// 15.3MB and the old whole-log scan made every 1s dashboard poll read all
+// of it (and wrongly report codex-notify unverified once it crossed the
+// 10MB read cap).
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-LOG="$ROOT/${devguardPaths.codexNotifyLog}"
-mkdir -p "$(dirname "$LOG")" "$ROOT/${devguardPaths.reportsDir}"
+export const hookStateNames = ["claude.stop", "codex.stop", "codex.notify", "codex.turn.completed"] as const;
+export type HookStateName = (typeof hookStateNames)[number];
 
-payload="$1"
-if [ -z "$payload" ]; then
-  if IFS= read -r -t 1 line || [ -n "$line" ]; then
-    payload="$line"
-  else
-    payload="{}"
-  fi
-fi
+export interface HookStateLines {
+  trigger?: string;
+  last?: string;
+  success?: string;
+  runtimeSuccess?: string;
+  source: "state" | "legacy-log-tail";
+}
 
-timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-hook_source="\${DEV_GUARD_HOOK_SOURCE:-agent_runtime}"
-# See shellHook's identical export for why this exists.
-export DEV_GUARD_COMPLETION_SOURCE="hook-codex-notify"
-event_type="$(printf '%s\\n' "$payload" | sed -n 's/.*"type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1)"
-if [ -z "$event_type" ]; then
-  event_type="$(printf '%s\\n' "$payload" | sed -n 's/.*"event"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1)"
-fi
-if [ -z "$event_type" ]; then
-  event_type="unknown"
-fi
+export type HookStates = Record<HookStateName, HookStateLines>;
 
-{
-  echo "timestamp=$timestamp hook=codex.notify status=start source=$hook_source event=$event_type"
-  echo "timestamp=$timestamp hook=codex.notify payload_begin"
-  printf '%s\\n' "$payload"
-  echo "timestamp=$timestamp hook=codex.notify payload_end"
-  if [ "$event_type" != "agent-turn-complete" ]; then
-    echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=codex.notify status=skipped source=$hook_source event=$event_type reason=not_agent_turn_complete"
-    exit 0
-  fi
-  cd "$ROOT" || exit 1
-  if [ -f package.json ] && grep -q '"cli"' package.json; then
-    if command -v pnpm >/dev/null 2>&1; then
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=codex.notify command=pnpm_cli_done status=running"
-      pnpm cli done
-      done_status=$?
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=codex.notify command=pnpm_cli_done status=completed exit=$done_status"
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=codex.notify command=pnpm_cli_status status=running"
-      pnpm cli status
-      status_status=$?
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=codex.notify command=pnpm_cli_status status=completed exit=$status_status"
-    else
-      echo "dev-guard Codex notify failed: pnpm was not found. Install pnpm or run dev-guard done/status manually."
-      done_status=127
-      status_status=127
-    fi
-  else
-    if command -v dev-guard >/dev/null 2>&1; then
-      dev-guard done
-      done_status=$?
-      dev-guard status
-      status_status=$?
-    else
-      echo "dev-guard Codex notify failed: dev-guard was not found on PATH."
-      done_status=127
-      status_status=127
-    fi
-  fi
-  if [ "$done_status" -eq 0 ] && [ "$status_status" -eq 0 ]; then
-    echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=codex.notify status=success source=$hook_source done=$done_status status_cmd=$status_status"
-  else
-    echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=codex.notify status=failed source=$hook_source done=$done_status status_cmd=$status_status"
-  fi
-} >> "$LOG" 2>&1
+const HOOK_STATE_READ_BYTES = 4096;
+// Legacy fallback only (hook scripts generated before hook-state existed):
+// look for evidence in a bounded tail of the old log instead of the whole
+// file. Old-format logs emit a final status line roughly every 12KB, so
+// 512KB comfortably contains recent evidence.
+const LEGACY_LOG_TAIL_BYTES = 512 * 1024;
 
-exit 0
-`;
+const hookStateLogPaths: Record<HookStateName, string> = {
+  "claude.stop": claudeLogPath,
+  "codex.stop": codexLogPath,
+  "codex.notify": codexNotifyLogPath,
+  "codex.turn.completed": codexLogPath
+};
+
+export async function readHookStates(root: string): Promise<HookStates> {
+  const entries = await Promise.all(hookStateNames.map(async (name) => [name, await readHookState(root, name)] as const));
+  return Object.fromEntries(entries) as HookStates;
+}
+
+async function readHookState(root: string, name: HookStateName): Promise<HookStateLines> {
+  const dir = fromRoot(root, devguardPaths.hookStateDir);
+  const [trigger, last, success, runtimeSuccess] = await Promise.all(
+    ["trigger", "last", "success", "runtime-success"].map((kind) => readStateLine(join(dir, `${name}.${kind}`)))
+  );
+  if (trigger || last || success || runtimeSuccess) {
+    return { trigger, last, success, runtimeSuccess, source: "state" };
+  }
+  return legacyHookState(fromRoot(root, hookStateLogPaths[name]), name);
+}
+
+async function readStateLine(path: string): Promise<string | undefined> {
+  const text = await readTextFilePrefix(path, HOOK_STATE_READ_BYTES);
+  const line = text?.split(/\r?\n/, 1)[0]?.trim();
+  return line ? line : undefined;
+}
+
+// Keyed by absolute log path; holds only the (few) status lines from the
+// bounded tail, and is re-read only when the log's size/mtime changes, so
+// repeated dashboard polls cost one stat() per legacy log.
+const legacyTailCache = new Map<string, { size: number; mtimeMs: number; lines: string[] }>();
+
+async function legacyHookState(logPath: string, name: HookStateName): Promise<HookStateLines> {
+  const lines = (await legacyStatusLines(logPath)).filter((line) => line.includes(` hook=${name} status=`));
+  const finals = lines.filter((line) => /\bstatus=(success|failed)\b/.test(line));
+  const successes = finals.filter((line) => /\bstatus=success\b/.test(line));
+  return {
+    trigger: latestTimestampedLine(lines.filter((line) => /\bstatus=start\b/.test(line))),
+    last: latestTimestampedLine(finals),
+    success: latestTimestampedLine(successes),
+    runtimeSuccess: latestTimestampedLine(successes.filter((line) => /\bsource=agent_runtime\b/.test(line))),
+    source: "legacy-log-tail"
+  };
+}
+
+async function legacyStatusLines(logPath: string): Promise<string[]> {
+  let info;
+  try {
+    info = await stat(logPath);
+  } catch {
+    legacyTailCache.delete(logPath);
+    return [];
+  }
+  const cached = legacyTailCache.get(logPath);
+  if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) return cached.lines;
+  const lines = (await readTailLines(logPath, LEGACY_LOG_TAIL_BYTES)).filter((line) => line.startsWith("timestamp=") && / hook=\S+ status=/.test(line));
+  legacyTailCache.set(logPath, { size: info.size, mtimeMs: info.mtimeMs, lines });
+  return lines;
+}
+
+function definedLines(lines: Array<string | undefined>): string[] {
+  return lines.filter((line): line is string => Boolean(line));
 }
 
 export async function writeHookStatusReport(root: string): Promise<string> {
@@ -262,6 +287,196 @@ export async function writeHookStatusReport(root: string): Promise<string> {
   return hookStatusPath;
 }
 
+// Bump whenever generated hook script content changes: existing installs
+// carrying an older (or no) marker are regenerated in place by
+// refreshGeneratedHookScripts on the next `dev-guard watch`/prepare, so a
+// project never keeps running an outdated unbounded-logging hook.
+export const HOOK_SCRIPT_VERSION = 2;
+const hookScriptMarker = `dev-guard-hook-script: v${HOOK_SCRIPT_VERSION}`;
+
+// DEV_GUARD_HOOK_DEBUG=1 only: max raw payload bytes / command output
+// lines kept per event.
+const HOOK_DEBUG_PAYLOAD_BYTES = 4096;
+const HOOK_OUTPUT_TAIL_LINES = 40;
+
+function hookShellHelpers(hookName: string): string {
+  return `# ${hookScriptMarker}
+HOOK_NAME="${hookName}"
+STATE_DIR="$ROOT/${devguardPaths.hookStateDir}"
+LOG_MAX_BYTES="\${DEV_GUARD_HOOK_LOG_MAX_BYTES:-${HOOK_LOG_ROTATE_BYTES}}"
+LOG_GENERATIONS=${HOOK_LOG_GENERATIONS}
+
+now_utc() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+file_size() {
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0
+}
+
+# Size-based rotation: LOG -> LOG.1 -> ... -> LOG.$LOG_GENERATIONS (oldest
+# dropped). Metadata-only (stat), never reads the log.
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  size="$(file_size "$LOG")"
+  case "$size" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$size" -lt "$LOG_MAX_BYTES" ] && return 0
+  gen=$LOG_GENERATIONS
+  while [ "$gen" -gt 1 ]; do
+    prev=$((gen - 1))
+    [ -f "$LOG.$prev" ] && mv -f "$LOG.$prev" "$LOG.$gen"
+    gen=$prev
+  done
+  mv -f "$LOG" "$LOG.1"
+}
+
+# Small verification state (see readHookStates in hooks.ts): one line per
+# file, replaced atomically.
+record_hook_state() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  tmp="$STATE_DIR/.$HOOK_NAME.$1.$$"
+  printf '%s\\n' "$2" > "$tmp" 2>/dev/null && mv -f "$tmp" "$STATE_DIR/$HOOK_NAME.$1"
+}
+
+log_start() {
+  echo "$1"
+  record_hook_state trigger "$1"
+}
+
+log_final() {
+  echo "$1"
+  record_hook_state last "$1"
+  case "$1" in
+    *" status=success "*)
+      record_hook_state success "$1"
+      case "$1" in *" source=agent_runtime "*) record_hook_state runtime-success "$1" ;; esac
+      ;;
+  esac
+}
+
+# Runs a command, logging exit code and output size; the output itself is
+# kept (last ${HOOK_OUTPUT_TAIL_LINES} lines) only on failure or with DEV_GUARD_HOOK_DEBUG=1.
+run_logged() {
+  label="$1"
+  shift
+  echo "timestamp=$(now_utc) hook=$HOOK_NAME command=$label status=running"
+  output="$("$@" 2>&1)"
+  rc=$?
+  echo "timestamp=$(now_utc) hook=$HOOK_NAME command=$label status=completed exit=$rc output_bytes=\${#output}"
+  if [ "$rc" -ne 0 ] || [ "\${DEV_GUARD_HOOK_DEBUG:-}" = "1" ]; then
+    printf '%s\\n' "$output" | tail -n ${HOOK_OUTPUT_TAIL_LINES}
+  fi
+  return $rc
+}
+
+# Bounded raw payload, only with DEV_GUARD_HOOK_DEBUG=1.
+log_debug_payload() {
+  [ "\${DEV_GUARD_HOOK_DEBUG:-}" = "1" ] || return 0
+  echo "timestamp=$(now_utc) hook=$HOOK_NAME payload_begin limit=${HOOK_DEBUG_PAYLOAD_BYTES}"
+  printf '%s' "$1" | head -c ${HOOK_DEBUG_PAYLOAD_BYTES}
+  echo ""
+  echo "timestamp=$(now_utc) hook=$HOOK_NAME payload_end"
+}
+
+json_field() {
+  printf '%s\\n' "$2" | sed -n "s/.*\\"$1\\"[[:space:]]*:[[:space:]]*\\"\\\\([^\\"]*\\\\)\\".*/\\\\1/p" | head -n 1 | tr -cd 'A-Za-z0-9._:-' | cut -c1-80
+}
+
+byte_count() {
+  printf '%s' "$1" | wc -c | tr -d '[:space:]'
+}
+
+# Runs dev-guard done + status via the local CLI (DevGuard's own repo) or
+# the dev-guard binary; sets done_status / status_status.
+run_done_and_status() {
+  if [ -f package.json ] && grep -q '"cli"' package.json; then
+    if command -v pnpm >/dev/null 2>&1; then
+      run_logged pnpm_cli_done pnpm cli done
+      done_status=$?
+      run_logged pnpm_cli_status pnpm cli status
+      status_status=$?
+    else
+      echo "dev-guard hook failed: pnpm was not found. Install pnpm or run dev-guard done/status manually."
+      done_status=127
+      status_status=127
+    fi
+  else
+    if command -v dev-guard >/dev/null 2>&1; then
+      run_logged dev-guard_done dev-guard done
+      done_status=$?
+      run_logged dev-guard_status dev-guard status
+      status_status=$?
+    else
+      echo "dev-guard hook failed: dev-guard was not found on PATH. Install/link dev-guard or run the local CLI manually."
+      done_status=127
+      status_status=127
+    fi
+  fi
+}
+`;
+}
+
+function codexNotifyHook(): string {
+  return `#!/usr/bin/env bash
+set +e
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+LOG="$ROOT/${devguardPaths.codexNotifyLog}"
+mkdir -p "$(dirname "$LOG")" "$ROOT/${devguardPaths.reportsDir}"
+
+${hookShellHelpers("codex.notify")}
+payload="$1"
+if [ -z "$payload" ]; then
+  if IFS= read -r -t 1 line || [ -n "$line" ]; then
+    payload="$line"
+  else
+    payload="{}"
+  fi
+fi
+
+timestamp="$(now_utc)"
+hook_source="\${DEV_GUARD_HOOK_SOURCE:-agent_runtime}"
+# See shellHook's identical export for why this exists.
+export DEV_GUARD_COMPLETION_SOURCE="hook-codex-notify"
+event_type="$(printf '%s\\n' "$payload" | sed -n 's/.*"type"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1)"
+if [ -z "$event_type" ]; then
+  event_type="$(printf '%s\\n' "$payload" | sed -n 's/.*"event"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' | head -n 1)"
+fi
+if [ -z "$event_type" ]; then
+  event_type="unknown"
+fi
+# Summary only: the raw payload (it embeds the full input messages and last
+# assistant message, ~8KB per turn) is not logged unless DEV_GUARD_HOOK_DEBUG=1.
+payload_bytes="$(byte_count "$payload")"
+thread_id="$(json_field thread-id "$payload")"
+turn_id="$(json_field turn-id "$payload")"
+
+rotate_log
+{
+  log_start "timestamp=$timestamp hook=codex.notify status=start source=$hook_source event=$event_type payload_bytes=$payload_bytes thread=\${thread_id:-none} turn=\${turn_id:-none}"
+  log_debug_payload "$payload"
+  if [ "$event_type" != "agent-turn-complete" ]; then
+    echo "timestamp=$(now_utc) hook=codex.notify status=skipped source=$hook_source event=$event_type reason=not_agent_turn_complete"
+    exit 0
+  fi
+  # Codex sends one notify per turn; the same turn-id arriving again (e.g. a
+  # notify chain that loops back into this hook) must not re-run done.
+  if [ -n "$turn_id" ] && [ -f "$STATE_DIR/codex.notify.turn" ] && [ "$(head -c 200 "$STATE_DIR/codex.notify.turn")" = "$turn_id" ]; then
+    echo "timestamp=$(now_utc) hook=codex.notify status=skipped source=$hook_source event=$event_type reason=duplicate_turn turn=$turn_id"
+    exit 0
+  fi
+  cd "$ROOT" || exit 1
+  run_done_and_status
+  if [ "$done_status" -eq 0 ] && [ "$status_status" -eq 0 ]; then
+    [ -n "$turn_id" ] && record_hook_state turn "$turn_id"
+    log_final "timestamp=$(now_utc) hook=codex.notify status=success source=$hook_source done=$done_status status_cmd=$status_status"
+  else
+    log_final "timestamp=$(now_utc) hook=codex.notify status=failed source=$hook_source done=$done_status status_cmd=$status_status"
+  fi
+} >> "$LOG" 2>&1
+
+exit 0
+`;
+}
+
 function shellHook(kind: "claude" | "codex", logPath: string): string {
   return `#!/usr/bin/env bash
 set +e
@@ -270,6 +485,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 LOG="$ROOT/${logPath}"
 mkdir -p "$(dirname "$LOG")" "$ROOT/${devguardPaths.reportsDir}"
 
+${hookShellHelpers(`${kind}.stop`)}
 read_hook_input() {
   local line=""
   if IFS= read -r -t 1 line || [ -n "$line" ]; then
@@ -287,60 +503,27 @@ if [ -z "$hook_input" ]; then
 else
   hook_input_state="present"
 fi
-timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+timestamp="$(now_utc)"
 hook_source="\${DEV_GUARD_HOOK_SOURCE:-agent_runtime}"
 # Lets \`dev-guard done\` (invoked below) record which real trigger produced
 # this completion — a human running \`dev-guard done\` by hand and this hook
 # both land on the same CLI call, and completionSource could not otherwise
 # tell them apart (see CompletionSource in runtime-state.ts).
 export DEV_GUARD_COMPLETION_SOURCE="hook-${kind}-stop"
+session_id="$(json_field session_id "$hook_input")"
+
+rotate_log
 {
-  echo "timestamp=$timestamp hook=${kind}.stop status=start source=$hook_source"
-  if [ "$hook_input_state" = "empty_or_timeout" ]; then
-    echo "timestamp=$timestamp hook=${kind}.stop stdin=empty_or_timeout"
-  else
-    echo "timestamp=$timestamp hook=${kind}.stop stdin_json_begin"
-    printf '%s\\n' "$hook_input"
-    echo "timestamp=$timestamp hook=${kind}.stop stdin_json_end"
-  fi
+  log_start "timestamp=$timestamp hook=${kind}.stop status=start source=$hook_source stdin=$hook_input_state stdin_bytes=$(byte_count "$hook_input") session=\${session_id:-none}"
+  [ "$hook_input_state" = "present" ] && log_debug_payload "$hook_input"
   cd "$ROOT" || exit 1
-  if [ -f package.json ] && grep -q '"cli"' package.json; then
-    if command -v pnpm >/dev/null 2>&1; then
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=pnpm_cli_done status=running"
-      pnpm cli done
-      done_status=$?
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=pnpm_cli_done status=completed exit=$done_status"
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=pnpm_cli_status status=running"
-      pnpm cli status
-      status_status=$?
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=pnpm_cli_status status=completed exit=$status_status"
-    else
-      echo "dev-guard hook failed: pnpm was not found. Install pnpm or run dev-guard done/status manually."
-      done_status=127
-      status_status=127
-    fi
-  else
-    if command -v dev-guard >/dev/null 2>&1; then
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=dev-guard_done status=running"
-      dev-guard done
-      done_status=$?
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=dev-guard_done status=completed exit=$done_status"
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=dev-guard_status status=running"
-      dev-guard status
-      status_status=$?
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop command=dev-guard_status status=completed exit=$status_status"
-    else
-      echo "dev-guard hook failed: dev-guard was not found on PATH. Install/link dev-guard or run the local CLI manually."
-      done_status=127
-      status_status=127
-    fi
-  fi
+  run_done_and_status
   if [ "$done_status" -eq 0 ] && [ "$status_status" -eq 0 ]; then
-    echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop status=success source=$hook_source done=$done_status status_cmd=$status_status"
+    log_final "timestamp=$(now_utc) hook=${kind}.stop status=success source=$hook_source done=$done_status status_cmd=$status_status"
   else
-    echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop status=failed source=$hook_source done=$done_status status_cmd=$status_status"
+    log_final "timestamp=$(now_utc) hook=${kind}.stop status=failed source=$hook_source done=$done_status status_cmd=$status_status"
     if [ "$done_status" -ne 0 ]; then
-      echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ") hook=${kind}.stop handoff=not_generated reason=done_failed"
+      echo "timestamp=$(now_utc) hook=${kind}.stop handoff=not_generated reason=done_failed"
     fi
   fi
 } >> "$LOG" 2>&1
@@ -356,7 +539,7 @@ export DEV_GUARD_COMPLETION_SOURCE="hook-${kind}-stop"
   printf -- '- ${claudeSettingsPath}: %s\\n' "$([ -f "$ROOT/${claudeSettingsPath}" ] && echo exists || echo missing)"
   printf -- '- ${codexHooksPath}: %s\\n\\n' "$([ -f "$ROOT/${codexHooksPath}" ] && echo exists || echo missing)"
   printf '## Last Hook Trigger\\n'
-  printf -- '- time: %s\\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  printf -- '- time: %s\\n' "$(now_utc)"
   printf -- '- success: %s\\n' "$([ "$done_status" -eq 0 ] && [ "$status_status" -eq 0 ] && echo yes || echo no)"
 } > "$ROOT/${devguardPaths.hookStatus}"
 
@@ -370,13 +553,42 @@ exit 0
 
 function codexEventListener(): string {
   return `#!/usr/bin/env node
+// ${hookScriptMarker}
 const { spawnSync } = require("node:child_process");
-const { appendFileSync, mkdirSync } = require("node:fs");
+const { appendFileSync, existsSync, mkdirSync, renameSync, statSync, writeFileSync } = require("node:fs");
 const { dirname, resolve } = require("node:path");
 
 const root = resolve(__dirname, "../..");
 const logPath = resolve(root, "${devguardPaths.codexLog}");
+const stateDir = resolve(root, "${devguardPaths.hookStateDir}");
+const maxBytes = Number(process.env.DEV_GUARD_HOOK_LOG_MAX_BYTES) || ${HOOK_LOG_ROTATE_BYTES};
+const generations = ${HOOK_LOG_GENERATIONS};
+const debug = process.env.DEV_GUARD_HOOK_DEBUG === "1";
 mkdirSync(dirname(logPath), { recursive: true });
+
+function rotateLog() {
+  try {
+    if (statSync(logPath).size < maxBytes) return;
+    for (let gen = generations; gen > 1; gen -= 1) {
+      if (existsSync(logPath + "." + (gen - 1))) renameSync(logPath + "." + (gen - 1), logPath + "." + gen);
+    }
+    renameSync(logPath, logPath + ".1");
+  } catch {}
+}
+
+function recordState(name, kind, line) {
+  try {
+    mkdirSync(stateDir, { recursive: true });
+    const tmp = resolve(stateDir, "." + name + "." + kind + "." + process.pid);
+    writeFileSync(tmp, line + "\\n");
+    renameSync(tmp, resolve(stateDir, name + "." + kind));
+  } catch {}
+}
+
+function outputTail(result) {
+  const text = (result.stdout || "") + (result.stderr || "");
+  return text.split(/\\r?\\n/).slice(-${HOOK_OUTPUT_TAIL_LINES}).join("\\n") + "\\n";
+}
 
 let input = "";
 process.stdin.setEncoding("utf8");
@@ -394,23 +606,63 @@ process.stdin.on("end", () => {
     }
     const type = event.type || event.event || event.name;
     if (type !== "turn.completed" && type !== "turn.failed") continue;
-    appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=start\\n");
+    const name = "codex." + type;
+    rotateLog();
+    const startLine = "timestamp=" + new Date().toISOString() + " hook=" + name + " status=start";
+    appendFileSync(logPath, startLine + "\\n");
+    recordState(name, "trigger", startLine);
     if (type === "turn.completed") {
       if (spawnSync("pnpm", ["--version"], { cwd: root, encoding: "utf8" }).status !== 0) {
         appendFileSync(logPath, "dev-guard codex JSONL listener failed: pnpm was not found. Install pnpm or run dev-guard done/status manually.\\n");
-        appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=failed done=127 status_cmd=127\\n");
+        const failedLine = "timestamp=" + new Date().toISOString() + " hook=" + name + " status=failed done=127 status_cmd=127";
+        appendFileSync(logPath, failedLine + "\\n");
+        recordState(name, "last", failedLine);
         continue;
       }
       const done = spawnSync("pnpm", ["cli", "done"], { cwd: root, encoding: "utf8" });
       const status = spawnSync("pnpm", ["cli", "status"], { cwd: root, encoding: "utf8" });
-      appendFileSync(logPath, done.stdout + done.stderr + status.stdout + status.stderr);
-      appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=" + (done.status === 0 && status.status === 0 ? "success" : "failed") + " done=" + done.status + " status_cmd=" + status.status + "\\n");
+      const ok = done.status === 0 && status.status === 0;
+      if (!ok || debug) appendFileSync(logPath, outputTail(done) + outputTail(status));
+      const finalLine = "timestamp=" + new Date().toISOString() + " hook=" + name + " status=" + (ok ? "success" : "failed") + " done=" + done.status + " status_cmd=" + status.status;
+      appendFileSync(logPath, finalLine + "\\n");
+      recordState(name, "last", finalLine);
+      if (ok) recordState(name, "success", finalLine);
     } else {
-      appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=codex." + type + " status=skipped_failed_turn\\n");
+      appendFileSync(logPath, "timestamp=" + new Date().toISOString() + " hook=" + name + " status=skipped_failed_turn\\n");
     }
   }
 });
 `;
+}
+
+// Regenerates DevGuard-generated hook scripts that predate the current
+// HOOK_SCRIPT_VERSION (e.g. the old unbounded-logging scripts), in place,
+// without touching agent configs (.claude/settings.json, .codex/hooks.json,
+// ~/.codex/config.toml). Only files that exist AND are recognisably
+// DevGuard-generated (they log hook=<kind>.<event>) are touched; a script
+// already carrying the current marker is left alone, so a deliberate local
+// edit to a current script survives.
+export async function refreshGeneratedHookScripts(root: string): Promise<string[]> {
+  const candidates: Array<{ path: string; signature: string; content: () => string }> = [
+    { path: claudeHookPath, signature: "hook=claude.stop", content: () => shellHook("claude", claudeLogPath) },
+    { path: codexHookPath, signature: "hook=codex.stop", content: () => shellHook("codex", codexLogPath) },
+    { path: codexNotifyHookPath, signature: "hook=codex.notify", content: codexNotifyHook },
+    { path: codexListenerPath, signature: "turn.completed", content: codexEventListener }
+  ];
+  const refreshed: string[] = [];
+  for (const candidate of candidates) {
+    const absolute = fromRoot(root, candidate.path);
+    const current = await readTextFilePrefix(absolute, 64 * 1024);
+    if (current === undefined || current.includes(hookScriptMarker) || !current.includes(candidate.signature)) continue;
+    try {
+      await writeTextFile(absolute, candidate.content());
+      await chmod(absolute, 0o755);
+      refreshed.push(candidate.path);
+    } catch {
+      // Best effort: an unwritable script just keeps its old behavior.
+    }
+  }
+  return refreshed;
 }
 
 async function installJsonHookConfig(
@@ -536,14 +788,6 @@ function latestTimestampedLine(lines: string[]): string | undefined {
     .filter((entry): entry is { line: string; timestamp: string } => Boolean(entry.timestamp))
     .sort((a, b) => a.timestamp.localeCompare(b.timestamp))
     .at(-1)?.line;
-}
-
-function latestFinalHookLine(lines: string[]): string | undefined {
-  return latestTimestampedLine(lines.filter(isFinalHookLine));
-}
-
-function isFinalHookLine(line: string): boolean {
-  return /hook=[a-z]+\.(stop|notify) status=(success|failed)\b/.test(line);
 }
 
 function errorMessage(error: unknown): string {

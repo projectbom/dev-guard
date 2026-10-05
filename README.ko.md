@@ -337,7 +337,7 @@ cp ~/.codex/config.toml.devguard-backup-YYYYMMDD-HHmmss ~/.codex/config.toml
 
 전략이 설치된 것과 실제 runtime에서 검증된 것은 다릅니다. `dev-guard doctor --agents`는 Claude/Codex 전략 상태를 보여줍니다. `dev-guard doctor --hooks --dry-run`은 hook 파일/권한/설정 command 경로만 검사하고, `dev-guard doctor --hooks`는 hook script를 직접 실행합니다. 직접 실행 검사는 `dev-guard done`과 `dev-guard status`를 실행할 수 있습니다.
 
-Codex는 project trust와 hook definition trust가 별도일 수 있습니다. Codex Stop Hook을 쓴다면 Codex TUI에서 `/hooks`를 열어 dev-guard Stop Hook을 review/trust해야 합니다. Claude Code Hook은 Claude Code가 설치되어 있고 해당 프로젝트에서 `.claude/settings.json`을 읽는 환경에서만 동작합니다. 실제 실행 여부는 `.devguard/logs/claude-hook.log`, `.devguard/logs/codex-hook.log`, `.devguard/logs/codex-notify.log`, `dev-guard status`로 확인합니다.
+Codex는 project trust와 hook definition trust가 별도일 수 있습니다. Codex Stop Hook을 쓴다면 Codex TUI에서 `/hooks`를 열어 dev-guard Stop Hook을 review/trust해야 합니다. Claude Code Hook은 Claude Code가 설치되어 있고 해당 프로젝트에서 `.claude/settings.json`을 읽는 환경에서만 동작합니다. 실제 실행 여부(runtime verification)는 hook 스크립트가 `.devguard/hook-state/`에 남기는 작은 상태 파일로 판정하며 `dev-guard status`로 확인합니다. `.devguard/logs/claude-hook.log`, `codex-hook.log`, `codex-notify.log`는 진단용 로그일 뿐입니다: 이벤트마다 짧은 요약만 기록하고(raw payload 없음, 명령 출력은 실패 시에만), 2MB마다 회전해 이전 세대 2개(`.log.1`, `.log.2`)만 보존합니다. `DEV_GUARD_HOOK_DEBUG=1`을 설정하면 최대 4KB의 raw payload와 명령 출력 tail도 기록합니다. 이전 버전 DevGuard가 생성한 hook 스크립트는 다음 `dev-guard watch` 때 자동으로 재생성됩니다.
 
 Codex의 `turn.completed`는 Hook 이벤트가 아니라 `codex exec --json` JSONL 출력 이벤트입니다. JSONL listener는 이 스트림을 감시하는 보조 기능이며 `.codex/hooks.json`에 섞지 않습니다.
 

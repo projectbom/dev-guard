@@ -3,8 +3,8 @@ import { access } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fromRoot, readTextFile, readTextFileCapped } from "./fs.js";
-import { getHookStatus, hookConfigPaths } from "./hooks.js";
+import { fromRoot, readTextFile } from "./fs.js";
+import { getHookStatus, hookConfigPaths, readHookStates } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
 import { getCodexNotifyConfigStatus } from "./codex-notify.js";
 
@@ -34,7 +34,10 @@ export interface AgentStrategyReport {
 const codexUserConfigPath = join(homedir(), ".codex", "config.toml");
 
 export async function getAgentStrategyReport(root: string): Promise<AgentStrategyReport> {
-  const hookStatus = await getHookStatus(root);
+  // Bounded single-line state files only — never the (diagnostic,
+  // rotated) hook logs. This runs on every 1s dashboard /api/state poll.
+  const hookStates = await readHookStates(root);
+  const hookStatus = await getHookStatus(root, hookStates);
   const [claudeScriptVerified, codexStopScriptVerified, codexNotifyScriptVerified, codexJsonlScriptVerified] = await Promise.all([
     isExecutable(root, devguardPaths.claudeHook),
     isExecutable(root, devguardPaths.codexHook),
@@ -43,14 +46,14 @@ export async function getAgentStrategyReport(root: string): Promise<AgentStrateg
   ]);
   const codexNotifyInstalled = await isCodexNotifyConfigured(root);
   const codexNotifyConfig = await getCodexNotifyConfigStatus();
-  const codexNotifyRuntimeVerified = await hasFinalLogLine(root, devguardPaths.codexNotifyLog, /hook=codex\.notify status=success\b.*source=agent_runtime\b/);
-  const codexJsonlRuntimeVerified = await hasFinalLogLine(root, devguardPaths.codexLog, /hook=codex\.turn\.completed status=success\b/);
+  const codexNotifyRuntimeVerified = matchesLine(hookStates["codex.notify"].runtimeSuccess, /hook=codex\.notify status=success\b.*source=agent_runtime\b/);
+  const codexJsonlRuntimeVerified = matchesLine(hookStates["codex.turn.completed"].success, /hook=codex\.turn\.completed status=success\b/);
   const claudeInstalled = hookStatus.claudeInstalled && hookStatus.claudeHookFile;
   const codexStopInstalled = hookStatus.codexInstalled && hookStatus.codexHookFile;
   const codexCliAvailable = commandAvailable("codex");
 
-  const claudeRuntimeVerified = await hasFinalLogLine(root, devguardPaths.claudeLog, /hook=claude\.stop status=success\b/);
-  const codexStopRuntimeVerified = await hasFinalLogLine(root, devguardPaths.codexLog, /hook=codex\.stop status=success\b.*source=agent_runtime\b/);
+  const claudeRuntimeVerified = matchesLine(hookStates["claude.stop"].success, /hook=claude\.stop status=success\b/);
+  const codexStopRuntimeVerified = matchesLine(hookStates["codex.stop"].runtimeSuccess, /hook=codex\.stop status=success\b.*source=agent_runtime\b/);
 
   const claude: AgentStrategyStatus = {
     name: "claude-stop-hook",
@@ -68,14 +71,14 @@ export async function getAgentStrategyReport(root: string): Promise<AgentStrateg
     name: "codex-notify",
     agent: "Codex",
     available: codexCliAvailable,
-    installed: codexNotifyInstalled || codexNotifyConfig.notifyIsDispatcher,
+    installed: codexNotifyInstalled || codexNotifyConfig.notifyIsDispatcher || codexNotifyConfig.notifyWrapsDispatcher,
     scriptVerified: codexNotifyScriptVerified,
     runtimeVerified: codexNotifyRuntimeVerified,
     requiresUserTrust: false,
     recommended: true,
     next: codexNotifyConfig.existingNotifyDetected
       ? "Existing Codex notify detected. Run dev-guard install-hooks --agent codex-notify --install-dispatcher."
-      : codexNotifyInstalled || codexNotifyConfig.notifyIsDispatcher
+      : codexNotifyInstalled || codexNotifyConfig.notifyIsDispatcher || codexNotifyConfig.notifyWrapsDispatcher
       ? "Run a Codex turn and check .devguard/logs/codex-notify.log."
       : "Configure user-level ~/.codex/config.toml notify to call .devguard/hooks/codex-notify.sh."
   };
@@ -136,19 +139,11 @@ async function isCodexNotifyConfigured(root: string): Promise<boolean> {
   return text.includes(fromRoot(root, devguardPaths.codexNotifyHook)) || text.includes(devguardPaths.codexNotifyHook);
 }
 
-// Checks whether the hook EVER succeeded, anywhere in its lifetime log —
-// not just the most recent run (see getHookStatus's latestFinalHookLine
-// for that) — so this intentionally scans the whole file, not just a
-// tail. These are append-only logs with no rotation, growing for the
-// project's entire lifetime, and getAgentStrategyReport (hence this) is
-// called on every 1s dashboard poll, so a capped read is still required:
-// readTextFileCapped refuses to load a pathological multi-GB log into
-// memory rather than scanning it, which only matters as a safety ceiling
-// — any realistically-sized hook log (even years of continuous use) stays
-// far under the cap.
-async function hasFinalLogLine(root: string, path: string, pattern: RegExp): Promise<boolean> {
-  const text = await readTextFileCapped(fromRoot(root, path));
-  return text.split(/\r?\n/).some((line) => pattern.test(line));
+// "Ever succeeded" evidence comes from the hook's own state file (the
+// latest success line, which hook scripts only ever overwrite with a newer
+// success), so it survives log rotation and costs O(1) per poll.
+function matchesLine(line: string | undefined, pattern: RegExp): boolean {
+  return line !== undefined && pattern.test(line);
 }
 
 async function isExecutable(root: string, path: string): Promise<boolean> {

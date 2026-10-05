@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { readTextFile, writeTextFile } from "./fs.js";
+import { HOOK_LOG_GENERATIONS, HOOK_LOG_ROTATE_BYTES } from "./hook-log-policy.js";
 
 export interface CodexNotifyConfigStatus {
   configPath: string;
@@ -11,6 +12,12 @@ export interface CodexNotifyConfigStatus {
   notify?: string[];
   notifyConfigured: boolean;
   notifyIsDispatcher: boolean;
+  /**
+   * notify is another program (e.g. Codex Computer Use's SkyComputerUseClient
+   * `--previous-notify [...]`) that itself chains to our dispatcher — the
+   * dispatcher is still reached on every turn, so this counts as installed.
+   */
+  notifyWrapsDispatcher: boolean;
   existingNotifyDetected: boolean;
 }
 
@@ -29,6 +36,7 @@ export async function getCodexNotifyConfigStatus(): Promise<CodexNotifyConfigSta
   const text = await readTextFile(codexNotifyConfigPath);
   const notify = parseTopLevelNotify(text);
   const notifyIsDispatcher = Boolean(notify?.[0] === codexNotifyDispatcherPath);
+  const notifyWrapsDispatcher = !notifyIsDispatcher && referencesDispatcher(notify);
   return {
     configPath: codexNotifyConfigPath,
     dispatcherPath: codexNotifyDispatcherPath,
@@ -36,7 +44,8 @@ export async function getCodexNotifyConfigStatus(): Promise<CodexNotifyConfigSta
     notify,
     notifyConfigured: Boolean(notify),
     notifyIsDispatcher,
-    existingNotifyDetected: Boolean(notify && !notifyIsDispatcher)
+    notifyWrapsDispatcher,
+    existingNotifyDetected: Boolean(notify && !notifyIsDispatcher && !notifyWrapsDispatcher)
   };
 }
 
@@ -44,9 +53,36 @@ export async function installCodexNotifyDispatcher(options: { force?: boolean } 
   const text = await readTextFile(codexNotifyConfigPath);
   const notify = parseTopLevelNotify(text);
   const notifyIsDispatcher = Boolean(notify?.[0] === codexNotifyDispatcherPath);
-  const originalNotify = notifyIsDispatcher ? readOriginalNotifyFromDispatcher() ?? [] : notify ?? [];
+  const notifyWrapsDispatcher = !notifyIsDispatcher && referencesDispatcher(notify);
+  const existingDispatcherText = existsSync(codexNotifyDispatcherPath) ? readFileSync(codexNotifyDispatcherPath, "utf8") : "";
+  const existingOriginal = readOriginalNotifyFromDispatcher(existingDispatcherText);
 
-  if (notifyIsDispatcher && existsSync(codexNotifyDispatcherPath) && !options.force) {
+  if (notifyWrapsDispatcher) {
+    // Another notify program already calls our dispatcher (via
+    // --previous-notify). Rewriting config.toml would fight that program,
+    // and chaining it again from the dispatcher is exactly the infinite
+    // loop seen in the wild (Codex -> Sky -> dispatcher -> Sky -> ...):
+    // keep config.toml as is and make the dispatcher a leaf.
+    const originalNotify = withoutRedundantWrapper(stripDispatcherSelfReference(existingOriginal ?? []), notify ?? []);
+    const nextScript = dispatcherScript(originalNotify);
+    if (existingDispatcherText === nextScript) {
+      return { changed: false, dispatcherPath: codexNotifyDispatcherPath, message: "Codex notify dispatcher already installed (reached via an existing notify wrapper)" };
+    }
+    const backupPath = existingDispatcherText ? `${codexNotifyDispatcherPath}.devguard-backup-${timestampForFile()}` : undefined;
+    if (backupPath) await copyFile(codexNotifyDispatcherPath, backupPath);
+    await writeTextFile(codexNotifyDispatcherPath, nextScript);
+    await chmod(codexNotifyDispatcherPath, 0o755);
+    return {
+      changed: true,
+      backupPath,
+      dispatcherPath: codexNotifyDispatcherPath,
+      message: "Codex notify dispatcher regenerated; config.toml left unchanged (existing notify already chains to the dispatcher)"
+    };
+  }
+
+  const originalNotify = stripDispatcherSelfReference(notifyIsDispatcher ? existingOriginal ?? [] : notify ?? []);
+
+  if (notifyIsDispatcher && existingDispatcherText && !options.force) {
     return {
       changed: false,
       dispatcherPath: codexNotifyDispatcherPath,
@@ -72,12 +108,41 @@ export async function installCodexNotifyDispatcher(options: { force?: boolean } 
   };
 }
 
+/**
+ * The dispatcher must never (directly or via a wrapper's
+ * `--previous-notify`) call itself: drop any `--previous-notify <value>`
+ * pair whose value references the dispatcher, and if the dispatcher is
+ * still referenced anywhere after that, drop the whole original command.
+ */
+export function stripDispatcherSelfReference(command: string[]): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < command.length; index += 1) {
+    if (command[index] === "--previous-notify" && index + 1 < command.length && referencesDispatcher([command[index + 1]])) {
+      index += 1;
+      continue;
+    }
+    result.push(command[index]);
+  }
+  return referencesDispatcher(result) ? [] : result;
+}
+
+// When config.toml's notify is a wrapper that already runs before the
+// dispatcher, re-running that same program from the dispatcher would fire
+// it twice per turn.
+function withoutRedundantWrapper(original: string[], configNotify: string[]): string[] {
+  const wrapper = stripDispatcherSelfReference(configNotify);
+  return original.length > 0 && original[0] === wrapper[0] ? [] : original;
+}
+
+function referencesDispatcher(command: string[] | undefined): boolean {
+  return Boolean(command?.some((part) => part.replace(/\\\//g, "/").includes(codexNotifyDispatcherPath)));
+}
+
 export function formatNotifyCommand(command: string[] | undefined): string {
   return command && command.length > 0 ? command.map((part) => JSON.stringify(part)).join(" ") : "none";
 }
 
-function readOriginalNotifyFromDispatcher(): string[] | undefined {
-  const text = existsSync(codexNotifyDispatcherPath) ? readFileSync(codexNotifyDispatcherPath, "utf8") : "";
+function readOriginalNotifyFromDispatcher(text: string): string[] | undefined {
   const match = /^ORIGINAL_NOTIFY=\((.*)\)$/m.exec(text);
   return match ? parseShellArray(match[1]) : undefined;
 }
@@ -106,16 +171,42 @@ function replaceTopLevelNotify(text: string, notify: string[]): string {
   return `${line}\n${text}`;
 }
 
-function dispatcherScript(originalNotify: string[]): string {
+export function dispatcherScript(originalNotify: string[]): string {
   return `#!/usr/bin/env bash
 set +e
 
 LOG="${codexNotifyDispatcherLogPath}"
 ORIGINAL_NOTIFY=(${originalNotify.map(shellQuote).join(" ")})
+LOG_MAX_BYTES="\${DEV_GUARD_HOOK_LOG_MAX_BYTES:-${HOOK_LOG_ROTATE_BYTES}}"
+LOG_GENERATIONS=${HOOK_LOG_GENERATIONS}
 
 mkdir -p "$(dirname "$LOG")"
 timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 log() { printf 'timestamp=%s dispatcher=codex.notify %s\\n' "$(timestamp)" "$*" >> "$LOG"; }
+file_size() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || echo 0; }
+rotate_log() {
+  [ -f "$LOG" ] || return 0
+  size="$(file_size "$LOG")"
+  case "$size" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$size" -lt "$LOG_MAX_BYTES" ] && return 0
+  gen=$LOG_GENERATIONS
+  while [ "$gen" -gt 1 ]; do
+    prev=$((gen - 1))
+    [ -f "$LOG.$prev" ] && mv -f "$LOG.$prev" "$LOG.$gen"
+    gen=$prev
+  done
+  mv -f "$LOG" "$LOG.1"
+}
+
+rotate_log
+# Re-entry guard: if ORIGINAL_NOTIFY (or anything it runs) ever calls this
+# dispatcher again, stop instead of recursing (a real notify loop reached
+# 8000+ nested processes and exhausted the user's process limit).
+if [ -n "\${DEV_GUARD_NOTIFY_DISPATCHER_ACTIVE:-}" ]; then
+  log "status=skipped reason=reentrant argc=$#"
+  exit 0
+fi
+export DEV_GUARD_NOTIFY_DISPATCHER_ACTIVE=1
 
 log "status=start argc=$#"
 
