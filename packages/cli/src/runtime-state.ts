@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 import {
   analyzeDiff,
   defaultConfig,
+  extractNegatedTerms,
+  filterDiffTextForFiles,
   filterDevGuardContextFiles,
   formatInferredDiffIntentClusters,
   generateUpdateSuggestions,
@@ -18,7 +20,7 @@ import {
   type DevGuardConfig
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTailLines, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
-import { computeWorkingTreeContentHash, getDiffForChangeFiles, getFileContentAtRef, getGitChanges, getGitIdentity, type GitChanges } from "./git.js";
+import { computeWorkingTreeContentHash, getDiffForChangeFiles, getFileContentAtRef, getGitChanges, getGitIdentity, hashWorkingFiles, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
 import { discoverWorkspaceSourceRoots, ensureProjectKnowledge, readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
@@ -86,6 +88,14 @@ export interface BeforeAgentTask {
    * philosophy — a missed regression is worse than an unflattering note).
    */
   changedFilesAtCreation?: string[];
+  /**
+   * Content hash (git blob id) of each changedFilesAtCreation entry at the
+   * same moment. Lets processDoneEvent tell a carried-over file this task
+   * actually edited again (hash changed -> task-scoped) from one it never
+   * touched (hash unchanged -> carried over). Absent on older tasks, in
+   * which case every baseline file is treated as carried over (old behavior).
+   */
+  changedFileHashesAtCreation?: Record<string, string>;
   /** codeStateHash at the moment this lineage began — see computeWorkingTreeContentHash. */
   codeStateHashAtCreation?: string;
 }
@@ -323,7 +333,50 @@ export interface PreparedTaskContextResult extends BeforeAgentPreparationResult 
    * automatic action DevGuard takes on its own.
    */
   rollover: RolloverAssessment;
+  /** One concrete next step, from the routed files and unresolved evidence. */
+  nextAction: string;
+  /** Carried-over dirty work at task start — a count and warning, never a file list. */
+  scope: { carriedOverDirtyFiles: number; warning?: string };
+  /** Up to 3 unresolved (FAIL/UNKNOWN) results the previous task left behind. */
+  openValidation: string[];
 }
+
+/**
+ * The compact payload the MCP tool actually sends to the agent: the
+ * PreparedTaskContextResult minus duplicated artifact paths, per-artifact
+ * cost rows and boilerplate range reasons, serialized without indentation.
+ * Everything an agent needs to start is here; the markdown fallbacks are
+ * named once, for the MCP-failure case only.
+ */
+export function toAgentContextPayload(result: PreparedTaskContextResult): Record<string, unknown> {
+  return {
+    task: result.task,
+    nextAction: result.nextAction,
+    files: result.files.map((file) => ({
+      path: file.path,
+      relevance: file.relevance,
+      reason: truncateLine(file.reason, 160),
+      ranges: file.ranges.slice(0, 3).map((range) => ({ lines: `${range.startLine}-${range.endLine}`, label: range.label, confidence: range.confidence }))
+    })),
+    constraints: result.constraints,
+    scope: result.scope,
+    validation: {
+      freshForThisTask: result.validation.fresh.map((entry) => `${entry.kind} ${entry.name}: ${entry.status}`),
+      staleCount: result.validation.staleCount,
+      unboundCount: result.validation.unboundCount
+    },
+    openValidation: result.openValidation,
+    indexFreshness: result.indexFreshness,
+    coverage: result.coverage,
+    warnings: result.warnings,
+    rollover: { status: result.rollover.status, advice: ROLLOVER_ADVICE },
+    workflow: "Read the files/ranges above first. Search the repository only for a concrete gap they do not cover. Do not read .devguard markdown unless this result is insufficient.",
+    fallbackOnly: [result.contextFiles.agentBrief, result.contextFiles.readMap, result.contextFiles.codeMap]
+  };
+}
+
+export const ROLLOVER_ADVICE =
+  "DevGuard cannot see the provider's context window. Start each distinct task in a fresh agent thread with prepare_task_context; if this thread already handled another task or was compacted, move to a fresh thread instead of waiting for compaction.";
 
 export interface PreparedTaskContextFile {
   path: string;
@@ -581,7 +634,7 @@ interface CodeIndexSymbol {
 
 type ContextPriority = "Required" | "Recommended" | "Optional";
 type ContextFreshness = "Fresh" | "Stale" | "Unknown";
-type ContextRelevance = "Targeted" | "Candidate" | "Unknown";
+type ContextRelevance = "Targeted" | "Candidate" | "Reference" | "Unknown";
 type ContextConfidence = "High" | "Medium" | "Low";
 type ContextCoverage = "Focused" | "Partial" | "Unknown";
 
@@ -1369,8 +1422,28 @@ export async function processDoneEvent(root: string, options: { completionSource
   // produced files it never touched. Undefined (not computed) when no task
   // was active this round: there is then no baseline to split against.
   const taskBaseline = runtime.currentTask?.changedFilesAtCreation;
-  const taskScopedChangedFiles = taskBaseline ? changedFiles.filter((file) => !taskBaseline.includes(file)) : undefined;
-  const carriedOverChangedFiles = taskBaseline ? changedFiles.filter((file) => taskBaseline.includes(file)) : undefined;
+  // A baseline file whose content changed since the task began was edited by
+  // THIS task (it is task-scoped work, not leftover).
+  const editedBaselineFiles = await baselineFilesEditedSince(root, runtime.currentTask, changedFiles);
+  // "Carried over" means EARLIER work: a baseline file an earlier `done`
+  // already reported (it is in the previous history record) and this task
+  // has not edited since. A file that was dirty at prepare time but never
+  // finalized is this task's own pre-prepare work and stays in scope.
+  const previouslyFinalized = new Set((await readHistoryRecords(root, 1)).at(-1)?.changedFiles ?? []);
+  const isCarriedOver = (file: string) => Boolean(taskBaseline?.includes(file)) && previouslyFinalized.has(file) && !editedBaselineFiles.has(file);
+  const taskScopedChangedFiles = taskBaseline ? changedFiles.filter((file) => !isCarriedOver(file)) : undefined;
+  const carriedOverChangedFiles = taskBaseline ? changedFiles.filter(isCarriedOver) : undefined;
+  // Task-scoped documents: Quality Report / Handoff / Next Prompt / history
+  // intent describe THIS task's files only. Carried-over dirty work is kept
+  // as a count + warning (judgments below) and in history, never presented
+  // as the current task's change set. Without an active task there is no
+  // baseline, so the full changed set is used exactly as before.
+  const documentFiles = taskScopedChangedFiles ?? changedFiles;
+  const documentFileSet = new Set(documentFiles);
+  const documentChangeFiles = taskScopedChangedFiles ? changeFiles.filter((file) => documentFileSet.has(file.path)) : changeFiles;
+  // filterDiffTextForFiles returns the WHOLE diff for an empty file list, so a
+  // task with no scoped changes must get an explicitly empty diff.
+  const documentDiffText = !taskScopedChangedFiles ? diffText : documentFiles.length === 0 ? "" : filterDiffTextForFiles(diffText, documentFiles);
   const { fresh: freshQaResults, stale: staleQaResults, unbound: unboundQaResults } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
   const diffStat = await getGitDiffStat(root).catch(() => "git diff stat unavailable");
   const [projectMarkdown, architectureMarkdown, decisionsMarkdown, tasksMarkdown, config, codeGraph] = await Promise.all([
@@ -1382,36 +1455,39 @@ export async function processDoneEvent(root: string, options: { completionSource
     readJsonFile<CodeGraphEntry[]>(fromRoot(root, ".devguard/code-graph.json"), [])
   ]);
   perfMark("done:diffStat+markdown-reads-complete");
-  const clusters = inferDiffIntentClusters({ changedFiles, changeFiles, diffText, codeGraph });
+  const clusters = inferDiffIntentClusters({ changedFiles: intentInputFiles(documentFiles), changeFiles: documentChangeFiles.filter((file) => !isAgentConfigPath(file.path)), diffText: documentDiffText, codeGraph });
   const checkReport = analyzeDiff({
-    changedFiles,
-    changeFiles,
-    diffText,
+    changedFiles: documentFiles,
+    changeFiles: documentChangeFiles,
+    diffText: documentDiffText,
     taskText: [tasksMarkdown, projectMarkdown, architectureMarkdown].join("\n\n"),
     rulesText: decisionsMarkdown,
     config,
     includeContextFiles: false
   });
   const updateSuggestions = generateUpdateSuggestions({
-    changedFiles,
-    changeFiles,
-    diffText,
+    changedFiles: documentFiles,
+    changeFiles: documentChangeFiles,
+    diffText: documentDiffText,
     taskMarkdown: tasksMarkdown || projectMarkdown || "No active task document.",
     rulesMarkdown: decisionsMarkdown,
     mistakesMarkdown: architectureMarkdown,
     includeContextFiles: false
   });
-  const areas = classifyAreas(changedFiles);
+  const areas = classifyAreas(documentFiles);
   const judgments = buildJudgments({ areas, clusters, checkFindings: checkReport.findings.map((finding) => finding.message), architectureMarkdown, decisionsMarkdown });
   if (carriedOverChangedFiles && carriedOverChangedFiles.length > 0) {
-    const shown = carriedOverChangedFiles.slice(0, 5).join(", ");
-    const more = carriedOverChangedFiles.length > 5 ? ` (+${carriedOverChangedFiles.length - 5} more)` : "";
     judgments.push(
-      `${carriedOverChangedFiles.length} file(s) were already dirty before this task's prepare_task_context call: ${shown}${more}. Confirm they belong to this task or are leftover from earlier, unfinished work.`
+      `${carriedOverChangedFiles.length} file(s) were already dirty before this task started and were not edited by it; they are carried-over work from earlier tasks and are excluded from this task's report.`
     );
   }
   const drift = clusters.mixedRisk;
-  const summary = formatInferredDiffIntentClusters(clusters);
+  // History intent leads with the explicit task (when one is active); the
+  // diff-based classification only describes this task's own files.
+  const diffIntentSummary = formatInferredDiffIntentClusters(clusters);
+  const summary = runtime.currentTask?.text?.trim()
+    ? `TASK: ${truncateLine(runtime.currentTask.text.trim(), 120)}; ${documentFiles.length === 0 ? "no task-scoped file changes" : diffIntentSummary}`
+    : diffIntentSummary;
   const previousProjectState = await readProjectState(root);
   const canonicalTaskGoal = runtime.currentTask?.text?.trim() || undefined;
   const resolvedGoal = resolveSessionTaskGoal({
@@ -1430,8 +1506,8 @@ export async function processDoneEvent(root: string, options: { completionSource
   // actual diff) as if it still described these changes. See
   // stateIntegrity below for how Quality Report/Handoff surface this.
   const documentationSummary = buildDocumentationSummary({
-    changedFiles,
-    diffText,
+    changedFiles: documentFiles,
+    diffText: documentDiffText,
     diffStat,
     taskText: [runtime.currentTask?.text ?? "", tasksMarkdown, projectMarkdown].join("\n\n"),
     canonicalGoal: resolvedGoal.goal,
@@ -1467,8 +1543,8 @@ export async function processDoneEvent(root: string, options: { completionSource
   const codeIndex = await updateCodeIndex(root, changedFiles, documentationSummary);
   perfMark("done:codeIndex-update-complete");
   const timestamp = new Date().toISOString();
-  const majorChanges = inferMajorChanges({ summary, changedFiles, areas, diffText });
-  const testCandidates = await inferTestCandidates(root, { areas, changedFiles });
+  const majorChanges = inferMajorChanges({ summary, changedFiles: documentFiles, areas, diffText: documentDiffText });
+  const testCandidates = await inferTestCandidates(root, { areas, changedFiles: documentFiles });
   const projectContext = summarizeProjectContext({ projectMarkdown, architectureMarkdown, decisionsMarkdown });
   const docUpdateCandidates = [updateSuggestions.summary];
   const historyRecord: HistoryRecord = {
@@ -1488,11 +1564,11 @@ export async function processDoneEvent(root: string, options: { completionSource
   };
   const previousHistory = await readHistoryRecords(root, 20);
   const nextHistory = [...previousHistory, historyRecord];
-  const decisionCandidates = inferDecisionCandidates({ areas, changedFiles, judgments, summary });
-  const riskDetails = buildRiskDetails({ judgments, changedFiles, areas });
-  const nextTask = chooseNextTask({ drift, judgments, areas, changedFiles, testCandidates });
+  const decisionCandidates = inferDecisionCandidates({ areas, changedFiles: documentFiles, judgments, summary });
+  const riskDetails = buildRiskDetails({ judgments, changedFiles: documentFiles, areas });
+  const nextTask = chooseNextTask({ drift, judgments, areas, changedFiles: documentFiles, testCandidates });
   let qualityReport = await assessCompletionQuality(root, {
-    changedFiles,
+    changedFiles: documentFiles,
     rawChangedFiles,
     areas,
     judgments,
@@ -1516,7 +1592,7 @@ export async function processDoneEvent(root: string, options: { completionSource
     qualityReport = await enhanceQualityReportWithAI(root, {
       locale,
       report: qualityReport,
-      changedFiles,
+      changedFiles: documentFiles,
       areas,
       judgments,
       summary,
@@ -1557,7 +1633,7 @@ export async function processDoneEvent(root: string, options: { completionSource
   const promptMarkdown = renderNextPrompt({
     projectContext,
     summary,
-    changedFiles,
+    changedFiles: documentFiles,
     areas,
     judgments,
     drift,
@@ -1588,7 +1664,7 @@ export async function processDoneEvent(root: string, options: { completionSource
       lastDrift: drift,
       lastQualityVerdict: qualityReport.verdict,
       lastQualityNextAction: qualityReport.nextRecommendedAction,
-      lastChangedFiles: changedFiles,
+      lastChangedFiles: documentFiles,
       lastTaskGoal: sessionTaskGoal,
       lastTaskGoalSource: sessionTaskGoalSource,
       lastTaskGoalSessionId: sessionTaskGoalSessionId,
@@ -1680,6 +1756,41 @@ export async function processDoneEvent(root: string, options: { completionSource
   } // end finalizeOnce
 }
 
+async function baselineFilesEditedSince(root: string, task: BeforeAgentTask | undefined, changedFiles: string[]): Promise<Set<string>> {
+  const before = task?.changedFileHashesAtCreation;
+  const baselineFiles = task?.changedFilesAtCreation;
+  if (!before || !baselineFiles?.length) return new Set();
+  const candidates = changedFiles.filter((file) => baselineFiles.includes(file));
+  if (candidates.length === 0) return new Set();
+  const now = await hashWorkingFiles(root, candidates);
+  // A file with a recorded hash whose content now differs (or that is now
+  // gone) was edited by this task. Files with no recorded hash (directories,
+  // or a hashing failure) stay carried over — the conservative default.
+  return new Set(candidates.filter((file) => before[file] !== undefined && before[file] !== now[file]));
+}
+
+// Agent/tool configuration files (.claude/, .codex/, .mcp.json, AGENTS.md,
+// CLAUDE.md, .devguard/) describe the tooling, not the project's work; they
+// must not drive the history intent classification.
+function isAgentConfigPath(file: string): boolean {
+  return /^(?:\.claude\/|\.codex\/|\.devguard\/|\.mcp\.json$|AGENTS\.md$|CLAUDE\.md$)/.test(file);
+}
+
+function intentInputFiles(files: string[]): string[] {
+  return files.filter((file) => !isAgentConfigPath(file));
+}
+
+// History lines shown to agents carry the diff intent only; the "TASK: …"
+// prefix is a past session's goal and must never read as current work.
+function historyIntentOnly(summary: string): string {
+  return summary.replace(/^TASK: .*?; (?=INTENT:|no task-scoped)/, "");
+}
+
+function truncateLine(value: string, max: number): string {
+  const single = value.replace(/\s+/g, " ");
+  return single.length > max ? `${single.slice(0, max - 3)}...` : single;
+}
+
 export async function prepareBeforeAgentContext(root: string, task: string, continueCurrentTask = false): Promise<BeforeAgentPreparationResult> {
   const result = await prepareTaskContext({ root, task, persistTask: true, continueCurrentTask });
   return {
@@ -1721,20 +1832,26 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   // would make the baseline creep forward and hide the task's own earlier
   // files as "carried over" from itself.
   const baseline = isContinuing && current.currentTask
-    ? { changedFilesAtCreation: current.currentTask.changedFilesAtCreation, codeStateHashAtCreation: current.currentTask.codeStateHashAtCreation }
+    ? {
+        changedFilesAtCreation: current.currentTask.changedFilesAtCreation,
+        codeStateHashAtCreation: current.currentTask.codeStateHashAtCreation,
+        changedFileHashesAtCreation: current.currentTask.changedFileHashesAtCreation
+      }
     : await (async () => {
         const [{ changedFiles: baselineChangedFiles }, { codeStateHash: baselineCodeStateHash }] = await Promise.all([
           gatherCurrentChangeState(root, current),
           resolveCurrentCodeState(root)
         ]);
-        return { changedFilesAtCreation: baselineChangedFiles, codeStateHashAtCreation: baselineCodeStateHash };
+        const baselineHashes = await hashWorkingFiles(root, baselineChangedFiles);
+        return { changedFilesAtCreation: baselineChangedFiles, codeStateHashAtCreation: baselineCodeStateHash, changedFileHashesAtCreation: baselineHashes };
       })();
   const currentTask: BeforeAgentTask = {
     text,
     source: "explicit-before-agent-input",
     createdAt: new Date().toISOString(),
     changedFilesAtCreation: baseline.changedFilesAtCreation,
-    codeStateHashAtCreation: baseline.codeStateHashAtCreation
+    codeStateHashAtCreation: baseline.codeStateHashAtCreation,
+    changedFileHashesAtCreation: baseline.changedFileHashesAtCreation
   };
   perfMark("prepare:baseline-computed");
   const taskTransition: "new" | "continued" | "replaced" = isContinuing ? "continued" : current.currentTask ? "replaced" : "new";
@@ -1783,7 +1900,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     perfMark("prepare:pathHints-resolved");
     const rankedFiles = readableContextFiles(context.files, context.summary, codeIndex, context.filesResolved).filter((file) => !pathHints.includes(file));
     perfMark("prepare:readableContextFiles-ranked");
-    const files = [...pathHints, ...rankedFiles].slice(0, 8);
+    const files = capReferenceOnlyFiles([...pathHints, ...rankedFiles], context.summary, pathHints).slice(0, 8);
     const structuredFiles = await Promise.all(files.map(async (file) => {
       const content = await readTextFile(fromRoot(root, file)).catch(() => "");
       return preparedTaskContextFile(file, context.summary, codeIndex, content, pathHints.includes(file), readCandidatesCache);
@@ -1796,12 +1913,15 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     perfMark("prepare:measureResumeBundleCost-done");
     const rollover = computeRolloverAssessment({
       changedFileCount: runtimeWithTask.pendingChangedFiles.length,
-      qaResultCount: Object.keys(runtimeWithTask.qaResults ?? {}).length,
+      qaResultCount: currentSessionQaCount(runtimeWithTask),
       taskCreatedAt: runtimeWithTask.currentTask?.createdAt,
       contextBundleEstimatedTokens: resumeCost.totalEstimatedTokens
     });
     const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask);
     perfMark("prepare:validationSummary-done");
+    const openValidation = previousTaskOpenValidation(runtimeWithTask);
+    const carriedOverDirtyFiles = currentTask.changedFilesAtCreation?.length ?? 0;
+    const nextAction = preparedNextAction(structuredFiles, openValidation);
     await recordTaskTelemetry(root, {
       event: taskTransition === "continued" ? "TASK_CONTINUED" : taskTransition === "replaced" ? "TASK_REPLACED" : "TASK_PREPARED",
       sessionId,
@@ -1818,7 +1938,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       coverage: aggregateCoverage(trusts),
       coverageGaps,
       files: structuredFiles,
-      constraints: readMapSkips(context.summary, files, "en-US"),
+      constraints: await preparedTaskConstraints(root, context.summary),
       warnings: [...warnings, ...coverageGaps],
       validation,
       contextFiles: {
@@ -1831,6 +1951,14 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       },
       resumeCost,
       rollover,
+      nextAction,
+      scope: {
+        carriedOverDirtyFiles,
+        ...(carriedOverDirtyFiles > 0
+          ? { warning: `${carriedOverDirtyFiles} file(s) were already dirty before this task (earlier work). Do not edit or revert them unless this task requires it; they are excluded from this task's report.` }
+          : {})
+      },
+      openValidation,
       readMapPath,
       codeMapPath,
       workingContextPath,
@@ -1854,6 +1982,53 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     if (!persistTask) await writeRuntimeState(root, { ...current, currentTask: current.currentTask, sessionId: current.sessionId });
     perfFlush();
   }
+}
+
+// Constraints for the MCP result, each tagged with its source ([task] from
+// the task text, [project config] from .devguard/config.json protectedPaths).
+// Never a fixed default list.
+async function preparedTaskConstraints(root: string, summary: DocumentationSummary | undefined): Promise<string[]> {
+  const config = await readJsonFile<DevGuardConfig>(fromRoot(root, ".devguard/config.json"), defaultConfig);
+  const fromTask = summary?.excludedAreas ?? [];
+  const fromConfig = (config.protectedPaths ?? []).slice(0, 4).map((path) => `protected path: ${path} — change only if the task requires it [project config]`);
+  const lines = [...fromTask, ...fromConfig];
+  return lines.length > 0 ? lines : ["No task-specific exclusions were stated."];
+}
+
+// Rollover counts only THIS task's recorded validations. Counting every
+// result ever stored made the signal permanently ROLL_OVER_RECOMMENDED once
+// a project had accumulated 13+ results, regardless of the current session.
+export function currentSessionQaCount(runtime: RuntimeState): number {
+  if (!runtime.sessionId) return 0;
+  return Object.values(runtime.qaResults ?? {}).filter((entry) => entry.sessionId === runtime.sessionId).length;
+}
+
+function previousTaskOpenValidation(runtime: RuntimeState): string[] {
+  const others = Object.values(runtime.qaResults ?? {}).filter((entry) => entry.sessionId && entry.sessionId !== runtime.sessionId);
+  if (others.length === 0) return [];
+  const latest = others.reduce((a, b) => (Date.parse(b.completedAt) > Date.parse(a.completedAt) ? b : a));
+  const sameSession = Object.fromEntries(
+    others.filter((entry) => entry.sessionId === latest.sessionId && entry.status !== "PASS").map((entry) => [`${entry.kind}::${entry.name}`, entry])
+  );
+  return canonicalValidationLines(sameSession, 3).map((line) => line.replace(/^- /, ""));
+}
+
+function preparedNextAction(files: PreparedTaskContextFile[], openValidation: string[]): string {
+  const first = files.find((file) => file.relevance !== "Reference");
+  const start = first
+    ? `Read ${first.path}${first.ranges[0] ? `:${first.ranges[0].startLine}-${first.ranges[0].endLine}` : ""} first, then implement the task.`
+    : "No routed file — read the task's explicitly named files, then search only for the concrete gap.";
+  return openValidation.length > 0 ? `Previous task left unresolved: ${openValidation[0].replace(/[.\s]+$/, "")}. Check whether it affects this task. ${start}` : start;
+}
+
+// Reference-only (task-excluded) files never fill more than 2 of the 8 slots.
+function capReferenceOnlyFiles(files: string[], summary: DocumentationSummary | undefined, pathHints: string[]): string[] {
+  let references = 0;
+  return files.filter((file) => {
+    if (pathHints.includes(file) || !negatedTermInPath(file, summary)) return true;
+    references += 1;
+    return references <= 2;
+  });
 }
 
 /**
@@ -2044,6 +2219,16 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
 // file was fully re-tokenized via extractSearchTokens/buildCodeIndexFile on
 // every single call, regardless of whether its content had actually
 // changed. The task string is no longer read here at all.
+// One-time migration for indexes built before "Front Card"/"Back Card"
+// block labels required the literal phrase: an entry whose label is not
+// backed by its own content is re-extracted instead of reused.
+function hasStaleCardBlockLabel(entry: CodeIndexFile, content: string): boolean {
+  return entry.blocks.some((block) =>
+    (block.name === "Front Card" && !/Front Card|front card|frontCard|FrontCard/.test(content)) ||
+    (block.name === "Back Card" && !/Back Card|back card|backCard|BackCard/.test(content))
+  );
+}
+
 async function hydrateCodeIndex(root: string): Promise<void> {
   const hydrateStart = performance.now();
   const current = await readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), {
@@ -2074,7 +2259,7 @@ async function hydrateCodeIndex(root: string): Promise<void> {
     stats.bytesRead += content.length;
     if (!content.trim()) return;
     const hash = hashText(content);
-    if (entry.hash === hash && entry.tokens?.length) {
+    if (entry.hash === hash && entry.tokens?.length && !hasStaleCardBlockLabel(entry, content)) {
       stats.entriesReused += 1;
       return;
     }
@@ -2205,11 +2390,11 @@ export async function generateAgentContext(root: string, preloaded?: ResumeRawIn
   // so relying on it as the primary source is what produced "current goal:
   // 확인 필요" next to a real, current task goal elsewhere.
   const currentGoal = documentationSummary?.goal ?? firstSectionBullet(project, "현재 목표") ?? "확인 필요";
-  const lastSummary = documentationSummary?.overview?.join("; ") ?? state.lastSummary ?? "확인 필요";
+  const lastSummary = documentationSummary?.overview?.join("; ") ?? (state.lastSummary ? historyIntentOnly(state.lastSummary) : undefined) ?? "확인 필요";
   const recentHistory = historyRecords
     .slice(-3)
     .reverse()
-    .map((r) => `${r.timestamp}: ${r.inferredSummary}`);
+    .map((r) => `${r.timestamp}: ${historyIntentOnly(r.inferredSummary)}`);
   const markdown = renderAgentContext({
     projectPurpose,
     currentGoal,
@@ -2308,9 +2493,9 @@ function resolveBeforeAgentContext(input: {
 }): { summary?: DocumentationSummary; files: string[]; source: ContextTaskSource; filesResolved: boolean } {
   const currentTask = input.runtime.currentTask?.text?.trim();
   if (currentTask) {
-    const baseSummary = beforeAgentTaskSummary(currentTask, input.codeIndex);
+    const baseSummary = registerTokenWeightIndex(beforeAgentTaskSummary(currentTask, input.codeIndex), input.codeIndex);
     const candidateFiles = taskRelevantIndexCandidates(baseSummary, input.codeIndex, new Set()).slice(0, 12);
-    const summary = beforeAgentTaskSummary(currentTask, input.codeIndex, candidateFiles);
+    const summary = registerTokenWeightIndex(beforeAgentTaskSummary(currentTask, input.codeIndex, candidateFiles), input.codeIndex);
     return {
       summary,
       // This IS the one, full readableContextFiles resolution for this call
@@ -2359,7 +2544,7 @@ function beforeAgentTaskSummary(task: string, index: CodeIndex, candidates: stri
     changeTypes: types,
     impact: {
       affected,
-      unaffected: unaffectedAreasFromDocumentation(affected),
+      unaffected: [],
       risk: "None",
       riskReason: "Before-Agent context preparation only; no source change has been finalized."
     },
@@ -2367,7 +2552,7 @@ function beforeAgentTaskSummary(task: string, index: CodeIndex, candidates: stri
     qaChecks: ["Use Read Map to choose the first file.", "Use Code Map ranges before opening full files."],
     remainingWork: ["Implement the current task after reading the targeted context."],
     structure: ["Before-Agent task", "↓", "Code Index Task Routing", "↓", "Read Map / Code Map / Agent Brief"],
-    excludedAreas: unaffectedAreasFromDocumentation(affected),
+    excludedAreas: taskScopeConstraints(task),
     constraints: extractTaskConstraints(task)
   };
 }
@@ -2452,6 +2637,15 @@ function preparedTaskContextFile(file: string, summary: DocumentationSummary | u
       confidence: "Medium",
       reason: "Task named this file directly; it is not yet in the Code Index, so no symbol-level range is available — start from the top."
     }];
+  }
+  const negatedTerm = isExplicitPathHint ? undefined : negatedTermInPath(file, summary);
+  if (negatedTerm) {
+    return {
+      path: file,
+      relevance: "Reference",
+      reason: `Task excludes "${negatedTerm}" changes — reference/comparison only, not an edit target.`,
+      ranges: ranges.slice(0, 2)
+    };
   }
   return {
     path: file,
@@ -2813,8 +3007,8 @@ function cheapCandidatePrefilterPasses(file: CodeIndexFile, taskWords: string[],
 }
 
 function taskRelevantIndexCandidates(summary: DocumentationSummary, index: CodeIndex, existing: Set<string>): string[] {
-  const taskTokens = meaningfulRankingTokens(taskRoutingText(summary));
-  const codeTokens = explicitCodeTokens(taskRoutingText(summary));
+  const taskTokens = withoutNegatedTokens(meaningfulRankingTokens(taskRoutingText(summary)), summary);
+  const codeTokens = withoutNegatedTokens(explicitCodeTokens(taskRoutingText(summary)), summary);
   if (taskTokens.size === 0 && codeTokens.size === 0) return [];
   const taskWords = [...taskTokens];
   const codeTokenSquashed = [...codeTokens].map((token) => normalizeCodeToken(token)).filter(Boolean);
@@ -2822,6 +3016,7 @@ function taskRelevantIndexCandidates(summary: DocumentationSummary, index: CodeI
     .filter((file) => !existing.has(file.path))
     .filter((file) => !isIgnoredWatchPath(file.path) && !isDevguardManagedDocPath(file.path))
     .filter((file) => !shouldExcludeContextCandidate(file.path, summary))
+    .filter((file) => !isBuildOutputPath(file.path))
     .filter((file) => cheapCandidatePrefilterPasses(file, taskWords, codeTokenSquashed, codeTokens, summary))
     .map((file) => ({
       file: file.path,
@@ -2854,30 +3049,160 @@ function taskIndexCandidateScore(file: CodeIndexFile, taskTokens: Set<string>, c
   const tokenOverlap = [...taskTokens].filter((token) => candidateTokens.has(token)).length;
   const pathOverlap = [...taskTokens].filter((token) => pathTokens.has(token)).length;
   const symbolOverlap = [...taskTokens].filter((token) => symbolTokens.has(token)).length;
+  const weights = taskTokenWeights(summary, taskTokens);
+  const weightedTokenOverlap = weightedOverlap(taskTokens, candidateTokens, weights);
+  const weightedPathOverlap = weightedOverlap(taskTokens, pathTokens, weights);
+  const weightedSymbolOverlap = weightedOverlap(taskTokens, symbolTokens, weights);
+  const usageWordOverlap = taskTokens.size > PROSE_TASK_TOKEN_THRESHOLD ? weightedOverlap(taskTokens, usageSubwords(file), weights) : 0;
+  const partialUsageOverlap = partialCodeTokenUsage(codeTokens, usageTokens);
   const importOverlap = [...taskTokens].filter((token) => importTokens.has(token)).length;
   const exactUsageOverlap = [...codeTokens].filter((token) => usageTokens.has(normalizeCodeToken(token))).length;
   const exactSymbolOverlap = [...codeTokens].filter((token) => symbolTokens.has(normalizeCodeToken(token)) || pathTokens.has(normalizeCodeToken(token))).length;
   const routeScore = routePathMatchScore(file.path, summary);
   const profileFlowSignal = /profile|shared|owner|viewer|visitor|readOnly/i.test(`${file}\n${file.exports.join("\n")}\n${file.symbols.map((symbol) => symbol.name).join("\n")}\n${file.tokens?.join("\n") ?? ""}`);
   if (isRuntimePageBugTask(taskRoutingText(summary)) && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0 && !profileFlowSignal) return 0;
-  if (pathOverlap === 0 && symbolOverlap === 0 && tokenOverlap < 3 && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0) return 0;
-  if (tokenOverlap < 2 && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0) return 0;
+  if (pathOverlap === 0 && symbolOverlap === 0 && tokenOverlap < 3 && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0 && usageWordOverlap < 0.5 && partialUsageOverlap === 0) return 0;
+  if (tokenOverlap < 2 && exactUsageOverlap === 0 && exactSymbolOverlap === 0 && routeScore === 0 && usageWordOverlap < 0.5 && partialUsageOverlap === 0) return 0;
   const implementationSignal = file.symbols.some((symbol) => symbol.kind === "component" || symbol.kind === "function" || symbol.kind === "class") ? 2 : 0;
   const blockSignal = file.blocks.length > 0 ? 2 : 0;
   const behaviorSignal = behaviorStorageScore(file, summary);
   const generatedPenalty = shouldExcludeContextCandidate(file.path, summary) ? -80 : 0;
   const scopeScore = sharedProfileScopeScore(file, summary, exactUsageOverlap);
   const sharedProfileHelperPenalty = isSharedProfileTask(taskRoutingText(summary)) && /^lib\/profile\//.test(file.path) ? -120 : 0;
-  return exactUsageOverlap * 35 + exactSymbolOverlap * 22 + routeScore + behaviorSignal + scopeScore + sharedProfileHelperPenalty + pathOverlap * 5 + symbolOverlap * 4 + tokenOverlap * 2 + importOverlap + implementationSignal + blockSignal + generatedPenalty;
+  const negatedPenalty = negatedTermInPath(file.path, summary) ? -60 : 0;
+  return negatedPenalty + usageWordOverlap * 12 + partialUsageOverlap * 18 + exactUsageOverlap * 35 + exactSymbolOverlap * 22 + routeScore + behaviorSignal + scopeScore + sharedProfileHelperPenalty + weightedPathOverlap * 5 + weightedSymbolOverlap * 4 + weightedTokenOverlap * 2 + importOverlap + implementationSignal + blockSignal + generatedPenalty;
 }
 
+// Negative intent: terms the task explicitly keeps out of scope ("without
+// importing Shadow changes", "X 변경 금지") must never act as POSITIVE
+// ranking tokens, and files named after them are demoted to reference-only
+// context instead of edit candidates. Memoized per goal string — the same
+// summary is scored once per candidate file.
+const negatedTermsCache = new Map<string, Set<string>>();
+
+function negatedTaskTerms(summary: DocumentationSummary): Set<string> {
+  const goal = summary.goal ?? "";
+  let terms = negatedTermsCache.get(goal);
+  if (!terms) {
+    terms = new Set(extractNegatedTerms(goal));
+    if (negatedTermsCache.size > 64) negatedTermsCache.clear();
+    negatedTermsCache.set(goal, terms);
+  }
+  return terms;
+}
+
+// Rarity weighting for plain task-word overlap. On a long task description
+// most words are common across the repository ("production", "release",
+// "tests") and a flat +1 per shared word lets any long document outrank the
+// files that share the task's DISTINCTIVE words ("standby", "retention").
+// Each word is weighted by inverse document frequency over the Code Index,
+// capped at the old flat weight of 1 so no score can grow past what it was.
+// Only applied once the index is large enough for frequencies to mean
+// something (small fixture repos keep the flat weights).
+const MIN_FILES_FOR_TOKEN_WEIGHTING = 50;
+const tokenWeightIndex = new WeakMap<DocumentationSummary, CodeIndex>();
+const tokenWeightCache = new WeakMap<DocumentationSummary, Map<string, number>>();
+
+function registerTokenWeightIndex(summary: DocumentationSummary, index: CodeIndex): DocumentationSummary {
+  tokenWeightIndex.set(summary, index);
+  return summary;
+}
+
+function taskTokenWeights(summary: DocumentationSummary, taskTokens: Set<string>): Map<string, number> | undefined {
+  const index = tokenWeightIndex.get(summary);
+  if (!index) return undefined;
+  const files = Object.values(index.files);
+  if (files.length < MIN_FILES_FOR_TOKEN_WEIGHTING) return undefined;
+  let weights = tokenWeightCache.get(summary);
+  if (!weights) {
+    weights = new Map();
+    tokenWeightCache.set(summary, weights);
+  }
+  const missing = [...taskTokens].filter((token) => !weights!.has(token));
+  if (missing.length > 0) {
+    const texts = files.map((file) => `${indexedCandidateText(file)}\n${(file.tokens ?? []).join(" ")}`.toLowerCase());
+    const scale = Math.log((files.length + 1) / 2);
+    for (const token of missing) {
+      const df = texts.reduce((count, text) => count + (text.includes(token) ? 1 : 0), 0);
+      weights.set(token, Math.min(1, Math.max(0.1, Math.log((files.length + 1) / (df + 1)) / scale)));
+    }
+  }
+  return weights;
+}
+
+// Code identifiers split into words ("isStandbyMode" -> is/standby/mode), so
+// a prose task word can match code it names. Cached per index entry object.
+const usageSubwordCache = new WeakMap<CodeIndexFile, Set<string>>();
+
+function usageSubwords(file: CodeIndexFile): Set<string> {
+  let words = usageSubwordCache.get(file);
+  if (!words) {
+    words = meaningfulRankingTokens((file.tokens ?? []).join(" ").replace(/_/g, " "));
+    usageSubwordCache.set(file, words);
+  }
+  return words;
+}
+
+// An identifier-shaped task token ("STANDBY_MODE") also counts when a code
+// identifier CONTAINS it ("isStandbyMode"). Long tokens only (>= 8 chars
+// normalized), so short fragments never match everything.
+function partialCodeTokenUsage(codeTokens: Set<string>, usageTokens: Set<string>): number {
+  let count = 0;
+  for (const token of codeTokens) {
+    const normalized = normalizeCodeToken(token);
+    if (normalized.length < 8 || usageTokens.has(normalized)) continue;
+    for (const usage of usageTokens) {
+      if (usage.length > normalized.length && usage.includes(normalized)) {
+        count += 1;
+        break;
+      }
+    }
+  }
+  return Math.min(count, 3);
+}
+
+function weightedOverlap(taskTokens: Set<string>, candidateTokens: Set<string>, weights: Map<string, number> | undefined): number {
+  let total = 0;
+  for (const token of taskTokens) if (candidateTokens.has(token)) total += weights?.get(token) ?? 1;
+  return total;
+}
+
+function withoutNegatedTokens(tokens: Set<string>, summary: DocumentationSummary): Set<string> {
+  const negated = negatedTaskTerms(summary);
+  if (negated.size === 0) return tokens;
+  return new Set([...tokens].filter((token) => !negated.has(token.toLowerCase()) && !negated.has(normalizeCodeToken(token))));
+}
+
+function negatedTermInPath(file: string, summary: DocumentationSummary | undefined): string | undefined {
+  if (!summary) return undefined;
+  const negated = negatedTaskTerms(summary);
+  if (negated.size === 0) return undefined;
+  const segments = new Set(file.toLowerCase().split(/[^a-z0-9가-힣]+/).filter(Boolean));
+  return [...negated].find((term) => segments.has(term) || file.toLowerCase().includes(`/${term}/`));
+}
+
+// DevGuard's own fixed scaffolding lines (see beforeAgentTaskSummary). They
+// describe DevGuard's workflow, not the task, and their words ("map",
+// "ranges", "routing", "input") must never become ranking tokens.
+const ROUTING_BOILERPLATE_LINES = new Set([
+  "Task Source: Explicit Before-Agent Input",
+  "Use Read Map to choose the first file.",
+  "Use Code Map ranges before opening full files.",
+  "Implement the current task after reading the targeted context.",
+  "Before-Agent task",
+  "↓",
+  "Code Index Task Routing",
+  "Read Map / Code Map / Agent Brief"
+]);
+
 function taskRoutingText(summary: DocumentationSummary): string {
+  const lines = (items: string[]) => items.filter((line) => !ROUTING_BOILERPLATE_LINES.has(line.trim())).join("\n");
   return [
     summary.goal,
-    summary.overview.join("\n"),
-    summary.structure.join("\n"),
-    summary.remainingWork.join("\n"),
-    summary.qaChecks.join("\n")
+    lines(summary.overview),
+    lines(summary.structure),
+    lines(summary.remainingWork),
+    lines(summary.qaChecks)
   ].join("\n");
 }
 
@@ -2918,6 +3243,10 @@ function readMapTargets(summary: DocumentationSummary | undefined, files: string
 
 function sortReadMapCandidates(files: string[], summary: DocumentationSummary, index: CodeIndex): string[] {
   return [...new Set(files)].sort((a, b) => {
+    // Negative intent is structural, not a score: files the task explicitly
+    // excludes always come after every non-excluded candidate.
+    const excludedDelta = Number(Boolean(negatedTermInPath(a, summary))) - Number(Boolean(negatedTermInPath(b, summary)));
+    if (excludedDelta !== 0) return excludedDelta;
     const aChange = summary.fileChanges.find((change) => change.file === a);
     const bChange = summary.fileChanges.find((change) => change.file === b);
     return readMapCandidateScore(b, summary, index, bChange) - readMapCandidateScore(a, summary, index, aChange) || a.localeCompare(b);
@@ -2927,7 +3256,7 @@ function sortReadMapCandidates(files: string[], summary: DocumentationSummary, i
 function readMapCandidateScore(file: string, summary: DocumentationSummary, index: CodeIndex, change?: DocumentationFileChange): number {
   const indexed = index.files[file];
   const taskText = taskRoutingText(summary);
-  const codeTokens = explicitCodeTokens(taskText);
+  const codeTokens = withoutNegatedTokens(explicitCodeTokens(taskText), summary);
   const candidateText = [
     file,
     change?.purpose ?? "",
@@ -2945,7 +3274,7 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
     taskText,
     candidateText
   ].join("\n");
-  const taskTokens = meaningfulRankingTokens(taskText);
+  const taskTokens = withoutNegatedTokens(meaningfulRankingTokens(taskText), summary);
   const candidateTokens = meaningfulRankingTokens(candidateText);
   const tokenOverlap = [...taskTokens].filter((token) => candidateTokens.has(token)).length;
   const pathTokenOverlap = [...taskTokens].filter((token) => meaningfulRankingTokens(file).has(token)).length;
@@ -2957,7 +3286,9 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   const exactSymbolOverlap = [...codeTokens].filter((token) =>
     meaningfulRankingTokens([...(indexed?.exports ?? []), ...(indexed?.symbols.map((symbol) => symbol.name) ?? [])].join("\n")).has(normalizeCodeToken(token))
   ).length;
-  const isUiTask = summary.changeTypes.includes("UI") || /user-facing UI|layout|interaction|component|front card|back card|hero/i.test(text);
+  // Task-text only: testing the candidate's OWN text here made every file
+  // with a UI-named block ("Front Card") score itself as a UI task.
+  const isUiTask = summary.changeTypes.includes("UI") || /user-facing UI|layout|interaction|component|front card|back card|hero/i.test(taskText);
   const isDocsTask = summary.changeTypes.includes("Docs");
   const isConfigTask = summary.changeTypes.includes("Config") || summary.changeTypes.includes("Release");
   const isQaTask = summary.changeTypes.includes("QA");
@@ -2977,9 +3308,12 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   score += exactSymbolOverlap * 24;
   score += routePathMatchScore(file, summary);
   score += behaviorStorageScore(indexed, summary);
-  score += tokenOverlap * 10;
-  score += pathTokenOverlap * 14;
-  score += symbolTokenOverlap * 12;
+  const weights = taskTokenWeights(summary, taskTokens);
+  if (taskTokens.size > PROSE_TASK_TOKEN_THRESHOLD && indexed) score += weightedOverlap(taskTokens, usageSubwords(indexed), weights) * 16;
+  score += partialCodeTokenUsage(codeTokens, usageTokens) * 24;
+  score += weightedOverlap(taskTokens, candidateTokens, weights) * 10;
+  score += weightedOverlap(taskTokens, meaningfulRankingTokens(file), weights) * 14;
+  score += (symbolTokenOverlap > 0 ? weightedOverlap(taskTokens, meaningfulRankingTokens([...(indexed?.exports ?? []), ...(indexed?.symbols.map((symbol) => symbol.name) ?? []), ...(indexed?.blocks.map((block) => block.name) ?? [])].join("\n")), weights) : 0) * 12;
   if (hasComponentOwner) score += 8;
   if (indexed?.blocks.length) score += 4;
   const developerImpact = indexed?.developerImpact?.join("\n") ?? "";
@@ -3014,6 +3348,7 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
 
   if (/Updates the user-facing wording from ".+" to "[@\w/.-]+"/i.test(text)) score -= 12;
   if (shouldExcludeContextCandidate(file, summary)) score -= 90;
+  if (negatedTermInPath(file, summary)) score -= 60;
   if (isRuntimePageBugTask(taskText) && /^app\/api\/(og|compare)\//i.test(file)) score -= 35;
   if (isSharedProfileTask(taskText) && /^lib\/profile\//.test(file)) score -= 120;
   const primary = primaryIndexedSymbol(indexed);
@@ -3021,20 +3356,37 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   return score;
 }
 
+// Above this many meaningful words a task is treated as prose: plain words
+// are no longer promoted to exact code tokens (see explicitCodeTokens) and
+// instead match code usage only through rarity-weighted overlap.
+const PROSE_TASK_TOKEN_THRESHOLD = 12;
+
 function explicitCodeTokens(value: string): Set<string> {
   const tokens = new Set<string>();
   for (const match of value.matchAll(/`([^`]+)`/g)) {
     for (const token of match[1].split(/[^A-Za-z0-9_$.[\]/-]+/)) addCodeToken(tokens, token);
   }
+  // On a long (prose) task only identifier-SHAPED words count as explicit code tokens (camelCase,
+  // snake_case/SCREAMING_CASE, `$`, dotted access). A plain prose word
+  // ("production", "release", "Shadow") is already a normal ranking token
+  // via meaningfulRankingTokens; promoting every word of a long task to an
+  // exact-usage code token (worth 35–40 points each) made prose-heavy docs
+  // outrank the real implementation files on any long task description.
+  const isProseTask = meaningfulRankingTokens(value).size > PROSE_TASK_TOKEN_THRESHOLD;
   for (const match of value.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)?\b/g)) {
-    addCodeToken(tokens, match[0]);
+    if (!isProseTask || /[a-z][A-Z]|[A-Za-z0-9]_[A-Za-z0-9]|\$|[A-Za-z]\.[A-Za-z]/.test(match[0])) addCodeToken(tokens, match[0]);
   }
   for (const match of value.matchAll(/(?:^|[\s(["'`])\/[A-Za-z0-9_./:[\]-]+/g)) {
     addCodeToken(tokens, match[0].trim());
   }
   const lower = value.toLowerCase();
   const meaningful = [...meaningfulRankingTokens(value)];
-  for (let index = 0; index < meaningful.length - 1; index += 1) {
+  // Bigram synthesis ("card style" -> cardStyle) guesses an identifier from
+  // a SHORT phrase. On a long prose task it fabricates hundreds of fake
+  // identifiers from unrelated adjacent words, each worth an exact-match
+  // score, so it is skipped once the task is clearly prose.
+  const synthesizeBigrams = meaningful.length <= PROSE_TASK_TOKEN_THRESHOLD;
+  for (let index = 0; synthesizeBigrams && index < meaningful.length - 1; index += 1) {
     const first = meaningful[index];
     const second = meaningful[index + 1];
     if (/^[a-z][a-z0-9]+$/.test(first) && /^[a-z][a-z0-9]+$/.test(second)) {
@@ -3072,6 +3424,12 @@ function normalizeCodeToken(value: string): string {
     .replace(/[^A-Za-z0-9가-힣]+/g, " ")
     .toLowerCase()
     .replace(/\s+/g, "");
+}
+
+// Generated build/deploy output (e.g. AWS CDK's cdk.out) is never a task
+// edit target, regardless of how many task words its manifests contain.
+function isBuildOutputPath(file: string): boolean {
+  return /(^|\/)(cdk\.out|dist|build|\.next|\.turbo|coverage|\.vercel\/output)\//.test(file);
 }
 
 function shouldExcludeContextCandidate(file: string, summary: DocumentationSummary): boolean {
@@ -3161,13 +3519,20 @@ function relatedCandidateScores(scored: Array<{ file: string; score: number }>, 
   const top = scored.filter((candidate) => candidate.score >= 30).sort((a, b) => b.score - a.score).slice(0, 4);
   for (const candidate of top) {
     for (const relatedFile of resolveIndexedImports(candidate.file, index)) {
-      if (relatedFile !== candidate.file) related.push({ file: relatedFile, score: Math.max(8, candidate.score - 12) });
+      if (relatedFile !== candidate.file) related.push({ file: relatedFile, score: relatedScore(candidate.score, 0.45) });
     }
     for (const importer of indexedImporters(candidate.file, index)) {
-      related.push({ file: importer, score: Math.max(8, candidate.score - 16) });
+      related.push({ file: importer, score: relatedScore(candidate.score, 0.4) });
     }
   }
   return related;
+}
+
+// Dependency relevance is a supporting signal: a neighbor inherits only a
+// fraction of its parent's score (it used to inherit parent - 12), so it can
+// no longer outrank files that match the task directly.
+function relatedScore(parentScore: number, factor: number): number {
+  return Math.max(8, Math.round(parentScore * factor));
 }
 
 function resolveIndexedImports(file: string, index: CodeIndex): string[] {
@@ -3417,14 +3782,14 @@ function extractTaskSpecificRanges(file: string, content: string, taskSummary?: 
   return clusters
     .map((cluster) => {
       const text = lines.slice(cluster.start, cluster.end + 1).join("\n");
-      const actualSignals = taskRangeSignals(text);
+      const actualSignals = taskRangeSignals(text, taskText);
       return {
-        name: taskRangeLabel(text, actualSignals),
+        name: taskRangeLabel(text, actualSignals, taskText, [...cluster.tokens]),
         kind: "block" as const,
         startLine: cluster.start + 1,
         endLine: cluster.end + 1,
         summary: `Task-specific exact code range in ${file}.`,
-        role: taskRangeRole(text),
+        role: taskRangeRole(text, taskText),
         editPoint: taskRangeReason(actualSignals),
         qa: taskRangeQa(text, taskText),
         priority: 0
@@ -3440,7 +3805,14 @@ function nearbyRecentMatch(matches: Array<{ index: number }>, index: number, dis
   return Boolean(last && index - last.index <= distance);
 }
 
-function taskRangeSignals(text: string): string[] {
+// Sharing/ownership signals are only meaningful when the TASK is about
+// sharing/ownership; otherwise any code mentioning "owner" or "readOnly"
+// was labelled as a "shared/readOnly mode guard" in unrelated projects.
+function isSharingModeTask(taskText: string): boolean {
+  return /\b(?:shared|readOnly|read-only mode|owner|visitor|viewer)\b|공유|방문자|소유자/i.test(taskText);
+}
+
+function taskRangeSignals(text: string, taskText = ""): string[] {
   const signals = new Set<string>();
   if (/CARD_STYLE_KEY/.test(text)) signals.add("CARD_STYLE_KEY");
   if (/localStorage\.getItem/.test(text)) signals.add("localStorage.getItem");
@@ -3449,22 +3821,23 @@ function taskRangeSignals(text: string): string[] {
   if (/\buseEffect\b/.test(text)) signals.add("useEffect");
   if (/\bcardStyle\b/.test(text)) signals.add("cardStyle");
   if (/\bsetCardStyle\b/.test(text)) signals.add("setCardStyle");
-  if (/\breadOnly\b/.test(text)) signals.add("readOnly");
-  if (/\b(shared|owner|viewer|visitor)\b/i.test(text)) signals.add("shared/owner/viewer");
+  if (isSharingModeTask(taskText) && /\breadOnly\b/.test(text)) signals.add("readOnly");
+  if (isSharingModeTask(taskText) && /\b(shared|owner|viewer|visitor)\b/i.test(text)) signals.add("shared/owner/viewer");
   return [...signals];
 }
 
-function taskRangeLabel(text: string, signals: string[]): string {
+function taskRangeLabel(text: string, signals: string[], taskText = "", matchedTokens: string[] = []): string {
   if (/localStorage\.getItem/.test(text) && /setCardStyle|useState|cardStyle/.test(text)) return "cardStyle state and localStorage hydration";
   if (/localStorage\.setItem/.test(text)) return "cardStyle localStorage persistence";
   if (/CARD_STYLE_KEY/.test(text)) return "storage key definition";
-  if (/\breadOnly|shared|owner|visitor|viewer\b/i.test(text)) return "shared/readOnly mode guard";
-  return signals.length > 0 ? `exact code usage: ${signals.slice(0, 3).join(", ")}` : "task-specific code range";
+  if (isSharingModeTask(taskText) && /\breadOnly|shared|owner|visitor|viewer\b/i.test(text)) return "shared/readOnly mode guard";
+  if (signals.length > 0) return `exact code usage: ${signals.slice(0, 3).join(", ")}`;
+  return matchedTokens.length > 0 ? `task terms: ${matchedTokens.slice(0, 3).join(", ")}` : "task-specific code range";
 }
 
-function taskRangeRole(text: string): string {
+function taskRangeRole(text: string, taskText = ""): string {
   if (/localStorage|getItem|setItem|useState|useEffect/.test(text)) return "State, effect, or persistence logic directly involved in the requested behavior.";
-  if (/ProfileView|OwnedProfileView|readOnly|shared|owner|visitor|viewer/i.test(text)) return "Caller or mode guard related to shared profile behavior.";
+  if (isSharingModeTask(taskText) && /ProfileView|OwnedProfileView|readOnly|shared|owner|visitor|viewer/i.test(text)) return "Caller or mode guard related to shared profile behavior.";
   return "Exact task-token usage range.";
 }
 
@@ -3502,7 +3875,7 @@ function codeMapRangeTaskContext(taskSummary?: DocumentationSummary, fileSummary
     taskText
   ].join("\n"));
   const codeTokens = explicitCodeTokens(taskText);
-  const isUiTask = Boolean(taskSummary?.changeTypes.includes("UI") || /ui|layout|interaction|card|section|screen|view|front|back|cta|button|form/i.test(taskText));
+  const isUiTask = Boolean(taskSummary?.changeTypes.includes("UI") || /\b(?:ui|layout|interaction|card|section|screen|view|cta|button|form)\b|front\s*card|back\s*card/i.test(taskText));
   return { taskText, taskTokens, codeTokens, isUiTask };
 }
 
@@ -3730,7 +4103,7 @@ function renderWorkingContext(input: { files: string[]; state: ProjectState; his
       : ["현재 task 기준 진입 파일을 제공할 수 없습니다. `prepare_task_context`를 호출하세요."]),
     "",
     "## 컴포넌트 관계",
-    ...componentTree,
+    ...(componentTree.length > 0 ? componentTree : ["- (no structural map; start from the entry files above)"]),
     "",
     "## 현재 구조",
     ...structure,
@@ -3781,7 +4154,7 @@ function workingCurrentWork(state: ProjectState, domains: Set<string>): string {
   if (domains.has("watch")) return "watch 런타임 상태 추적 조정";
   if (domains.has("hooks")) return "agent hook/notify 자동 완료 흐름 조정";
   if (domains.has("knowledge")) return "Project Knowledge 생성 및 활용 조정";
-  return state.lastSummary && state.lastSummary !== "확인 필요" ? state.lastSummary : "현재 작업 목표 확인 필요";
+  return state.lastSummary && state.lastSummary !== "확인 필요" ? historyIntentOnly(state.lastSummary) : "현재 작업 목표 확인 필요";
 }
 
 function workingTargets(domains: Set<string>): string[] {
@@ -3792,21 +4165,24 @@ function workingTargets(domains: Set<string>): string[] {
   if (domains.has("watch")) targets.push("watch runtime state", "pending file tracking", "dashboard refresh state");
   if (domains.has("hooks")) targets.push("Claude/Codex completion triggers", "hook script status", "agent strategy verification");
   if (domains.has("knowledge")) targets.push("Project Knowledge extraction", "first-run project understanding");
-  if (domains.has("docs")) targets.push("README/docs user-facing guidance");
-  if (domains.has("config")) targets.push("package/config metadata");
-  return targets.length > 0 ? [...new Set(targets)] : ["변경 파일 기준 작업 범위 확인 필요"];
+  if (hasDevGuardSelfDomain(domains) && domains.has("docs")) targets.push("README/docs user-facing guidance");
+  if (hasDevGuardSelfDomain(domains) && domains.has("config")) targets.push("package/config metadata");
+  return targets.length > 0 ? [...new Set(targets)] : ["진입 파일 목록 기준 (현재 task의 Code Index routing)"];
 }
 
-function workingExcludedAreas(domains: Set<string>): string[] {
-  const exclusions = new Set(["large refactors", "automatic git commit/publish", "unrelated package release flow"]);
-  if (!domains.has("dashboard")) exclusions.add("Dashboard UI");
-  if (!domains.has("watch")) exclusions.add("watch completion behavior");
-  if (!domains.has("hooks")) exclusions.add("Claude/Codex hook runtime");
-  if (!domains.has("core")) exclusions.add("core analysis engine");
-  if (!domains.has("knowledge")) exclusions.add("Project Knowledge extraction");
-  if (!domains.has("docs")) exclusions.add("README/docs wording");
-  exclusions.add("auth / database / routing unless directly changed");
-  return [...exclusions];
+// No unsourced exclusions: these used to be DevGuard-repo domain defaults
+// ("Dashboard UI", "auth / database / routing") rendered for every project.
+// Real exclusions come from the task text (taskScopeConstraints).
+function workingExcludedAreas(_domains: Set<string>): string[] {
+  return [];
+}
+
+// Domains inferWorkingDomains derives from DevGuard's OWN source layout;
+// the DevGuard-specific trees/tips/targets apply only when one is present.
+const DEVGUARD_SELF_DOMAINS = new Set(["dashboard", "reports", "cli", "watch", "hooks", "knowledge", "core"]);
+
+function hasDevGuardSelfDomain(domains: Set<string>): boolean {
+  return [...domains].some((domain) => DEVGUARD_SELF_DOMAINS.has(domain));
 }
 
 function workingEntryFiles(files: string[], profile: { entryPoints: string[]; architecture: Array<{ name: string; files: string[] }> }): string[] {
@@ -3866,6 +4242,7 @@ function workingComponentTree(domains: Set<string>): string[] {
       "└── external done/status refresh observer"
     ];
   }
+  if (!hasDevGuardSelfDomain(domains)) return [];
   return ["CLI", "├── packages/cli/src/index.ts", "├── command implementation files", "└── generated `.devguard` artifacts"];
 }
 
@@ -3889,6 +4266,7 @@ function workingCurrentStructure(domains: Set<string>): string[] {
 
 function workingTips(domains: Set<string>): string[] {
   const tips = ["Start with the entry files above before opening adjacent modules.", "Do not scan `.devguard/**`; it is generated runtime state."];
+  if (!hasDevGuardSelfDomain(domains)) return tips;
   if (domains.has("reports")) tips.push("For generated report behavior, start in `packages/cli/src/runtime-state.ts`.", "For QA result capture, start in `packages/cli/src/self.ts`.");
   if (!domains.has("dashboard")) tips.push("Dashboard UI is not part of the current edit unless a dashboard file appears in changed files.");
   if (!domains.has("hooks")) tips.push("Hook runtime is not part of the current edit.");
@@ -3933,7 +4311,6 @@ function renderAgentContext(input: {
     `2. \`${devguardPaths.readMap}\` — file priority`,
     `3. \`${devguardPaths.codeMap}\` — file-internal ranges`,
     `4. \`${devguardPaths.workingContext}\` — structural background only when needed`,
-    `5. \`${devguardPaths.qualityReport}\` — QA verdict and verification details`,
     "",
     "## Current State",
     `- project purpose: ${input.projectPurpose}`,
@@ -3966,8 +4343,6 @@ function renderAgentContext(input: {
       ? input.documentationSummary.excludedAreas.slice(0, 8).map((area) => `- ${area}`)
       : []),
     `- \`${devguardPaths.reportsDir}\`, \`${devguardPaths.promptsDir}\`, \`${devguardPaths.contextDir}\`, \`${devguardPaths.runtime}\` — auto-generated by dev-guard`,
-    "- existing public command UX: watch / done / status / reset",
-    "- auth / database / api / config unless directly required by current task",
     "- large refactors not explicitly requested",
     "",
     "## Additional Context",
@@ -3980,6 +4355,8 @@ function renderAgentContext(input: {
 function renderNextClaudePrompt(input: { qualityVerdict: string; nextBestTask: string }): string {
   return [
     "# Next Claude Prompt",
+    "",
+    "> Fallback artifact. When DevGuard MCP is available, `prepare_task_context` already returns everything below — do not read this file in addition.",
     "",
     "For a new task:",
     "",
@@ -4042,7 +4419,7 @@ function buildDocumentationSummary(input: {
     changeTypes,
     impact: {
       affected,
-      unaffected: unaffectedAreasFromDocumentation(affected),
+      unaffected: [],
       risk: risk.level,
       riskReason: risk.reason
     },
@@ -4050,7 +4427,7 @@ function buildDocumentationSummary(input: {
     qaChecks: documentationQAChecks(fileChanges, changeTypes, input.qaResults, constraints),
     remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults, input.staleQaResults, input.unboundQaResults),
     structure: documentationStructure(changeTypes, fileChanges),
-    excludedAreas: unaffectedAreasFromDocumentation(affected),
+    excludedAreas: taskScopeConstraints(input.currentTaskText),
     constraints
   };
 }
@@ -4510,9 +4887,33 @@ function affectedAreasFromDocumentation(files: DocumentationFileChange[], types:
   return areas.size > 0 ? [...areas] : ["Implementation"];
 }
 
-function unaffectedAreasFromDocumentation(affected: string[]): string[] {
-  const candidates = ["Watch", "Hooks", "Auth", "Database", "Routing", "Core engine", "Project Knowledge extraction"];
-  return candidates.filter((item) => !affected.some((affectedItem) => affectedItem.toLowerCase().includes(item.toLowerCase())));
+/**
+ * Scope exclusions with a traceable source, replacing the old fixed list
+ * ("Watch / Hooks / Auth / Database / Routing / Core engine") that described
+ * DevGuard's OWN codebase and was rendered as "do not modify" in every
+ * downstream project — including tasks that were literally Auth/DB work.
+ * Every line carries its basis: `[task]` = stated in the current task text.
+ * Project-config sources (protectedPaths) are appended by the caller that
+ * has the config. Empty when nothing is stated — never a generic default.
+ */
+export function taskScopeConstraints(taskText: string | undefined): string[] {
+  if (!taskText?.trim()) return [];
+  const lines: string[] = [];
+  const add = (line: string) => {
+    if (!lines.some((existing) => existing.toLowerCase() === line.toLowerCase())) lines.push(line);
+  };
+  for (const term of extractNegatedTerms(taskText)) add(`keep "${term}" out of scope — reference/comparison only [task]`);
+  for (const clause of taskText.split(/[;\n]+|(?<=[.!?])\s+/)) {
+    const trimmed = clause.trim().replace(/\s+/g, " ");
+    if (trimmed.length < 6) continue;
+    if (/^(?:no|do not|don'?t|never|must not|preserve|keep|without)\b/i.test(trimmed) || /금지|하지\s*(?:말|마)|말\s*것/.test(trimmed)) {
+      add(`${trimmed.length > 140 ? `${trimmed.slice(0, 137)}...` : trimmed} [task]`);
+    }
+  }
+  for (const constraint of extractTaskConstraints(taskText)) {
+    if (!lines.some((line) => line.toLowerCase().includes(constraint.text.toLowerCase().replace(/^no /, "")))) add(`${constraint.text} [task]`);
+  }
+  return lines.slice(0, 6);
 }
 
 function documentationQAChecks(
@@ -4546,7 +4947,10 @@ function documentationQAChecks(
   if ((types.includes("Build") || types.includes("Logic") || types.includes("QA")) && buildStatus !== "PASS" && !flags.noFullRepoBuild) {
     add("Run `pnpm run build`.");
   }
-  if (!flags.noDevGuardCli) {
+  // Generic tool recommendations only when this task actually changed files;
+  // with nothing task-scoped to verify they were filler presented as the
+  // "next task" in every artifact.
+  if (!flags.noDevGuardCli && files.length > 0) {
     const selfCheckEntry = findQAEntry(qaResults, "CUSTOM", "self-check");
     if (!selfCheckEntry || selfCheckEntry.status !== "PASS") add("Run `dev-guard self-check`.");
     add("Run `dev-guard done`.");
@@ -5114,8 +5518,10 @@ function extractCodeBlocks(content: string): CodeIndexSymbol[] {
       qa: "Agent Brief should tell the next agent where to start without repository-wide discovery.",
       priority: 0
     },
-    { name: "Front Card", regex: /Front Card|front card|Hero|Ability|Strength|Growth|Summary/i, requiresJsx: true },
-    { name: "Back Card", regex: /Back Card|back card|Meta Map|Evidence|Timeline|MBTI/i, requiresJsx: true },
+    // Card labels only on the literal phrase: generic words ("Summary",
+    // "Evidence", "Timeline") used to label unrelated JSX in any project.
+    { name: "Front Card", regex: /Front Card|front card|frontCard|FrontCard/, requiresJsx: true },
+    { name: "Back Card", regex: /Back Card|back card|backCard|BackCard/, requiresJsx: true },
     { name: "Ability", regex: /Ability|abilityBars|strength|강점|대표 능력/i, requiresJsx: true },
     { name: "Footer", regex: /Footer|footer/i, requiresJsx: true },
     { name: "Theme", regex: /Theme|getCardTheme|theme toggle|dark mode|light mode/i, requiresJsx: true },
@@ -5436,8 +5842,11 @@ function renderNextPrompt(input: {
 }): string {
   const firstFiles = input.changedFiles.slice(0, 3);
   const needsQualityReview = input.qualityReport.verdict !== "PASS";
+  const taskGuardrails = input.qualityReport.documentationSummary?.excludedAreas ?? [];
   return [
     "# Codex Handoff Prompt",
+    "",
+    "> Fallback artifact. When DevGuard MCP is available, `prepare_task_context` already returns everything below — do not read this file in addition.",
     "",
     "For a new task, call DevGuard MCP `prepare_task_context` with the current user request before broad search or unrelated source reads.",
     `Use \`${devguardPaths.agentBrief}\`, \`${devguardPaths.readMap}\`, and \`${devguardPaths.codeMap}\` only when MCP is unavailable or insufficient.`,
@@ -5461,11 +5870,29 @@ function renderNextPrompt(input: {
     `- line ranges: \`${devguardPaths.codeMap}\``,
     `- structural background: \`${devguardPaths.workingContext}\``,
     "",
+    "## Next Task",
+    `- ${reliableNextAction(input.qualityReport)}`,
+    "- Next distinct task: start a fresh agent thread and call `prepare_task_context` there instead of continuing this conversation.",
+    "",
     "## Guardrails",
-    "- Do not introduce new features.",
-    `- ${devguardPaths.reportsDir}, ${devguardPaths.promptsDir}, ${devguardPaths.runtime} 직접 수정 금지`,
-    "- Keep watch/done/status/reset UX unchanged."
+    ...taskGuardrails.map((line) => `- ${line}`),
+    `- ${devguardPaths.reportsDir}, ${devguardPaths.promptsDir}, ${devguardPaths.runtime} 직접 수정 금지`
   ].join("\n") + "\n";
+}
+
+/**
+ * The one next action every generated artifact (Next Prompt, Next Claude
+ * Prompt, prepare_task_context) uses. Built only from current-task facts:
+ * unresolved recorded validation first, then concrete QA checks derived from
+ * the task's own files. Never a generic guess — says so when nothing is known.
+ */
+export const NO_RELIABLE_NEXT_TASK = "No reliable next task inferred — start the next task with `prepare_task_context` in a fresh agent thread.";
+
+function reliableNextAction(report: QualityReport): string {
+  const open = canonicalValidationLines(report.qaResults, 10).find((line) => /: (FAIL|UNKNOWN)\b/.test(line));
+  if (open) return `Resolve recorded validation ${open.replace(/^- /, "")}`;
+  const check = report.documentationSummary?.qaChecks.find((item) => !/^Use (Read|Code) Map/.test(item));
+  return check ?? NO_RELIABLE_NEXT_TASK;
 }
 
 function formatBullets(items: string[]): string[] {
@@ -5506,7 +5933,11 @@ function parseProjectState(stateJson: string): ProjectState {
 }
 
 function lastHistoryFiles(records: HistoryRecord[]): string[] {
-  return records.length > 0 ? records[records.length - 1].changedFiles : [];
+  const last = records.at(-1);
+  if (!last) return [];
+  // Task-scoped when the record has a task baseline; the full changed set
+  // (including carried-over dirty work) is only the no-task fallback.
+  return last.taskScopedChangedFiles ?? last.changedFiles;
 }
 
 export async function ensureDevguardDirs(root: string): Promise<void> {
@@ -6908,9 +7339,11 @@ function formatQualityImpact(report: QualityReport, locale: DevGuardLocale): str
   if (report.documentationSummary) {
     const lines = locale === "ko-KR" ? ["영향 있음"] : ["Affected"];
     for (const item of report.documentationSummary.impact.affected) lines.push(`- ${localizeSentence(item, locale)}`);
-    lines.push("");
-    lines.push(locale === "ko-KR" ? "영향 없음 또는 변경 없음" : "No direct change detected");
-    for (const item of report.documentationSummary.impact.unaffected.slice(0, 8)) lines.push(`- ${localizeSentence(item, locale)}`);
+    if (report.documentationSummary.impact.unaffected.length > 0) {
+      lines.push("");
+      lines.push(locale === "ko-KR" ? "영향 없음 또는 변경 없음" : "No direct change detected");
+      for (const item of report.documentationSummary.impact.unaffected.slice(0, 8)) lines.push(`- ${localizeSentence(item, locale)}`);
+    }
     return lines;
   }
   const files = new Set(report.relatedFiles);
@@ -7678,8 +8111,16 @@ function renderProjectHandoff(input: {
   const qualityLines = handoffQualityLines(quality, changedFiles, input.locale, documentationSummary);
   const outstanding = handoffOutstandingItems(quality, changedFiles, input.locale, documentationSummary);
   const nextSteps = handoffNextActions(quality, nextTask, changedFiles, input.locale, documentationSummary);
-  const verification = handoffVerificationLines(quality, input.locale, changedFiles, documentationSummary?.constraints, input.completionSource);
+  const verification = handoffVerificationLines(quality, input.locale, changedFiles, documentationSummary?.constraints, input.completionSource, input.qualityReportState?.qaResults);
   const resumePrompt = handoffResumePrompt(goal, nextSteps, changedFiles, input.locale, documentationSummary?.constraints);
+  const carriedOverCount = input.records.at(-1)?.carriedOverChangedFiles?.length ?? 0;
+  if (carriedOverCount > 0) {
+    fileChanges.push(
+      input.locale === "ko-KR"
+        ? `- 참고: 이 작업 이전부터 dirty 상태였고 이번 작업이 수정하지 않은 파일 ${carriedOverCount}개는 이전 작업분이라 위 목록에서 제외했습니다.`
+        : `- Note: ${carriedOverCount} file(s) were already dirty before this task and were not edited by it; they are earlier work and are excluded above.`
+    );
+  }
   const missing = missingInputs([input.project, input.architecture, input.tasks, input.qualityReport, input.projectKnowledge, input.historySummary]);
   const body: string[] = [`# ${copy.title}`, ""];
   body.push(
@@ -8013,6 +8454,11 @@ function handoffNextActions(quality: ParsedQuality, nextTask: string, files: str
   if (documentationSummary?.qaChecks.length) {
     return documentationSummary.qaChecks.slice(0, 5).map((check, index) => `${index + 1}. ${localizeSentence(check, locale)}`);
   }
+  if (files.length === 0) {
+    return locale === "ko-KR"
+      ? ["1. 이 작업에서 추론할 수 있는 다음 작업이 없습니다 (작업 범위 변경 파일 없음).", "2. 다음 작업은 새 agent thread에서 `prepare_task_context`로 시작하세요."]
+      : [`1. ${NO_RELIABLE_NEXT_TASK}`];
+  }
   const targetFile = files.find((file) => /runtime-state\.ts$|dashboard\.ts$|dashboard-i18n\.ts$/.test(file)) ?? files[0];
   const verificationCommands = handoffVerificationCommands(quality, files, constraints);
   if (locale === "ko-KR") {
@@ -8020,17 +8466,17 @@ function handoffNextActions(quality: ParsedQuality, nextTask: string, files: str
       targetFile ? `1. 먼저 \`${targetFile}\` 변경이 현재 요청 범위에만 해당하는지 확인합니다.` : "1. 먼저 변경 파일 목록을 확인하고 현재 요청과 직접 관련된 파일만 남깁니다.",
       quality.verdict === "BLOCKED"
         ? "2. BLOCKED 이유에 해당하는 파일과 실패 원인을 먼저 수정합니다."
-        : "2. 문제가 있으면 해당 파일의 Handoff 생성 문구와 필터링 로직만 수정합니다.",
+        : "2. Quality Report의 검토 항목 중 이 파일과 직접 관련된 것만 처리합니다.",
       ...(verificationCommands.length > 0 ? [`3. 수정 후 ${formatCommandRunList(verificationCommands)}을 실행합니다.`] : []),
-      ...(noDevGuardCli ? [] : ["4. `dev-guard done`으로 Handoff를 재생성하고 내부 분석값이나 rule id가 노출되지 않는지 직접 엽니다."])
+      ...(noDevGuardCli ? [] : ["4. 끝나면 `dev-guard done`으로 작업을 마감합니다."])
     ];
     return actions;
   }
   return [
     targetFile ? `1. First confirm \`${targetFile}\` is scoped to the current request.` : "1. First review changed files and keep only files directly tied to the current request.",
-    quality.verdict === "BLOCKED" ? "2. Fix the file and cause named by the BLOCKED reason first." : "2. If needed, adjust only the Handoff copy and filtering logic in the related file.",
+    quality.verdict === "BLOCKED" ? "2. Fix the file and cause named by the BLOCKED reason first." : "2. Address only the Quality Report review items that concern this file.",
     ...(verificationCommands.length > 0 ? [`3. Run ${compactCommandList(verificationCommands)} after changes.`] : []),
-    ...(noDevGuardCli ? [] : ["4. Run `dev-guard done` to regenerate Handoff, then open it and confirm internal analysis values or rule identifiers are not exposed."])
+    ...(noDevGuardCli ? [] : ["4. Finish with `dev-guard done`."])
   ];
 }
 
@@ -8045,9 +8491,11 @@ function handoffVerificationLines(
   locale: DevGuardLocale,
   files: string[] = [],
   constraints?: TaskConstraint[],
-  completionSource?: CompletionSource
+  completionSource?: CompletionSource,
+  qaResults?: Record<string, QAExecutionResult>
 ): string[] {
   const planned = handoffVerificationCommands(quality, files, constraints);
+  const recorded = canonicalValidationLines(qaResults, 6);
   // Completion Provenance: report exactly which real trigger produced this
   // Handoff, not an unconditional "dev-guard done: pass" — `dev-guard
   // handoff`/`prepare_task_context` regenerate Handoff from already-
@@ -8078,51 +8526,56 @@ function handoffVerificationLines(
   if (locale === "ko-KR") {
     return [
       doneLine,
-      `- 외부 검증 결과: ${handoffCopy[locale].noExecutedVerification}`,
+      ...(recorded.length > 0 ? ["- 기록된 검증 결과 (Quality Report와 동일한 source):", ...recorded.map((line) => `  ${line}`)] : [`- 외부 검증 결과: ${handoffCopy[locale].noExecutedVerification}`]),
       ...planned.map((command) => `- 다음 세션에서 실행할 검증: \`${command}\``)
     ];
   }
   return [
     doneLine,
-    `- External verification result: ${handoffCopy[locale].noExecutedVerification}`,
+    ...(recorded.length > 0 ? ["- Recorded validation results (same source as the Quality Report):", ...recorded.map((line) => `  ${line}`)] : [`- External verification result: ${handoffCopy[locale].noExecutedVerification}`]),
     ...planned.map((command) => `- Verification to run next: \`${command}\``)
   ];
 }
 
-function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[], locale: DevGuardLocale, constraints?: TaskConstraint[]): string {
+// Rollover-first: the resume prompt no longer tells the agent to re-run
+// commands and re-open this handoff (that made agents re-read generated
+// markdown after every turn); it points at a fresh thread + prepare_task_context.
+function handoffResumePrompt(goal: string[], nextSteps: string[], files: string[], locale: DevGuardLocale, _constraints?: TaskConstraint[]): string {
   const cleanGoal = goal.map((line) => line.replace(/^- /, "")).find(isUsefulHandoffText) ?? (locale === "ko-KR" ? "목표 확인 필요" : "Goal needs confirmation");
   const fileText = files.slice(0, 3).map((file) => `\`${file}\``).join(", ") || (locale === "ko-KR" ? "변경 파일" : "changed files");
   const firstStep = nextSteps[0]?.replace(/^\d+\.\s*/, "").replace(/^먼저\s+/, "") ?? (locale === "ko-KR" ? "현재 Handoff를 확인합니다." : "Review the current Handoff.");
-  // The closing verification line used to hardcode `pnpm run build`,
-  // `dev-guard self-check`, `dev-guard done` unconditionally — exactly the
-  // command recommendation the current task's constraints can forbid. Build
-  // it from the same constraint-filtered command set Handoff's own
-  // verification section uses, instead of a second independent list.
-  const commands = filterCommandsByConstraints(["pnpm run build", "dev-guard self-check", "dev-guard done"], constraints);
-  const verificationLine =
-    commands.length > 0
-      ? locale === "ko-KR"
-        ? `${formatCommandRunList(commands)}을 실행한 뒤 \`.devguard/reports/project-handoff.md\`를 직접 열어 결과를 확인하세요.`
-        : `Run ${formatCommandRunList(commands)}, then open \`.devguard/reports/project-handoff.md\` to verify the result.`
-      : locale === "ko-KR"
-        ? "현재 task 제약상 위 명령을 실행하지 말고 `.devguard/reports/project-handoff.md`를 직접 열어 결과를 확인하세요."
-        : "Current task constraints forbid those commands; open `.devguard/reports/project-handoff.md` directly to verify the result instead.";
   if (locale === "ko-KR") {
     return [
       `이번 세션의 목표는 ${cleanGoal}`,
-      `먼저 ${fileText}를 열어 변경 이유와 현재 요청 범위가 일치하는지 확인하세요.`,
-      `그다음 ${firstStep}`,
-      "문제가 있으면 관련 파일의 Handoff 생성 문구와 내부 분석값 필터링만 수정하세요.",
-      verificationLine
+      ...(files.length > 0 ? [`이 작업의 변경 파일: ${fileText}`] : []),
+      `다음 행동: ${firstStep}`,
+      "이어서 작업하려면 새 agent thread에서 위 내용을 구체적인 task로 바꿔 `prepare_task_context`를 호출하고, 반환된 파일/range부터 읽으세요."
     ].join("\n");
   }
   return [
     `The current goal is: ${cleanGoal}`,
-    `Open ${fileText} first and confirm the change rationale matches the current request.`,
-    firstStep,
-    "If there is a problem, only adjust the Handoff copy and internal-analysis filtering in the related file.",
-    verificationLine
+    ...(files.length > 0 ? [`Files changed by this task: ${fileText}`] : []),
+    `Next action: ${firstStep}`,
+    "To continue, open a fresh agent thread, turn this into a concrete task, call `prepare_task_context`, and start from the returned files/ranges."
   ].join("\n");
+}
+
+/**
+ * Canonical one-line-per-result validation summary. Handoff, the
+ * prepare_task_context result and the Next Prompt all render recorded
+ * evidence through this one function (from the same qaResults object the
+ * Quality Report rendered), so no document can claim "nothing recorded"
+ * while another lists real results. FAIL/UNKNOWN first.
+ */
+export function canonicalValidationLines(qaResults: Record<string, QAExecutionResult> | undefined, limit: number): string[] {
+  const rank = (status: string) => (status === "FAIL" ? 0 : status === "UNKNOWN" ? 1 : 2);
+  return Object.values(qaResults ?? {})
+    .sort((a, b) => rank(a.status) - rank(b.status) || Date.parse(b.completedAt) - Date.parse(a.completedAt))
+    .slice(0, limit)
+    .map((entry) => {
+      const detail = entry.status === "PASS" ? entry.summary : entry.reason ?? entry.summary;
+      return `- ${entry.kind ?? "CUSTOM"} ${entry.name}: ${entry.status}${detail ? ` — ${truncateLine(detail, 140)}` : ""}`;
+    });
 }
 
 function formatCommandRunList(commands: string[]): string {
@@ -8130,6 +8583,8 @@ function formatCommandRunList(commands: string[]): string {
 }
 
 function handoffVerificationCommands(quality: ParsedQuality, files: string[], constraints?: TaskConstraint[]): string[] {
+  // Nothing task-scoped changed: recommending a full build/test is filler.
+  if (files.length === 0) return [];
   const commands = new Set<string>();
   if (files.some((file) => /runtime-state\.ts$/.test(file))) {
     commands.add("pnpm run build");

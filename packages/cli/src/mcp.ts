@@ -6,7 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fromRoot } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { prepareTaskContext, recordValidationEvidence } from "./runtime-state.js";
+import { prepareTaskContext, recordValidationEvidence, toAgentContextPayload } from "./runtime-state.js";
 
 /**
  * DevGuard's own installed version — read from the CLI package's own
@@ -65,7 +65,7 @@ export async function runMcpServer(root: string): Promise<void> {
     {
       title: "Prepare DevGuard task context",
       description:
-        "Call this once at the start of every new coding task, before searching or reading project source files — this is DevGuard's only signal that a new task has begun, so a bare call always starts a clean task lineage (see continueCurrentTask for the one exception). It uses the local DevGuard Code Index to return relevant files, line ranges, constraints, freshness, coverage, and generated context artifact paths. After you run a build/test/manual check for this task, report it with record_validation_result so Quality Report/Handoff reflect real evidence.",
+        "Call this once at the start of every new coding task, before searching or reading project source files — this is DevGuard's only signal that a new task has begun, so a bare call always starts a clean task lineage (see continueCurrentTask for the one exception). It uses the local DevGuard Code Index to return the files and line ranges to read first, source-tagged constraints, a next action, unresolved validation from the previous task, and rollover advice. Read the returned ranges before any repository-wide search, and do not also read DevGuard's markdown reports when this result is sufficient. Start each distinct task in a fresh agent thread. After you run a build/test/manual check for this task, report it with record_validation_result so Quality Report/Handoff reflect real evidence.",
       inputSchema: toolInputSchema
     },
     async ({ task, continueCurrentTask, projectRoot }) => {
@@ -77,12 +77,15 @@ export async function runMcpServer(root: string): Promise<void> {
           continueCurrentTask,
           persistTask: true
         });
+        // Compact, de-duplicated agent payload (see toAgentContextPayload):
+        // this text is what lands in the agent's context on every task start.
+        const payload = toAgentContextPayload(result);
         return {
-          structuredContent: result as unknown as Record<string, unknown>,
+          structuredContent: payload,
           content: [
             {
               type: "text",
-              text: JSON.stringify(result, null, 2)
+              text: JSON.stringify(payload)
             }
           ]
         };

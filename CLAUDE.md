@@ -2,72 +2,42 @@
 
 ## DevGuard Instructions for Claude
 
-DevGuard is an AI Coding Context Provider. It prepares context before AI work and preserves context after AI work in local `.devguard/` files.
+DevGuard is an AI Coding Context Provider. It does not shorten or speed up the AI provider's own context compaction; it makes starting a fresh agent thread cheap, so a long thread never has to be compacted.
 
 ## DevGuard Task Context
 
-For every new coding or code-analysis task, before broad repository search or reading unrelated source files:
+Primary context source — `prepare_task_context` (DevGuard MCP):
 
-1. Call the DevGuard MCP tool `prepare_task_context` with the user's current concrete request.
-2. Start with the highest-priority files and line ranges returned by DevGuard.
-3. Expand to additional callers, dependencies, routes, schemas, or tests only when needed to verify data flow or impact.
-4. Do not begin with broad repository-wide search when DevGuard returns relevant candidates.
-5. Use `.devguard/context/agent-brief.md`, `.devguard/reports/read-map.md`, and `.devguard/reports/code-map.md` only when MCP is unavailable or its result is insufficient.
-6. Do not treat `.devguard/reports/project-handoff.md` as the source of truth for a new task.
+1. For every new coding or code-analysis task, call `prepare_task_context` with the user's concrete request before any repository search or unrelated file reads.
+2. Read the returned files and line ranges first. The result already contains the task goal, source-tagged constraints, the carried-over dirty-work warning, unresolved validation from the previous task, and a next action.
+3. Do not immediately run repository-wide `rg`/`grep`/`find`. Search only for a concrete gap the returned ranges do not cover, and keep that search targeted.
+4. When `prepare_task_context` succeeds, do not also read DevGuard's markdown (`.devguard/reports/project-handoff.md`, `.devguard/reports/quality-report.md`, `.devguard/prompts/next-codex-prompt.md`, `.devguard/prompts/next-claude-prompt.md`, `.devguard/context/agent-brief.md`, `.devguard/reports/working-context.md`, `.devguard/context/agent-context.md`). They are fallback and human-diagnostic artifacts.
 
-For explicitly resumed work:
+Fresh thread per task (rollover-first):
 
-1. Read `.devguard/reports/project-handoff.md`.
-2. Convert the next action into a concrete task.
-3. Call `prepare_task_context` with that concrete task.
-4. Continue from the returned files and ranges.
+- When a task is done and the next request is a separate task, recommend continuing in a fresh agent thread and call `prepare_task_context` there.
+- If this thread has already handled another task or has been compacted once, move the next task to a fresh thread instead of waiting for another compaction.
+- DevGuard cannot see the provider's context window; its rollover status is advice from DevGuard-owned signals only.
 
-MCP fallback order:
+Only when MCP is unavailable or its result is insufficient, in this order:
 
 1. `.devguard/context/agent-brief.md` — compact current-task brief.
 2. `.devguard/reports/read-map.md` — file priority.
 3. `.devguard/reports/code-map.md` — file-internal ranges.
-4. `.devguard/reports/working-context.md` — structural background only when needed.
 
-Read only when needed:
+Only on explicit request:
 
-- `.devguard/reports/project-handoff.md` — previous-session resume instruction, not the default entry for a new task.
-- `.devguard/reports/quality-report.md` — QA result and remaining verification.
-- `.devguard/context/agent-context.md` — agent rules and current constraints.
-- `.devguard/project/project-knowledge.json` — long-term project structure before broad exploration.
-- `dev-guard status` — current runtime state when unclear.
+- `.devguard/reports/project-handoff.md` — when the user explicitly asks to resume previous work (then turn its next action into a concrete task and call `prepare_task_context`), or to debug DevGuard output.
+- `.devguard/reports/quality-report.md` — when a person asks for quality details or an explicit QA investigation.
 
-Common commands:
+Validation and completion:
 
-- `dev-guard --help`
-- `dev-guard doctor`
-- `dev-guard init`
-- `dev-guard install-agent-instructions`
-- `dev-guard install-hooks`
-- `dev-guard watch`
-- `dev-guard status`
-- `dev-guard done`
-- `dev-guard handoff`
-- `dev-guard knowledge`
-- `dev-guard prompt`
-- `dev-guard self-check`
-
-Session workflow:
-
-- Start new work: call `prepare_task_context`, then inspect only the returned file ranges needed for the task.
-- Resume previous work: read the handoff, turn its next action into a concrete task, then call `prepare_task_context`.
-- During work: keep `dev-guard watch` running in another terminal when continuous change tracking is wanted.
-- Finish: run the relevant project checks, then run `dev-guard done` and `dev-guard status` so handoff/status files are current.
-- Next Claude session: use `.devguard/reports/read-map.md`, `.devguard/reports/code-map.md`, `.devguard/context/agent-brief.md`, `.devguard/reports/working-context.md`, or `.devguard/prompts/next-claude-prompt.md` to resume without rediscovering the repo.
+- After running a build/test/manual check for the task, report it with `record_validation_result`.
+- Finish with `dev-guard done` (or let the installed Stop hook run it). Do not re-open the generated handoff or reports afterwards.
 
 Rules:
 
-- Use the DevGuard MCP result as the primary source for where to read first on new tasks.
-- Do not perform repository-wide scans before calling DevGuard MCP when it is available.
-- Use `.devguard/context/agent-brief.md`, `.devguard/reports/read-map.md`, and `.devguard/reports/code-map.md` as fallback when MCP is unavailable or insufficient.
-- Use `.devguard/reports/project-handoff.md` only for explicitly resumed work and `.devguard/reports/quality-report.md` only for QA status.
-- Treat `.devguard/project/project-knowledge.json` as long-term structure memory, not a task instruction.
 - Do not manually edit `.devguard/context/*`, `.devguard/reports/*`, `.devguard/prompts/*`, or `.devguard/runtime.json`; they are generated artifacts.
 - Do not make broad unrelated changes.
-- Do not invent unsupported DevGuard commands; verify commands with `dev-guard --help` or the current CLI source.
+- Do not invent unsupported DevGuard commands; verify commands with `dev-guard --help`.
 <!-- dev-guard-section-end -->

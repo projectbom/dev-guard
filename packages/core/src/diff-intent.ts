@@ -291,7 +291,7 @@ function inferTypeSubtype(changedFiles: string[], text: string, symbols: string[
   if (isAppSourceContext(changedFiles) && hasAppArchitectureSignal(changedFiles, text)) {
     return { type: "app_feature_refactor", subtype: "app_feature_refactor" };
   }
-  if ((cliTooling && promptPattern.test(text)) || changedFiles.some((file) => /prompt|task-ai|ai\.ts|task-router|completion|density/i.test(file))) {
+  if ((cliTooling && promptPattern.test(text)) || changedFiles.some((file) => /(?:^|\/)(?:[\w-]*prompt[\w-]*|task-ai|ai|task-router|completion|density)\.(?:ts|tsx|js|mjs)$/i.test(file))) {
     return /token|density|compact|ultra|budget/i.test(text) ? { type: "polish", subtype: "token_optimization" } : { type: "bugfix", subtype: "prompt_quality" };
   }
   if ((cliTooling && relevancePattern.test(text)) || changedFiles.some((file) => /relevance|command-target|task-router|drift|analyze/i.test(file))) {

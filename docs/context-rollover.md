@@ -35,9 +35,10 @@ grown without reading it.
 - `ROLL_OVER_SOON`
 - `ROLL_OVER_RECOMMENDED`
 
-from DevGuard-owned signals only — pending changed file count, recorded
-validation count, current task age, and the estimated resume-bundle size
-above. **It never reads or guesses any AI provider's actual context-window
+from DevGuard-owned signals only — pending changed file count, validations
+recorded for the CURRENT task (an all-time count used to pin every mature
+project at `ROLL_OVER_RECOMMENDED`), current task age, and the estimated
+resume-bundle size above. **It never reads or guesses any AI provider's actual context-window
 usage** — there is no portable, official API for that, and doing so would be
 exactly the kind of unverifiable claim this feature has to avoid. It is a
 recommendation for a human to act on (start a new AI session and call
@@ -52,6 +53,35 @@ This is surfaced in two places, from the same computation:
 - `dev-guard status` — a human-readable `Context Rollover: ...` line.
 - `prepare_task_context`'s MCP result — a `rollover` field an agent can read
   directly, alongside the existing `files`/`constraints`/`warnings`.
+
+## Rollover-First Workflow
+
+DevGuard cannot shorten or speed up a provider's own context compaction, and
+it cannot see the provider's context window. What it can do is make a fresh
+thread cheap. A real downstream audit found one agent thread kept open for
+23 hours through 8 compactions while every task start already had a small
+MCP context available. The intended loop is:
+
+1. Task done (`dev-guard done` or the Stop hook).
+2. Next distinct task → open a fresh agent thread (or move after the first
+   compaction at the latest).
+3. `prepare_task_context` → read the returned ranges → targeted search only
+   for a concrete gap.
+
+`dev-guard done`, the Next Prompt, the Handoff resume prompt, the agent
+instructions, and the MCP result's `rollover.advice` all state this.
+
+## Agent Payload
+
+The MCP tool sends `toAgentContextPayload(result)`, serialized without
+indentation: task, `nextAction`, files with ranges (excluded-by-task files
+labelled `Reference`), source-tagged `constraints` (`[task]` /
+`[project config]`, never a fixed default list), `scope` (carried-over dirty
+work as a count + warning), current-task validation, `openValidation` (the
+previous task's FAIL/UNKNOWN results), and `rollover`. Duplicated artifact
+paths and per-artifact cost rows are omitted; the markdown fallbacks are named
+once under `fallbackOnly`. Agent instructions tell agents not to read
+handoff/quality/next-prompt markdown when this result is sufficient.
 
 ## Validation Summary In `prepare_task_context`
 

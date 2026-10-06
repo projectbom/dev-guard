@@ -125,12 +125,20 @@ is unaffected — the shared snapshot is an opt-in parameter, not a required
 one.
 
 `prepare_task_context`'s MCP result is the primary entry point for a new AI
-session. It returns machine-oriented, progressively-loadable data only —
-task, constraints, candidate files with specific line ranges, a compact
-validation summary (fresh/stale/unbound evidence counts, reusing the same
-freshness rule as Quality Report), `resumeCost` (approximate size of the
-markdown fallback bundle), and `rollover` (DevGuard-owned Context Rollover
-signal — see [context-rollover.md](./context-rollover.md)). The six
+session. The MCP tool sends a compact agent payload (see
+[context-rollover.md](./context-rollover.md#agent-payload)): task, next
+action, candidate files with specific line ranges (files a task explicitly
+excludes — "without X", "X 변경 금지" — demoted to `Reference`), constraints
+tagged with their source (task text or project config, never DevGuard's own
+default domains), the carried-over dirty-work count, a compact validation
+summary reusing the same freshness rule as Quality Report, the previous
+task's unresolved validation, and rollover advice.
+
+Quality Report, Handoff, Next Prompt, and history intent describe the task's
+own files: a baseline file counts as carried over only when an earlier `done`
+already reported it and this task has not edited it since (per-file content
+hashes captured at `prepare_task_context`). Handoff lists recorded validation
+through the same canonical summary the Quality Report renders from. The six
 before-agent markdown artifacts remain available as a documented fallback
 (see `CLAUDE.md`/`AGENTS.md`'s MCP fallback order) for when MCP is
 unavailable or its result is insufficient — they are not meant to be read by

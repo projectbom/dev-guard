@@ -243,9 +243,11 @@ test("Test N: an Admin layout change is Dashboard/UI affected and Database unaff
   await processDoneEvent(root);
   const quality = await readQuality(root);
   const impactSection = quality.split(/## 4\. Impact/)[1]?.split(/\n## /)[0] ?? "";
-  assert.match(impactSection, /Database/, "Database must be listed (as unaffected) for a non-DB change");
-  const affectedBlock = impactSection.split(/No direct change detected/)[0] ?? "";
-  assert.doesNotMatch(affectedBlock, /Database/, "Database must not appear in the affected list for an Admin layout change");
+  // Contract change: there is no fixed "unaffected" domain list any more
+  // (it was DevGuard's own Watch/Hooks/Auth/Database/... list rendered for
+  // every project). Database must simply not be claimed as affected.
+  assert.doesNotMatch(impactSection, /Database/, "Database must not appear in the affected list for an Admin layout change");
+  assert.doesNotMatch(impactSection, /Core engine|Project Knowledge extraction/, "no generic DevGuard domain list may be rendered");
 });
 
 // --- PartnerFlow broken-lifecycle fixture (section 29) ---------------------

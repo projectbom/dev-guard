@@ -22,7 +22,7 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
-import { generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState, type CompletionSource } from "./runtime-state.js";
+import { currentSessionQaCount, generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState, type CompletionSource } from "./runtime-state.js";
 import { computeRolloverAssessment, measureResumeBundleCost } from "./rollover.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
@@ -406,11 +406,19 @@ async function runDone(root: string): Promise<void> {
     console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");
     console.log(copy.changedFiles);
-    for (const file of result.changedFiles.slice(0, 20)) {
+    const taskFiles = result.taskScopedChangedFiles ?? result.changedFiles;
+    for (const file of taskFiles.slice(0, 20)) {
       console.log(`- ${file}`);
     }
-    if (result.changedFiles.length > 20) {
-      console.log(`- ... +${result.changedFiles.length - 20} files`);
+    if (taskFiles.length > 20) {
+      console.log(`- ... +${taskFiles.length - 20} files`);
+    }
+    if (result.carriedOverChangedFiles?.length) {
+      console.log(
+        locale === "ko-KR"
+          ? `- (이전 작업에서 넘어온 dirty 파일 ${result.carriedOverChangedFiles.length}개는 이 작업 범위에서 제외)`
+          : `- (${result.carriedOverChangedFiles.length} carried-over dirty file(s) from earlier work excluded from this task)`
+      );
     }
     console.log("");
     console.log(copy.detectedAreas);
@@ -445,7 +453,11 @@ async function runDone(root: string): Promise<void> {
     console.log(`  Fallback: read ${result.agentBriefPath}, ${result.readMapPath}, and ${result.codeMapPath}.`);
     console.log("");
     console.log(copy.nextTask);
-    console.log(locale === "ko-KR" ? `${result.promptPath} 확인 후 필요한 수정 진행` : `Review ${result.promptPath} and continue with the required fixes.`);
+    console.log(
+      locale === "ko-KR"
+        ? "  다음 작업이 별도 작업이면 새 agent thread를 열고 거기서 prepare_task_context를 호출하세요 (이 대화에서 계속하지 마세요)."
+        : "  If the next task is a separate task, open a fresh agent thread and call prepare_task_context there (do not continue in this conversation)."
+    );
   } catch (error) {
     console.error(`dev-guard done failed: ${errorMessage(error)}`);
     console.error("recovery: run dev-guard status, then dev-guard reset if the pending buffer is wrong");
@@ -598,12 +610,12 @@ async function runStatus(root: string): Promise<void> {
   console.log(devguardPaths.agentContext);
   console.log("");
   console.log(copy.resumePrompt);
-  console.log(`  Read ${devguardPaths.agentContext} and continue.`);
+  console.log("  In a fresh agent thread, call DevGuard MCP prepare_task_context with the concrete task and start from the returned files/ranges.");
   if (initialized) {
     const resumeCost = await measureResumeBundleCost(root);
     const rollover = computeRolloverAssessment({
       changedFileCount: runtime.pendingChangedFiles.length,
-      qaResultCount: Object.keys(runtime.qaResults ?? {}).length,
+      qaResultCount: currentSessionQaCount(runtime),
       taskCreatedAt: runtime.currentTask?.createdAt,
       contextBundleEstimatedTokens: resumeCost.totalEstimatedTokens
     });

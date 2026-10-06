@@ -96,7 +96,9 @@ test("Scenario A: Task B's scope does not silently inherit Task A's leftover dir
   assert.deepEqual(resultB.taskScopedChangedFiles, ["b.js"]);
   assert.deepEqual(resultB.carriedOverChangedFiles, ["a.js"]);
   assert.ok(
-    resultB.judgments.some((j) => j.includes("already dirty before this task") && j.includes("a.js")),
+    // Carried-over work is reported as a count, never as a file list that
+    // could read as this task's changes.
+    resultB.judgments.some((j) => j.includes("already dirty before this task") && j.startsWith("1 file(s)")),
     "Task B's judgments must flag the carried-over file"
   );
 });

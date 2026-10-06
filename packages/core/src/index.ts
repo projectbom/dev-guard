@@ -7,6 +7,7 @@ export {
   trimTaskAIPromptSections,
   analyzeFileRelevance,
   detectRequirementMismatch,
+  extractNegatedTerms,
   extractTaskAIKeywords,
   generateTaskMarkdown,
   generateTaskMarkdownResult,

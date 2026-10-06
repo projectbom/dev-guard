@@ -259,6 +259,48 @@ function detectNegatedConcepts(requirement: string): Set<string> {
   return negated;
 }
 
+const NEGATED_TERM = "([A-Za-z][A-Za-z0-9_./-]{2,})";
+const NEGATED_TERM_VERBS = "(?:import(?:ing)?|modify(?:ing)?|chang(?:e|ing)|touch(?:ing)?|edit(?:ing)?|mutat(?:e|ing)|copy(?:ing)?|includ(?:e|ing)|bring(?:ing)?\\s+in|pull(?:ing)?\\s+in)";
+const NEGATED_TERM_PATTERNS: RegExp[] = [
+  // "without importing Shadow changes", "excluding legacy", "except vendor"
+  new RegExp(`\\b(?:without|excluding|except(?:\\s+for)?)\\s+(?:${NEGATED_TERM_VERBS}\\s+)?(?:any\\s+|the\\s+)?${NEGATED_TERM}`, "gi"),
+  // "do not import Shadow", "never modify billing", "must not touch legacy or vendor"
+  new RegExp(`\\b(?:do\\s*not|don'?t|never|must\\s+not|should\\s+not)\\s+${NEGATED_TERM_VERBS}\\s+(?:any\\s+|the\\s+)?${NEGATED_TERM}(?:\\s+(?:or|and|/)\\s+${NEGATED_TERM})?`, "gi"),
+  // "exclude Shadow"
+  new RegExp(`\\bexclude\\s+(?:any\\s+|the\\s+)?${NEGATED_TERM}`, "gi"),
+  // "Shadow 변경을 가져오지 말 것", "legacy 수정하지 마", "billing 건드리지 말고"
+  /([A-Za-z][A-Za-z0-9_./-]{2,}|[가-힣]{2,})\s*(?:관련\s*)?(?:변경|수정|코드|파일)?(?:사항)?\s*(?:을|를|은|는|도)?\s*(?:가져오지|수정하지|변경하지|건드리지|포함하지)\s*(?:말|마|않)/g,
+  // "Shadow 변경 금지", "legacy 제외"
+  /([A-Za-z][A-Za-z0-9_./-]{2,}|[가-힣]{2,})\s*(?:관련\s*)?(?:변경|수정|import)?\s*(?:금지|제외)/g
+];
+const NEGATED_TERM_STOPWORDS = new Set([
+  "any", "the", "changes", "change", "changing", "files", "file", "code", "other", "others", "existing", "anything",
+  "it", "them", "this", "that", "these", "those", "unrelated", "new", "all", "more", "work", "dirty",
+  "변경", "수정", "파일", "코드", "기존", "다른", "관련"
+]);
+
+/**
+ * Open-vocabulary counterpart to detectNegatedConcepts: the terms a task
+ * explicitly keeps OUT of scope ("without importing Shadow changes",
+ * "Shadow 변경을 가져오지 말 것", "do not modify legacy"). detectNegatedConcepts
+ * only knows a fixed generic concept list, so a project-specific term such
+ * as a module/feature name would otherwise be read as a POSITIVE ranking
+ * token by any keyword-overlap ranker — the exact inversion this exists to
+ * prevent. Returns lowercase terms; matching is the caller's job.
+ */
+export function extractNegatedTerms(text: string): string[] {
+  const terms = new Set<string>();
+  for (const pattern of NEGATED_TERM_PATTERNS) {
+    for (const match of text.matchAll(pattern)) {
+      for (const raw of match.slice(1)) {
+        const term = raw?.trim().toLowerCase().replace(/[./-]+$/, "");
+        if (term && term.length >= 3 && !NEGATED_TERM_STOPWORDS.has(term)) terms.add(term);
+      }
+    }
+  }
+  return [...terms];
+}
+
 function matchedNegatedConcept(
   negatedConcepts: Set<string>,
   tokenSets: Array<Set<string>>

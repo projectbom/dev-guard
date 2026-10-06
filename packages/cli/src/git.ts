@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { rm } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -128,6 +128,33 @@ export async function computeWorkingTreeContentHash(cwd: string): Promise<string
     return undefined;
   } finally {
     await rm(tempIndexPath, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Content fingerprint per working-tree file (git blob id of the current
+ * content), for the given repo-relative paths. Missing paths and
+ * directories are omitted. One `git hash-object` call for all files; on any
+ * git failure returns {} (callers treat a missing hash as "unknown").
+ */
+export async function hashWorkingFiles(cwd: string, files: string[]): Promise<Record<string, string>> {
+  const regular: string[] = [];
+  await Promise.all(files.map(async (file) => {
+    try {
+      if ((await stat(join(cwd, file))).isFile()) regular.push(file);
+    } catch {
+      // deleted or unreadable: no hash
+    }
+  }));
+  if (regular.length === 0) return {};
+  regular.sort();
+  try {
+    const { stdout } = await execFileAsync("git", ["hash-object", "--no-filters", "--", ...regular], { cwd, maxBuffer: 4 * 1024 * 1024 });
+    const hashes = stdout.trim().split(/\r?\n/);
+    if (hashes.length !== regular.length) return {};
+    return Object.fromEntries(regular.map((file, index) => [file, hashes[index]]));
+  } catch {
+    return {};
   }
 }
 
