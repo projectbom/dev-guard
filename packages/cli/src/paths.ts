@@ -56,6 +56,8 @@ export const devguardPaths = {
   nextClaudePrompt: `${DEVGUARD_DIR}/prompts/next-claude-prompt.md`,
   agentContext: `${DEVGUARD_DIR}/context/agent-context.md`,
   agentBrief: `${DEVGUARD_DIR}/context/agent-brief.md`,
+  /** The last prepare_task_context agent payload (canonical task state for the dashboard). */
+  taskContextState: `${DEVGUARD_DIR}/context/task-context.json`,
   projectKnowledge: `${DEVGUARD_DIR}/project/project-knowledge.json`,
   codeIndex: `${DEVGUARD_DIR}/memory/code-index.json`,
   changeLog: `${DEVGUARD_DIR}/memory/change-log.jsonl`

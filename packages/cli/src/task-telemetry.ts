@@ -72,6 +72,12 @@ export interface TaskTelemetryEvent {
    */
   taskPreparedAt?: string;
   firstChangeObservedAt?: string;
+  /** TASK_PREPARED/CONTINUED/REPLACED: repo-relative paths prepare_task_context provided (max 8; paths only). */
+  providedFiles?: string[];
+  /** TASK_PREPARED/CONTINUED/REPLACED: number of line ranges provided across those files. */
+  providedRangeCount?: number;
+  /** TASK_PREPARED/CONTINUED/REPLACED: estimated tokens of the MCP agent payload. Never provider-billed. */
+  mcpPayloadTokens?: number;
 }
 
 const telemetryPath = devguardPaths.taskTelemetry;

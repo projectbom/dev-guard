@@ -11,6 +11,7 @@ import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
 import { resolveOpenAIApiKey, writeConfigValue, writeOpenAIApiKey, type OpenAIKeySource } from "./config.js";
+import { getContextEfficiencyReport } from "./context-efficiency.js";
 
 const DEFAULT_PORT = 3737;
 const HOST = "127.0.0.1";
@@ -268,6 +269,16 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
   if (url.pathname === "/api/state") {
     try {
       sendJson(response, await getDashboardState(root));
+    } catch (error) {
+      sendJson(response, { error: errorMessage(error) }, 500);
+    }
+    return;
+  }
+  // Context Efficiency: separate from /api/state (polled every 1s) so the
+  // status loop never pays for activity aggregation; cached ~10s server-side.
+  if (url.pathname === "/api/efficiency") {
+    try {
+      sendJson(response, await getContextEfficiencyReport(root));
     } catch (error) {
       sendJson(response, { error: errorMessage(error) }, 500);
     }
@@ -726,6 +737,41 @@ function renderPage(): string {
       --r-sm: 6px;
     }
 
+    /* ── Context Efficiency ── */
+    .eff:empty { display: none; }
+    .eff { margin-bottom: 12px; display: grid; gap: 10px; }
+    .eff-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+    .eff-title { font-size: 13px; font-weight: 700; }
+    .eff-sub { font-size: 11px; color: var(--muted); }
+    .eff-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
+    .eff-tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px 11px; min-width: 0; }
+    .eff-tile.wide { grid-column: span 2; }
+    .eff-k { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+    .eff-v { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+    .eff-v.sm { font-size: 13px; font-weight: 600; }
+    .eff-note { font-size: 11.5px; color: var(--ink2); margin-top: 2px; }
+    .eff-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
+    .stack { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--line); }
+    .stack span { height: 100%; min-width: 0; }
+    .eff-row { display: grid; grid-template-columns: minmax(90px, 30%) 1fr auto; gap: 8px; align-items: center; font-size: 12px; margin: 5px 0; }
+    .eff-row .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink2); }
+    .eff-row .num { font: 11px/1 var(--mono); color: var(--muted); white-space: nowrap; }
+    .bar { height: 10px; border-radius: 3px; background: var(--line); overflow: hidden; }
+    .bar > span { display: block; height: 100%; background: var(--accent); }
+    .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--ink2); margin-top: 8px; }
+    .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+    .ev { display: inline-block; font: 9.5px/1 var(--mono); padding: 2px 4px; border-radius: 3px; border: 1px solid var(--line2); color: var(--muted); margin-left: 4px; vertical-align: 1px; cursor: help; }
+    .eff-kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; font-size: 12px; }
+    .eff-kv dt { color: var(--muted); }
+    .eff-kv dd { margin: 0; overflow-wrap: anywhere; }
+    .eff-recs li { padding: 7px 0; border-top: 1px solid var(--line); font-size: 12.5px; }
+    .eff-recs li:first-child { border-top: 0; }
+    .eff-recs .why { color: var(--muted); font-size: 11.5px; }
+    .roll-CONTINUE { color: var(--ok); } .roll-NEW_THREAD_SOON { color: var(--warn); } .roll-NEW_THREAD_RECOMMENDED { color: var(--bad); }
+    .tl svg { width: 100%; height: 130px; display: block; }
+    .eff-legend-line { font-size: 10.5px; color: var(--muted); }
+    @media (max-width: 640px) { .eff-tile.wide { grid-column: auto; } .eff-row { grid-template-columns: 1fr auto; } .eff-row .bar, .eff-row .stack { grid-column: 1 / -1; } }
+
     /* ── Reset ── */
     *, *::before, *::after { box-sizing: border-box; }
     body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 var(--sans); -webkit-font-smoothing: antialiased; }
@@ -972,6 +1018,7 @@ function renderPage(): string {
       <div class="timestamp" id="ts"></div>
     </div>
   </div>
+  <div id="efficiency" class="eff"></div>
   <div id="root"></div>
 </div>
 
@@ -1009,6 +1056,7 @@ function setLang(l, opts = {}) {
   brandSub.textContent = t('appSubtitle');
   refreshBtn.textContent = t('refresh');
   if (last) render(last); else root.textContent = t('loading');
+  if (typeof effLast !== 'undefined' && effLast) renderEff(effLast);
   if (!opts.skipPersist) persistLocale(l);
 }
 async function persistLocale(l) {
@@ -1683,9 +1731,111 @@ async function tick() {
   }
 }
 
+// ── Context Efficiency panel (polled separately, every 15s) ──
+const effRoot = document.getElementById('efficiency');
+let effLast = null;
+const CAT_ORDER = ['MCP','FALLBACK_DOCS','SEARCH','CODE_READS','CODE_EDITS','VALIDATION','ADMIN','OTHER'];
+const CAT_COLOR = { MCP:'#2563eb', FALLBACK_DOCS:'#d97706', SEARCH:'#dc2626', CODE_READS:'#0891b2', CODE_EDITS:'#16a34a', VALIDATION:'#7c3aed', ADMIN:'#64748b', OTHER:'#cbd5e1' };
+const MODE_ORDER = ['IMPLEMENTATION','EXPLORATION','VALIDATION','CONTEXT_ADMIN','RESUME_RECOVERY','OTHER'];
+const TL_COLOR = { TASK_PREPARED:'#2563eb', TASK_DONE:'#16a34a', VALIDATION:'#7c3aed', ROLLOVER_SOON:'#d97706', ROLLOVER_RECOMMENDED:'#dc2626', NEW_THREAD:'#0891b2', COMPACTION:'#111318' };
+const EV_HELP = { OBSERVED:'Recorded event', ESTIMATED:'Text-size estimate (chars/4), not provider tokens', INFERRED:'Deterministic rule over observed data' };
+function ev(kind) { return '<span class="ev" title="' + esc(EV_HELP[kind] || '') + '">' + esc(kind) + '</span>'; }
+function fmtTok(n) { n = n || 0; return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'K' : String(n); }
+function pct(part, total) { return total > 0 ? Math.round(part / total * 100) : 0; }
+function stackBar(costs, total, widthPct) {
+  const segs = CAT_ORDER.filter(c => (costs[c] || 0) > 0).map(c => '<span title="' + esc(t('cat' + c) + ': ' + fmtTok(costs[c]) + ' (' + pct(costs[c], total) + '%)') + '" style="width:' + (costs[c] / total * 100).toFixed(2) + '%;background:' + CAT_COLOR[c] + '"></span>').join('');
+  return '<div class="stack" style="width:' + (widthPct || 100) + '%">' + segs + '</div>';
+}
+function catLegend(costs, total) {
+  return '<div class="legend">' + CAT_ORDER.filter(c => (costs[c] || 0) > 0).map(c => '<span><i style="background:' + CAT_COLOR[c] + '"></i>' + esc(t('cat' + c)) + ' ' + fmtTok(costs[c]) + ' · ' + pct(costs[c], total) + '%</span>').join('') + '</div>';
+}
+function timelineSvg(tl) {
+  const pts = tl.cumulative || [];
+  const evs = tl.events || [];
+  const all = pts.map(p => Date.parse(p.ts)).concat(evs.map(e => Date.parse(e.ts)));
+  if (all.length < 2) return '<div class="eff-note">' + esc(t('effNoActivity')) + '</div>';
+  const t0 = Math.min(...all), t1 = Math.max(...all), span = Math.max(1, t1 - t0);
+  const maxY = Math.max(1, ...pts.map(p => p.estTokens));
+  const x = ts => (Date.parse(ts) - t0) / span * 590 + 5;
+  const y = v => 118 - v / maxY * 100;
+  const line = pts.map(p => x(p.ts).toFixed(1) + ',' + y(p.estTokens).toFixed(1)).join(' ');
+  const marks = evs.map(e => '<line x1="' + x(e.ts).toFixed(1) + '" x2="' + x(e.ts).toFixed(1) + '" y1="8" y2="120" stroke="' + (TL_COLOR[e.type] || '#999') + '" stroke-width="' + (e.type === 'COMPACTION' ? 2 : 1) + '" stroke-dasharray="' + (e.type === 'VALIDATION' ? '2,3' : '') + '"><title>' + esc(t('tl' + e.type) + (e.detail ? ' — ' + e.detail : '') + ' · ' + new Date(e.ts).toLocaleString() + ' · ' + e.evidence) + '</title></line>').join('');
+  const types = [...new Set(evs.map(e => e.type))];
+  return '<svg viewBox="0 0 600 130" preserveAspectRatio="none" role="img" aria-label="' + esc(t('effTimelineTitle')) + '">' + marks +
+    '<polyline points="' + line + '" fill="none" stroke="#111318" stroke-width="1.6"/>' +
+    '<text x="6" y="12" font-size="10" fill="#6b7280">' + fmtTok(maxY) + '</text></svg>' +
+    '<div class="legend">' + types.map(k => '<span><i style="background:' + TL_COLOR[k] + '"></i>' + esc(t('tl' + k)) + '</span>').join('') + '</div>';
+}
+function renderEff(d) {
+  if (!d || d.error) { effRoot.innerHTML = ''; return; }
+  const s = d.summary || {}; const cur = d.current;
+  const head = '<div class="eff-head"><div><div class="eff-title">' + esc(t('effTitle')) + '</div><div class="eff-sub">' + esc(t('effSubtitle')) + '</div></div>' +
+    '<div class="eff-legend-line">' + esc(d.threadIdentity === 'observed' ? '' : t('effThreadUnavailable')) + '</div></div>';
+  if (!cur) { effRoot.innerHTML = head + '<div class="card"><div class="eff-note">' + esc(t('effNoTask')) + '</div></div>'; return; }
+  const roll = s.rollover || {};
+  const rec = s.topRecommendation;
+  const tiles = '<div class="eff-tiles">' +
+    '<div class="eff-tile wide"><div class="eff-k">' + esc(t('effCurrentTask')) + '</div><div class="eff-v sm">' + esc(s.task || '') + '</div></div>' +
+    '<div class="eff-tile"><div class="eff-k">' + esc(t('effEstimated')) + ev('ESTIMATED') + '</div><div class="eff-v">' + fmtTok(s.estimatedContextTokens) + '</div></div>' +
+    '<div class="eff-tile"><div class="eff-k">' + esc(t('effLargest')) + ev('ESTIMATED') + '</div><div class="eff-v sm">' + (s.largestCost ? esc(t('cat' + s.largestCost.category)) + ' — ' + s.largestCost.share + '%' : '—') + '</div></div>' +
+    '<div class="eff-tile"><div class="eff-k">' + esc(t('effMode')) + ev('INFERRED') + '</div><div class="eff-v sm">' + (s.workMode ? esc(t('mode' + s.workMode.mode)) + (s.workMode.heavy ? ' ' + esc(t('modeHeavy')) : '') + ' · ' + s.workMode.share + '%' : '—') + '</div></div>' +
+    '<div class="eff-tile"><div class="eff-k">' + esc(t('effCandidates')) + ev('OBSERVED') + '</div><div class="eff-v">' + (s.candidateUsage ? s.candidateUsage.used + ' / ' + s.candidateUsage.of : '—') + '</div></div>' +
+    '<div class="eff-tile"><div class="eff-k">' + esc(t('effRollover')) + ev(roll.evidence || 'INFERRED') + '</div><div class="eff-v sm roll-' + esc(roll.state || '') + '">' + esc(t('roll' + (roll.state || 'CONTINUE'))) + '</div><div class="eff-note">' + esc(roll.reason || '') + '</div></div>' +
+    (rec ? '<div class="eff-tile wide"><div class="eff-k">' + esc(t('effTopRec')) + ev(rec.evidence) + '</div><div class="eff-v sm">' + esc(t('rec' + rec.id)) + '</div><div class="eff-note">' + esc(rec.reason) + '</div></div>' : '') +
+    '</div>';
+  const total = cur.estTokens || 0;
+  const recent = d.recent || [];
+  const maxTask = Math.max(1, ...recent.map(r => r.estTokens || 0));
+  const costCard = '<div class="card"><div class="card-title">' + esc(t('effCostTitle')) + ev('ESTIMATED') + '</div>' +
+    '<div class="eff-k">' + esc(t('effCostCurrent')) + ' · ' + fmtTok(total) + '</div>' + stackBar(cur.costByCategory, total) + catLegend(cur.costByCategory, total) +
+    '<div class="eff-k" style="margin-top:12px">' + esc(t('effCostRecent')) + '</div>' +
+    recent.map(r => '<div class="eff-row"><span class="lbl" title="' + esc(r.label) + '">' + esc(r.label) + '</span>' + (r.estTokens > 0 ? stackBar(r.costByCategory, r.estTokens, Math.max(2, r.estTokens / maxTask * 100)) : '<div></div>') + '<span class="num">' + fmtTok(r.estTokens) + (r.sameThreadAsPrevious ? ' ↺' : '') + (r.compactions ? ' ⧉' + r.compactions : '') + '</span></div>').join('') +
+    '<div class="eff-legend-line">↺ ' + esc(t('effSameThread')) + ' · ⧉ ' + esc(t('tlCOMPACTION')) + '</div></div>';
+  const modeCard = '<div class="card"><div class="card-title">' + esc(t('effModeTitle')) + ev('INFERRED') + '</div>' +
+    MODE_ORDER.filter(m => (cur.modeTokens[m] || 0) > 0).sort((a, b) => cur.modeTokens[b] - cur.modeTokens[a]).map(m => '<div class="eff-row"><span class="lbl">' + esc(t('mode' + m)) + '</span><div class="bar"><span style="width:' + pct(cur.modeTokens[m], total) + '%"></span></div><span class="num">' + pct(cur.modeTokens[m], total) + '%</span></div>').join('') + '</div>';
+  const util = cur.candidateUtilization;
+  const provCard = '<div class="card"><div class="card-title">' + esc(t('effProvidedTitle')) + '</div><dl class="eff-kv">' +
+    '<dt>' + esc(t('effProvidedFiles')) + ev('OBSERVED') + '</dt><dd>' + cur.provided.files + (cur.provided.ranges !== undefined && cur.provided.ranges !== null ? ' · ' + cur.provided.ranges + ' ranges' : '') + '</dd>' +
+    '<dt>' + esc(t('effUsedFiles')) + ev('OBSERVED') + '</dt><dd>' + cur.usedFiles + '</dd>' +
+    '<dt>' + esc(t('effUsedFromDevGuard')) + '</dt><dd>' + cur.providedUsed + '</dd>' +
+    '<dt>' + esc(t('effDiscovered')) + '</dt><dd>' + cur.nonProvidedUsed + '</dd>' +
+    '<dt>' + esc(t('effBroad')) + ev('OBSERVED') + '</dt><dd>' + cur.broadSearchCalls + ' / ' + cur.searchCalls + '</dd>' +
+    '<dt>' + esc(t('effUtil')) + ev('INFERRED') + '</dt><dd>' + (util ? util.used + ' / ' + util.of + ' = ' + pct(util.used, util.of) + '%' : '—') + '</dd>' +
+    '<dt>' + esc(t('effSearchFirst')) + '</dt><dd>' + esc(cur.searchBeforeProvidedRead ? t('effYes') : t('effNo')) + '</dd>' +
+    '<dt>' + esc(t('effFallbackReads')) + ev('OBSERVED') + '</dt><dd>' + cur.fallbackDocReads + (cur.repeatedFallbackDocReads ? ' (' + cur.repeatedFallbackDocReads + ' repeated)' : '') + '</dd>' +
+    '</dl></div>';
+  const tlCard = '<div class="card tl"><div class="card-title">' + esc(t('effTimelineTitle')) + ev('ESTIMATED') + '</div>' + timelineSvg(d.timeline || {}) + '<div class="eff-legend-line">' + esc(t('effTimelineNote')) + '</div></div>';
+  const c = d.taskCard;
+  const list = a => (a && a.length) ? a.map(x => esc(x)).join('<br>') : esc(t('effNone'));
+  const cardCard = c ? '<div class="card"><div class="card-title">' + esc(t('effTaskCardTitle')) + '</div><dl class="eff-kv">' +
+    '<dt>' + esc(t('effGoal')) + '</dt><dd>' + esc(c.goal) + '</dd>' +
+    '<dt>' + esc(t('effNext')) + '</dt><dd>' + esc(c.nextAction || '—') + '</dd>' +
+    '<dt>' + esc(t('effEdit')) + '</dt><dd>' + list(c.edit) + '</dd>' +
+    '<dt>' + esc(t('effReference')) + '</dt><dd>' + list(c.reference) + '</dd>' +
+    '<dt>' + esc(t('effProtected')) + '</dt><dd>' + list(c.protected) + '</dd>' +
+    '<dt>' + esc(t('effFresh')) + '</dt><dd>' + list(c.freshValidation) + '</dd>' +
+    '<dt>' + esc(t('effOpen')) + '</dt><dd>' + list(c.openValidation) + '</dd>' +
+    '<dt>' + esc(t('effCarried')) + '</dt><dd>' + (c.carriedOver !== undefined && c.carriedOver !== null ? c.carriedOver : '—') + '</dd>' +
+    '</dl></div>' : '';
+  const recs = d.recommendations || [];
+  const recCard = '<div class="card"><div class="card-title">' + esc(t('effRecsTitle')) + '</div>' + (recs.length ? '<ul class="eff-recs">' + recs.map(r => '<li>' + esc(t('rec' + r.id)) + ev(r.evidence) + '<div class="why">' + esc(r.reason) + '</div></li>').join('') + '</ul>' : '<div class="eff-note">' + esc(t('effNoRecs')) + '</div>') + '</div>';
+  effRoot.innerHTML = head + tiles + '<div class="eff-grid">' + costCard + modeCard + provCard + recCard + tlCard + cardCard + '</div><div class="eff-legend-line">' + esc(t('effLegend')) + '</div>';
+}
+async function tickEff() {
+  try {
+    const res = await fetch('/api/efficiency', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    effLast = await res.json();
+    renderEff(effLast);
+  } catch (e) {
+    effRoot.innerHTML = '';
+  }
+}
 setLang(lang);
 tick();
 setInterval(tick, 1000);
+tickEff();
+setInterval(tickEff, 15000);
 </script>
 </body>
 </html>`;

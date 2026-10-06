@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import {
   analyzeDiff,
   defaultConfig,
+  estimateTokens,
   extractNegatedTerms,
   filterDiffTextForFiles,
   filterDevGuardContextFiles,
@@ -1922,14 +1923,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     const openValidation = previousTaskOpenValidation(runtimeWithTask);
     const carriedOverDirtyFiles = currentTask.changedFilesAtCreation?.length ?? 0;
     const nextAction = preparedNextAction(structuredFiles, openValidation);
-    await recordTaskTelemetry(root, {
-      event: taskTransition === "continued" ? "TASK_CONTINUED" : taskTransition === "replaced" ? "TASK_REPLACED" : "TASK_PREPARED",
-      sessionId,
-      candidateFileCount: structuredFiles.length,
-      estimatedResumeTokens: resumeCost.totalEstimatedTokens,
-      rolloverStatus: rollover.status
-    });
-    return {
+    const result: PreparedTaskContextResult = {
       task: text,
       source: currentTask.source,
       taskSource: "explicit",
@@ -1966,6 +1960,23 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       agentContextPath,
       nextClaudePromptPath
     };
+    const payload = toAgentContextPayload(result);
+    await recordTaskTelemetry(root, {
+      event: taskTransition === "continued" ? "TASK_CONTINUED" : taskTransition === "replaced" ? "TASK_REPLACED" : "TASK_PREPARED",
+      sessionId,
+      candidateFileCount: structuredFiles.length,
+      estimatedResumeTokens: resumeCost.totalEstimatedTokens,
+      rolloverStatus: rollover.status,
+      providedFiles: structuredFiles.map((file) => file.path).slice(0, 8),
+      providedRangeCount: structuredFiles.reduce((sum, file) => sum + file.ranges.length, 0),
+      mcpPayloadTokens: estimateTokens(JSON.stringify(payload))
+    });
+    // Canonical task state for the dashboard's Task card — the same payload
+    // the agent received, so the dashboard never re-derives it independently.
+    if (persistTask) {
+      await writeTextFile(fromRoot(root, devguardPaths.taskContextState), JSON.stringify({ sessionId, preparedAt: currentTask.createdAt, ...payload })).catch(() => undefined);
+    }
+    return result;
   } finally {
     // persistTask:false revert bug (found via a real PartnerFlow smoke
     // check, not a synthetic test): writeRuntimeState's default write path

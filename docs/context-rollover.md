@@ -126,3 +126,42 @@ dev-guard --help        # now resolves to your local build
 Run `pnpm --filter @dev-guard/cli watch` (or the same in `packages/core`)
 during active development so `dist/` stays current without re-running
 `pnpm build` after every edit.
+
+## Context Efficiency Dashboard
+
+The dashboard's Context Efficiency panel (`/api/efficiency`, refreshed every
+15s, cached ~10s, separate from the 1s `/api/state` loop) shows where each
+DevGuard task's context went:
+
+- **Sources.** DevGuard telemetry gives task windows, provided files
+  (`TASK_PREPARED.providedFiles`), validation, completion and rollover status.
+  Codex's local session logs (`$CODEX_HOME/sessions/**/rollout-*.jsonl`,
+  `item_completed` events) give executed commands with Codex's own
+  read/search/list parse, MCP calls, file changes, observed context
+  compactions and thread identity (`session_meta.thread_source`: user vs
+  subagent). Only rollouts whose `cwd` is the project are read, incrementally.
+  A Claude Code adapter exists as an interface stub.
+- **Evidence labels.** OBSERVED = a recorded event; ESTIMATED = a text-size
+  estimate (chars/4) of what entered the agent's context, never
+  provider-billed tokens; INFERRED = a deterministic rule over the above.
+  No provider context-window percentage, billed tokens or hidden reasoning
+  are shown.
+- **Categories.** DevGuard MCP, fallback docs, search, code reads, code edits,
+  validation, admin, other (other is labelled by tool, e.g. an external MCP
+  server, web, or an inline script).
+- **Work modes.** Implementation (edits, and reads of files the task edits),
+  exploration, validation, context admin, resume/recovery, other.
+- **Provided vs searched.** Candidate utilization = how many of the first 5
+  files the agent used were DevGuard candidates; plus repository-wide search
+  count and whether a broad search came before reading any provided file.
+- **Rollover.** `NEW THREAD RECOMMENDED` only from observed facts (task done,
+  the same thread hosting several tasks, a compaction); DevGuard's own
+  heuristic alone gives at most `NEW THREAD SOON`.
+- **Recommendations.** At most 3, from fixed rules: fallback docs > MCP (A),
+  broad search with low candidate use (B), fresh thread (C), exploration far
+  above implementation (D), context admin ≥ 15% (E).
+- **Privacy.** Stored/returned: timestamps, hashed thread ids, categories,
+  repo-relative read/edit paths, estimated token counts, durations. Never
+  stored: prompts, responses, command text or output, source content,
+  search queries, reasoning. `prepare_task_context` additionally writes its
+  agent payload to `.devguard/context/task-context.json` for the Task card.
