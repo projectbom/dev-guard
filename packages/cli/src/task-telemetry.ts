@@ -37,7 +37,19 @@ export type TaskTelemetryEventType =
    * changes (e.g. once per agent turn instead of once per real edit).
    */
   | "COMPLETION_SIGNAL_RECEIVED"
+  /** The one effective finalization that closes a task — exactly once per task. */
   | "TASK_DONE"
+  /**
+   * A later finalization in the same lineage after its task was already
+   * closed (edits made after `dev-guard done`). Real work, not a completion.
+   */
+  | "TASK_FOLLOWUP_FINALIZED"
+  /**
+   * A hook completion that was NOT acted on because it came from a provider
+   * thread other than the current task's owner (diagnostic only — nothing
+   * was finalized, cleared, or regenerated).
+   */
+  | "COMPLETION_IGNORED"
   | "HOOK_DONE_TRIGGERED";
 
 export interface TaskTelemetryEvent {
@@ -78,8 +90,21 @@ export interface TaskTelemetryEvent {
   providedTargets?: string[];
   /** TASK_PREPARED/CONTINUED/REPLACED: number of line ranges provided across those files. */
   providedRangeCount?: number;
-  /** TASK_PREPARED/CONTINUED/REPLACED: estimated tokens of the MCP agent payload. Never provider-billed. */
+  /** TASK_PREPARED/CONTINUED/REPLACED: estimated tokens of the MCP agent payload as delivered (single copy). Never provider-billed. */
   mcpPayloadTokens?: number;
+  /** TASK_PREPARED/CONTINUED/REPLACED: observed provider thread pressure (see thread-ownership.ts). */
+  threadPressure?: string;
+  /** TASK_PREPARED/CONTINUED/REPLACED: how the task's owning thread was identified, if at all. */
+  ownerSource?: string;
+  /** COMPLETION_SIGNAL_RECEIVED: true when the request was a no-op duplicate of an already-finalized state. */
+  alreadyProcessed?: boolean;
+  /** COMPLETION_SIGNAL_RECEIVED (hook sources): "owner" or "unverified" (no observable thread identity — fail-open). */
+  ownership?: string;
+  /** COMPLETION_IGNORED: why the request was not acted on. */
+  reason?: string;
+  /** COMPLETION_IGNORED: hashed thread ids (never raw provider ids). */
+  ownerThreadHash?: string;
+  sourceThreadHash?: string;
 }
 
 const telemetryPath = devguardPaths.taskTelemetry;

@@ -86,29 +86,14 @@ AI provider를 끄거나 로컬 휴리스틱 중심으로만 쓰려면:
 dev-guard configure ai --provider none --model gpt-4o-mini
 ```
 
-## 4. AGENTS.md에 넣을 문구
+## 4. AGENTS.md / CLAUDE.md 문구
 
-`dev-guard install-agent-instructions`가 자동으로 넣는 권장 섹션입니다. 수동으로 넣어야 한다면 아래 블록을 `AGENTS.md`에 추가합니다.
+`dev-guard install-agent-instructions`가 `AGENTS.md`(Codex)와 `CLAUDE.md`(Claude Code)에 표시된 섹션(`<!-- dev-guard-section-start -->` … `<!-- dev-guard-section-end -->`)을 씁니다. 설치된 버전과 문구가 항상 일치하도록 직접 붙여넣기보다 명령을 사용하세요. 이 섹션은 하나의 workflow만 설명합니다.
 
-```md
-<!-- dev-guard-section-start -->
-
-## Agent Instructions
-
-Before doing any work:
-
-1. Read `.devguard/reports/working-context.md`
-2. Read `.devguard/reports/project-handoff.md`
-3. Read `.devguard/reports/quality-report.md`
-
-Use dev-guard artifacts as the primary source of project context.
-Do not perform repository-wide scans before reading them.
-Start from the entry files and excluded areas in Working Context.
-Only open additional files when required for the current task.
-Continue from the latest dev-guard state.
-
-<!-- dev-guard-section-end -->
-```
+- **MCP 사용 가능:** 새 작업마다 먼저 `prepare_task_context` 호출 → TARGET 범위 읽기 → 구체적인 공백이 있을 때만 CANDIDATE 열기 → 둘 다 다루지 못한 부분만 좁게 검색. `.devguard` markdown은 함께 읽지 않습니다.
+- **MCP 사용 불가:** `.devguard/context/agent-brief.md` → `.devguard/reports/read-map.md` → `.devguard/reports/code-map.md` 순서로 fallback.
+- `project-handoff.md` / `quality-report.md`는 명시적 요청(이전 작업 재개, QA 조사)이 있을 때만 읽습니다.
+- 서로 다른 작업은 새 agent thread에서 시작하고, 검증은 `record_validation_result`로 기록하며, `dev-guard done` 또는 Stop hook으로 마칩니다.
 
 기존 dev-guard 섹션을 최신 문구로 갱신하려면:
 
@@ -116,30 +101,9 @@ Continue from the latest dev-guard state.
 dev-guard install-agent-instructions --force
 ```
 
-## 5. CLAUDE.md에 넣을 문구
+## 5. 전역 agent 지시문
 
-`CLAUDE.md`에도 같은 목적의 시작 지시문을 넣습니다.
-
-```md
-<!-- dev-guard-section-start -->
-
-## Startup Instructions
-
-Always read the latest dev-guard context before exploring the repository.
-
-Required reading:
-
-* `.devguard/context/agent-context.md`
-* `.devguard/reports/working-context.md`
-* `.devguard/reports/project-handoff.md`
-* `.devguard/reports/quality-report.md`
-
-Avoid repository-wide scans unless the dev-guard context is insufficient.
-Start from the Working Context entry files and excluded areas.
-Prefer continuing from dev-guard context rather than rediscovering project state.
-
-<!-- dev-guard-section-end -->
-```
+DevGuard는 `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md` 같은 사용자 전역 지시문 파일을 쓰지 않습니다. 예전 가이드는 그곳에 "`project-handoff.md` / `quality-report.md`를 먼저 읽어라" 블록을 붙여넣도록 안내했는데, 이 블록은 위 프로젝트 섹션(MCP 우선, markdown 읽지 않음)과 충돌합니다. 전역 파일에 아직 남아 있다면 직접 제거하세요. `dev-guard doctor --agents`가 해당 블록을 발견하면 알려줍니다.
 
 ## 6. Codex / Claude hook 확인
 

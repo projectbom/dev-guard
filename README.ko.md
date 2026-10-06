@@ -404,36 +404,35 @@ dev-guard status
 
 ## Context Overflow 복구
 
-Claude/Codex 세션이 context window 초과로 끊기면 긴 history를 붙여넣지 말고 다음 파일을 사용합니다.
+긴 스레드가 compaction될 때까지 기다리거나 긴 history를 새 스레드에 붙여넣지 마세요. 서로 다른 작업은 새 agent 스레드에서 시작하고, 그곳에서 구체적인 작업으로 DevGuard MCP `prepare_task_context`를 호출합니다. 읽을 파일/범위, 제약, 이월된 dirty 작업, 이전 작업의 미해결 검증이 함께 반환됩니다. `record_validation_result` 응답에도 (provider가 기록하는 경우) 현재 스레드의 관측된 압박도가 포함되어 언제 넘어가야 할지 알 수 있습니다.
+
+이전 작업을 명시적으로 재개하거나 MCP를 쓸 수 없을 때만 handoff를 재생성해 읽습니다.
 
 ```bash
 dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-새 Claude/Codex 스레드에서는 `.devguard/reports/project-handoff.md`를 읽게 합니다. 이 파일은 `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, `Project` 중심의 압축 resume라 긴 대화 기록 없이 이어서 작업할 수 있습니다.
+그 next action을 구체적인 작업으로 바꿔 새 스레드에서 `prepare_task_context`를 호출하세요.
 
 ## Multi-Agent Workflow
-
-`dev-guard done` (또는 Auto Mode)은 새 Agent 세션을 위한 컨텍스트 파일 묶음을 생성합니다. 새 Agent는 전체 레포지토리를 스캔하기 전에 Before-AI 파일부터 읽습니다.
 
 ### 권장 세션 인수인계 순서
 
 1. `dev-guard watch` — watcher 시작
-2. Claude/Codex가 파일 수정; Stop Hook이 `done` 자동 실행
-3. `dev-guard done` — Read Map, Code Map, Agent Brief, QA, handoff, context, memory 산출물 생성
-4. 새 Agent 세션 시작
-5. `.devguard/reports/read-map.md`, `.devguard/reports/code-map.md`, `.devguard/context/agent-brief.md` 읽기
+2. Claude/Codex가 파일 수정; Stop Hook이 `done` 자동 실행 (작업을 준비한 스레드가 아닌 다른 스레드의 Stop은 무시됨)
+3. 다음 작업은 새 Agent 세션에서 시작
+4. 작업 내용으로 `prepare_task_context` 호출; TARGET 범위부터 읽기
 
 ### Codex ↔ Claude 전환 시 (또는 다른 Agent로 전환)
 
-새 세션 시작 프롬프트:
+둘 다 같은 프로젝트 섹션(`AGENTS.md` / `CLAUDE.md`)을 읽으므로 시작 프롬프트는 작업 내용이면 충분합니다. MCP를 쓸 수 없을 때만:
 
 ```txt
-Read .devguard/reports/read-map.md, .devguard/reports/code-map.md, and .devguard/context/agent-brief.md; then continue from the targeted file ranges.
+Read .devguard/context/agent-brief.md, then .devguard/reports/read-map.md and .devguard/reports/code-map.md; continue from the targeted file ranges.
 ```
 
-전체 다음 작업 지시가 필요하면 `.devguard/reports/project-handoff.md`를 읽습니다. QA 상태가 필요하면 `.devguard/reports/quality-report.md`를 읽습니다.
+`.devguard/reports/project-handoff.md` / `.devguard/reports/quality-report.md`는 명시적으로 재개하거나 QA를 조사할 때만 읽습니다.
 
 ### 생성되는 Agent context 파일
 

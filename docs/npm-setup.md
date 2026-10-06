@@ -86,29 +86,14 @@ To disable the AI provider and use local heuristics only:
 dev-guard configure ai --provider none --model gpt-4o-mini
 ```
 
-## 4. AGENTS.md Text
+## 4. AGENTS.md / CLAUDE.md Text
 
-`dev-guard install-agent-instructions` adds this recommended section automatically. If you need to add it manually, paste this into `AGENTS.md`.
+`dev-guard install-agent-instructions` writes a marked section (`<!-- dev-guard-section-start -->` … `<!-- dev-guard-section-end -->`) into `AGENTS.md` (Codex) and `CLAUDE.md` (Claude Code). Prefer the command over pasting by hand, so the text always matches the installed version. The section describes exactly one workflow:
 
-```md
-<!-- dev-guard-section-start -->
-
-## Agent Instructions
-
-Before doing any work:
-
-1. Read `.devguard/reports/working-context.md`
-2. Read `.devguard/reports/project-handoff.md`
-3. Read `.devguard/reports/quality-report.md`
-
-Use dev-guard artifacts as the primary source of project context.
-Do not perform repository-wide scans before reading them.
-Start from the entry files and excluded areas in Working Context.
-Only open additional files when required for the current task.
-Continue from the latest dev-guard state.
-
-<!-- dev-guard-section-end -->
-```
+- **MCP available:** for every new task, call `prepare_task_context` first → read the TARGET ranges → open a CANDIDATE only for a concrete gap → targeted search only for what neither covers. Do not also read `.devguard` markdown.
+- **MCP unavailable:** fall back to `.devguard/context/agent-brief.md`, then `.devguard/reports/read-map.md`, then `.devguard/reports/code-map.md`.
+- `project-handoff.md` / `quality-report.md` are read only on explicit request (resume previous work, QA investigation).
+- Start each distinct task in a fresh agent thread; report checks with `record_validation_result`; finish with `dev-guard done` or the Stop hook.
 
 To refresh an existing dev-guard section:
 
@@ -116,30 +101,9 @@ To refresh an existing dev-guard section:
 dev-guard install-agent-instructions --force
 ```
 
-## 5. CLAUDE.md Text
+## 5. Global Agent Instructions
 
-Add the same startup guidance to `CLAUDE.md`.
-
-```md
-<!-- dev-guard-section-start -->
-
-## Startup Instructions
-
-Always read the latest dev-guard context before exploring the repository.
-
-Required reading:
-
-* `.devguard/context/agent-context.md`
-* `.devguard/reports/working-context.md`
-* `.devguard/reports/project-handoff.md`
-* `.devguard/reports/quality-report.md`
-
-Avoid repository-wide scans unless the dev-guard context is insufficient.
-Start from the Working Context entry files and excluded areas.
-Prefer continuing from dev-guard context rather than rediscovering project state.
-
-<!-- dev-guard-section-end -->
-```
+DevGuard never writes user-level instruction files such as `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`. Older DevGuard guides suggested pasting a "Read `project-handoff.md` / `quality-report.md` first" block there; that block now contradicts the project section above (MCP first, no markdown reads). If your global file still contains it, remove that block by hand — `dev-guard doctor --agents` reports it when present.
 
 ## 6. Verify Codex / Claude Hooks
 

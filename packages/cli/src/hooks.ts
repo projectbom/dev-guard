@@ -291,7 +291,7 @@ export async function writeHookStatusReport(root: string): Promise<string> {
 // carrying an older (or no) marker are regenerated in place by
 // refreshGeneratedHookScripts on the next `dev-guard watch`/prepare, so a
 // project never keeps running an outdated unbounded-logging hook.
-export const HOOK_SCRIPT_VERSION = 2;
+export const HOOK_SCRIPT_VERSION = 3;
 const hookScriptMarker = `dev-guard-hook-script: v${HOOK_SCRIPT_VERSION}`;
 
 // DEV_GUARD_HOOK_DEBUG=1 only: max raw payload bytes / command output
@@ -448,6 +448,9 @@ fi
 payload_bytes="$(byte_count "$payload")"
 thread_id="$(json_field thread-id "$payload")"
 turn_id="$(json_field turn-id "$payload")"
+# Completion ownership: \`dev-guard done\` ignores a notify from a thread that
+# does not own the current task (see thread-ownership.ts).
+export DEV_GUARD_HOOK_THREAD_ID="$thread_id"
 
 rotate_log
 {
@@ -511,6 +514,10 @@ hook_source="\${DEV_GUARD_HOOK_SOURCE:-agent_runtime}"
 # tell them apart (see CompletionSource in runtime-state.ts).
 export DEV_GUARD_COMPLETION_SOURCE="hook-${kind}-stop"
 session_id="$(json_field session_id "$hook_input")"
+# Completion ownership: the Stop payload's session_id is the provider thread
+# id; \`dev-guard done\` ignores a Stop from a thread that does not own the
+# current task (see thread-ownership.ts).
+export DEV_GUARD_HOOK_THREAD_ID="$session_id"
 
 rotate_log
 {

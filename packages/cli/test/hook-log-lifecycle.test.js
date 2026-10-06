@@ -295,7 +295,7 @@ test("outdated generated hook scripts are refreshed in place; current or foreign
   await writeFile(claudePath, "#!/usr/bin/env bash\necho my own hook\n");
   const refreshed = await refreshGeneratedHookScripts(project.root);
   assert.deepEqual(refreshed, [devguardPaths.codexNotifyHook]);
-  assert.match(await readFile(notifyPath, "utf8"), /dev-guard-hook-script: v2/);
+  assert.match(await readFile(notifyPath, "utf8"), /dev-guard-hook-script: v3/);
   assert.equal(await readFile(claudePath, "utf8"), "#!/usr/bin/env bash\necho my own hook\n");
   assert.deepEqual(await refreshGeneratedHookScripts(project.root), []);
 });

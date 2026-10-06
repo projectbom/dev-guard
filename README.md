@@ -499,36 +499,35 @@ dev-guard handoff
 
 ## Context Overflow Recovery
 
-When a Claude/Codex session hits the context window, do not paste long history into a new thread. Use the generated handoff:
+Do not wait for a long thread to be compacted, and do not paste long history into a new thread. Start each distinct task in a fresh agent thread and call DevGuard MCP `prepare_task_context` there with the concrete task — it returns the files/ranges to read, constraints, carried-over dirty work, and the previous task's unresolved validation. `record_validation_result` responses also report the current thread's observed pressure (when the provider records it) so an agent knows when to move on.
+
+To explicitly resume earlier work (or when MCP is unavailable), regenerate and read the handoff:
 
 ```bash
 dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-In the new thread, attach or ask the agent to read `.devguard/reports/project-handoff.md`. It is a compact resume organized around `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, and `Project` so the next agent can continue without reading a long chat history.
+Turn its next action into a concrete task and call `prepare_task_context` with it in the new thread.
 
 ## Multi-Agent Workflow
-
-`dev-guard done` (or Auto Mode) generates context files for new agent sessions. Start with the Before-AI files, then read the after-work files only when needed.
 
 ### Recommended session handoff order
 
 1. `dev-guard watch` — start the watcher
-2. Claude/Codex edits files; Stop Hooks run `done` automatically
-3. `dev-guard done` — generates Read Map, Code Map, Agent Brief, QA, handoff, context, and memory artifacts
-4. Start a new agent session
-5. Read `.devguard/reports/read-map.md`, `.devguard/reports/code-map.md`, and `.devguard/context/agent-brief.md`
+2. Claude/Codex edits files; Stop Hooks run `done` automatically (a Stop from a different thread than the one that prepared the task is ignored)
+3. Start a new agent session for the next task
+4. Call `prepare_task_context` with the task; read the TARGET ranges first
 
 ### When switching between Codex and Claude (or any agent)
 
-Paste this as the opening prompt in the new session:
+Both read the same project section (`AGENTS.md` / `CLAUDE.md`), so the opening prompt is just the task. Only when MCP is unavailable:
 
 ```txt
-Read .devguard/reports/read-map.md, .devguard/reports/code-map.md, and .devguard/context/agent-brief.md; then continue from the targeted file ranges.
+Read .devguard/context/agent-brief.md, then .devguard/reports/read-map.md and .devguard/reports/code-map.md; continue from the targeted file ranges.
 ```
 
-For the full next-session instruction, also read `.devguard/reports/project-handoff.md`. For QA state, read `.devguard/reports/quality-report.md`.
+Read `.devguard/reports/project-handoff.md` / `.devguard/reports/quality-report.md` only when explicitly resuming or investigating QA.
 
 ### Generated agent context files
 

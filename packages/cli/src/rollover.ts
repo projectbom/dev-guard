@@ -2,18 +2,21 @@ import { estimateTokens } from "@dev-guard/core";
 import { fromRoot, readTextFile } from "./fs.js";
 import { devguardPaths } from "./paths.js";
 
+import type { ThreadPressure } from "./thread-ownership.js";
+
 /**
  * Context Rollover signal.
  *
- * DevGuard cannot read any AI provider's actual context-window usage — there
- * is no portable, official API for that, and guessing at a provider's
- * internal percentage would be exactly the kind of unverifiable claim this
- * feature must avoid. Instead this is built only from signals DevGuard
- * itself already owns: how many files are pending, how much validation
- * evidence has accumulated, how long the current task has been open, and
- * how large the generated "before-agent" markdown bundle has grown. It is a
- * recommendation a human can act on (start a new AI session), never a
- * guarantee about the AI provider's internal state.
+ * Two separate concepts, never mixed:
+ * - Thread Pressure (thread-ownership.ts): how heavy the provider thread
+ *   itself is, from what the provider actually recorded (input tokens vs
+ *   window, compactions). UNKNOWN when not observable — never estimated.
+ * - Task weight: signals DevGuard itself owns for the current task (pending
+ *   files, validations recorded this task, task age).
+ * The size of DevGuard's own resume bundle (measureResumeBundleCost) is a
+ * third, unrelated number — the cost of resuming in a NEW thread — and is
+ * reported separately; it never moves this status (a fresh agent thread with a
+ * large resume packet is not under pressure).
  */
 export type RolloverStatus = "SAFE" | "ROLL_OVER_SOON" | "ROLL_OVER_RECOMMENDED";
 
@@ -21,7 +24,6 @@ export interface RolloverBudgets {
   changedFiles: number;
   qaResults: number;
   taskAgeMinutes: number;
-  contextTokens: number;
 }
 
 /**
@@ -31,8 +33,7 @@ export interface RolloverBudgets {
 export const DEFAULT_ROLLOVER_BUDGETS: RolloverBudgets = {
   changedFiles: 20,
   qaResults: 10,
-  taskAgeMinutes: 180,
-  contextTokens: 6000
+  taskAgeMinutes: 180
 };
 
 export interface RolloverSignalInput {
@@ -40,14 +41,20 @@ export interface RolloverSignalInput {
   qaResultCount: number;
   /** ISO timestamp the current task started, if any. Omitted when no task is active. */
   taskCreatedAt?: string;
-  /** Approximate — see context-cost.ts. */
-  contextBundleEstimatedTokens: number;
+  /** Observed provider thread pressure, when available (see thread-ownership.ts). */
+  threadPressure?: ThreadPressure;
+  /**
+   * Hybrid policy input: the calling thread already finished the previous
+   * task, and this task is NOT in the same workstream. Reusing a thread for
+   * unrelated work is advised against even at low pressure.
+   */
+  reusedThreadForNewWorkstream?: boolean;
   now?: Date;
   budgets?: Partial<RolloverBudgets>;
 }
 
 export interface RolloverSignalRatio {
-  label: "changedFiles" | "qaResults" | "contextTokens" | "taskAgeMinutes";
+  label: "changedFiles" | "qaResults" | "taskAgeMinutes";
   value: number;
   budget: number;
   ratio: number;
@@ -59,6 +66,10 @@ export interface RolloverAssessment {
   score: number;
   signals: RolloverSignalRatio[];
   dominantSignal?: RolloverSignalRatio;
+  /** Observed provider thread pressure (UNKNOWN when not observable). */
+  thread: ThreadPressure;
+  /** One-line action matching `status` and the thread observation. */
+  advice: string;
   note: string;
 }
 
@@ -68,13 +79,18 @@ const RATIO_CAP = 1.5;
 const SINGLE_SIGNAL_SOON_RATIO = 1.0;
 const SINGLE_SIGNAL_RECOMMENDED_RATIO = 1.3;
 
+const STATUS_RANK: Record<RolloverStatus, number> = { SAFE: 0, ROLL_OVER_SOON: 1, ROLL_OVER_RECOMMENDED: 2 };
+
+function maxStatus(a: RolloverStatus, b: RolloverStatus): RolloverStatus {
+  return STATUS_RANK[a] >= STATUS_RANK[b] ? a : b;
+}
+
 export function computeRolloverAssessment(input: RolloverSignalInput): RolloverAssessment {
   const budgets = { ...DEFAULT_ROLLOVER_BUDGETS, ...input.budgets };
   const now = input.now ?? new Date();
   const signals: RolloverSignalRatio[] = [
     ratio("changedFiles", input.changedFileCount, budgets.changedFiles),
-    ratio("qaResults", input.qaResultCount, budgets.qaResults),
-    ratio("contextTokens", input.contextBundleEstimatedTokens, budgets.contextTokens)
+    ratio("qaResults", input.qaResultCount, budgets.qaResults)
   ];
   if (input.taskCreatedAt) {
     const createdAtMs = new Date(input.taskCreatedAt).getTime();
@@ -87,23 +103,37 @@ export function computeRolloverAssessment(input: RolloverSignalInput): RolloverA
   const score = cappedRatios.length > 0 ? cappedRatios.reduce((sum, value) => sum + value, 0) / cappedRatios.length : 0;
   const dominantSignal = [...signals].sort((a, b) => b.ratio - a.ratio)[0];
   const maxRatio = dominantSignal?.ratio ?? 0;
-  // Averaging alone can mask one already-over-budget signal (e.g. the
-  // resume bundle itself exceeding its token budget) behind several quiet
-  // ones. A single signal already past its own budget must floor the
-  // status at ROLL_OVER_SOON regardless of the average.
-  const status: RolloverStatus =
+  // Averaging alone can mask one already-over-budget signal behind several
+  // quiet ones, so a single signal past its own budget floors the status.
+  const taskStatus: RolloverStatus =
     score >= RECOMMENDED_THRESHOLD || maxRatio >= SINGLE_SIGNAL_RECOMMENDED_RATIO
       ? "ROLL_OVER_RECOMMENDED"
       : score >= SOON_THRESHOLD || maxRatio >= SINGLE_SIGNAL_SOON_RATIO
         ? "ROLL_OVER_SOON"
         : "SAFE";
+  const thread = input.threadPressure ?? { status: "UNKNOWN" as const, reason: "Provider thread usage is not observable here." };
+  const threadStatus: RolloverStatus = thread.status === "NEW_THREAD" ? "ROLL_OVER_RECOMMENDED" : thread.status === "SOON" ? "ROLL_OVER_SOON" : "SAFE";
+  const workstreamStatus: RolloverStatus = input.reusedThreadForNewWorkstream ? "ROLL_OVER_SOON" : "SAFE";
+  const status = maxStatus(maxStatus(taskStatus, threadStatus), workstreamStatus);
   return {
     status,
     score: Math.round(score * 100) / 100,
     signals,
     dominantSignal,
-    note: "Heuristic from DevGuard-owned signals only (changed files, recorded validations, task age, estimated artifact size). Not a reading of the AI provider's actual context window usage."
+    thread,
+    advice: rolloverAdvice(status, thread, Boolean(input.reusedThreadForNewWorkstream)),
+    note: "Thread pressure comes only from provider-recorded usage (UNKNOWN when unavailable); the other signals are DevGuard-owned (changed files, recorded validations, task age). DevGuard's resume bundle size is reported separately and never moves this status — it is not a reading of the AI provider's context window."
   };
+}
+
+function rolloverAdvice(status: RolloverStatus, thread: ThreadPressure, reusedForNewWorkstream: boolean): string {
+  if (thread.status === "NEW_THREAD") return `${thread.reason} Finish or checkpoint, then continue in a fresh agent thread with prepare_task_context.`;
+  if (status === "ROLL_OVER_RECOMMENDED") return "This task has grown large (files/validations/age). Start the next step in a fresh agent thread with prepare_task_context.";
+  if (reusedForNewWorkstream) return "This thread already finished a different workstream. Prefer a fresh agent thread for this task.";
+  if (thread.status === "SOON") return `${thread.reason} Finish this task here; start the next task in a fresh agent thread.`;
+  if (status === "ROLL_OVER_SOON") return "Task weight is rising. Finish this task here; start the next task in a fresh agent thread.";
+  if (thread.status === "LOW") return `${thread.reason} Continue in this thread.`;
+  return "Thread usage is not observable. Start each distinct task in a fresh agent thread with prepare_task_context; move to a fresh agent thread if this one was compacted.";
 }
 
 function ratio(label: RolloverSignalRatio["label"], value: number, budget: number): RolloverSignalRatio {

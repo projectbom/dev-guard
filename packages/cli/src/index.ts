@@ -23,6 +23,7 @@ import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
 import { currentSessionQaCount, generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState, type CompletionSource } from "./runtime-state.js";
+import { observeThreadPressure } from "./thread-ownership.js";
 import { computeRolloverAssessment, measureResumeBundleCost } from "./rollover.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
@@ -291,7 +292,7 @@ All commands:
                   [--poll] [--include-lockfiles] [--compact|--ultra]
   dev-guard dashboard [--port <port>] [--no-open]
   dev-guard doctor [--hooks] [--agents] [--dry-run]
-  dev-guard telemetry
+  dev-guard telemetry                 task event counts + drift telemetry summary
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
   dev-guard review [--heuristic] [--fix-prompt] [--copy] [--output <file>] [--copy-fix]
                    [--include-context-files] [--staged] [--commit <ref>]
@@ -401,7 +402,19 @@ async function runDone(root: string): Promise<void> {
   try {
     const locale = await refreshRuntimeLocale(root);
     const copy = cliCopy(locale);
-    const result = await processDoneEvent(root, { completionSource: resolveDoneCompletionSource() });
+    const completionSource = resolveDoneCompletionSource();
+    const result = await processDoneEvent(root, {
+      completionSource,
+      // Set by the installed hook scripts from the hook payload (Codex
+      // session_id / thread-id, Claude session_id) — see hooks.ts.
+      sourceThreadId: completionSource === "cli-done" ? undefined : process.env.DEV_GUARD_HOOK_THREAD_ID?.trim() || undefined
+    });
+    if (result.ignored) {
+      console.log("dev-guard done: completion ignored");
+      console.log(`- reason: ${result.ignored.reason} (hook thread ${result.ignored.sourceThreadHash} does not own the current task; owner ${result.ignored.ownerThreadHash})`);
+      console.log("- The current task was left untouched for its own thread to finish.");
+      return;
+    }
     console.log("dev-guard done (manual finalization)");
     console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");
@@ -617,11 +630,12 @@ async function runStatus(root: string): Promise<void> {
       changedFileCount: runtime.pendingChangedFiles.length,
       qaResultCount: currentSessionQaCount(runtime),
       taskCreatedAt: runtime.currentTask?.createdAt,
-      contextBundleEstimatedTokens: resumeCost.totalEstimatedTokens
+      threadPressure: await observeThreadPressure({ owner: runtime.currentTask?.owner })
     });
     console.log("");
     console.log(`Context Rollover: ${rollover.status}`);
-    console.log(`Estimated resume context: ~${resumeCost.totalEstimatedTokens} tokens (approximate; before-agent markdown bundle)`);
+    console.log(`Thread pressure: ${rollover.thread.status} — ${rollover.thread.reason}`);
+    console.log(`Resume cost (new thread): ~${resumeCost.totalEstimatedTokens} tokens (approximate; before-agent markdown bundle — not thread pressure)`);
     if (rollover.dominantSignal) {
       console.log(`Dominant signal: ${rollover.dominantSignal.label} ${Math.round(rollover.dominantSignal.value)}/${rollover.dominantSignal.budget}`);
     }

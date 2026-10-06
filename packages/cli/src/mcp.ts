@@ -6,7 +6,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fromRoot } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { prepareTaskContext, recordValidationEvidence, toAgentContextPayload } from "./runtime-state.js";
+import { currentThreadPressure, prepareTaskContext, recordValidationEvidence, toAgentContextPayload } from "./runtime-state.js";
+import { identityFromMcpContext } from "./thread-ownership.js";
 
 /**
  * DevGuard's own installed version — read from the CLI package's own
@@ -68,20 +69,25 @@ export async function runMcpServer(root: string): Promise<void> {
         "Call this once at the start of every new coding task, before searching or reading project source files — this is DevGuard's only signal that a new task has begun, so a bare call always starts a clean task lineage (see continueCurrentTask for the one exception). It uses the local DevGuard Code Index to return TARGET files to read first (CANDIDATE files only if the targets are not enough — never batch-read them all), source-tagged constraints, a next action, unresolved validation from the previous task, and rollover advice. Read the returned ranges before any repository-wide search, and do not also read DevGuard's markdown reports when this result is sufficient. Start each distinct task in a fresh agent thread. After you run a build/test/manual check for this task, report it with record_validation_result so Quality Report/Handoff reflect real evidence.",
       inputSchema: toolInputSchema
     },
-    async ({ task, continueCurrentTask, projectRoot }) => {
+    async ({ task, continueCurrentTask, projectRoot }, extra) => {
       try {
         const project = await resolveMcpProjectRoot(root, projectRoot);
         const result = await prepareTaskContext({
           root: project,
           task,
           continueCurrentTask,
-          persistTask: true
+          persistTask: true,
+          caller: identityFromMcpContext(process.env, extra?._meta),
+          observeCodexOwner: true
         });
         // Compact, de-duplicated agent payload (see toAgentContextPayload):
         // this text is what lands in the agent's context on every task start.
+        // Delivered ONCE, as text. No outputSchema is declared, so MCP does
+        // not require structuredContent, and every client (Claude Code,
+        // Codex) reads `content`; sending both made clients that surface
+        // the whole result (Codex) receive the payload twice.
         const payload = toAgentContextPayload(result);
         return {
-          structuredContent: payload,
           content: [
             {
               type: "text",
@@ -115,7 +121,7 @@ export async function runMcpServer(root: string): Promise<void> {
         "Call this after you actually run a build, typecheck, test, lint, manual QA step, or runtime smoke check (e.g. a real API call, DB check, or browser check) outside of DevGuard. It records the real PASS/FAIL/UNKNOWN result so the next Quality Report and Handoff reflect actual evidence instead of showing 'not recorded'. Only call this for checks you actually ran — never to report work you did not verify. Call prepare_task_context before recording validation for a new task: results are bound to the currently active DevGuard task (see the returned `taskBinding` field). If there is no active task, the evidence is recorded as UNBOUND and will not be used as current-task PASS/FAIL verification, even once a task is later declared — call prepare_task_context first, then record again.",
       inputSchema: recordValidationInputSchema
     },
-    async ({ kind, status, name, command, exitCode, summary, reason, projectRoot }) => {
+    async ({ kind, status, name, command, exitCode, summary, reason, projectRoot }, extra) => {
       try {
         const project = await resolveMcpProjectRoot(root, projectRoot);
         const result = await recordValidationEvidence({
@@ -129,11 +135,18 @@ export async function runMcpServer(root: string): Promise<void> {
           reason,
           source: "mcp-agent"
         });
+        // During-task rollover: the thread's observed pressure rides along
+        // with every validation, so the agent learns it is getting heavy
+        // without any extra call. UNKNOWN when not observable.
+        const pressure = await currentThreadPressure(project, identityFromMcpContext(process.env, extra?._meta)).catch(() => undefined);
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ recorded: result }, null, 2)
+              text: JSON.stringify({
+                recorded: result,
+                ...(pressure ? { thread: { status: pressure.status, reason: pressure.reason } } : {})
+              }, null, 2)
             }
           ]
         };

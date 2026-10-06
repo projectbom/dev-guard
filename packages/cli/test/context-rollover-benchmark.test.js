@@ -104,13 +104,44 @@ test("computeRolloverAssessment (Scenario E): never needs any AI-provider contex
   assert.match(result.note, /not a reading of the AI provider/i);
 });
 
-test("computeRolloverAssessment: one signal already past its own budget floors status at ROLL_OVER_SOON even when every other signal is quiet", () => {
+test("computeRolloverAssessment: one task signal already past its own budget floors status at ROLL_OVER_SOON even when every other signal is quiet", () => {
+  const result = computeRolloverAssessment({
+    changedFileCount: 22, // > default budget of 20, alone
+    qaResultCount: 0
+  });
+  assert.notEqual(result.status, "SAFE", "an already-over-budget signal must not be averaged away into SAFE by quiet unrelated signals");
+});
+
+test("computeRolloverAssessment: DevGuard's resume bundle size is NOT thread pressure — a fresh thread with a large resume packet stays SAFE", () => {
+  // Real S1 regression: a brand new thread got ROLL_OVER_SOON because the
+  // resume bundle estimate (6,266) exceeded a 6,000 budget.
   const result = computeRolloverAssessment({
     changedFileCount: 0,
     qaResultCount: 0,
-    contextBundleEstimatedTokens: 7923 // > default budget of 6000, alone
+    contextBundleEstimatedTokens: 6266,
+    threadPressure: { status: "LOW", reason: "Observed input reached 12% of the provider window (31000/258400)." }
   });
-  assert.notEqual(result.status, "SAFE", "an already-over-budget resume bundle must not be averaged away into SAFE by quiet unrelated signals");
+  assert.equal(result.status, "SAFE");
+  assert.ok(!result.signals.some((signal) => signal.label === "contextTokens"), "resume cost must not be a rollover signal");
+  assert.match(result.advice, /Continue in this thread/);
+});
+
+test("computeRolloverAssessment: observed thread pressure drives the status (SOON / NEW_THREAD), UNKNOWN never invents one", () => {
+  const soon = computeRolloverAssessment({ changedFileCount: 0, qaResultCount: 0, threadPressure: { status: "SOON", reason: "Observed input reached 63% of the provider window (163000/258400)." } });
+  assert.equal(soon.status, "ROLL_OVER_SOON");
+  assert.match(soon.advice, /63%/);
+  const heavy = computeRolloverAssessment({ changedFileCount: 0, qaResultCount: 0, threadPressure: { status: "NEW_THREAD", reason: "Thread was already compacted 1 time(s).", compactions: 1 } });
+  assert.equal(heavy.status, "ROLL_OVER_RECOMMENDED");
+  const unknown = computeRolloverAssessment({ changedFileCount: 0, qaResultCount: 0, threadPressure: { status: "UNKNOWN", reason: "not observable" } });
+  assert.equal(unknown.status, "SAFE");
+  assert.equal(unknown.thread.status, "UNKNOWN");
+});
+
+test("computeRolloverAssessment (hybrid policy): a reused thread starting a different workstream is SOON even at low pressure", () => {
+  const result = computeRolloverAssessment({ changedFileCount: 0, qaResultCount: 0, threadPressure: { status: "LOW", reason: "low" }, reusedThreadForNewWorkstream: true });
+  assert.equal(result.status, "ROLL_OVER_SOON");
+  const sameWorkstream = computeRolloverAssessment({ changedFileCount: 0, qaResultCount: 0, threadPressure: { status: "LOW", reason: "low" }, reusedThreadForNewWorkstream: false });
+  assert.equal(sameWorkstream.status, "SAFE", "same workstream + low pressure: continue");
 });
 
 test("estimateTokens is a plain character-based approximation (provider independent)", () => {

@@ -1,5 +1,7 @@
 import { constants } from "node:fs";
-import { access, stat } from "node:fs/promises";
+import { access, readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { loadConfig } from "./config.js";
 import { fromRoot, readTextFile } from "./fs.js";
@@ -175,6 +177,46 @@ async function runHookDoctor(root: string, options: { dryRun: boolean }): Promis
 async function runAgentDoctor(root: string): Promise<void> {
   console.log("dev-guard doctor --agents");
   await printAgentStrategies(root);
+  await printInstructionAuthority();
+}
+
+export interface LegacyGlobalInstruction {
+  path: string;
+  lines: number[];
+}
+
+/**
+ * Read-only audit of user-level agent instruction files. Older DevGuard
+ * guides had users paste "read project-handoff.md / quality-report.md
+ * first" into them, which now contradicts the project-managed section (MCP
+ * first, no markdown reads). DevGuard does not own these files — no marker
+ * section is ever written there — so this only reports; it never edits.
+ */
+export async function findLegacyGlobalInstructions(home = homedir()): Promise<LegacyGlobalInstruction[]> {
+  const found: LegacyGlobalInstruction[] = [];
+  for (const path of [join(home, ".codex", "AGENTS.md"), join(home, ".claude", "CLAUDE.md")]) {
+    const text = await readFile(path, "utf8").catch(() => "");
+    if (!text || /prepare_task_context/.test(text)) continue;
+    const lines = text
+      .split(/\r?\n/)
+      .flatMap((line, index) => (/\.devguard\/(?:reports\/(?:project-handoff|quality-report|working-context)|prompts\/next-(?:codex|claude)-prompt)\.md/.test(line) ? [index + 1] : []));
+    if (lines.length > 0) found.push({ path, lines });
+  }
+  return found;
+}
+
+async function printInstructionAuthority(): Promise<void> {
+  const legacy = await findLegacyGlobalInstructions();
+  console.log("");
+  console.log("Instruction Authority");
+  if (legacy.length === 0) {
+    console.log("- global instruction files: no conflicting DevGuard workflow found");
+    return;
+  }
+  for (const entry of legacy) {
+    console.log(`- CONFLICT ${entry.path} (lines ${entry.lines.join(", ")}): tells agents to read DevGuard markdown first, which contradicts the project section (prepare_task_context first).`);
+  }
+  console.log("- next: remove that block by hand. DevGuard does not edit user-level instruction files.");
 }
 
 async function printAgentStrategies(root: string): Promise<void> {
