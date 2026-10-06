@@ -127,41 +127,61 @@ Run `pnpm --filter @dev-guard/cli watch` (or the same in `packages/core`)
 during active development so `dist/` stays current without re-running
 `pnpm build` after every edit.
 
+## TARGET / CANDIDATE / REFERENCE
+
+`prepare_task_context` marks every suggested file with a role:
+
+- **TARGET** — read first. Explicitly named files, or top-ranked files (within
+  60% of the best score, max 3) that also have a strong signal: an
+  identifier-shaped task token used in the file (exact or contained), a
+  *rare* task word in the path (rarity from the Code Index), or same-workstream
+  continuity.
+- **CANDIDATE** — open only when the targets leave a concrete gap. Docs for a
+  non-docs task, tests for a task that never mentions tests and UI files for a
+  non-UI task can only be TARGET through one of the strong signals above.
+- **REFERENCE** — background, e.g. a scope the task explicitly excludes.
+
+The agent payload gives targets up to 3 ranges and others 1, lists targets
+first, and tells the agent not to batch-read every file. Same-workstream
+continuity: when the previous finalized goal shares ≥2 rare terms with the
+current task, that task's own changed files that share a rare term become
+low-cost candidates (never carried-over dirty files).
+
 ## Context Efficiency Dashboard
 
-The dashboard's Context Efficiency panel (`/api/efficiency`, refreshed every
-15s, cached ~10s, separate from the 1s `/api/state` loop) shows where each
-DevGuard task's context went:
+The dashboard's Context Efficiency panel is problem-first. The default view
+answers five questions — is it OK (health), what is wrong (one issue + why),
+what to do (one action), should this thread continue (thread + reason), and
+the current task — then shows four numbers (suggestions used, repository
+searches, context overhead, open blockers), one focus sentence and one "where
+context went" bar. Trends, provided-vs-searched details, timeline, work mode,
+the agent's task packet and sources are under "View details".
 
-- **Sources.** DevGuard telemetry gives task windows, provided files
-  (`TASK_PREPARED.providedFiles`), validation, completion and rollover status.
-  Codex's local session logs (`$CODEX_HOME/sessions/**/rollout-*.jsonl`,
-  `item_completed` events) give executed commands with Codex's own
-  read/search/list parse, MCP calls, file changes, observed context
-  compactions and thread identity (`session_meta.thread_source`: user vs
-  subagent). Only rollouts whose `cwd` is the project are read, incrementally.
-  A Claude Code adapter exists as an interface stub.
-- **Evidence labels.** OBSERVED = a recorded event; ESTIMATED = a text-size
-  estimate (chars/4) of what entered the agent's context, never
-  provider-billed tokens; INFERRED = a deterministic rule over the above.
-  No provider context-window percentage, billed tokens or hidden reasoning
-  are shown.
-- **Categories.** DevGuard MCP, fallback docs, search, code reads, code edits,
-  validation, admin, other (other is labelled by tool, e.g. an external MCP
-  server, web, or an inline script).
-- **Work modes.** Implementation (edits, and reads of files the task edits),
-  exploration, validation, context admin, resume/recovery, other.
-- **Provided vs searched.** Candidate utilization = how many of the first 5
-  files the agent used were DevGuard candidates; plus repository-wide search
-  count and whether a broad search came before reading any provided file.
-- **Rollover.** `NEW THREAD RECOMMENDED` only from observed facts (task done,
-  the same thread hosting several tasks, a compaction); DevGuard's own
-  heuristic alone gives at most `NEW THREAD SOON`.
-- **Recommendations.** At most 3, from fixed rules: fallback docs > MCP (A),
-  broad search with low candidate use (B), fresh thread (C), exploration far
-  above implementation (D), context admin ≥ 15% (E).
+- **Sources.** DevGuard telemetry (task windows, provided files/targets,
+  validation, completion). Codex local session logs (`item_completed`
+  commands/MCP calls/file changes/compactions, `token_count` context usage,
+  `session_meta` thread identity). A Claude Code adapter is an interface stub.
+- **Measurement.** Commands are classified from the complete command text;
+  Codex's `parsed_cmd.cmd` is a truncated display string and never decides
+  scope. Searches are `broad` (repository root), `targeted` (a file or
+  directory), `external` (outside the project, e.g. agent memory — not a
+  repository search) or `unknown` (never promoted to broad). Reads include
+  multi-file `cat`/`sed`, shell loops and inline scripts' string-literal
+  paths that exist in the repository; `git status/log` read no file.
+- **Health.** Deterministic issues — compaction or ≥60% observed context use,
+  DevGuard doc re-reads, repository-wide search, suggested files read once and
+  unused (≥3 files, ≥3K tokens), suggestions missed, context overhead ≥15%,
+  exploration-heavy. No issue → GOOD; ≥2 strong (or 1 strong + 2 more) → POOR;
+  otherwise NEEDS ATTENTION.
+- **Thread.** CONTINUE / SOON / NEW THREAD from observed pressure (compaction,
+  the agent log's own input/context-window figures — never estimated), thread
+  reuse and a deterministic workstream relation (shared goal words, shared
+  files; UNKNOWN is never treated as different). A finished task alone is not a
+  reason for a new thread: heavy (≥70%) → NEW THREAD, moderate (≥45%) or
+  3+ tasks in the thread → SOON, light → CONTINUE for the same workstream.
+- **Evidence.** Observed = directly recorded; Estimated = text-size
+  approximation (chars/4), not provider tokens; Inferred = rule-based.
 - **Privacy.** Stored/returned: timestamps, hashed thread ids, categories,
-  repo-relative read/edit paths, estimated token counts, durations. Never
-  stored: prompts, responses, command text or output, source content,
-  search queries, reasoning. `prepare_task_context` additionally writes its
-  agent payload to `.devguard/context/task-context.json` for the Task card.
+  repo-relative read/edit paths, estimated token counts, observed context-use
+  numbers, durations. Never stored: prompts, responses, command text or output,
+  source content, search queries, reasoning.

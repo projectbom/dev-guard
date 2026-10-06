@@ -74,6 +74,8 @@ export interface TaskTelemetryEvent {
   firstChangeObservedAt?: string;
   /** TASK_PREPARED/CONTINUED/REPLACED: repo-relative paths prepare_task_context provided (max 8; paths only). */
   providedFiles?: string[];
+  /** TASK_PREPARED/CONTINUED/REPLACED: the subset of providedFiles marked TARGET (read first). */
+  providedTargets?: string[];
   /** TASK_PREPARED/CONTINUED/REPLACED: number of line ranges provided across those files. */
   providedRangeCount?: number;
   /** TASK_PREPARED/CONTINUED/REPLACED: estimated tokens of the MCP agent payload. Never provider-billed. */

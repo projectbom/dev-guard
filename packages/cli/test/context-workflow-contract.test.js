@@ -236,7 +236,10 @@ test("MCP payload is the complete small resume core: next action, scope, open va
   const result = await prepareTaskContext({ root, task: STANDBY_TASK, persistTask: false });
   const payload = toAgentContextPayload(result);
   assert.match(payload.nextAction, /^Previous task left unresolved: RUNTIME_SMOKE worker-readiness: UNKNOWN/);
-  assert.match(payload.nextAction, /Read packages\/config\/src\/env\.ts|Read apps\/api\/src\/retention/);
+  assert.match(payload.nextAction, /Read the TARGET ranges first \(.*(?:packages\/config\/src\/env\.ts|apps\/api\/src\/retention)/);
+  assert.match(payload.nextAction, /open CANDIDATE files only if needed/);
+  assert.ok(payload.files.some((file) => file.role === "TARGET"));
+  assert.match(payload.workflow, /do not batch-read every file listed/);
   assert.equal(payload.scope.carriedOverDirtyFiles, 1);
   assert.match(payload.scope.warning, /already dirty before this task/);
   assert.deepEqual(payload.openValidation, ["RUNTIME_SMOKE worker-readiness: UNKNOWN — endpoint not reachable"]);

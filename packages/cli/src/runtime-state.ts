@@ -355,9 +355,11 @@ export function toAgentContextPayload(result: PreparedTaskContextResult): Record
     nextAction: result.nextAction,
     files: result.files.map((file) => ({
       path: file.path,
-      relevance: file.relevance,
-      reason: truncateLine(file.reason, 160),
-      ranges: file.ranges.slice(0, 3).map((range) => ({ lines: `${range.startLine}-${range.endLine}`, label: range.label, confidence: range.confidence }))
+      role: file.role ?? (file.relevance === "Reference" ? "REFERENCE" : "CANDIDATE"),
+      reason: truncateLine(file.reason, file.role === "TARGET" ? 160 : 100),
+      // Targets carry their ranges; candidates/references only the first one,
+      // so nothing invites batch-reading every suggestion up front.
+      ranges: file.ranges.slice(0, file.role === "TARGET" ? 3 : 1).map((range) => ({ lines: `${range.startLine}-${range.endLine}`, label: range.label }))
     })),
     constraints: result.constraints,
     scope: result.scope,
@@ -371,7 +373,7 @@ export function toAgentContextPayload(result: PreparedTaskContextResult): Record
     coverage: result.coverage,
     warnings: result.warnings,
     rollover: { status: result.rollover.status, advice: ROLLOVER_ADVICE },
-    workflow: "Read the files/ranges above first. Search the repository only for a concrete gap they do not cover. Do not read .devguard markdown unless this result is insufficient.",
+    workflow: "Read TARGET ranges first. Open a CANDIDATE only when the targets leave a concrete gap — do not batch-read every file listed. Search the repository only for a gap neither covers. Do not read .devguard markdown unless this result is insufficient.",
     fallbackOnly: [result.contextFiles.agentBrief, result.contextFiles.readMap, result.contextFiles.codeMap]
   };
 }
@@ -382,6 +384,13 @@ export const ROLLOVER_ADVICE =
 export interface PreparedTaskContextFile {
   path: string;
   relevance: ContextRelevance;
+  /**
+   * TARGET = high confidence, read first; CANDIDATE = possibly relevant, open
+   * only when the targets are not enough; REFERENCE = comparison/background
+   * (e.g. a scope the task explicitly excludes). Protected scope is carried
+   * by `constraints`, not by files.
+   */
+  role?: "TARGET" | "CANDIDATE" | "REFERENCE";
   reason: string;
   ranges: PreparedTaskContextRange[];
 }
@@ -1906,6 +1915,8 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       const content = await readTextFile(fromRoot(root, file)).catch(() => "");
       return preparedTaskContextFile(file, context.summary, codeIndex, content, pathHints.includes(file), readCandidatesCache);
     }));
+    assignFileRoles(structuredFiles, context.summary, codeIndex, pathHints, context.workstreamPrior ?? []);
+    structuredFiles.sort((a, b) => roleRank(a.role) - roleRank(b.role));
     perfMark("prepare:structuredFiles-built");
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
     const coverageGaps = preparedTaskCoverageGaps(structuredFiles, context.summary);
@@ -1968,6 +1979,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       estimatedResumeTokens: resumeCost.totalEstimatedTokens,
       rolloverStatus: rollover.status,
       providedFiles: structuredFiles.map((file) => file.path).slice(0, 8),
+      providedTargets: structuredFiles.filter((file) => file.role === "TARGET").map((file) => file.path),
       providedRangeCount: structuredFiles.reduce((sum, file) => sum + file.ranges.length, 0),
       mcpPayloadTokens: estimateTokens(JSON.stringify(payload))
     });
@@ -2025,11 +2037,117 @@ function previousTaskOpenValidation(runtime: RuntimeState): string[] {
 }
 
 function preparedNextAction(files: PreparedTaskContextFile[], openValidation: string[]): string {
-  const first = files.find((file) => file.relevance !== "Reference");
+  const targets = files.filter((file) => file.role === "TARGET");
+  const first = targets[0];
   const start = first
-    ? `Read ${first.path}${first.ranges[0] ? `:${first.ranges[0].startLine}-${first.ranges[0].endLine}` : ""} first, then implement the task.`
-    : "No routed file — read the task's explicitly named files, then search only for the concrete gap.";
+    ? `Read the TARGET ranges first (${targets.map((file) => `${file.path}${file.ranges[0] ? `:${file.ranges[0].startLine}-${file.ranges[0].endLine}` : ""}`).join(", ")}), then implement; open CANDIDATE files only if needed.`
+    : files.some((file) => file.role === "CANDIDATE")
+      ? "No high-confidence target: open only the CANDIDATE that best matches the task, or search one specific area."
+      : "No routed file — read the task's explicitly named files, then search only for the concrete gap.";
   return openValidation.length > 0 ? `Previous task left unresolved: ${openValidation[0].replace(/[.\s]+$/, "")}. Check whether it affects this task. ${start}` : start;
+}
+
+// --- TARGET vs CANDIDATE --------------------------------------------------
+
+const workstreamPriorBySummary = new WeakMap<DocumentationSummary, Set<string>>();
+const TARGET_LIMIT = 3;
+const TARGET_SCORE_RATIO = 0.6;
+const RARE_TOKEN_WEIGHT = 0.55;
+
+/**
+ * A file type that only weakly signals relevance for this task: docs for a
+ * non-docs task, tests for a task that never mentions tests, UI files for a
+ * non-UI task. Not excluded — only unable to become TARGET without a strong
+ * signal (see hasStrongTargetSignal).
+ */
+function isLowSignalForTask(file: string, summary: DocumentationSummary): boolean {
+  const taskText = taskRoutingText(summary);
+  if (/(^|\/)README(?:\.[\w-]+)?\.md$|\.mdx?$|(^|\/)docs\//i.test(file)) return !summary.changeTypes.includes("Docs") && !/\b(?:readme|docs?|documentation|design|plan|report)\b|문서|설계/i.test(taskText);
+  if (/\.(?:test|spec)\.[\w]+$|(^|\/)(?:tests?|__tests__)\//i.test(file)) return !/\b(?:tests?|spec|coverage)\b|테스트/i.test(taskText);
+  if (/\.(?:tsx|jsx|vue|svelte)$|(^|\/)components\//i.test(file)) return !summary.changeTypes.includes("UI");
+  return false;
+}
+
+/**
+ * Strong evidence that a file is a task TARGET: same-workstream continuity,
+ * an identifier-shaped task token used in the file (exact or contained), or
+ * a RARE task word in its path (rarity from the Code Index; any overlap when
+ * the index is too small to weigh words).
+ */
+function hasStrongTargetSignal(file: string, summary: DocumentationSummary, index: CodeIndex): boolean {
+  if (workstreamPriorBySummary.get(summary)?.has(file)) return true;
+  const entry = index.files[file];
+  const taskText = taskRoutingText(summary);
+  const codeTokens = withoutNegatedTokens(explicitCodeTokens(taskText), summary);
+  if (entry) {
+    const usage = new Set((entry.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
+    const exact = [...codeTokens].some((token) => /[a-z][A-Z]|[A-Za-z0-9]_[A-Za-z0-9]|\$|[A-Za-z]\.[A-Za-z]/.test(token) && usage.has(normalizeCodeToken(token)));
+    if (exact || partialCodeTokenUsage(codeTokens, usage) > 0) return true;
+  }
+  const taskTokens = withoutNegatedTokens(meaningfulRankingTokens(taskText), summary);
+  const weights = taskTokenWeights(summary, taskTokens);
+  const pathTokens = meaningfulRankingTokens(file);
+  return [...taskTokens].some((token) => pathTokens.has(token) && (weights ? (weights.get(token) ?? 0) >= RARE_TOKEN_WEIGHT : true));
+}
+
+function roleRank(role: PreparedTaskContextFile["role"]): number {
+  return role === "TARGET" ? 0 : role === "CANDIDATE" ? 1 : 2;
+}
+
+function assignFileRoles(files: PreparedTaskContextFile[], summary: DocumentationSummary | undefined, index: CodeIndex, pathHints: string[], prior: string[]): void {
+  if (!summary) {
+    for (const file of files) file.role = file.relevance === "Reference" ? "REFERENCE" : pathHints.includes(file.path) ? "TARGET" : "CANDIDATE";
+    return;
+  }
+  const scored = files
+    .filter((file) => file.relevance !== "Reference" && !pathHints.includes(file.path))
+    .map((file) => ({ file, score: readMapCandidateScore(file.path, summary, index, summary.fileChanges.find((change) => change.file === file.path)) }))
+    .sort((a, b) => b.score - a.score);
+  const top = scored[0]?.score ?? 0;
+  let targets = 0;
+  for (const file of files) {
+    if (file.relevance === "Reference") file.role = "REFERENCE";
+    else if (pathHints.includes(file.path)) {
+      file.role = "TARGET";
+      targets += 1;
+    } else file.role = "CANDIDATE";
+  }
+  for (const [rank, entry] of scored.entries()) {
+    if (targets >= TARGET_LIMIT || rank >= TARGET_LIMIT) break;
+    if (top > 0 && entry.score >= top * TARGET_SCORE_RATIO && hasStrongTargetSignal(entry.file.path, summary, index)) {
+      entry.file.role = "TARGET";
+      targets += 1;
+    }
+  }
+  for (const file of files) if (prior.includes(file.path) && file.role === "CANDIDATE" && file.reason && !/same workstream/i.test(file.reason)) file.reason = `Changed by the previous task in the same workstream. ${file.reason}`;
+}
+
+/**
+ * Same-workstream continuity: when the previous finalized task's goal shares
+ * at least two RARE terms with the current task, the files that task changed
+ * (task-scoped only, never carried-over dirt) and that share a rare term with
+ * the current task become low-cost candidates. Never a blanket "recent files"
+ * list.
+ */
+function workstreamPriorFiles(state: ProjectState, records: HistoryRecord[], summary: DocumentationSummary, index: CodeIndex): string[] {
+  const previousGoal = state.lastTaskGoal;
+  const previousFiles = records.at(-1)?.taskScopedChangedFiles ?? [];
+  if (!previousGoal || previousFiles.length === 0) return [];
+  const currentTokens = withoutNegatedTokens(meaningfulRankingTokens(summary.goal ?? ""), summary);
+  const weights = taskTokenWeights(summary, currentTokens);
+  const rare = (token: string) => (weights ? (weights.get(token) ?? 0) >= RARE_TOKEN_WEIGHT : true);
+  const previousTokens = meaningfulRankingTokens(previousGoal);
+  const sharedRare = [...currentTokens].filter((token) => previousTokens.has(token) && rare(token));
+  if (sharedRare.length < 2) return [];
+  const currentRare = new Set([...currentTokens].filter(rare));
+  return previousFiles
+    .filter((file) => index.files[file] && !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file) && !negatedTermInPath(file, summary))
+    .filter((file) => {
+      const entry = index.files[file];
+      const words = new Set([...meaningfulRankingTokens(file), ...meaningfulRankingTokens([...(entry.exports ?? []), ...(entry.symbols ?? []).map((symbol) => symbol.name)].join("\n"))]);
+      return [...currentRare].some((token) => words.has(token));
+    })
+    .slice(0, 4);
 }
 
 // Reference-only (task-excluded) files never fill more than 2 of the 8 slots.
@@ -2501,14 +2619,17 @@ function resolveBeforeAgentContext(input: {
   runtime: RuntimeState;
   records: HistoryRecord[];
   codeIndex: CodeIndex;
-}): { summary?: DocumentationSummary; files: string[]; source: ContextTaskSource; filesResolved: boolean } {
+}): { summary?: DocumentationSummary; files: string[]; source: ContextTaskSource; filesResolved: boolean; workstreamPrior?: string[] } {
   const currentTask = input.runtime.currentTask?.text?.trim();
   if (currentTask) {
     const baseSummary = registerTokenWeightIndex(beforeAgentTaskSummary(currentTask, input.codeIndex), input.codeIndex);
-    const candidateFiles = taskRelevantIndexCandidates(baseSummary, input.codeIndex, new Set()).slice(0, 12);
+    const workstreamPrior = workstreamPriorFiles(input.state, input.records, baseSummary, input.codeIndex);
+    const candidateFiles = [...new Set([...taskRelevantIndexCandidates(baseSummary, input.codeIndex, new Set()).slice(0, 12), ...workstreamPrior])];
     const summary = registerTokenWeightIndex(beforeAgentTaskSummary(currentTask, input.codeIndex, candidateFiles), input.codeIndex);
+    workstreamPriorBySummary.set(summary, new Set(workstreamPrior));
     return {
       summary,
+      workstreamPrior,
       // This IS the one, full readableContextFiles resolution for this call
       // (it scans the whole Code Index via taskRelevantIndexCandidates).
       // filesResolved: true tells every downstream render function (Read
@@ -3013,6 +3134,12 @@ function cheapCandidatePrefilterPasses(file: CodeIndexFile, taskWords: string[],
   if (/profile|shared|owner|viewer|visitor|readOnly/i.test(flowText)) return true;
   const raw = indexedCandidateText(file).toLowerCase();
   if (taskWords.some((word) => raw.includes(word))) return true;
+  // Prose tasks also match code identifiers by sub-word (see usageSubwords),
+  // so the prefilter must look at the file's code tokens too to stay lossless.
+  if (taskWords.length > PROSE_TASK_TOKEN_THRESHOLD) {
+    const usage = (file.tokens ?? []).join(" ").toLowerCase();
+    if (taskWords.some((word) => word.length >= 4 && usage.includes(word))) return true;
+  }
   const squashed = raw.replace(/[^a-z0-9가-힣]/g, "");
   return codeTokenSquashed.some((token) => squashed.includes(token));
 }
@@ -3360,6 +3487,8 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   if (/Updates the user-facing wording from ".+" to "[@\w/.-]+"/i.test(text)) score -= 12;
   if (shouldExcludeContextCandidate(file, summary)) score -= 90;
   if (negatedTermInPath(file, summary)) score -= 60;
+  if (workstreamPriorBySummary.get(summary)?.has(file)) score += 30;
+  if (isLowSignalForTask(file, summary) && !hasStrongTargetSignal(file, summary, index)) score -= 15;
   if (isRuntimePageBugTask(taskText) && /^app\/api\/(og|compare)\//i.test(file)) score -= 35;
   if (isSharedProfileTask(taskText) && /^lib\/profile\//.test(file)) score -= 120;
   const primary = primaryIndexedSymbol(indexed);
@@ -3452,8 +3581,13 @@ function isAgentInstructionTask(taskText: string): boolean {
   return /devguard|dev-guard|claude|codex|mcp|agent instruction|agents\.md|claude\.md|readme|문서|설정|setup|handoff/i.test(taskText);
 }
 
+// UI page-state bugs (shared/owner views, localStorage hydration). It used
+// to also match generic words ("runtime", "persist", "fallback", "저장"),
+// which turned any backend task mentioning e.g. "runtime admission" into a
+// page-bug task and zeroed every file without an exact identifier match —
+// the reason core DB/config files were never suggested for such tasks.
 function isRuntimePageBugTask(taskText: string): boolean {
-  return /섞|적용|저장|초기화|방문자|소유자|공유|shared|visitor|owner|localstorage|fallback|hydrate|persist|runtime/i.test(taskText);
+  return /섞|초기화|방문자|소유자|공유|\bshared\b|\bvisitor\b|\bowner\b|localstorage|hydrat/i.test(taskText);
 }
 
 function routePathMatchScore(file: string, summary: DocumentationSummary): number {
@@ -5143,7 +5277,10 @@ async function fileExists(path: string): Promise<boolean> {
 
 function isIndexableSourceFile(file: string): boolean {
   if (isIgnoredWatchPath(file) || isDevguardManagedDocPath(file)) return false;
-  return /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json)$/i.test(file);
+  // yml/yaml/sql/sh: CI workflows, service templates, migrations and scripts
+  // are real task targets in infrastructure work; without them those files
+  // could never be suggested, only discovered by the agent's own search.
+  return /\.(ts|tsx|js|jsx|mjs|cjs|md|mdx|json|ya?ml|sql|sh)$/i.test(file);
 }
 
 // `isIndexableSourceFile` matches by extension only, including `.json` — a

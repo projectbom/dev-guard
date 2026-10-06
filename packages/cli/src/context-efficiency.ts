@@ -48,6 +48,12 @@ export interface TaskEfficiency {
   sameThreadAsPrevious?: boolean;
   compactions: number;
   activityEvents: number;
+  /** Highest provider-reported input/context-window ratio in this task (OBSERVED from the agent's local log), when logged. */
+  peakContextUse?: number;
+  /** Provided files read exactly once and never edited — suggestions that cost initial context but were not used further. */
+  unusedSuggestionReads: { files: number; estTokens: number };
+  /** Repo files read/edited plus provided files (max 30) — for workstream overlap. */
+  touchedFiles: string[];
 }
 
 export interface TimelineEvent {
@@ -66,8 +72,126 @@ export interface Recommendation {
 
 export type RolloverState = "CONTINUE" | "NEW_THREAD_SOON" | "NEW_THREAD_RECOMMENDED";
 
+// --- Problem-first view (developer dashboard) ------------------------------
+
+export type ContextHealth = "GOOD" | "NEEDS_ATTENTION" | "POOR";
+export type IssueId = "CONTEXT_PRESSURE" | "DOC_REREADS" | "BROAD_SEARCH" | "UNUSED_SUGGESTIONS" | "SUGGESTIONS_MISSED" | "CONTEXT_OVERHEAD" | "EXPLORATION_HEAVY";
+
+export interface ContextIssue {
+  id: IssueId;
+  severity: "strong" | "mild";
+  /** One sentence: what is wrong. */
+  issue: string;
+  /** One sentence: why (with the observed numbers). */
+  why: string;
+  /** One sentence: what to do. */
+  action: string;
+  evidence: EvidenceKind;
+}
+
+export type ContextGroup = "DEVGUARD" | "CODE" | "SEARCH" | "VALIDATION" | "CONTEXT_MANAGEMENT" | "OTHER";
+
+/** Six human groups for the one default graph ("Where context went"). */
+export function contextGroups(costs: Record<ContextCostCategory, number>): Record<ContextGroup, number> {
+  return {
+    DEVGUARD: costs.MCP,
+    CODE: costs.CODE_READS + costs.CODE_EDITS,
+    SEARCH: costs.SEARCH,
+    VALIDATION: costs.VALIDATION,
+    CONTEXT_MANAGEMENT: costs.FALLBACK_DOCS + costs.ADMIN,
+    OTHER: costs.OTHER
+  };
+}
+
+/**
+ * Deterministic issues for one task. Thresholds come from the real
+ * downstream baseline: before the context-workflow fixes a long thread showed
+ * 2–6 DevGuard-doc re-reads and many repository-wide searches per task;
+ * after them, healthy sessions showed 0 doc re-reads, 0 repository-wide
+ * searches and 1.5–2% context overhead.
+ */
+export function contextIssues(task: TaskEfficiency): ContextIssue[] {
+  const issues: ContextIssue[] = [];
+  const total = Math.max(1, task.estTokens);
+  if (task.compactions > 0) {
+    issues.push({ id: "CONTEXT_PRESSURE", severity: "strong", issue: "The agent thread was compacted during this task.", why: `${task.compactions} compaction(s) were recorded in the agent's own log.`, action: "Finish this task here, then start the next task in a fresh thread.", evidence: "OBSERVED" });
+  } else if (task.peakContextUse !== undefined && task.peakContextUse >= 0.6) {
+    issues.push({
+      id: "CONTEXT_PRESSURE",
+      severity: "mild",
+      issue: task.broadSearchCalls === 0 ? "Context usage was high, but repository discovery remained targeted." : "Context usage was high for this task.",
+      why: `The agent's own log reported up to ${Math.round(task.peakContextUse * 100)}% of its context window in use.`,
+      action: "Finish this task here; start a different or heavy next task in a fresh thread.",
+      evidence: "OBSERVED"
+    });
+  }
+  if (task.fallbackDocReads >= 2 || (task.fallbackDocReads > 0 && task.costByCategory.FALLBACK_DOCS > task.costByCategory.MCP)) {
+    issues.push({ id: "DOC_REREADS", severity: "strong", issue: "The agent re-read DevGuard reports instead of using the task context it was given.", why: `${task.fallbackDocReads} DevGuard markdown read(s), ${share(task.costByCategory.FALLBACK_DOCS, total)}% of this task's estimated context.`, action: "Use the prepare_task_context result only; do not open DevGuard reports during the task.", evidence: "OBSERVED" });
+  }
+  if (task.broadSearchCalls >= 3 || (task.broadSearchCalls > 0 && task.searchBeforeProvidedRead)) {
+    issues.push({ id: "BROAD_SEARCH", severity: task.broadSearchCalls >= 3 ? "strong" : "mild", issue: "The agent searched the whole repository instead of starting from DevGuard's suggestions.", why: `${task.broadSearchCalls} repository-wide search(es)${task.searchBeforeProvidedRead ? ", before any suggested file was opened" : ""}.`, action: "Open DevGuard target ranges before searching the repository.", evidence: "OBSERVED" });
+  }
+  if (task.unusedSuggestionReads.files >= 3 && task.unusedSuggestionReads.estTokens >= 3000) {
+    issues.push({ id: "UNUSED_SUGGESTIONS", severity: "mild", issue: "Too much initial context was spent on suggested files the task did not use further.", why: `${task.unusedSuggestionReads.files} suggested files (~${fmtK(task.unusedSuggestionReads.estTokens)} estimated tokens) were read once and never used again.`, action: "Read TARGET files first; open CANDIDATE files only when the targets are not enough.", evidence: "INFERRED" });
+  }
+  if (task.candidateUtilization && task.candidateUtilization.of >= 3 && task.candidateUtilization.used / task.candidateUtilization.of < 0.4) {
+    issues.push({ id: "SUGGESTIONS_MISSED", severity: "mild", issue: "Most files the agent worked with were not DevGuard suggestions.", why: `Only ${task.candidateUtilization.used} of the first ${task.candidateUtilization.of} files used were suggested.`, action: "Name the target area or files in the task description so DevGuard can suggest them.", evidence: "INFERRED" });
+  }
+  const overhead = share(task.costByCategory.FALLBACK_DOCS + task.costByCategory.ADMIN, total);
+  if (overhead >= 15 && !issues.some((item) => item.id === "DOC_REREADS")) {
+    issues.push({ id: "CONTEXT_OVERHEAD", severity: "mild", issue: "DevGuard workflow overhead is high for this task.", why: `${overhead}% of estimated context went to DevGuard docs/commands.`, action: "Avoid DevGuard status/report commands during the task.", evidence: "ESTIMATED" });
+  }
+  const exploration = share(task.modeTokens.EXPLORATION, total);
+  if (exploration >= 50 && task.modeTokens.EXPLORATION > 2 * task.modeTokens.IMPLEMENTATION) {
+    issues.push({ id: "EXPLORATION_HEAVY", severity: "mild", issue: "The agent is spending more context finding files than implementing.", why: `Exploration is ${exploration}% of estimated context vs ${share(task.modeTokens.IMPLEMENTATION, total)}% implementation.`, action: "Narrow the task to a specific area or file before reading further.", evidence: "INFERRED" });
+  }
+  const order: IssueId[] = ["CONTEXT_PRESSURE", "DOC_REREADS", "BROAD_SEARCH", "UNUSED_SUGGESTIONS", "SUGGESTIONS_MISSED", "CONTEXT_OVERHEAD", "EXPLORATION_HEAVY"];
+  return issues.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === "strong" ? -1 : 1) || order.indexOf(a.id) - order.indexOf(b.id));
+}
+
+export function contextHealth(issues: ContextIssue[]): ContextHealth {
+  const strong = issues.filter((issue) => issue.severity === "strong").length;
+  if (issues.length === 0) return "GOOD";
+  if (strong >= 2 || (strong >= 1 && issues.length >= 3)) return "POOR";
+  return "NEEDS_ATTENTION";
+}
+
+export function agentFocus(task: TaskEfficiency): { mode: "IMPLEMENTING" | "EXPLORING" | "VALIDATING" | "MIXED"; sentence: string } {
+  const { IMPLEMENTATION, EXPLORATION, VALIDATION } = task.modeTokens;
+  const known = IMPLEMENTATION + EXPLORATION + VALIDATION;
+  if (known === 0) return { mode: "MIXED", sentence: "Not enough classified activity yet." };
+  if (EXPLORATION > IMPLEMENTATION * 1.5 && EXPLORATION >= VALIDATION) return { mode: "EXPLORING", sentence: "The agent is spending more context finding and reading files than implementing." };
+  if (VALIDATION > IMPLEMENTATION && VALIDATION > EXPLORATION) return { mode: "VALIDATING", sentence: "Most activity is checking the work (tests, builds, runtime checks)." };
+  if (IMPLEMENTATION >= EXPLORATION * 0.6) return { mode: "IMPLEMENTING", sentence: "Most activity is focused on implementing the task." };
+  return { mode: "MIXED", sentence: "Activity is split between finding files and implementing." };
+}
+
+function fmtK(value: number): string {
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}K` : String(value);
+}
+
 export interface ContextEfficiencyReport {
   generatedAt: string;
+  /** The five-second view: is it OK, what is wrong, why, what to do, keep the thread? */
+  now: {
+    health: ContextHealth;
+    task?: string;
+    primaryIssue?: ContextIssue;
+    otherIssues: ContextIssue[];
+    message: string;
+    action: string;
+    thread: { state: RolloverState; reason: string; evidence: EvidenceKind };
+  };
+  /** At most four human-labelled numbers for the current task. */
+  currentTask?: {
+    suggestionsUsed?: { used: number; of: number };
+    repositorySearches: { total: number; broad: number };
+    contextOverheadPct: number;
+    openBlockers: number;
+    focus: { mode: string; sentence: string };
+    whereContextWent: Record<ContextGroup, number>;
+    estimatedContextTokens: number;
+  };
   sources: Array<{ provider: string; available: boolean; note?: string; userThreads: number; subagentThreads: number }>;
   threadIdentity: "observed" | "unavailable";
   current?: TaskEfficiency;
@@ -90,7 +214,10 @@ export interface ContextEfficiencyReport {
 export interface TaskCard {
   goal: string;
   nextAction?: string;
+  /** TARGET files (read first). */
   edit: string[];
+  /** CANDIDATE files (open only if needed). */
+  candidates: string[];
   reference: string[];
   protected: string[];
   freshValidation: string[];
@@ -167,13 +294,16 @@ export function taskWindows(events: TaskTelemetryEvent[]): TaskWindow[] {
 export function aggregateTask(window: TaskWindow, events: ActivityEvent[], userThreads: Set<string>, previousThreads: Set<string>): TaskEfficiency {
   const start = window.startedAt;
   const end = window.endedAt ?? "9999";
-  const inWindow = events.filter((event) => event.ts >= start && event.ts < end && userThreads.has(event.thread));
+  const windowEvents = events.filter((event) => event.ts >= start && event.ts < end && userThreads.has(event.thread));
+  const usage = windowEvents.filter((event) => event.kind === "context_usage" && event.inputTokens && event.contextWindow);
+  const inWindow = windowEvents.filter((event) => event.kind !== "context_usage");
   const costByCategory = emptyCosts();
   const modeTokens = emptyModes();
   const otherBreakdown: Record<string, number> = {};
   const editedPaths = new Set(inWindow.filter((event) => event.category === "CODE_EDITS").flatMap((event) => event.paths ?? []));
   const provided = new Set(window.providedFiles.length ? window.providedFiles : inWindow.find((event) => event.providedPaths?.length)?.providedPaths ?? []);
   const usedOrder: string[] = [];
+  const providedReadCounts = new Map<string, { reads: number; estTokens: number }>();
   const fallbackDocCounts = new Map<string, number>();
   let searchCalls = 0;
   let broadSearchCalls = 0;
@@ -195,10 +325,17 @@ export function aggregateTask(window: TaskWindow, events: ActivityEvent[], userT
       }
     }
     if (event.category === "FALLBACK_DOCS") for (const path of event.paths?.length ? event.paths : ["(devguard doc)"]) fallbackDocCounts.set(path, (fallbackDocCounts.get(path) ?? 0) + 1);
-    if (event.category === "CODE_READS" || event.category === "CODE_EDITS") {
-      for (const path of event.paths ?? []) {
+    if (event.category === "CODE_READS" || event.category === "CODE_EDITS" || event.category === "SEARCH") {
+      const paths = event.paths ?? [];
+      for (const path of paths) {
         if (!usedOrder.includes(path)) usedOrder.push(path);
         if (provided.has(path) && firstProvidedUseIndex < 0) firstProvidedUseIndex = index;
+        if (provided.has(path) && event.category !== "CODE_EDITS") {
+          const entry = providedReadCounts.get(path) ?? { reads: 0, estTokens: 0 };
+          entry.reads += 1;
+          entry.estTokens += Math.round(event.estTokens / paths.length);
+          providedReadCounts.set(path, entry);
+        }
       }
     }
   }
@@ -232,7 +369,12 @@ export function aggregateTask(window: TaskWindow, events: ActivityEvent[], userT
     threads,
     ...(threads.length > 0 && previousThreads.size > 0 ? { sameThreadAsPrevious: previousThreads.has(threads[0]) } : {}),
     compactions,
-    activityEvents: inWindow.length
+    activityEvents: inWindow.length,
+    ...(usage.length ? { peakContextUse: Math.max(...usage.map((event) => event.inputTokens! / event.contextWindow!)) } : {}),
+    touchedFiles: [...new Set([...usedOrder, ...provided])].slice(0, 30),
+    unusedSuggestionReads: [...providedReadCounts.entries()]
+      .filter(([path, entry]) => entry.reads === 1 && !editedPaths.has(path))
+      .reduce((sum, [, entry]) => ({ files: sum.files + 1, estTokens: sum.estTokens + entry.estTokens }), { files: 0, estTokens: 0 })
   };
 }
 
@@ -289,22 +431,83 @@ export function recommendationsFor(task: TaskEfficiency | undefined, rollover: {
   return list.slice(0, 3);
 }
 
-/** Rollover state from observed facts first, DevGuard's own heuristic second. Never a context-window %. */
-export function rolloverStateFor(current: TaskEfficiency | undefined, threadTaskCounts: Map<string, number>, hasActiveTask: boolean): { state: RolloverState; reason: string; evidence: EvidenceKind } {
-  if (current?.doneAt && !hasActiveTask) {
-    return { state: "NEW_THREAD_RECOMMENDED", reason: "Previous task completed. Starting the next distinct task in a fresh agent thread reduces carried context.", evidence: "OBSERVED" };
+export type WorkstreamRelation = "SAME" | "DIFFERENT" | "UNKNOWN";
+
+const STOP_WORDS = new Set(["the", "and", "for", "with", "from", "into", "only", "then", "that", "this", "without", "after", "before", "read", "write", "make", "update", "change", "check", "verify", "task", "phase", "using", "current", "existing", "또는", "그리고"]);
+
+function goalWords(goal: string): Set<string> {
+  return new Set((goal.toLowerCase().match(/[a-z0-9가-힣_]{4,}/g) ?? []).filter((word) => !STOP_WORDS.has(word)));
+}
+
+function jaccard<T>(a: Set<T>, b: Set<T>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  for (const item of a) if (b.has(item)) shared += 1;
+  return shared / (a.size + b.size - shared);
+}
+
+/**
+ * Deterministic workstream relation between two consecutive tasks: shared
+ * goal vocabulary and shared files. UNKNOWN when there is not enough data —
+ * never assumed to be a different workstream.
+ */
+export function workstreamRelation(previous: { goal?: string; files: string[] }, current: { goal?: string; files: string[] }): { relation: WorkstreamRelation; goalOverlap: number; fileOverlap: number } {
+  const previousWords = goalWords(previous.goal ?? "");
+  const currentWords = goalWords(current.goal ?? "");
+  const goalOverlap = jaccard(previousWords, currentWords);
+  const sharedWords = [...currentWords].filter((word) => previousWords.has(word)).length;
+  const hasFiles = previous.files.length > 0 && current.files.length > 0;
+  const fileOverlap = hasFiles ? jaccard(new Set(previous.files), new Set(current.files)) : 0;
+  const hasGoals = previousWords.size >= 3 && currentWords.size >= 3;
+  if ((hasGoals && goalOverlap >= 0.15 && sharedWords >= 3) || fileOverlap >= 0.2) return { relation: "SAME", goalOverlap, fileOverlap };
+  if (hasGoals && goalOverlap < 0.06 && (!hasFiles || fileOverlap < 0.05)) return { relation: "DIFFERENT", goalOverlap, fileOverlap };
+  return { relation: "UNKNOWN", goalOverlap, fileOverlap };
+}
+
+const HIGH_CONTEXT_USE = 0.7;
+const MODERATE_CONTEXT_USE = 0.45;
+
+/**
+ * CONTINUE / SOON / NEW THREAD from observed context pressure (compaction,
+ * provider-reported context use in the agent's own log), thread reuse and
+ * workstream relation — never from "a task finished" alone, and never from
+ * an estimated provider context percentage.
+ */
+export function rolloverStateFor(
+  current: TaskEfficiency | undefined,
+  threadTaskCounts: Map<string, number>,
+  hasActiveTask: boolean,
+  relation: { relation: WorkstreamRelation; goalOverlap: number; fileOverlap: number } = { relation: "UNKNOWN", goalOverlap: 0, fileOverlap: 0 }
+): { state: RolloverState; reason: string; evidence: EvidenceKind } {
+  if (!current) return { state: "CONTINUE", reason: "No DevGuard task recorded yet.", evidence: "INFERRED" };
+  const peak = current.peakContextUse;
+  const peakText = peak !== undefined ? `${Math.round(peak * 100)}% of the context window (agent log)` : undefined;
+  const thread = current.threads.at(-1);
+  const tasksInThread = thread ? threadTaskCounts.get(thread) ?? 1 : 1;
+  const observed = current.threads.length > 0;
+  if (current.doneAt && !hasActiveTask) {
+    if (current.compactions > 0) return { state: "NEW_THREAD_RECOMMENDED", reason: `The finished task's thread was compacted ${current.compactions}× — start the next task in a fresh thread.`, evidence: "OBSERVED" };
+    if (peak !== undefined && peak >= HIGH_CONTEXT_USE) return { state: "NEW_THREAD_RECOMMENDED", reason: `The finished task was heavy (up to ${peakText}) — start the next task in a fresh thread.`, evidence: "OBSERVED" };
+    if ((peak !== undefined && peak >= MODERATE_CONTEXT_USE) || tasksInThread >= 3) {
+      return { state: "NEW_THREAD_SOON", reason: `${peakText ? `Context use reached ${peakText}` : `This thread has hosted ${tasksInThread} tasks`}: continue only a small follow-up in the same workstream; start anything else in a fresh thread.`, evidence: observed ? "OBSERVED" : "INFERRED" };
+    }
+    if (peak === undefined && !observed) return { state: "NEW_THREAD_SOON", reason: "Agent context use is not observable here; prefer a fresh thread for the next distinct task.", evidence: "INFERRED" };
+    return { state: "CONTINUE", reason: `Light task with no context pressure${peakText ? ` (${peakText})` : ""}: continue here if the next task is in the same workstream; use a fresh thread for a different workstream.`, evidence: "OBSERVED" };
   }
-  const thread = current?.threads.at(-1);
-  if (current && thread && (threadTaskCounts.get(thread) ?? 0) >= 2) {
-    return { state: "NEW_THREAD_RECOMMENDED", reason: `This agent thread has already hosted ${threadTaskCounts.get(thread)} DevGuard tasks${current.compactions ? ` and was compacted ${current.compactions}×` : ""}. Continue the next task in a fresh thread.`, evidence: "OBSERVED" };
+  if (current.compactions > 0) return { state: "NEW_THREAD_RECOMMENDED", reason: `This thread was compacted ${current.compactions}× during the task — finish here and move on in a fresh thread.`, evidence: "OBSERVED" };
+  if (peak !== undefined && peak >= HIGH_CONTEXT_USE) return { state: "NEW_THREAD_SOON", reason: `Context use reached ${peakText}: finish this task, then start the next one in a fresh thread.`, evidence: "OBSERVED" };
+  if (current.sameThreadAsPrevious) {
+    if (relation.relation === "DIFFERENT") return { state: "NEW_THREAD_RECOMMENDED", reason: "This task is a different workstream from the previous task in this thread (little goal or file overlap) — a fresh thread avoids carrying unrelated context.", evidence: "INFERRED" };
+    if (relation.relation === "UNKNOWN") return { state: "NEW_THREAD_SOON", reason: "This thread already hosted another task and the workstream relation is unclear; prefer a fresh thread at the next boundary.", evidence: "INFERRED" };
+    if (tasksInThread >= 4) return { state: "NEW_THREAD_SOON", reason: `Same workstream, but this thread has hosted ${tasksInThread} tasks; start a fresh thread at the next boundary.`, evidence: "OBSERVED" };
+    return { state: "CONTINUE", reason: `Same workstream as the previous task (goal overlap ${Math.round(relation.goalOverlap * 100)}%, file overlap ${Math.round(relation.fileOverlap * 100)}%) and no context pressure observed.`, evidence: "INFERRED" };
   }
-  if (current && current.compactions > 0) {
-    return { state: "NEW_THREAD_RECOMMENDED", reason: `The agent thread was compacted ${current.compactions}× during this task. Move the next task to a fresh thread.`, evidence: "OBSERVED" };
+  if (!observed) {
+    return current.rolloverStatusAtPrepare && current.rolloverStatusAtPrepare !== "SAFE"
+      ? { state: "NEW_THREAD_SOON", reason: "DevGuard's own rollover signal (not the provider's context window) suggests a fresh thread at the next boundary.", evidence: "INFERRED" }
+      : { state: "CONTINUE", reason: "No context pressure signal available for this task.", evidence: "INFERRED" };
   }
-  if (current?.rolloverStatusAtPrepare && current.rolloverStatusAtPrepare !== "SAFE") {
-    return { state: "NEW_THREAD_SOON", reason: "DevGuard's own rollover signal (DevGuard-owned heuristics, not the provider's context window) suggests a fresh thread soon.", evidence: "INFERRED" };
-  }
-  return { state: "CONTINUE", reason: "No completed task, thread reuse or compaction observed for the current task.", evidence: "INFERRED" };
+  return { state: "CONTINUE", reason: `This task runs in its own thread with no context pressure observed${peakText ? ` (${peakText})` : ""}.`, evidence: "OBSERVED" };
 }
 
 const TIMELINE_LIMIT = 200;
@@ -347,14 +550,41 @@ export async function buildContextEfficiencyReport(
     task.label = label ? shortLabel(label) : `Task ${task.startedAt.slice(5, 16).replace("T", " ")}`;
   }
   const current = tasks.at(-1);
-  const rollover = rolloverStateFor(current, threadTaskCounts, Boolean(runtime.currentTask?.text?.trim()));
+  const previous = tasks.at(-2);
+  const relation = current && previous ? workstreamRelation({ goal: labels.get(previous.sessionId), files: previous.touchedFiles }, { goal: labels.get(current.sessionId), files: current.touchedFiles }) : undefined;
+  const rollover = rolloverStateFor(current, threadTaskCounts, Boolean(runtime.currentTask?.text?.trim()), relation);
   const recommendations = recommendationsFor(current, rollover);
 
   const largest = current ? COST_CATEGORIES.map((category) => ({ category, value: current.costByCategory[category] })).sort((a, b) => b.value - a.value)[0] : undefined;
   const dominantMode = current ? WORK_MODES.map((mode) => ({ mode, value: current.modeTokens[mode] })).sort((a, b) => b.value - a.value)[0] : undefined;
 
+  const issues = current ? contextIssues(current) : [];
+  const primaryIssue = issues[0];
+  const openBlockers = (taskCard?.openValidation.length ?? 0) + (current ? current.validation.fail : 0);
   return {
     generatedAt: new Date(now).toISOString(),
+    now: {
+      health: contextHealth(issues),
+      task: current?.label,
+      ...(primaryIssue ? { primaryIssue } : {}),
+      otherIssues: issues.slice(1, 3),
+      message: primaryIssue ? primaryIssue.issue : current ? "No significant context inefficiency detected." : "No DevGuard task recorded yet.",
+      action: primaryIssue ? primaryIssue.action : rollover.state === "CONTINUE" ? "Keep going in this thread." : "Start the next task in a fresh agent thread.",
+      thread: rollover
+    },
+    ...(current
+      ? {
+          currentTask: {
+            ...(current.candidateUtilization ? { suggestionsUsed: current.candidateUtilization } : {}),
+            repositorySearches: { total: current.searchCalls, broad: current.broadSearchCalls },
+            contextOverheadPct: share(current.costByCategory.FALLBACK_DOCS + current.costByCategory.ADMIN, Math.max(1, current.estTokens)),
+            openBlockers,
+            focus: agentFocus(current),
+            whereContextWent: contextGroups(current.costByCategory),
+            estimatedContextTokens: current.estTokens
+          }
+        }
+      : {}),
     sources: snapshots.map((snapshot) => ({
       provider: snapshot.provider,
       available: snapshot.available,
@@ -424,7 +654,7 @@ interface StoredTaskContext {
   sessionId?: string;
   task?: string;
   nextAction?: string;
-  files?: Array<{ path: string; relevance: string }>;
+  files?: Array<{ path: string; relevance?: string; role?: string }>;
   constraints?: string[];
   scope?: { carriedOverDirtyFiles?: number };
   validation?: { freshForThisTask?: string[] };
@@ -438,8 +668,9 @@ async function readTaskCard(root: string): Promise<(TaskCard & { sessionId?: str
     sessionId: stored.sessionId,
     goal: stored.task,
     nextAction: stored.nextAction,
-    edit: (stored.files ?? []).filter((file) => file.relevance !== "Reference").map((file) => file.path),
-    reference: (stored.files ?? []).filter((file) => file.relevance === "Reference").map((file) => file.path),
+    edit: (stored.files ?? []).filter((file) => (file.role ?? (file.relevance === "Reference" ? "REFERENCE" : "TARGET")) === "TARGET").map((file) => file.path),
+    candidates: (stored.files ?? []).filter((file) => file.role === "CANDIDATE").map((file) => file.path),
+    reference: (stored.files ?? []).filter((file) => (file.role ?? (file.relevance === "Reference" ? "REFERENCE" : "")) === "REFERENCE").map((file) => file.path),
     protected: stored.constraints ?? [],
     freshValidation: stored.validation?.freshForThisTask ?? [],
     openValidation: stored.openValidation ?? [],

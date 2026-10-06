@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
@@ -33,15 +34,20 @@ export interface ActivityEvent {
   provider: "codex" | "claude";
   /** sha256(thread id) prefix — never the raw id. */
   thread: string;
-  kind: "command" | "mcp" | "file_change" | "compaction" | "web" | "other_tool";
+  kind: "command" | "mcp" | "file_change" | "compaction" | "web" | "other_tool" | "context_usage";
   category: ContextCostCategory;
   mode: WorkMode;
   /** ESTIMATED context tokens (chars/4 of the text that entered context). Not provider-billed. */
   estTokens: number;
   /** Repo-relative paths read/edited (reads, edits only; never search queries). */
   paths?: string[];
-  /** Repository-wide search (no narrowing path). */
+  /** Repository-wide search (repository root scope). */
   broadSearch?: boolean;
+  /** Scope of each search in the command; "external" (outside the repo) is not a repository search. */
+  searchScopes?: SearchScope[];
+  /** Observed provider-reported context usage from the agent's own local log (kind "context_usage" only). */
+  inputTokens?: number;
+  contextWindow?: number;
   /** MCP prepare_task_context result: the files it provided (repo-relative). */
   providedPaths?: string[];
   /** OTHER only: a non-sensitive label of what it was (MCP server/tool name, "web", "inline script", "shell"). */
@@ -76,19 +82,43 @@ export function hashThreadId(id: string): string {
 }
 
 // --- classification (deterministic) ------------------------------------
+//
+// Evidence hierarchy: (1) structured path fields, (2) the agent's full
+// command argv, (3) a conservative shell parser over that full command,
+// (4) OTHER. Codex's `parsed_cmd[].cmd` is a TRUNCATED display string (it
+// cut path arguments off, which made targeted searches look repository-
+// wide), so it is never used to decide scope; only its `path` field is used,
+// and only when it is a real relative/absolute path (not a bare basename).
 
 const FALLBACK_DOC_PATTERN = /\.devguard\/(?:reports|context|prompts)\/[\w.-]+|\.devguard\/(?:task|rules|mistakes|project|architecture|decisions|tasks)\.md/;
-const VALIDATION_PATTERN = /\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+|--filter\s+\S+\s+|-r\s+)*(?:test|lint|typecheck|type-check|build|check|verify)\b|\bnode\s+--test\b|\b(?:tsc|vitest|jest|pytest|eslint|playwright|cargo\s+test|go\s+test)\b|\bcurl\b|\bdev-guard\s+self-check\b/;
-const ADMIN_PATTERN = /(?:^|[\s/;&|])dev-guard(?:\s+|$)|\bnpx\s+(?:--no-install\s+)?dev-guard\b/;
-const SEARCH_HEAD = /^(?:rg|grep|egrep|fgrep|find|fd|ag|ack|git\s+grep|git\s+ls-files)\b/;
-const READ_HEAD = /^(?:cat|sed|head|tail|nl|less|more|bat|wc|jq)\b/;
-const GIT_READ = /^git\s+(?:diff|status|log|show|blame)\b/;
+const VALIDATION_PATTERN = /\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+|--filter\s+\S+\s+|-r\s+|-w\s+)*(?:test|lint|typecheck|type-check|build|check|verify)\b|\bnode\s+--test\b|\b(?:tsc|vitest|jest|pytest|eslint|playwright|cargo\s+test|go\s+test)\b|\bcurl\b|\bdev-guard\s+self-check\b/;
+const ADMIN_PATTERN = /(?:^|[\s/;&|])dev-guard(?:\s+(?!self-check)|$)|\bnpx\s+(?:--no-install\s+)?dev-guard\b/;
+const SEARCH_COMMANDS = new Set(["rg", "grep", "egrep", "fgrep", "find", "fd", "ag", "ack"]);
+const READ_COMMANDS = new Set(["cat", "sed", "head", "tail", "nl", "less", "more", "bat", "wc", "jq", "awk"]);
+const NOOP_COMMANDS = new Set(["cd", "pwd", "set", "export", "echo", "printf", "true", "ulimit", "clear", "mkdir", "test", "["]);
+/** Option flags that consume the following word, per search/read command. */
+const OPTIONS_WITH_VALUE: Record<string, Set<string>> = {
+  rg: new Set(["-e", "-f", "-g", "--glob", "-t", "--type", "-T", "--type-not", "-A", "-B", "-C", "-m", "--max-count", "--max-depth", "-M", "--max-columns", "-r", "--replace", "--iglob", "-j", "--threads", "--sort", "--sortr"]),
+  grep: new Set(["-e", "-f", "-A", "-B", "-C", "-m", "--include", "--exclude", "--exclude-dir"]),
+  head: new Set(["-n", "-c"]),
+  tail: new Set(["-n", "-c"]),
+  sed: new Set(["-e", "-f"]),
+  awk: new Set(["-F", "-v", "-f"]),
+  jq: new Set(["--arg", "--argjson", "-f"]),
+  nl: new Set(["-b", "-s", "-w", "-v", "-i"])
+};
+const PATH_LITERAL = /['"]((?:\.{1,2}\/|\/)?[A-Za-z0-9_@.()[\]-]+(?:\/[A-Za-z0-9_@.()[\]-]+)*\.[A-Za-z0-9]{1,8})['"]/g;
+
+export type SearchScope = "broad" | "targeted" | "external" | "unknown";
 
 export interface CommandClassification {
   category: ContextCostCategory;
   mode: WorkMode;
+  /** Repository files read (repo-relative, de-duplicated). */
   paths: string[];
   broadSearch: boolean;
+  /** Scope of each search segment in the command (empty when none). */
+  searchScopes: SearchScope[];
   otherLabel?: string;
 }
 
@@ -99,81 +129,218 @@ interface ParsedCommandPart {
 }
 
 /**
- * Classifies one executed shell command. `parsed` is the agent's own
- * structured parse when available (Codex: read/search/list_files/unknown);
- * otherwise the command string is used. `cwd` and `root` turn paths into
- * repo-relative form; paths outside the repository are dropped.
+ * Classifies one executed shell command from its COMPLETE text. `parsed` is
+ * the agent's own structured parse (Codex), used only for real path fields.
+ * Paths outside the repository never count as repository reads; searches
+ * outside it are "external", never repository searches; an unparseable
+ * scope is "unknown", never "broad".
  */
-export function classifyCommand(command: string, parsed: ParsedCommandPart[], cwd: string, root: string): CommandClassification {
-  // `pwd && rg ...` / `cd x; sed -n ...`: classify by the first meaningful
-  // segment, not by a leading no-op.
-  const text = meaningfulSegment(command.trim());
-  const paths = new Set<string>();
-  if (FALLBACK_DOC_PATTERN.test(text)) {
-    for (const match of text.matchAll(new RegExp(FALLBACK_DOC_PATTERN.source, "g"))) paths.add(match[0]);
-    return { category: "FALLBACK_DOCS", mode: "CONTEXT_ADMIN", paths: [...paths], broadSearch: false };
+export function classifyCommand(command: string, parsed: ParsedCommandPart[], cwd: string, root: string, fileExists: (absolutePath: string) => boolean = existsSync): CommandClassification {
+  const text = command.trim();
+  const reads = new Set<string>();
+  const fallbackDocs = new Set<string>();
+  for (const match of text.matchAll(new RegExp(FALLBACK_DOC_PATTERN.source, "g"))) fallbackDocs.add(match[0]);
+  if (fallbackDocs.size > 0) {
+    return { category: "FALLBACK_DOCS", mode: "CONTEXT_ADMIN", paths: [...fallbackDocs], broadSearch: false, searchScopes: [] };
   }
-  if (ADMIN_PATTERN.test(text) && !/\bdev-guard\s+self-check\b/.test(text)) return { category: "ADMIN", mode: "CONTEXT_ADMIN", paths: [], broadSearch: false };
-  if (VALIDATION_PATTERN.test(text)) return { category: "VALIDATION", mode: "VALIDATION", paths: [], broadSearch: false };
+  if (ADMIN_PATTERN.test(text)) return { category: "ADMIN", mode: "CONTEXT_ADMIN", paths: [], broadSearch: false, searchScopes: [] };
+  if (VALIDATION_PATTERN.test(text)) return { category: "VALIDATION", mode: "VALIDATION", paths: [], broadSearch: false, searchScopes: [] };
 
-  const parts = parsed.length > 0 ? parsed : [{ type: "unknown", cmd: text }];
-  let search = false;
-  let broad = false;
-  let read = false;
-  for (const part of parts) {
-    const cmd = (part.cmd ?? text).trim();
-    if (part.type === "search" || part.type === "list_files" || SEARCH_HEAD.test(cmd) || /^ls\s+(?:-\w*R|--recursive)/.test(cmd)) {
-      search = true;
-      if (isBroadSearch(cmd, cwd, root)) broad = true;
-    } else if (part.type === "read" || READ_HEAD.test(cmd) || GIT_READ.test(cmd)) {
-      read = true;
-      const path = part.path ?? lastPathArgument(cmd);
-      const relative = path ? toRepoRelative(path, cwd, root) : undefined;
-      if (relative) paths.add(relative);
+  const searchScopes: SearchScope[] = [];
+  let workingDir = cwd;
+  let writes = false;
+  const isScript = /^(?:python3?|node)\b[^\n]*(?:<<|\s-c\s|\s-e\s)/.test(text);
+  if (isScript) {
+    // Inline script: repository files it names in string literals and that
+    // exist on disk. Anything it cannot prove stays unknown (OTHER).
+    for (const match of text.matchAll(PATH_LITERAL)) addRead(reads, match[1], workingDir, root, fileExists);
+    writes = /open\([^)]*['"][wa]\+?['"]|\.write_text\(|\.write_bytes\(|writeFileSync|\.write\(/.test(text);
+  } else {
+    for (const statement of splitStatements(text)) {
+      const pipeline = splitPipeline(statement);
+      for (const [position, segment] of pipeline.entries()) {
+        const words = shellWords(segment);
+        if (words.length === 0) continue;
+        const head = words[0];
+        if (head === "cd" && words[1]) {
+          workingDir = isAbsolute(words[1]) ? words[1] : join(workingDir, words[1]);
+          continue;
+        }
+        if (NOOP_COMMANDS.has(head)) continue;
+        const loop = /^for\s+(\w+)\s+in\s+(.+?)\s*$/.exec(segment);
+        if (loop) {
+          for (const word of shellWords(loop[2])) addRead(reads, word, workingDir, root, fileExists);
+          continue;
+        }
+        if (head === "git") {
+          const sub = words[1];
+          if (sub === "grep" || sub === "ls-files") {
+            const args = words.slice(2).filter((word) => !word.startsWith("-") && word !== "--");
+            searchScopes.push(scopeOf(sub === "grep" ? args.slice(1) : args, workingDir, root));
+          } else if (sub === "show") {
+            for (const word of words.slice(2)) if (/^[^:-][^:]*:./.test(word)) addRead(reads, word.slice(word.indexOf(":") + 1), root, root, fileExists);
+          } else if (sub === "diff" && words.includes("--")) {
+            for (const word of words.slice(words.indexOf("--") + 1)) addRead(reads, word, workingDir, root, fileExists);
+          }
+          // git status/log/blame without paths read no specific file.
+          continue;
+        }
+        if (SEARCH_COMMANDS.has(head) || (head === "ls" && words.some((w) => /^-\w*R/.test(w) || w === "--recursive"))) {
+          if (position > 0 && (head === "grep" || head === "rg" || head === "egrep" || head === "fgrep")) continue; // filter in a pipeline
+          searchScopes.push(searchScope(head, words, workingDir, root));
+          continue;
+        }
+        if (READ_COMMANDS.has(head)) {
+          if (position > 0) continue; // e.g. `... | head -20` reads stdin, not a file
+          for (const path of readArguments(head, words)) addRead(reads, path, workingDir, root, fileExists);
+          if (head === "sed" && words.includes("-i")) writes = true;
+        }
+      }
     }
   }
-  if (!search && !read && /^python3?\b/.test(text)) {
-    if (/\bos\.walk\b|\bglob\(|\.rglob\(|\bsubprocess\b.*\b(?:rg|grep|find)\b/.test(text)) return { category: "SEARCH", mode: "EXPLORATION", paths: [], broadSearch: true };
-    if (/open\([^)]*['"]w['"]|\.write_text\(|\.write\(/.test(text)) return { category: "CODE_EDITS", mode: "IMPLEMENTATION", paths: [], broadSearch: false };
+  for (const part of parsed) {
+    if (part.type === "read" && part.path && part.path.includes("/")) addRead(reads, part.path, cwd, root, fileExists);
   }
-  if (search) return { category: "SEARCH", mode: "EXPLORATION", paths: [], broadSearch: broad };
-  if (read) return { category: "CODE_READS", mode: "EXPLORATION", paths: [...paths], broadSearch: false };
-  return { category: "OTHER", mode: "OTHER", paths: [], broadSearch: false, otherLabel: /^python3?\b|^node\s+-e/.test(text) ? "inline script" : "shell" };
+  const repoSearches = searchScopes.filter((scope) => scope !== "external");
+  if (repoSearches.length > 0) {
+    return { category: "SEARCH", mode: "EXPLORATION", paths: [...reads], broadSearch: repoSearches.includes("broad"), searchScopes };
+  }
+  if (writes) return { category: "CODE_EDITS", mode: "IMPLEMENTATION", paths: [], broadSearch: false, searchScopes };
+  if (reads.size > 0) return { category: "CODE_READS", mode: "EXPLORATION", paths: [...reads], broadSearch: false, searchScopes };
+  if (searchScopes.length > 0) return { category: "OTHER", mode: "OTHER", paths: [], broadSearch: false, searchScopes, otherLabel: "external search" };
+  if (/^git\b/.test(text)) return { category: "CODE_READS", mode: "EXPLORATION", paths: [], broadSearch: false, searchScopes };
+  return { category: "OTHER", mode: "OTHER", paths: [], broadSearch: false, searchScopes, otherLabel: isScript ? "inline script" : "shell" };
 }
 
-const NOOP_SEGMENT = /^(?:cd|pwd|set|export|echo|printf|true|ulimit|clear)\b/;
-
-function meaningfulSegment(command: string): string {
-  if (/^python3?\b|<<|^node\s+-e/.test(command)) return command;
-  const segments = command.split(/\s*(?:&&|\|\||;|\n)\s*/).map((part) => part.trim()).filter(Boolean);
-  const meaningful = segments.filter((part) => !NOOP_SEGMENT.test(part));
-  return meaningful.length > 0 ? meaningful.join(" && ") : command;
+function addRead(reads: Set<string>, path: string, cwd: string, root: string, fileExists: (absolutePath: string) => boolean): void {
+  if (!path || path.startsWith("-") || /[*?$`{}]/.test(path)) return;
+  const absolute = isAbsolute(path) ? path : join(cwd, path);
+  const relativePath = toRepoRelative(absolute, root, root);
+  if (!relativePath || /^(?:\.git|node_modules)\//.test(relativePath)) return;
+  if (!fileExists(absolute)) return;
+  reads.add(relativePath);
 }
 
-function isBroadSearch(cmd: string, cwd: string, root: string): boolean {
-  const args = shellWords(cmd).slice(1).filter((arg) => !arg.startsWith("-"));
-  // rg/grep PATTERN [PATH...]; find [PATH...]; ls -R [PATH]
-  const isFind = /^(?:find|fd)\b/.test(cmd) || /^ls\b/.test(cmd) || /^git\s+ls-files\b/.test(cmd) || /--files\b/.test(cmd);
-  const pathArgs = isFind ? args.filter((arg) => !/^git$|^ls-files$/.test(arg)).slice(0, 1) : args.slice(1);
-  if (pathArgs.length === 0) return normalizeDir(cwd) === normalizeDir(root);
-  return pathArgs.some((arg) => {
-    const absolute = isAbsolute(arg) ? arg : join(cwd, arg);
-    return normalizeDir(absolute) === normalizeDir(root);
-  });
+function readArguments(head: string, words: string[]): string[] {
+  const takesValue = OPTIONS_WITH_VALUE[head] ?? new Set<string>();
+  const positionals: string[] = [];
+  let scriptConsumed = !(head === "sed" || head === "awk") || words.includes("-e") || words.includes("-f");
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index];
+    if (takesValue.has(word)) {
+      index += 1;
+      continue;
+    }
+    if (word.startsWith("-") && word !== "-") continue;
+    if (!scriptConsumed) {
+      scriptConsumed = true; // sed/awk program text
+      continue;
+    }
+    if (word === ">" || word === ">>" || word === "<") break;
+    positionals.push(word);
+  }
+  return positionals;
+}
+
+function searchScope(head: string, words: string[], cwd: string, root: string): SearchScope {
+  const takesValue = OPTIONS_WITH_VALUE[head === "egrep" || head === "fgrep" ? "grep" : head] ?? new Set<string>();
+  const positionals: string[] = [];
+  let patternGiven = words.includes("-e") || words.includes("-f") || words.includes("--files") || head === "find" || head === "fd" || head === "ls";
+  for (let index = 1; index < words.length; index += 1) {
+    const word = words[index];
+    if (takesValue.has(word)) {
+      index += 1;
+      continue;
+    }
+    if (word === "--") continue;
+    if (head === "find" && (word.startsWith("-") || word === "(" || word === "!")) break; // expression starts
+    if (word.startsWith("-")) continue;
+    if (word === ">" || word === ">>" || word === "2>") break;
+    positionals.push(word);
+  }
+  // rg/grep: first positional is the pattern unless -e/-f/--files supplied it.
+  // fd: first positional is the pattern; the rest are paths.
+  const paths = head === "fd" ? positionals.slice(1) : patternGiven ? positionals : positionals.slice(1);
+  if (!patternGiven && head !== "fd" && positionals.length === 0) return "unknown";
+  return scopeOf(paths, cwd, root);
+}
+
+function scopeOf(paths: string[], cwd: string, root: string): SearchScope {
+  const targets = paths.length > 0 ? paths : ["."];
+  let anyInside = false;
+  for (const target of targets) {
+    if (/[$`]/.test(target)) return "unknown";
+    const absolute = normalizeDir(isAbsolute(target) ? target : join(cwd, target));
+    const relativePath = relative(root, absolute);
+    if (relativePath.startsWith("..") || isAbsolute(relativePath)) continue;
+    anyInside = true;
+    if (relativePath === "" || relativePath === ".") return "broad";
+  }
+  return anyInside ? "targeted" : "external";
+}
+
+function splitStatements(command: string): string[] {
+  // Top-level split on && || ; and newlines, ignoring separators inside quotes.
+  const statements: string[] = [];
+  let current = "";
+  let quote: string | undefined;
+  for (let index = 0; index < command.length; index += 1) {
+    const char = command[index];
+    if (quote) {
+      if (char === quote) quote = undefined;
+      current += char;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    const two = command.slice(index, index + 2);
+    if (two === "&&" || two === "||") {
+      statements.push(current);
+      current = "";
+      index += 1;
+      continue;
+    }
+    if (char === ";" || char === "\n") {
+      statements.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  statements.push(current);
+  return statements.map((statement) => statement.trim().replace(/^do\s+/, "").replace(/^then\s+/, "")).filter((statement) => statement && statement !== "done" && statement !== "fi");
+}
+
+function splitPipeline(statement: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quote: string | undefined;
+  for (const char of statement) {
+    if (quote) {
+      if (char === quote) quote = undefined;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (char === "|") {
+      parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  parts.push(current.trim());
+  return parts.filter(Boolean);
 }
 
 function normalizeDir(path: string): string {
   return path.replace(/\/+$/, "").replace(/\/\.$/, "");
 }
 
-function lastPathArgument(cmd: string): string | undefined {
-  const args = shellWords(cmd).slice(1).filter((arg) => !arg.startsWith("-") && !/^\d+(,\d+)?p$/.test(arg) && !/^['"]?\d/.test(arg));
-  return args.at(-1);
-}
-
 function shellWords(cmd: string): string[] {
   const words: string[] = [];
-  for (const match of cmd.split(/[|;&]/)[0].matchAll(/'([^']*)'|"((?:[^"\\]|\\.)*)"|(\S+)/g)) words.push(match[1] ?? match[2] ?? match[3]);
+  for (const match of cmd.matchAll(/'([^']*)'|"((?:[^"\\]|\\.)*)"|(\S+)/g)) words.push(match[1] ?? match[2] ?? match[3]);
   return words;
 }
 
@@ -189,13 +356,14 @@ export function toRepoRelative(path: string, cwd: string, root: string): string 
 interface CodexFileState {
   size: number;
   offset: number;
+  lastUsage?: number;
   matches?: boolean;
   thread?: ThreadInfo;
   events: ActivityEvent[];
   partial: string;
 }
 
-const MAX_EVENTS_PER_THREAD = 5000;
+const MAX_EVENTS_PER_THREAD = 8000;
 const READ_CHUNK_BYTES = 8 * 1024 * 1024;
 
 /**
@@ -296,7 +464,7 @@ export class CodexLocalActivitySource implements AgentActivitySource {
     // Cheap prefilter before JSON.parse: only three line types matter.
     if (state.matches === undefined) {
       if (!line.includes('"session_meta"')) return;
-    } else if (!line.includes('"item_completed"')) {
+    } else if (!line.includes('"item_completed"') && !line.includes('"token_count"')) {
       return;
     }
     let entry: { timestamp?: string; type?: string; payload?: Record<string, unknown> };
@@ -320,11 +488,34 @@ export class CodexLocalActivitySource implements AgentActivitySource {
       }
       return;
     }
-    if (!state.matches || !state.thread || payload.type !== "item_completed") return;
+    if (!state.matches || !state.thread) return;
+    if (payload.type === "token_count") {
+      const usage = codexContextUsage(payload, entry.timestamp ?? "", state.thread.thread);
+      const previous = state.lastUsage;
+      if (usage && (!previous || Math.abs(usage.inputTokens! - previous) / Math.max(1, previous) >= 0.02)) {
+        state.lastUsage = usage.inputTokens;
+        state.events.push(usage);
+      }
+      return;
+    }
+    if (payload.type !== "item_completed") return;
     const item = (payload.item ?? {}) as Record<string, unknown>;
     const event = codexItemToEvent(item, entry.timestamp ?? "", state.thread.thread, root);
     if (event) state.events.push(event);
   }
+}
+
+/**
+ * Provider-reported context usage exactly as the agent logged it locally
+ * (Codex `token_count`: last turn's input tokens and the model context
+ * window). OBSERVED metadata only — never estimated or extrapolated.
+ */
+export function codexContextUsage(payload: Record<string, unknown>, ts: string, thread: string): ActivityEvent | undefined {
+  const info = (payload.info ?? {}) as { last_token_usage?: { input_tokens?: number }; model_context_window?: number };
+  const inputTokens = info.last_token_usage?.input_tokens;
+  const contextWindow = info.model_context_window;
+  if (typeof inputTokens !== "number" || typeof contextWindow !== "number" || contextWindow <= 0) return undefined;
+  return { ts, provider: "codex", thread, kind: "context_usage", category: "OTHER", mode: "OTHER", estTokens: 0, inputTokens, contextWindow };
 }
 
 function durationMs(value: unknown): number | undefined {
@@ -354,8 +545,9 @@ export function codexItemToEvent(item: Record<string, unknown>, ts: string, thre
         category: classified.category,
         mode: classified.mode,
         estTokens: estimateTokens(command) + estimateTokens(output),
-        ...(classified.paths.length ? { paths: classified.paths.slice(0, 8) } : {}),
+        ...(classified.paths.length ? { paths: classified.paths.slice(0, 16) } : {}),
         ...(classified.broadSearch ? { broadSearch: true } : {}),
+        ...(classified.searchScopes.length ? { searchScopes: classified.searchScopes } : {}),
         ...(classified.otherLabel ? { otherLabel: classified.otherLabel } : {}),
         durationMs: durationMs(item.duration)
       };

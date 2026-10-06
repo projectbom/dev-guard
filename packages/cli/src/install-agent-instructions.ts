@@ -23,7 +23,7 @@ function sharedDevGuardInstructions(_agentName: "Codex" | "Claude"): string[] {
     "Primary context source — `prepare_task_context` (DevGuard MCP):",
     "",
     "1. For every new coding or code-analysis task, call `prepare_task_context` with the user's concrete request before any repository search or unrelated file reads.",
-    "2. Read the returned files and line ranges first. The result already contains the task goal, source-tagged constraints, the carried-over dirty-work warning, unresolved validation from the previous task, and a next action.",
+    "2. Read the TARGET files' ranges first. Open a CANDIDATE file only when the targets leave a concrete gap — do not batch-read every returned file. REFERENCE files are background only. The result also contains the task goal, source-tagged constraints, the carried-over dirty-work warning, unresolved validation from the previous task, and a next action.",
     "3. Do not immediately run repository-wide `rg`/`grep`/`find`. Search only for a concrete gap the returned ranges do not cover, and keep that search targeted.",
     `4. When \`prepare_task_context\` succeeds, do not also read DevGuard's markdown (\`${devguardPaths.projectHandoff}\`, \`${devguardPaths.qualityReport}\`, \`${devguardPaths.nextCodexPrompt}\`, \`${devguardPaths.nextClaudePrompt}\`, \`${devguardPaths.agentBrief}\`, \`${devguardPaths.workingContext}\`, \`${devguardPaths.agentContext}\`). They are fallback and human-diagnostic artifacts.`,
     "",
