@@ -22,8 +22,8 @@ import { runTelemetry } from "./telemetry.js";
 import { runUpdate } from "./update.js";
 import { runWatch } from "./watch.js";
 import { fromRoot } from "./fs.js";
-import { currentSessionQaCount, generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState, type CompletionSource } from "./runtime-state.js";
-import { observeThreadPressure } from "./thread-ownership.js";
+import { currentSessionQaCount, threadStateForAgent, generateAgentBrief, generateAgentContext, generateCodeMap, generateNextClaudePrompt, generateProjectHandoff, generateReadMap, generateWorkingContext, prepareBeforeAgentContext, processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, resetRuntimeState, type CompletionSource } from "./runtime-state.js";
+import { identityFromShellEnv, observeThreadPressure } from "./thread-ownership.js";
 import { computeRolloverAssessment, measureResumeBundleCost } from "./rollover.js";
 import { runInstallAgentInstructions } from "./install-agent-instructions.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
@@ -398,6 +398,15 @@ function resolveDoneCompletionSource(): CompletionSource {
   return match ?? "cli-done";
 }
 
+// Printed LAST (after the long file/report listing), so an agent reading
+// the tail of `dev-guard done` output sees it. Silent for LOW/UNKNOWN.
+function printThreadNotice(state: { status: string; reason: string; userNotice?: string } | undefined): void {
+  if (!state?.userNotice) return;
+  console.log("");
+  console.log(`Thread: ${state.status} — ${state.reason}`);
+  console.log(`User notice (end your final reply with this): ${state.userNotice}`);
+}
+
 async function runDone(root: string): Promise<void> {
   try {
     const locale = await refreshRuntimeLocale(root);
@@ -415,6 +424,9 @@ async function runDone(root: string): Promise<void> {
       console.log("- The current task was left untouched for its own thread to finish.");
       return;
     }
+    // The agent's own `dev-guard done` is the task boundary: report its
+    // thread's fresh state so the final reply can carry the notice.
+    const threadState = completionSource === "cli-done" ? await threadStateForAgent(root, identityFromShellEnv(process.env)).catch(() => undefined) : undefined;
     console.log("dev-guard done (manual finalization)");
     console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");
@@ -471,6 +483,7 @@ async function runDone(root: string): Promise<void> {
         ? "  다음 작업이 별도 작업이면 새 agent thread를 열고 거기서 prepare_task_context를 호출하세요 (이 대화에서 계속하지 마세요)."
         : "  If the next task is a separate task, open a fresh agent thread and call prepare_task_context there (do not continue in this conversation)."
     );
+    printThreadNotice(threadState);
   } catch (error) {
     console.error(`dev-guard done failed: ${errorMessage(error)}`);
     console.error("recovery: run dev-guard status, then dev-guard reset if the pending buffer is wrong");

@@ -6,7 +6,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fromRoot } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { currentThreadPressure, prepareTaskContext, recordValidationEvidence, toAgentContextPayload } from "./runtime-state.js";
+import { prepareTaskContext, recordValidationEvidence, threadStateForAgent, toAgentContextPayload } from "./runtime-state.js";
 import { identityFromMcpContext } from "./thread-ownership.js";
 
 /**
@@ -138,14 +138,14 @@ export async function runMcpServer(root: string): Promise<void> {
         // During-task rollover: the thread's observed pressure rides along
         // with every validation, so the agent learns it is getting heavy
         // without any extra call. UNKNOWN when not observable.
-        const pressure = await currentThreadPressure(project, identityFromMcpContext(process.env, extra?._meta)).catch(() => undefined);
+        const thread = await threadStateForAgent(project, identityFromMcpContext(process.env, extra?._meta)).catch(() => undefined);
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify({
                 recorded: result,
-                ...(pressure ? { thread: { status: pressure.status, reason: pressure.reason } } : {})
+                ...(thread ? { thread } : {})
               }, null, 2)
             }
           ]

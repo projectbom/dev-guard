@@ -287,6 +287,35 @@ export async function claudeThreadPressure(sessionId: string, options: { project
   return unknownThreadPressure("The Claude Code transcript for this session was not found.");
 }
 
+/**
+ * The one-line, user-facing recommendation an agent appends to its FINAL
+ * reply of a task when its own thread is getting heavy. Undefined for
+ * LOW / UNKNOWN: no thread talk then.
+ */
+export function threadUserNotice(status: ThreadPressureStatus, locale: string): string | undefined {
+  const ko = locale === "ko-KR";
+  if (status === "NEW_THREAD") {
+    return ko
+      ? "현재 스레드는 컨텍스트 사용량이 높습니다. 다음 작업을 계속하기 전에 새 스레드로 전환하는 것을 권장합니다."
+      : "This thread's context usage is high. Switch to a fresh thread before continuing with the next task.";
+  }
+  if (status === "SOON") {
+    return ko
+      ? "현재 스레드의 컨텍스트 사용량이 높아지고 있습니다. 다음 큰 작업이나 별도 단계는 새 스레드에서 시작하는 것을 권장합니다."
+      : "This thread's context usage is rising. Start the next large task or separate step in a fresh thread.";
+  }
+  return undefined;
+}
+
+/** Identity of the agent thread a CLI process runs inside (an agent's shell tool), when the provider exposes it. */
+export function identityFromShellEnv(env: NodeJS.ProcessEnv): ObservedThreadIdentity | undefined {
+  const codex = env.CODEX_THREAD_ID?.trim();
+  if (codex) return { provider: "codex", threadId: codex, source: "mcp-env" };
+  const claude = env.CLAUDE_CODE_SESSION_ID?.trim();
+  if (claude) return { provider: "claude", threadId: claude, source: "mcp-env" };
+  return undefined;
+}
+
 /** Thread pressure for whichever thread identity is observable in this process. */
 export async function observeThreadPressure(input: { identity?: ObservedThreadIdentity; owner?: ProviderThreadOwner }): Promise<ThreadPressure> {
   try {

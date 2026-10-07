@@ -29,7 +29,8 @@ import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
 import { recordTaskTelemetry } from "./task-telemetry.js";
-import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, toOwner, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
+import { jsonSections, markdownSections, type DocumentSection } from "./document-ranges.js";
+import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, threadUserNotice, toOwner, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
 import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
 
 const execFileAsync = promisify(execFile);
@@ -1942,6 +1943,30 @@ export async function currentThreadPressure(root: string, caller?: ObservedThrea
   return observeThreadPressure({ identity: caller, owner: runtime.currentTask?.owner });
 }
 
+export interface ThreadStateForAgent {
+  status: ThreadPressure["status"];
+  reason: string;
+  /**
+   * Present only for SOON / NEW_THREAD observed on the CALLING thread
+   * itself, freshly at this call: the sentence to end the task's final
+   * user reply with. Never derived from another thread or an older read.
+   */
+  userNotice?: string;
+}
+
+/**
+ * Fresh thread state for the agent making this call. The notice is only
+ * attached when the observation is of the caller's own thread (provider-
+ * reported identity); a fallback to the task owner's thread (caller
+ * unknown) reports status only, since it may be a different thread.
+ */
+export async function threadStateForAgent(root: string, caller?: ObservedThreadIdentity): Promise<ThreadStateForAgent> {
+  const pressure = await currentThreadPressure(root, caller);
+  const locale = await resolveDevGuardLocale(root).catch(() => "en-US" as DevGuardLocale);
+  const userNotice = caller ? threadUserNotice(pressure.status, locale) : undefined;
+  return { status: pressure.status, reason: pressure.reason, ...(userNotice ? { userNotice } : {}) };
+}
+
 export async function prepareTaskContext(input: PrepareTaskContextInput): Promise<PreparedTaskContextResult> {
   perfMark("prepare:start");
   const { root, task, persistTask = true, continueCurrentTask = false, caller, observeCodexOwner = false } = input;
@@ -2198,6 +2223,8 @@ function preparedNextAction(files: PreparedTaskContextFile[], openValidation: st
 // --- TARGET vs CANDIDATE --------------------------------------------------
 
 const workstreamPriorBySummary = new WeakMap<DocumentationSummary, Set<string>>();
+/** Previous-task artifacts the new task referenced directly by identifier — ranked above plain continuity. */
+const workstreamDirectBySummary = new WeakMap<DocumentationSummary, Set<string>>();
 const TARGET_LIMIT = 3;
 const TARGET_SCORE_RATIO = 0.6;
 const RARE_TOKEN_WEIGHT = 0.55;
@@ -2292,16 +2319,35 @@ function workstreamPriorFiles(state: ProjectState, records: HistoryRecord[], sum
   const rare = (token: string) => (weights ? (weights.get(token) ?? 0) >= RARE_TOKEN_WEIGHT : true);
   const previousTokens = meaningfulRankingTokens(previousGoal);
   const sharedRare = [...currentTokens].filter((token) => previousTokens.has(token) && rare(token));
-  if (sharedRare.length < 2) return [];
+  // Direct reference: the new task names the previous task's own structured
+  // identifier ("Read required Phase5H artifacts" after "Phase 5H: ...").
+  // That is stronger evidence than shared vocabulary and needs no rarity
+  // threshold; generic words ("previous", "phase", "group") never qualify
+  // because a structured identifier always carries a number.
+  const directIds = previousTaskIdentifiers(previousGoal).filter((id) => currentTokens.has(id));
+  if (directIds.length === 0 && sharedRare.length < 2) return [];
   const currentRare = new Set([...currentTokens].filter(rare));
-  return previousFiles
+  const wordsOf = (file: string) => {
+    const entry = index.files[file];
+    return new Set([...meaningfulRankingTokens(file), ...meaningfulRankingTokens([entry.summary ?? "", ...(entry.exports ?? []), ...(entry.symbols ?? []).map((symbol) => symbol.name)].join("\n"))]);
+  };
+  const namesDirectId = (file: string) => directIds.some((id) => wordsOf(file).has(id));
+  const prior = previousFiles
     .filter((file) => index.files[file] && !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file) && !negatedTermInPath(file, summary))
-    .filter((file) => {
-      const entry = index.files[file];
-      const words = new Set([...meaningfulRankingTokens(file), ...meaningfulRankingTokens([entry.summary ?? "", ...(entry.exports ?? []), ...(entry.symbols ?? []).map((symbol) => symbol.name)].join("\n"))]);
-      return [...currentRare].some((token) => words.has(token));
-    })
-    .slice(0, 4);
+    .filter((file) => namesDirectId(file) || [...currentRare].some((token) => wordsOf(file).has(token)));
+  // The previous task's own named artifacts first, documents (its decision
+  // and acceptance records) before data files.
+  const rank = (file: string) => (namesDirectId(file) ? 0 : 2) + (/\.mdx?$/i.test(file) ? 0 : 1);
+  const selected = [...prior].sort((a, b) => rank(a) - rank(b)).slice(0, 4);
+  if (directIds.length > 0) workstreamDirectBySummary.set(summary, new Set(selected.filter(namesDirectId)));
+  return selected;
+}
+
+/** Structured identifiers a task names itself by: those in its title (before the first ":" or within its first 80 characters). */
+function previousTaskIdentifiers(goal: string): string[] {
+  const colon = goal.indexOf(":");
+  const title = colon > 0 && colon <= 120 ? goal.slice(0, colon) : goal.slice(0, 80);
+  return structuredIdentifierTokens(title);
 }
 
 // Reference-only (task-excluded) files never fill more than 2 of the 8 slots.
@@ -2784,6 +2830,8 @@ function resolveBeforeAgentContext(input: {
     const candidateFiles = [...new Set([...taskRelevantIndexCandidates(baseSummary, input.codeIndex, new Set()).slice(0, 12), ...workstreamPrior])];
     const summary = registerTokenWeightIndex(beforeAgentTaskSummary(currentTask, input.codeIndex, candidateFiles), input.codeIndex);
     workstreamPriorBySummary.set(summary, new Set(workstreamPrior));
+    const directPrior = workstreamDirectBySummary.get(baseSummary);
+    if (directPrior) workstreamDirectBySummary.set(summary, directPrior);
     return {
       summary,
       workstreamPrior,
@@ -3636,6 +3684,7 @@ function readMapCandidateScore(file: string, summary: DocumentationSummary, inde
   if (shouldExcludeContextCandidate(file, summary) && !workstreamPriorBySummary.get(summary)?.has(file)) score -= 90;
   if (negatedTermInPath(file, summary)) score -= 60;
   if (workstreamPriorBySummary.get(summary)?.has(file)) score += 30;
+  if (workstreamDirectBySummary.get(summary)?.has(file)) score += 25;
   if (isLowSignalForTask(file, summary) && !hasStrongTargetSignal(file, summary, index)) score -= 15;
   const primary = primaryIndexedSymbol(indexed);
   if (primary && primary.endLine - primary.startLine > 250) score -= 8;
@@ -3711,7 +3760,23 @@ function isBuildOutputPath(file: string): boolean {
 
 function shouldExcludeContextCandidate(file: string, summary: DocumentationSummary): boolean {
   if (isAgentInstructionTask(taskRoutingText(summary))) return false;
+  // A document named by a structured identifier the task states explicitly
+  // ("phase5i", "rfc123") is a requested artifact, not a generic doc.
+  if (namesTaskStructuredId(file, summary)) return false;
   return /^(AGENTS|CLAUDE)\.md$/i.test(file) || /^README(?:\.[\w-]+)?\.md$/i.test(file) || /^docs\//i.test(file);
+}
+
+const taskStructuredIdCache = new WeakMap<DocumentationSummary, Set<string>>();
+
+function namesTaskStructuredId(file: string, summary: DocumentationSummary): boolean {
+  let ids = taskStructuredIdCache.get(summary);
+  if (!ids) {
+    ids = new Set(structuredIdentifierTokens(taskRoutingText(summary)));
+    taskStructuredIdCache.set(summary, ids);
+  }
+  if (ids.size === 0) return false;
+  const pathTokens = meaningfulRankingTokens(file);
+  return [...ids].some((id) => pathTokens.has(id));
 }
 
 function isAgentInstructionTask(taskText: string): boolean {
@@ -3824,12 +3889,37 @@ function meaningfulRankingTokens(value: string): Set<string> {
     "typescript",
     "javascript"
   ]);
-  return new Set(
+  const tokens = new Set(
     expanded
       .split(/[^a-z0-9가-힣]+/i)
       .map((token) => token.trim())
       .filter((token) => (token.length >= 3 || token === "og") && !stop.has(token))
   );
+  for (const id of structuredIdentifierTokens(value)) tokens.add(id);
+  return tokens;
+}
+
+// "Phase 5H", "Phase5H", "Phase-5H", "phase_5h" -> "phase5h"; "Step 12B" ->
+// "step12b"; "RFC 123" -> "rfc123". Shorthand siblings after a slash are
+// expanded with the same prefix ("Phase5H/5D" -> phase5h, phase5d). Only a
+// 2-12 letter word directly followed by a number(+one letter) qualifies, and
+// a separated plain number needs a capitalized/upper-case word ("RFC 123",
+// "Step 4"), so ordinary prose ("top 10 files") is not glued together. The
+// canonical form is ADDED next to the ordinary tokens, never replacing them.
+const STRUCTURED_ID = /(?<![A-Za-z0-9])([A-Za-z]{2,12})([\s_-]?)(\d{1,4}[A-Za-z]?)(?![A-Za-z0-9])((?:\s*\/\s*\d{1,4}[A-Za-z]?(?![A-Za-z0-9]))*)/g;
+
+export function structuredIdentifierTokens(value: string): string[] {
+  const ids: string[] = [];
+  for (const match of value.matchAll(STRUCTURED_ID)) {
+    const [, word, separator, suffix, siblings] = match;
+    const capitalized = /^[A-Z]/.test(word);
+    if (separator && !/[A-Za-z]$/.test(suffix) && !capitalized) continue;
+    if (separator && /^[a-z]/.test(word) && !/[A-Za-z]$/.test(suffix)) continue;
+    const prefix = word.toLowerCase();
+    ids.push(`${prefix}${suffix.toLowerCase()}`);
+    for (const sibling of siblings.matchAll(/\d{1,4}[A-Za-z]?/g)) ids.push(`${prefix}${sibling[0].toLowerCase()}`);
+  }
+  return [...new Set(ids)];
 }
 
 function readMapSkips(summary: DocumentationSummary | undefined, files: string[], locale: DevGuardLocale): string[] {
@@ -3945,6 +4035,11 @@ function primaryIndexedSymbol(file?: CodeIndexFile): CodeIndexSymbol | undefined
 function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationSummary, fileSummary?: DocumentationFileChange, content = "", cache?: Map<string, CodeIndexSymbol[]>): CodeIndexSymbol[] {
   const cached = cache?.get(file.path);
   if (cached) return cached;
+  const documentRanges = documentReadRanges(file.path, content, taskSummary);
+  if (documentRanges) {
+    cache?.set(file.path, documentRanges);
+    return documentRanges;
+  }
   const taskSpecific = extractTaskSpecificRanges(file.path, content, taskSummary);
   // taskSummary/fileSummary are fixed for this whole sort — compute their
   // (regex-heavy) token derivation ONCE instead of inside codeMapRangeScore,
@@ -3959,6 +4054,88 @@ function indexedReadCandidates(file: CodeIndexFile, taskSummary?: DocumentationS
   const result = dedupeOverlappingRanges(sorted);
   cache?.set(file.path, result);
   return result;
+}
+
+const SMALL_DOCUMENT_LINES = 40;
+const DOCUMENT_RANGE_LIMIT = 3;
+
+/**
+ * Task-relevant sections of a Markdown or JSON file (see document-ranges.ts
+ * for structure). Each section is scored with the same generic primitives
+ * as code: rarity-weighted task-term overlap (heading/key words count
+ * triple), exact identifiers from the task, and structured identifiers
+ * ("phase5h"). Only sections with a positive score are returned, best
+ * first, labelled with what they are and what matched. Undefined means "no
+ * structure to use" (not a doc, minified JSON, no headings) — the caller's
+ * existing symbol/token ranges apply. A small document, or a task that
+ * explicitly asks for a whole-document review, gets one whole-file range.
+ */
+function documentReadRanges(path: string, content: string, summary?: DocumentationSummary): CodeIndexSymbol[] | undefined {
+  if (!summary || !content.trim()) return undefined;
+  const isMarkdown = /\.mdx?$/i.test(path);
+  if (!isMarkdown && !/\.json$/i.test(path)) return undefined;
+  const lineCount = content.replace(/\n+$/, "").split(/\r?\n/).length;
+  const taskText = taskRoutingText(summary);
+  const wholeRequested = /\b(?:entire|whole|full)\s+(?:doc|document|file)|\breview\s+the\s+(?:whole|entire)|전체\s*(?:문서|파일)|문서\s*전체/i.test(taskText);
+  if (lineCount <= SMALL_DOCUMENT_LINES || wholeRequested) {
+    return [{
+      name: `whole document (${lineCount} lines)`,
+      kind: "block",
+      startLine: 1,
+      endLine: lineCount,
+      summary: wholeRequested ? "The task asks for the whole document." : "Short document; read it whole.",
+      editPoint: wholeRequested ? "The task asks for the whole document." : "Short document; read it whole.",
+      priority: 1
+    }];
+  }
+  const sections = isMarkdown ? markdownSections(content) : jsonSections(content);
+  if (sections.length === 0) return undefined;
+  const taskTokens = withoutNegatedTokens(meaningfulRankingTokens(taskText), summary);
+  const weights = taskTokenWeights(summary, taskTokens);
+  const identifiers = [...withoutNegatedTokens(explicitCodeTokens(taskText), summary)].filter((token) => isIdentifierShaped(token));
+  const structuredIds = new Set(structuredIdentifierTokens(taskText));
+  const scored = sections
+    // A top-level heading spanning (almost) the whole file is the document
+    // itself, not a focused section.
+    .filter((section) => !(section.kind === "markdown" && section.endLine - section.startLine + 1 >= lineCount * 0.8 && sections.length > 1))
+    .map((section) => scoreDocumentSection(section, taskTokens, weights, identifiers, structuredIds))
+    .filter((entry) => entry.score > 0)
+    .sort((a, b) => b.score - a.score || a.section.startLine - b.section.startLine);
+  if (scored.length === 0) return undefined;
+  const ranges = scored.map(({ section, matched, score }) => {
+    const label = section.kind === "markdown" ? `markdown heading: ${section.name}` : section.kind === "json-key" ? `json key: ${section.name}` : `json item: ${section.name}`;
+    const reason = `Matches ${matched.slice(0, 4).join(", ")}.`;
+    return {
+      name: truncateLine(label, 64),
+      kind: "block" as const,
+      startLine: section.startLine,
+      endLine: section.endLine,
+      summary: reason,
+      editPoint: reason,
+      priority: score >= 8 ? 0 : 2
+    };
+  });
+  return dedupeOverlappingRanges(ranges).slice(0, DOCUMENT_RANGE_LIMIT);
+}
+
+function scoreDocumentSection(section: DocumentSection, taskTokens: Set<string>, weights: Map<string, number> | undefined, identifiers: string[], structuredIds: Set<string>): { section: DocumentSection; score: number; matched: string[] } {
+  const nameTokens = meaningfulRankingTokens(section.name);
+  const bodyTokens = meaningfulRankingTokens(section.text);
+  const normalizedBody = normalizeCodeToken(section.text);
+  const matched: string[] = [];
+  let score = weightedOverlap(taskTokens, nameTokens, weights) * 3 + weightedOverlap(taskTokens, bodyTokens, weights);
+  for (const token of taskTokens) if (nameTokens.has(token) || bodyTokens.has(token)) matched.push(token);
+  for (const identifier of identifiers) {
+    if (normalizedBody.includes(normalizeCodeToken(identifier))) {
+      score += 4;
+      matched.unshift(identifier);
+    }
+  }
+  for (const id of structuredIds) {
+    if (nameTokens.has(id)) score += 4;
+    else if (bodyTokens.has(id)) score += 2;
+  }
+  return { section, score, matched: [...new Set(matched)] };
 }
 
 function extractTaskSpecificRanges(file: string, content: string, taskSummary?: DocumentationSummary): CodeIndexSymbol[] {
