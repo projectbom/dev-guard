@@ -107,6 +107,9 @@ const OPTIONS_WITH_VALUE: Record<string, Set<string>> = {
   jq: new Set(["--arg", "--argjson", "-f"]),
   nl: new Set(["-b", "-s", "-w", "-v", "-i"])
 };
+const INLINE_SCRIPT = /^(?:env\s+(?:-\S+\s+)*(?:\w+=\S*\s+)*)?(?:python3?|node)\b[^\n]*(?:<<|\s-c\s|\s-e\s)/;
+/** `Path('dir') / 'file.json'` and `os.path.join('dir', 'file.json')` — both parts literal. */
+const LITERAL_PATH_JOIN = /Path\(\s*['"]([\w./()@-]+)['"]\s*\)\s*\/\s*['"]([\w.()@-]+\.[A-Za-z0-9]{1,8})['"]|os\.path\.join\(\s*['"]([\w./()@-]+)['"]\s*,\s*['"]([\w.()@-]+\.[A-Za-z0-9]{1,8})['"]\s*\)/g;
 const PATH_LITERAL = /['"]((?:\.{1,2}\/|\/)?[A-Za-z0-9_@.()[\]-]+(?:\/[A-Za-z0-9_@.()[\]-]+)*\.[A-Za-z0-9]{1,8})['"]/g;
 
 export type SearchScope = "broad" | "targeted" | "external" | "unknown";
@@ -149,14 +152,14 @@ export function classifyCommand(command: string, parsed: ParsedCommandPart[], cw
   const searchScopes: SearchScope[] = [];
   let workingDir = cwd;
   let writes = false;
-  const isScript = /^(?:python3?|node)\b[^\n]*(?:<<|\s-c\s|\s-e\s)/.test(text);
-  if (isScript) {
-    // Inline script: repository files it names in string literals and that
-    // exist on disk. Anything it cannot prove stays unknown (OTHER).
-    for (const match of text.matchAll(PATH_LITERAL)) addRead(reads, match[1], workingDir, root, fileExists);
-    writes = /open\([^)]*['"][wa]\+?['"]|\.write_text\(|\.write_bytes\(|writeFileSync|\.write\(/.test(text);
-  } else {
-    for (const statement of splitStatements(text)) {
+  // Also after a `cd dir &&` / `env -i VAR=…` prefix, as agents usually run them.
+  const scriptStatement = splitStatements(text).find((statement) => INLINE_SCRIPT.test(statement));
+  const isScript = Boolean(scriptStatement);
+  // Shell statements before an inline script are parsed as usual; the
+  // script body itself never is (it is not shell).
+  const shellPart = scriptStatement ? text.slice(0, text.indexOf(scriptStatement)) : text;
+  {
+    for (const statement of splitStatements(shellPart)) {
       const pipeline = splitPipeline(statement);
       for (const [position, segment] of pipeline.entries()) {
         const words = shellWords(segment);
@@ -197,6 +200,15 @@ export function classifyCommand(command: string, parsed: ParsedCommandPart[], cw
         }
       }
     }
+  }
+  if (isScript) {
+    // Inline script: repository files it names in string literals and that
+    // exist on disk. Anything it cannot prove stays unknown (OTHER).
+    const script = text.slice(shellPart.length);
+    for (const match of script.matchAll(PATH_LITERAL)) addRead(reads, match[1], workingDir, root, fileExists);
+    // A literal directory joined with a literal file name is just as observable.
+    for (const match of script.matchAll(LITERAL_PATH_JOIN)) addRead(reads, `${match[1] ?? match[3]}/${match[2] ?? match[4]}`, workingDir, root, fileExists);
+    writes ||= /open\([^)]*['"][wa]\+?['"]|\.write_text\(|\.write_bytes\(|writeFileSync|\.write\(/.test(script);
   }
   for (const part of parsed) {
     if (part.type === "read" && part.path && part.path.includes("/")) addRead(reads, part.path, cwd, root, fileExists);

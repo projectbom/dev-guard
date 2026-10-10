@@ -52,6 +52,10 @@ export interface TaskEfficiency {
   peakContextUse?: number;
   /** Provided files read exactly once and never edited — suggestions that cost initial context but were not used further. */
   unusedSuggestionReads: { files: number; estTokens: number };
+  /** Repo files the agent read that DevGuard did not provide (excluding files the task edits) — inputs it had to find itself. */
+  nonProvidedReads: { files: number; estTokens: number };
+  /** Provided Markdown/JSON read more than once without being edited — the given ranges were not enough; re-read cost only. */
+  providedDocRereads: { files: number; estTokens: number };
   /** Repo files read/edited plus provided files (max 30) — for workstream overlap. */
   touchedFiles: string[];
 }
@@ -75,7 +79,16 @@ export type RolloverState = "CONTINUE" | "NEW_THREAD_SOON" | "NEW_THREAD_RECOMME
 // --- Problem-first view (developer dashboard) ------------------------------
 
 export type ContextHealth = "GOOD" | "NEEDS_ATTENTION" | "POOR";
-export type IssueId = "CONTEXT_PRESSURE" | "DOC_REREADS" | "BROAD_SEARCH" | "UNUSED_SUGGESTIONS" | "SUGGESTIONS_MISSED" | "CONTEXT_OVERHEAD" | "EXPLORATION_HEAVY";
+export type IssueId =
+  | "CONTEXT_PRESSURE"
+  | "DOC_REREADS"
+  | "BROAD_SEARCH"
+  | "MISSING_REQUIRED_INPUTS"
+  | "INSUFFICIENT_DOCUMENT_RANGES"
+  | "UNUSED_SUGGESTIONS"
+  | "SUGGESTIONS_MISSED"
+  | "CONTEXT_OVERHEAD"
+  | "EXPLORATION_HEAVY";
 
 export interface ContextIssue {
   id: IssueId;
@@ -87,6 +100,8 @@ export interface ContextIssue {
   /** One sentence: what to do. */
   action: string;
   evidence: EvidenceKind;
+  /** Estimated tokens this issue accounts for — context-cost issues are ranked by it, largest first. */
+  impactTokens?: number;
 }
 
 export type ContextGroup = "DEVGUARD" | "CODE" | "SEARCH" | "VALIDATION" | "CONTEXT_MANAGEMENT" | "OTHER";
@@ -131,10 +146,33 @@ export function contextIssues(task: TaskEfficiency): ContextIssue[] {
   if (task.broadSearchCalls >= 3 || (task.broadSearchCalls > 0 && task.searchBeforeProvidedRead)) {
     issues.push({ id: "BROAD_SEARCH", severity: task.broadSearchCalls >= 3 ? "strong" : "mild", issue: "The agent searched the whole repository instead of starting from DevGuard's suggestions.", why: `${task.broadSearchCalls} repository-wide search(es)${task.searchBeforeProvidedRead ? ", before any suggested file was opened" : ""}.`, action: "Open DevGuard target ranges before searching the repository.", evidence: "OBSERVED" });
   }
-  if (task.unusedSuggestionReads.files >= 3 && task.unusedSuggestionReads.estTokens >= 3000) {
-    issues.push({ id: "UNUSED_SUGGESTIONS", severity: "mild", issue: "Too much initial context was spent on suggested files the task did not use further.", why: `${task.unusedSuggestionReads.files} suggested files (~${fmtK(task.unusedSuggestionReads.estTokens)} estimated tokens) were read once and never used again.`, action: "Read TARGET files first; open CANDIDATE files only when the targets are not enough.", evidence: "INFERRED" });
+  const missing = task.nonProvidedReads;
+  if (missing.estTokens >= 8000 && share(missing.estTokens, total) >= 15) {
+    issues.push({
+      id: "MISSING_REQUIRED_INPUTS",
+      severity: share(missing.estTokens, total) >= 30 ? "strong" : "mild",
+      issue: "The agent read many files DevGuard did not plan — required inputs were missing from the read plan.",
+      why: `${missing.files} file(s) DevGuard did not provide (~${fmtK(missing.estTokens)} estimated tokens, ${share(missing.estTokens, total)}% of this task) were read.`,
+      action: "Pass the files the user named as explicitInputs to prepare_task_context; DevGuard then plans them, and the scripts their evidence names, as one read plan.",
+      evidence: "INFERRED",
+      impactTokens: missing.estTokens
+    });
   }
-  if (task.candidateUtilization && task.candidateUtilization.of >= 3 && task.candidateUtilization.used / task.candidateUtilization.of < 0.4) {
+  if (task.providedDocRereads.files >= 1 && task.providedDocRereads.estTokens >= 2000) {
+    issues.push({
+      id: "INSUFFICIENT_DOCUMENT_RANGES",
+      severity: "mild",
+      issue: "Planned document ranges were not enough — the agent re-read the same documents.",
+      why: `${task.providedDocRereads.files} provided document(s) were read again (~${fmtK(task.providedDocRereads.estTokens)} estimated tokens of re-reads).`,
+      action: "Read a WHOLE_FILE target once; for large documents read the planned sections, then only the one missing section.",
+      evidence: "INFERRED",
+      impactTokens: task.providedDocRereads.estTokens
+    });
+  }
+  if (task.unusedSuggestionReads.files >= 3 && task.unusedSuggestionReads.estTokens >= 3000) {
+    issues.push({ id: "UNUSED_SUGGESTIONS", severity: "mild", issue: "Too much initial context was spent on suggested files the task did not use further.", why: `${task.unusedSuggestionReads.files} suggested files (~${fmtK(task.unusedSuggestionReads.estTokens)} estimated tokens) were read once and never used again.`, action: "Read TARGET files first; open CANDIDATE files only when the targets are not enough.", evidence: "INFERRED", impactTokens: task.unusedSuggestionReads.estTokens });
+  }
+  if (!issues.some((item) => item.id === "MISSING_REQUIRED_INPUTS") && task.candidateUtilization && task.candidateUtilization.of >= 3 && task.candidateUtilization.used / task.candidateUtilization.of < 0.4) {
     issues.push({ id: "SUGGESTIONS_MISSED", severity: "mild", issue: "Most files the agent worked with were not DevGuard suggestions.", why: `Only ${task.candidateUtilization.used} of the first ${task.candidateUtilization.of} files used were suggested.`, action: "Name the target area or files in the task description so DevGuard can suggest them.", evidence: "INFERRED" });
   }
   const overhead = share(task.costByCategory.FALLBACK_DOCS + task.costByCategory.ADMIN, total);
@@ -145,8 +183,16 @@ export function contextIssues(task: TaskEfficiency): ContextIssue[] {
   if (exploration >= 50 && task.modeTokens.EXPLORATION > 2 * task.modeTokens.IMPLEMENTATION) {
     issues.push({ id: "EXPLORATION_HEAVY", severity: "mild", issue: "The agent is spending more context finding files than implementing.", why: `Exploration is ${exploration}% of estimated context vs ${share(task.modeTokens.IMPLEMENTATION, total)}% implementation.`, action: "Narrow the task to a specific area or file before reading further.", evidence: "INFERRED" });
   }
-  const order: IssueId[] = ["CONTEXT_PRESSURE", "DOC_REREADS", "BROAD_SEARCH", "UNUSED_SUGGESTIONS", "SUGGESTIONS_MISSED", "CONTEXT_OVERHEAD", "EXPLORATION_HEAVY"];
-  return issues.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === "strong" ? -1 : 1) || order.indexOf(a.id) - order.indexOf(b.id));
+  // Workflow violations first (fixed order); context-cost issues by the
+  // estimated tokens they account for, so the primary issue is the largest
+  // real source, not whichever rule happens to be listed first.
+  const order: IssueId[] = ["CONTEXT_PRESSURE", "DOC_REREADS", "BROAD_SEARCH", "MISSING_REQUIRED_INPUTS", "INSUFFICIENT_DOCUMENT_RANGES", "UNUSED_SUGGESTIONS", "SUGGESTIONS_MISSED", "CONTEXT_OVERHEAD", "EXPLORATION_HEAVY"];
+  return issues.sort(
+    (a, b) =>
+      (a.severity === b.severity ? 0 : a.severity === "strong" ? -1 : 1) ||
+      (a.impactTokens !== undefined && b.impactTokens !== undefined ? b.impactTokens - a.impactTokens : 0) ||
+      order.indexOf(a.id) - order.indexOf(b.id)
+  );
 }
 
 export function contextHealth(issues: ContextIssue[]): ContextHealth {
@@ -304,6 +350,7 @@ export function aggregateTask(window: TaskWindow, events: ActivityEvent[], userT
   const provided = new Set(window.providedFiles.length ? window.providedFiles : inWindow.find((event) => event.providedPaths?.length)?.providedPaths ?? []);
   const usedOrder: string[] = [];
   const providedReadCounts = new Map<string, { reads: number; estTokens: number }>();
+  const otherReadTokens = new Map<string, number>();
   const fallbackDocCounts = new Map<string, number>();
   let searchCalls = 0;
   let broadSearchCalls = 0;
@@ -336,6 +383,7 @@ export function aggregateTask(window: TaskWindow, events: ActivityEvent[], userT
           entry.estTokens += Math.round(event.estTokens / paths.length);
           providedReadCounts.set(path, entry);
         }
+        if (!provided.has(path) && event.category === "CODE_READS") otherReadTokens.set(path, (otherReadTokens.get(path) ?? 0) + Math.round(event.estTokens / paths.length));
       }
     }
   }
@@ -374,7 +422,13 @@ export function aggregateTask(window: TaskWindow, events: ActivityEvent[], userT
     touchedFiles: [...new Set([...usedOrder, ...provided])].slice(0, 30),
     unusedSuggestionReads: [...providedReadCounts.entries()]
       .filter(([path, entry]) => entry.reads === 1 && !editedPaths.has(path))
-      .reduce((sum, [, entry]) => ({ files: sum.files + 1, estTokens: sum.estTokens + entry.estTokens }), { files: 0, estTokens: 0 })
+      .reduce((sum, [, entry]) => ({ files: sum.files + 1, estTokens: sum.estTokens + entry.estTokens }), { files: 0, estTokens: 0 }),
+    nonProvidedReads: [...otherReadTokens.entries()]
+      .filter(([path]) => !editedPaths.has(path))
+      .reduce((sum, [, estTokens]) => ({ files: sum.files + 1, estTokens: sum.estTokens + estTokens }), { files: 0, estTokens: 0 }),
+    providedDocRereads: [...providedReadCounts.entries()]
+      .filter(([path, entry]) => entry.reads > 1 && !editedPaths.has(path) && /\.(?:mdx?|json)$/i.test(path))
+      .reduce((sum, [, entry]) => ({ files: sum.files + 1, estTokens: sum.estTokens + Math.round((entry.estTokens * (entry.reads - 1)) / entry.reads) }), { files: 0, estTokens: 0 })
   };
 }
 

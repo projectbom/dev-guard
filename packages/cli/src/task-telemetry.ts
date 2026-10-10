@@ -84,8 +84,14 @@ export interface TaskTelemetryEvent {
    */
   taskPreparedAt?: string;
   firstChangeObservedAt?: string;
-  /** TASK_PREPARED/CONTINUED/REPLACED: repo-relative paths prepare_task_context provided (max 8; paths only). */
+  /** TASK_PREPARED/CONTINUED/REPLACED: repo-relative paths prepare_task_context provided (max 16; paths only). */
   providedFiles?: string[];
+  /** TASK_PREPARED/CONTINUED/REPLACED: validated user-named inputs planned as TARGETs (count only). */
+  explicitInputCount?: number;
+  /** TASK_PREPARED/CONTINUED/REPLACED: one-hop references planned from structured TARGETs. */
+  referenceFileCount?: number;
+  /** TASK_PREPARED/CONTINUED/REPLACED: estimated tokens of the planned TARGET reads (characters / 4). Never provider-billed. */
+  plannedInitialTokens?: number;
   /** TASK_PREPARED/CONTINUED/REPLACED: the subset of providedFiles marked TARGET (read first). */
   providedTargets?: string[];
   /** TASK_PREPARED/CONTINUED/REPLACED: number of line ranges provided across those files. */

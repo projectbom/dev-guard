@@ -10,9 +10,9 @@
  */
 
 export interface DocumentSection {
-  /** "markdown heading" | "json key" | "json item" */
-  kind: "markdown" | "json-key" | "json-item";
-  /** Heading text, top-level key, or `key[index]` (with an id hint when the element has one). */
+  /** "markdown heading" | "json key" | "json item" | one nested key of a top-level object ("json child") */
+  kind: "markdown" | "json-key" | "json-item" | "json-child";
+  /** Heading text, top-level key, `key[index]` (with an id hint when the element has one), or `parent.child`. */
   name: string;
   startLine: number;
   endLine: number;
@@ -46,7 +46,8 @@ export function markdownSections(content: string): DocumentSection[] {
     }
     if (fence) continue;
     const match = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
-    if (match) headings.push({ line: index + 1, level: match[1].length, text: match[2].replace(/[*_`]/g, "").trim() });
+    // Emphasis markers only: `ROUTE_500_CLASSIFICATION` keeps its underscores (it is a name, not __bold__).
+    if (match) headings.push({ line: index + 1, level: match[1].length, text: match[2].replace(/[*`]/g, "").replace(/(^|\s)__?(\S(?:.*?\S)?)__?(?=\s|$)/g, "$1$2").trim() });
   }
   return headings.map((heading, position) => {
     const nextAny = headings[position + 1]?.line ?? lines.length + 1;
@@ -80,7 +81,9 @@ function trimTrailingBlank(lines: string[], start: number, end: number): number 
  *
  * Returns top-level object properties, plus elements of top-level array
  * properties (with an id hint from the element's own `id`/`name`/`key`/
- * `code`/`case` string field). Minified or single-line JSON returns nothing
+ * `code`/`case` string field), plus the properties one level inside a
+ * top-level object value ("json child") so a very large object can be read
+ * part by part — never deeper. Minified or single-line JSON returns nothing
  * — a line range is meaningless there, and pretty-printing would invent
  * line numbers that do not exist in the file.
  */
@@ -102,6 +105,22 @@ export function jsonSections(content: string): DocumentSection[] {
   let elementIndex = 0;
   let elementKey: string | undefined;
   let rootIsObject = false;
+  // One nested level: a property of the current top-level OBJECT value.
+  let child: { key: string; line: number; valueStart: number } | undefined;
+  let pendingChildKey: { value: string; line: number } | undefined;
+  let lastNonSpaceLine = 1;
+  const closeChild = (endOffset: number, endLine: number) => {
+    if (!child || !current) return;
+    sections.push({
+      kind: "json-child",
+      name: `${current.key}.${child.key}`,
+      startLine: child.line,
+      endLine,
+      text: `${current.key} ${child.key}\n${content.slice(child.valueStart, Math.min(endOffset + 1, child.valueStart + MAX_SECTION_TEXT))}`,
+      level: 1
+    });
+    child = undefined;
+  };
 
   const closeCurrent = (endOffset: number, endLine: number) => {
     if (!current) return;
@@ -123,6 +142,9 @@ export function jsonSections(content: string): DocumentSection[] {
   let lastValueLine = 1;
   for (let offset = 0; offset < content.length; offset += 1) {
     const char = content[offset];
+    // Line of the last non-space character BEFORE this one.
+    const previousNonSpaceLine = lastNonSpaceLine;
+    if (!/\s/.test(char)) lastNonSpaceLine = line;
     if (char === "\n") line += 1;
     else if (!/\s/.test(char) && char !== "}" && char !== "]") lastValueLine = line;
     if (inString) {
@@ -141,6 +163,10 @@ export function jsonSections(content: string): DocumentSection[] {
       continue;
     }
     if (char === '"') {
+      if (depth === 2 && pendingChildKey) {
+        child = { key: pendingChildKey.value, line: pendingChildKey.line, valueStart: offset };
+        pendingChildKey = undefined;
+      }
       if (depth === 1 && pendingKey) {
         current = { key: pendingKey.value, line: pendingKey.line, valueStart: offset, isArray: false };
         pendingKey = undefined;
@@ -151,12 +177,17 @@ export function jsonSections(content: string): DocumentSection[] {
     }
     if (char === ":") {
       if (depth === 1 && rootIsObject && lastString) pendingKey = lastString;
+      if (depth === 2 && current && !current.isArray && lastString) pendingChildKey = lastString;
       if (element && depth === 3 && lastString) elementKey = lastString.value;
       lastString = undefined;
       continue;
     }
     if (char === "{" || char === "[") {
       if (depth === 0) rootIsObject = char === "{";
+      if (depth === 2 && pendingChildKey) {
+        child = { key: pendingChildKey.value, line: pendingChildKey.line, valueStart: offset };
+        pendingChildKey = undefined;
+      }
       depth += 1;
       if (depth === 2 && pendingKey && rootIsObject) {
         current = { key: pendingKey.value, line: pendingKey.line, valueStart: offset, isArray: char === "[" };
@@ -169,6 +200,7 @@ export function jsonSections(content: string): DocumentSection[] {
     }
     if (char === "}" || char === "]") {
       if (depth === 3 && element) captureIdHint();
+      if (depth === 2 && child) closeChild(offset - 1, previousNonSpaceLine);
       if (depth === 1 && current) closeCurrent(offset - 1, lastValueLine);
       if (depth === 3 && element && current) {
         sections.push({
@@ -186,6 +218,7 @@ export function jsonSections(content: string): DocumentSection[] {
       continue;
     }
     if (char === ",") {
+      if (depth === 2 && child) closeChild(offset - 1, previousNonSpaceLine);
       if (depth === 2 && current?.isArray) elementIndex += 1;
       if (element && depth === 3) captureIdHint();
       if (depth === 1 && current) {
@@ -195,6 +228,11 @@ export function jsonSections(content: string): DocumentSection[] {
       elementKey = depth === 3 ? undefined : elementKey;
       lastString = undefined;
       continue;
+    }
+    if (depth === 2 && pendingChildKey && !/\s/.test(char)) {
+      // Scalar value of a nested property starts here.
+      child = { key: pendingChildKey.value, line: pendingChildKey.line, valueStart: offset };
+      pendingChildKey = undefined;
     }
     if (depth === 1 && pendingKey && !/\s/.test(char)) {
       // Scalar value of a top-level property starts here.

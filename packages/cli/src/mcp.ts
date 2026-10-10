@@ -29,7 +29,14 @@ async function readOwnPackageVersion(): Promise<string> {
 }
 
 const toolInputSchema = {
-  task: z.string().min(1).describe("Current coding task. Call before searching or reading project source files."),
+  task: z.string().min(1).describe("Current coding task. Call before searching or reading project source files. Keep any file paths the user named."),
+  explicitInputs: z
+    .array(z.string().min(1))
+    .max(60)
+    .optional()
+    .describe(
+      "Repository-relative files the user explicitly told you to read or use for this task (e.g. a \"read first\" / \"반드시 먼저 읽기\" list), copied verbatim — one path per entry, combining a listed directory with each file listed under it. DevGuard returns them as TARGETs with fitting ranges and folds its own suggestions around them into one read plan. Paths only, never the prompt text."
+    ),
   continueCurrentTask: z
     .boolean()
     .optional()
@@ -66,15 +73,16 @@ export async function runMcpServer(root: string): Promise<void> {
     {
       title: "Prepare DevGuard task context",
       description:
-        "Call this once at the start of every new coding task, before searching or reading project source files — this is DevGuard's only signal that a new task has begun, so a bare call always starts a clean task lineage (see continueCurrentTask for the one exception). It uses the local DevGuard Code Index to return TARGET files to read first (CANDIDATE files only if the targets are not enough — never batch-read them all), source-tagged constraints, a next action, unresolved validation from the previous task, and rollover advice. Read the returned ranges before any repository-wide search, and do not also read DevGuard's markdown reports when this result is sufficient. Start each distinct task in a fresh agent thread. After you run a build/test/manual check for this task, report it with record_validation_result so Quality Report/Handoff reflect real evidence.",
+        "Call this once at the start of every new coding task, before searching or reading project source files — this is DevGuard's only signal that a new task has begun, so a bare call always starts a clean task lineage (see continueCurrentTask for the one exception). Pass any files the user named in `explicitInputs`. It uses the local DevGuard Code Index to return TARGET files to read first (CANDIDATE files only if the targets are not enough — never batch-read them all), source-tagged constraints, a next action, unresolved validation from the previous task, and rollover advice. Read the returned ranges before any repository-wide search, and do not also read DevGuard's markdown reports when this result is sufficient. Start each distinct task in a fresh agent thread. After you run a build/test/manual check for this task, report it with record_validation_result so Quality Report/Handoff reflect real evidence.",
       inputSchema: toolInputSchema
     },
-    async ({ task, continueCurrentTask, projectRoot }, extra) => {
+    async ({ task, explicitInputs, continueCurrentTask, projectRoot }, extra) => {
       try {
         const project = await resolveMcpProjectRoot(root, projectRoot);
         const result = await prepareTaskContext({
           root: project,
           task,
+          explicitInputs,
           continueCurrentTask,
           persistTask: true,
           caller: identityFromMcpContext(process.env, extra?._meta),
@@ -118,12 +126,13 @@ export async function runMcpServer(root: string): Promise<void> {
     {
       title: "Record DevGuard validation evidence",
       description:
-        "Call this after you actually run a build, typecheck, test, lint, manual QA step, or runtime smoke check (e.g. a real API call, DB check, or browser check) outside of DevGuard. It records the real PASS/FAIL/UNKNOWN result so the next Quality Report and Handoff reflect actual evidence instead of showing 'not recorded'. Only call this for checks you actually ran — never to report work you did not verify. Call prepare_task_context before recording validation for a new task: results are bound to the currently active DevGuard task (see the returned `taskBinding` field). If there is no active task, the evidence is recorded as UNBOUND and will not be used as current-task PASS/FAIL verification, even once a task is later declared — call prepare_task_context first, then record again.",
+        "Call this after you actually run a build, typecheck, test, lint, manual QA step, or runtime smoke check (e.g. a real API call, DB check, or browser check) outside of DevGuard. It records the real PASS/FAIL/UNKNOWN result so the next Quality Report and Handoff reflect actual evidence instead of showing 'not recorded'. Only call this for checks you actually ran — never to report work you did not verify. Call prepare_task_context before recording validation for a new task: results are bound to the currently active DevGuard task (see the returned `taskBinding` field). A check run right after `dev-guard done` in the same thread binds to the task just closed — no need to call prepare_task_context again for it. Otherwise, if there is no active task, the evidence is recorded as UNBOUND and will not be used as current-task PASS/FAIL verification, even once a task is later declared — call prepare_task_context first, then record again.",
       inputSchema: recordValidationInputSchema
     },
     async ({ kind, status, name, command, exitCode, summary, reason, projectRoot }, extra) => {
       try {
         const project = await resolveMcpProjectRoot(root, projectRoot);
+        const caller = identityFromMcpContext(process.env, extra?._meta);
         const result = await recordValidationEvidence({
           root: project,
           kind,
@@ -133,12 +142,13 @@ export async function runMcpServer(root: string): Promise<void> {
           exitCode,
           summary,
           reason,
-          source: "mcp-agent"
+          source: "mcp-agent",
+          caller
         });
         // During-task rollover: the thread's observed pressure rides along
         // with every validation, so the agent learns it is getting heavy
         // without any extra call. UNKNOWN when not observable.
-        const thread = await threadStateForAgent(project, identityFromMcpContext(process.env, extra?._meta)).catch(() => undefined);
+        const thread = await threadStateForAgent(project, caller).catch(() => undefined);
         return {
           content: [
             {

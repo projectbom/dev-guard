@@ -30,6 +30,7 @@ import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
 import { recordTaskTelemetry } from "./task-telemetry.js";
 import { jsonSections, markdownSections, type DocumentSection } from "./document-ranges.js";
+import { estimateRangeTokens, isStructuredDocument, planReferences, resolveExplicitInputs, wholeFileEligible, type ContextFileSource } from "./rehydration-plan.js";
 import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, threadUserNotice, toOwner, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
 import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
 
@@ -72,6 +73,8 @@ export interface BeforeAgentTask {
   text: string;
   source: "explicit-before-agent-input";
   createdAt: string;
+  /** Validated repo-relative paths the user named for this task (see PrepareTaskContextInput.explicitInputs). */
+  explicitInputs?: string[];
   /**
    * Task Boundary baseline: the set of files already dirty (changed-but-
    * uncommitted) at the moment THIS task/session lineage began — i.e.
@@ -163,6 +166,14 @@ export interface QAExecutionResult {
    * for safety (a false PASS is worse than an honest "not attributable").
    */
   taskBinding?: "BOUND" | "UNBOUND";
+  /**
+   * "completed-task": BOUND as a follow-up of the task that was just
+   * closed (no task active, but recorded in that task's lineage shortly
+   * after its `done`, from its own thread when observable) — so an agent
+   * never has to re-open the task with prepare_task_context just to attach
+   * a late check.
+   */
+  bindingScope?: "completed-task";
 }
 
 export interface RecordValidationEvidenceInput {
@@ -175,6 +186,8 @@ export interface RecordValidationEvidenceInput {
   reason?: string;
   source?: ValidationEvidenceSource;
   exitCode?: number;
+  /** Observed calling thread (MCP only) — used to keep follow-up evidence on the thread that closed the task. */
+  caller?: ObservedThreadIdentity;
 }
 
 export interface SetupStatus {
@@ -237,7 +250,32 @@ export interface ProjectState {
    * finalization leaves this alone — it is the workstream-continuity anchor.
    */
   lastClosedTaskGoal?: string;
+  /**
+   * What the working tree looked like at the last finalization of a task
+   * lineage (TASK_DONE or a follow-up of it). A later finalization in the
+   * same lineage with no task open compares against THIS instead of
+   * reporting the whole dirty tree as its change set. Bounded: content
+   * hashes of the dirty files only (MISSING_FILE_HASH for a dirty path that
+   * no longer exists), capped at POST_COMPLETION_BASELINE_LIMIT files.
+   */
+  postCompletionBaseline?: PostCompletionBaseline;
 }
+
+export interface PostCompletionBaseline {
+  sessionId: string;
+  completedAt: string;
+  codeStateHash?: string;
+  /** Hashed owner thread of the completed task, when one was observed. */
+  ownerThreadHash?: string;
+  fileHashes: Record<string, string>;
+  /** The completed task's own files (task-scoped, plus its follow-ups'), capped. */
+  taskFiles: string[];
+}
+
+const POST_COMPLETION_BASELINE_LIMIT = 5000;
+const MISSING_FILE_HASH = "-";
+/** How long after a task closes a validation recorded in its lineage still counts as that task's follow-up evidence. */
+const FOLLOW_UP_VALIDATION_WINDOW_MS = 60 * 60 * 1000;
 
 export interface DoneProcessingResult {
   /**
@@ -303,6 +341,13 @@ export interface BeforeAgentPreparationResult {
 export interface PrepareTaskContextInput {
   root: string;
   task: string;
+  /**
+   * Files the user explicitly told the agent to read/use (repo-relative).
+   * Strong authority: validated (exists, inside the repo, not generated)
+   * and planned as TARGETs ahead of any ranked suggestion. Only the
+   * normalized paths are kept — never the prompt they came from.
+   */
+  explicitInputs?: readonly string[];
   persistTask?: boolean;
   /**
    * Task identity contract: a bare `prepare_task_context` call always starts
@@ -370,6 +415,18 @@ export interface PreparedTaskContextResult extends BeforeAgentPreparationResult 
   scope: { carriedOverDirtyFiles: number; warning?: string };
   /** Up to 3 unresolved (FAIL/UNKNOWN) results the previous task left behind. */
   openValidation: string[];
+  /** The canonical read order for a fresh thread — see rehydration-plan.ts. */
+  readPlan: PreparedReadPlan;
+}
+
+export interface PreparedReadPlan {
+  /** TARGETs: explicit user inputs first, then routed targets. */
+  required: { files: number; estimatedTokens: number };
+  /** CANDIDATEs (first range each): open only for a gap the TARGETs leave. */
+  ifNeeded: { files: number; estimatedTokens: number };
+  explicitInputs: { captured: number; rejected: number };
+  /** One-hop references DevGuard added from structured TARGETs. */
+  references: number;
 }
 
 /**
@@ -387,10 +444,16 @@ export function toAgentContextPayload(result: PreparedTaskContextResult): Record
       path: file.path,
       role: file.role ?? (file.relevance === "Reference" ? "REFERENCE" : "CANDIDATE"),
       reason: truncateLine(file.reason, file.role === "TARGET" ? 160 : 100),
+      ...(file.source ? { source: file.source } : {}),
       // Targets carry their ranges; candidates/references only the first one,
       // so nothing invites batch-reading every suggestion up front.
-      ranges: file.ranges.slice(0, file.role === "TARGET" ? 3 : 1).map((range) => ({ lines: `${range.startLine}-${range.endLine}`, label: range.label }))
+      ranges: file.ranges.slice(0, file.role === "TARGET" ? 3 : 1).map((range) => ({ lines: `${range.startLine}-${range.endLine}`, label: range.label, ...(range.kind ? { kind: range.kind } : {}) }))
     })),
+    readPlan: {
+      ...result.readPlan,
+      estimateBasis: "characters of the planned files/ranges / 4 — not a provider token count",
+      order: "1) every TARGET (user-named inputs first) with its ranges — WHOLE_FILE means read it once, whole; 2) a CANDIDATE only for a gap the TARGETs leave; 3) search only if both leave a gap."
+    },
     constraints: result.constraints,
     scope: result.scope,
     validation: {
@@ -429,6 +492,8 @@ export interface PreparedTaskContextFile {
   role?: "TARGET" | "CANDIDATE" | "REFERENCE";
   reason: string;
   ranges: PreparedTaskContextRange[];
+  /** Why it is in the plan when not by ranking: named by the user, by path in the task, or by a structured TARGET. */
+  source?: ContextFileSource;
 }
 
 export interface PreparedTaskContextRange {
@@ -437,6 +502,8 @@ export interface PreparedTaskContextRange {
   label: string;
   confidence: ContextConfidence;
   reason: string;
+  /** WHOLE_FILE: read this file once, whole — not "a file without ranges". */
+  kind?: "WHOLE_FILE";
 }
 
 export interface PreparedTaskValidationEntry {
@@ -611,6 +678,8 @@ export interface HistoryRecord {
   taskScopedChangedFiles?: string[];
   /** See DoneProcessingResult.carriedOverChangedFiles. */
   carriedOverChangedFiles?: string[];
+  /** A follow-up finalization of the task closed just before it (edits made after `done`), not a task of its own. */
+  followUp?: boolean;
 }
 
 interface PackageJson {
@@ -822,7 +891,30 @@ async function resolveCurrentCodeState(root: string): Promise<{ gitHead: string;
   return { gitHead, codeStateHash };
 }
 
-export async function recordQAExecutionResult(root: string, result: QAExecutionResult): Promise<QAExecutionResult> {
+/**
+ * Follow-up evidence for the task closed last: no task is open, but the
+ * session is still that task's lineage (no new prepare_task_context since),
+ * the task closed within FOLLOW_UP_VALIDATION_WINDOW_MS, and — when both
+ * threads are observable — the caller is the thread that owned it. An
+ * agent that skipped prepare_task_context for a NEW task records from a
+ * fresh thread or long after, and stays UNBOUND.
+ */
+async function isCompletedTaskFollowUp(root: string, runtime: RuntimeState, caller: ObservedThreadIdentity | undefined): Promise<boolean> {
+  const baseline = (await readProjectState(root)).postCompletionBaseline;
+  if (!baseline || !runtime.sessionId || baseline.sessionId !== runtime.sessionId) return false;
+  const age = Date.now() - Date.parse(baseline.completedAt);
+  if (!(age >= 0 && age <= FOLLOW_UP_VALIDATION_WINDOW_MS)) return false;
+  if (caller && baseline.ownerThreadHash && toOwner(caller).threadIdHash !== baseline.ownerThreadHash) return false;
+  // Work on anything outside the closed task's own files since its `done`
+  // is different work started without prepare_task_context: its evidence
+  // must not be credited to the closed task.
+  const { changedFiles } = await gatherCurrentChangeState(root, runtime);
+  const { changed, reverted } = await changedSinceCompletion(root, changedFiles, baseline);
+  const own = new Set(baseline.taskFiles ?? []);
+  return [...changed, ...reverted].every((file) => own.has(file));
+}
+
+export async function recordQAExecutionResult(root: string, result: QAExecutionResult, caller?: ObservedThreadIdentity): Promise<QAExecutionResult> {
   const current = await readRuntimeState(root);
   const sessionId = current.sessionId ?? generateSessionId();
   // Task Binding Contract: evidence is only "BOUND" — eligible to ever be
@@ -835,11 +927,13 @@ export async function recordQAExecutionResult(root: string, result: QAExecutionR
   // displayed. See partitionQaResultsByFreshness for how BOUND/UNBOUND is
   // consumed.
   const hasActiveTask = Boolean(current.currentTask?.text?.trim());
+  const followUpOfCompletedTask = !hasActiveTask && !result.taskBinding && (await isCompletedTaskFollowUp(root, current, caller));
   const { gitHead, codeStateHash } = await resolveCurrentCodeState(root);
   const stamped: QAExecutionResult = {
     ...result,
     sessionId: result.sessionId ?? sessionId,
-    taskBinding: result.taskBinding ?? (hasActiveTask ? "BOUND" : "UNBOUND"),
+    taskBinding: result.taskBinding ?? (hasActiveTask || followUpOfCompletedTask ? "BOUND" : "UNBOUND"),
+    ...(followUpOfCompletedTask ? { bindingScope: "completed-task" as const } : {}),
     gitHead: result.gitHead ?? (gitHead || undefined),
     codeStateHash: result.codeStateHash ?? codeStateHash
   };
@@ -901,7 +995,7 @@ export async function recordValidationEvidence(input: RecordValidationEvidenceIn
     source: input.source ?? "external",
     exitCode: input.exitCode
   };
-  return recordQAExecutionResult(input.root, result);
+  return recordQAExecutionResult(input.root, result, input.caller);
 }
 
 function resolveValidationKind(result: QAExecutionResult): ValidationEvidenceKind {
@@ -1502,6 +1596,7 @@ export async function processDoneEvent(root: string, options: { completionSource
   // duplicate case above, re-reading ProjectState (which the winner may
   // have just updated) rather than assuming it's a duplicate.
   let previousFinalizedSessionId: string | undefined;
+  let followUpDelta: { changed: string[]; reverted: string[]; ownerThreadHash?: string; taskFiles?: string[] } | undefined;
   if (!(await acquireFinalizeLock(root))) {
     await recordSignal(true);
     return buildAlreadyProcessedResult(await readProjectState(root));
@@ -1511,6 +1606,19 @@ export async function processDoneEvent(root: string, options: { completionSource
     if (isDuplicateFinalization(codeStateHash, runtime.sessionId, postLockProjectState)) {
       await recordSignal(true);
       return buildAlreadyProcessedResult(postLockProjectState);
+    }
+    // Follow-up of a closed task (no task open, same lineage): its change set
+    // is what moved since that task's own finalization — never the whole
+    // dirty tree. Nothing moved (e.g. the code state hash changed only
+    // through files outside the dirty set) is a no-op, not a follow-up.
+    const completed = postLockProjectState.postCompletionBaseline;
+    if (!runtime.currentTask && completed && completed.sessionId === runtime.sessionId) {
+      followUpDelta = { ...(await changedSinceCompletion(root, changedFiles, completed)), ownerThreadHash: completed.ownerThreadHash, taskFiles: completed.taskFiles };
+      if (followUpDelta.changed.length === 0 && followUpDelta.reverted.length === 0) {
+        await recordSignal(true);
+        await writeProjectState(root, { ...postLockProjectState, lastFinalizedCodeStateHash: codeStateHash });
+        return buildAlreadyProcessedResult(postLockProjectState);
+      }
     }
     await recordSignal(false);
     perfMark("done:lock-acquired,finalizeOnce-start");
@@ -1546,8 +1654,11 @@ export async function processDoneEvent(root: string, options: { completionSource
   // finalized is this task's own pre-prepare work and stays in scope.
   const previouslyFinalized = new Set((await readHistoryRecords(root, 1)).at(-1)?.changedFiles ?? []);
   const isCarriedOver = (file: string) => Boolean(taskBaseline?.includes(file)) && previouslyFinalized.has(file) && !editedBaselineFiles.has(file);
-  const taskScopedChangedFiles = taskBaseline ? changedFiles.filter((file) => !isCarriedOver(file)) : undefined;
-  const carriedOverChangedFiles = taskBaseline ? changedFiles.filter(isCarriedOver) : undefined;
+  // A follow-up of a closed task is scoped by what changed since that
+  // task's finalization (see changedSinceCompletion), not by a task baseline.
+  const followUpScope = followUpDelta ? new Set(followUpDelta.changed) : undefined;
+  const taskScopedChangedFiles = followUpScope ? changedFiles.filter((file) => followUpScope.has(file)) : taskBaseline ? changedFiles.filter((file) => !isCarriedOver(file)) : undefined;
+  const carriedOverChangedFiles = followUpScope ? changedFiles.filter((file) => !followUpScope.has(file)) : taskBaseline ? changedFiles.filter(isCarriedOver) : undefined;
   // Task-scoped documents: Quality Report / Handoff / Next Prompt / history
   // intent describe THIS task's files only. Carried-over dirty work is kept
   // as a count + warning (judgments below) and in history, never presented
@@ -1591,7 +1702,11 @@ export async function processDoneEvent(root: string, options: { completionSource
   });
   const areas = classifyAreas(documentFiles);
   const judgments = buildJudgments({ areas, clusters, checkFindings: checkReport.findings.map((finding) => finding.message), architectureMarkdown, decisionsMarkdown });
-  if (carriedOverChangedFiles && carriedOverChangedFiles.length > 0) {
+  if (followUpDelta) {
+    judgments.push(
+      `Follow-up of the task closed just before: only the ${followUpDelta.changed.length} file(s) changed since its \`done\` are this round's changes${followUpDelta.reverted.length > 0 ? `; ${followUpDelta.reverted.length} file(s) returned to their committed state` : ""}. The other ${carriedOverChangedFiles?.length ?? 0} dirty file(s) were already finalized and are excluded.`
+    );
+  } else if (carriedOverChangedFiles && carriedOverChangedFiles.length > 0) {
     judgments.push(
       `${carriedOverChangedFiles.length} file(s) were already dirty before this task started and were not edited by it; they are carried-over work from earlier tasks and are excluded from this task's report.`
     );
@@ -1675,7 +1790,8 @@ export async function processDoneEvent(root: string, options: { completionSource
     generatedPromptPath: promptPath,
     reportPath,
     taskScopedChangedFiles,
-    carriedOverChangedFiles
+    carriedOverChangedFiles,
+    ...(followUpDelta ? { followUp: true } : {})
   };
   const previousHistory = await readHistoryRecords(root, 20);
   const nextHistory = [...previousHistory, historyRecord];
@@ -1759,6 +1875,16 @@ export async function processDoneEvent(root: string, options: { completionSource
     nextTask,
     qualityReport
   });
+  // Completion baseline for a later follow-up in this lineage (see
+  // ProjectState.postCompletionBaseline). Only a task lineage has one.
+  const postCompletionBaseline = runtime.currentTask || followUpDelta
+    ? await buildPostCompletionBaseline(root, changedFiles, {
+        sessionId: runtime.sessionId ?? "",
+        codeStateHash,
+        ownerThreadHash: runtime.currentTask?.owner?.threadIdHash ?? followUpDelta?.ownerThreadHash,
+        taskFiles: [...(followUpDelta?.taskFiles ?? []), ...(taskScopedChangedFiles ?? [])]
+      })
+    : undefined;
   await Promise.all([
     perfSpan("done:write:history", () => appendTextFile(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`)),
     perfSpan("done:write:lastRunReport", () => writeTextFile(fromRoot(root, reportPath), reportMarkdown)),
@@ -1800,7 +1926,9 @@ export async function processDoneEvent(root: string, options: { completionSource
       // does not yet (or vice versa).
       lastFinalizedSessionId: runtime.sessionId,
       lastFinalizedCodeStateHash: codeStateHash,
-      ...(runtime.currentTask ? { lastTaskOwnerThreadHash: runtime.currentTask.owner?.threadIdHash, lastClosedTaskGoal: runtime.currentTask.text } : {})
+      ...(runtime.currentTask ? { lastTaskOwnerThreadHash: runtime.currentTask.owner?.threadIdHash, lastClosedTaskGoal: runtime.currentTask.text } : {}),
+      // A taskless finalization outside any task lineage ends the follow-up window.
+      postCompletionBaseline
     })),
     perfSpan("done:write:resetRuntimeState", () => resetRuntimeState(root, { preserveQaResults: true }))
   ]);
@@ -1875,6 +2003,35 @@ export async function processDoneEvent(root: string, options: { completionSource
     drift
   };
   } // end finalizeOnce
+}
+
+async function buildPostCompletionBaseline(root: string, changedFiles: string[], identity: { sessionId: string; codeStateHash?: string; ownerThreadHash?: string; taskFiles: string[] }): Promise<PostCompletionBaseline> {
+  const files = changedFiles.slice(0, POST_COMPLETION_BASELINE_LIMIT);
+  const hashes = await hashWorkingFiles(root, files);
+  return {
+    sessionId: identity.sessionId,
+    completedAt: new Date().toISOString(),
+    ...(identity.codeStateHash ? { codeStateHash: identity.codeStateHash } : {}),
+    ...(identity.ownerThreadHash ? { ownerThreadHash: identity.ownerThreadHash } : {}),
+    fileHashes: Object.fromEntries(files.map((file) => [file, hashes[file] ?? MISSING_FILE_HASH])),
+    taskFiles: [...new Set(identity.taskFiles)].slice(0, POST_COMPLETION_BASELINE_LIMIT)
+  };
+}
+
+/**
+ * What moved since a task's finalization: dirty files that are new or whose
+ * content (or existence) differs from the completion baseline, and baseline
+ * files that are no longer dirty (returned to their committed state).
+ */
+async function changedSinceCompletion(root: string, changedFiles: string[], baseline: PostCompletionBaseline): Promise<{ changed: string[]; reverted: string[] }> {
+  const recorded = baseline.fileHashes;
+  const known = changedFiles.filter((file) => recorded[file] !== undefined);
+  const now = await hashWorkingFiles(root, known);
+  const current = new Set(changedFiles);
+  return {
+    changed: changedFiles.filter((file) => recorded[file] === undefined || recorded[file] !== (now[file] ?? MISSING_FILE_HASH)),
+    reverted: Object.keys(recorded).filter((file) => !current.has(file))
+  };
 }
 
 async function baselineFilesEditedSince(root: string, task: BeforeAgentTask | undefined, changedFiles: string[]): Promise<Set<string>> {
@@ -1985,6 +2142,12 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   // change between calls) nor sufficient (two unrelated tasks can share
   // wording, e.g. "Run milestone verification") to prove task identity.
   const isContinuing = continueCurrentTask && Boolean(current.sessionId);
+  // Explicit user inputs: validated paths only (never the prompt). A
+  // continuing call without new ones keeps the lineage's own.
+  const explicitResolution = await resolveExplicitInputs(root, input.explicitInputs ?? [], isExcludedContextPath);
+  const explicitInputs = explicitResolution.accepted.length > 0 || input.explicitInputs?.length
+    ? explicitResolution.accepted
+    : isContinuing ? current.currentTask?.explicitInputs ?? [] : [];
   // Task Boundary Baseline: snapshot "what was already dirty before this
   // task touched anything," so a LATER task started in the same dirty
   // working tree doesn't silently inherit files left over from earlier,
@@ -2014,6 +2177,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     changedFilesAtCreation: baseline.changedFilesAtCreation,
     codeStateHashAtCreation: baseline.codeStateHashAtCreation,
     changedFileHashesAtCreation: baseline.changedFileHashesAtCreation,
+    ...(explicitInputs.length > 0 ? { explicitInputs } : {}),
     ...(caller ? { owner: toOwner(caller) } : isContinuing && current.currentTask?.owner ? { owner: current.currentTask.owner } : {})
   };
   perfMark("prepare:baseline-computed");
@@ -2069,19 +2233,46 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     ]);
     perfMark("prepare:fallbackArtifacts-generated");
     perfMark("prepare:pathHints-resolved");
-    const rankedFiles = readableContextFiles(context.files, context.summary, codeIndex, context.filesResolved).filter((file) => !pathHints.includes(file));
+    // Tier A: what the user named — explicit inputs, then paths in the task text.
+    const explicitSet = new Set(explicitInputs);
+    const taskPathHints = pathHints.filter((file) => !explicitSet.has(file));
+    const tierA = [...explicitInputs, ...taskPathHints];
+    const rankedFiles = readableContextFiles(context.files, context.summary, codeIndex, context.filesResolved).filter((file) => !tierA.includes(file));
     perfMark("prepare:readableContextFiles-ranked");
-    const files = capReferenceOnlyFiles([...pathHints, ...rankedFiles], context.summary, pathHints).slice(0, 8);
-    const structuredFiles = await Promise.all(files.map(async (file) => {
-      const content = await readTextFile(fromRoot(root, file)).catch(() => "");
-      return preparedTaskContextFile(file, context.summary, codeIndex, content, pathHints.includes(file), readCandidatesCache);
+    const contents = new Map<string, string>();
+    const contentOf = async (file: string) => {
+      if (!contents.has(file)) contents.set(file, await readTextFile(fromRoot(root, file)).catch(() => ""));
+      return contents.get(file) ?? "";
+    };
+    const build = async (file: string) => preparedTaskContextFile(file, context.summary, codeIndex, await contentOf(file), tierA.includes(file), readCandidatesCache);
+    const ranked = capReferenceOnlyFiles(rankedFiles, context.summary, []).slice(0, SUGGESTED_FILE_LIMIT);
+    const firstPass = await Promise.all([...tierA, ...ranked].map(build));
+    assignFileRoles(firstPass, context.summary, codeIndex, tierA, context.workstreamPrior ?? []);
+    perfMark("prepare:roles-assigned");
+    // Tier B: one hop of references out of the structured documents the
+    // agent will read anyway (user inputs and routed TARGETs).
+    const referenceSources = await Promise.all(
+      firstPass.filter((file) => file.role === "TARGET" && isStructuredDocument(file.path)).map(async (file) => ({ path: file.path, content: await contentOf(file.path) }))
+    );
+    const references = await planReferences(root, referenceSources, {
+      planned: new Set(firstPass.map((file) => file.path)),
+      taskText: text,
+      isExcluded: isExcludedContextPath
+    });
+    const referenceFiles = await Promise.all(references.map(async (reference) => {
+      const file = await build(reference.path);
+      file.role = reference.namedByTask ? "TARGET" : "CANDIDATE";
+      file.source = "reference";
+      file.reason = `Referenced by ${reference.sources[0]}${reference.sources.length > 1 ? ` (+${reference.sources.length - 1} more)` : ""} at \`${reference.at}\`.`;
+      return file;
     }));
-    assignFileRoles(structuredFiles, context.summary, codeIndex, pathHints, context.workstreamPrior ?? []);
-    structuredFiles.sort((a, b) => roleRank(a.role) - roleRank(b.role));
+    perfMark("prepare:references-planned");
+    const structuredFiles = selectPlannedFiles({ firstPass, referenceFiles, explicitInputs, taskPathHints, prior: context.workstreamPrior });
+    for (const file of structuredFiles) applyWholeFilePlan(file, contents.get(file.path) ?? "");
     perfMark("prepare:structuredFiles-built");
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
     const coverageGaps = preparedTaskCoverageGaps(structuredFiles, context.summary);
-    const warnings = preparedTaskWarnings(structuredFiles, codeIndex);
+    const warnings = [...explicitResolution.warnings, ...preparedTaskWarnings(structuredFiles, codeIndex)];
     const resumeCost = await measureResumeBundleCost(root);
     perfMark("prepare:measureResumeBundleCost-done");
     const owner = await ownerPromise;
@@ -2135,6 +2326,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
           : {})
       },
       openValidation,
+      readPlan: buildReadPlan(structuredFiles, contents, explicitResolution, input.explicitInputs?.length ?? 0),
       readMapPath,
       codeMapPath,
       workingContextPath,
@@ -2151,7 +2343,10 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       rolloverStatus: rollover.status,
       threadPressure: threadPressure.status,
       ownerSource: currentTask.owner?.source,
-      providedFiles: structuredFiles.map((file) => file.path).slice(0, 8),
+      providedFiles: structuredFiles.map((file) => file.path).slice(0, 16),
+      explicitInputCount: explicitInputs.length,
+      referenceFileCount: referenceFiles.filter((file) => structuredFiles.includes(file)).length,
+      plannedInitialTokens: result.readPlan.required.estimatedTokens,
       providedTargets: structuredFiles.filter((file) => file.role === "TARGET").map((file) => file.path),
       providedRangeCount: structuredFiles.reduce((sum, file) => sum + file.ranges.length, 0),
       mcpPayloadTokens: estimateTokens(JSON.stringify(payload))
@@ -2178,6 +2373,82 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     if (!persistTask) await writeRuntimeState(root, { ...current, currentTask: current.currentTask, sessionId: current.sessionId });
     perfFlush();
   }
+}
+
+/** Ranked (non-explicit) suggestions per call — the long-standing 8-file budget. */
+const SUGGESTED_FILE_LIMIT = 8;
+/** From this many explicit inputs on, the user's list is the reading list: ranked files become CANDIDATEs. */
+const EXPLICIT_READING_LIST = 3;
+
+function isExcludedContextPath(path: string): boolean {
+  return isIgnoredWatchPath(path) || isDevguardManagedDocPath(path) || /^\.devguard\//.test(path);
+}
+
+/**
+ * One canonical plan, by authority tier: explicit user inputs and task-
+ * named paths (all kept), then — within the suggestion budget — the
+ * previous step's own artifacts, one-hop references, routed TARGETs and
+ * routed CANDIDATEs. Generic suggestions never take a slot ahead of a
+ * stronger tier.
+ */
+function selectPlannedFiles(input: { firstPass: PreparedTaskContextFile[]; referenceFiles: PreparedTaskContextFile[]; explicitInputs: string[]; taskPathHints: string[]; prior?: string[] }): PreparedTaskContextFile[] {
+  const explicit = new Set(input.explicitInputs);
+  const taskPaths = new Set(input.taskPathHints);
+  const tierA = input.firstPass.filter((file) => explicit.has(file.path) || taskPaths.has(file.path));
+  for (const file of tierA) {
+    file.role = "TARGET";
+    file.source = explicit.has(file.path) ? "explicit-user-input" : "task-path";
+    if (explicit.has(file.path)) file.reason = `Named by the user as a required input. ${file.reason}`.trim();
+  }
+  tierA.sort((a, b) => Number(!explicit.has(a.path)) - Number(!explicit.has(b.path)));
+  const readingList = input.explicitInputs.length >= EXPLICIT_READING_LIST;
+  const ranked = input.firstPass.filter((file) => !tierA.includes(file));
+  if (readingList) for (const file of ranked) if (file.role === "TARGET") file.role = "CANDIDATE";
+  const prior = new Set(input.prior ?? []);
+  const namedReferences = input.referenceFiles.filter((file) => file.role === "TARGET");
+  const otherReferences = input.referenceFiles.filter((file) => file.role !== "TARGET");
+  const order = readingList
+    ? [...namedReferences, ...ranked.filter((file) => prior.has(file.path)), ...otherReferences, ...ranked.filter((file) => !prior.has(file.path))]
+    : [...namedReferences, ...ranked.filter((file) => file.role === "TARGET"), ...otherReferences, ...ranked.filter((file) => file.role !== "TARGET")];
+  const slots = readingList ? Math.max(3, SUGGESTED_FILE_LIMIT - input.explicitInputs.length) : Math.max(0, SUGGESTED_FILE_LIMIT - tierA.length);
+  const planned = [...tierA, ...order.slice(0, slots)];
+  return planned.sort((a, b) => roleRank(a.role) - roleRank(b.role));
+}
+
+/** A small TARGET document is planned as one WHOLE_FILE read instead of sections it would be re-read for anyway. */
+function applyWholeFilePlan(file: PreparedTaskContextFile, content: string): void {
+  const lineCount = content.replace(/\n+$/, "").split(/\r?\n/).length;
+  const coversWhole = file.ranges.length === 1 && file.ranges[0].startLine === 1 && file.ranges[0].endLine >= lineCount;
+  if (coversWhole) {
+    file.ranges[0].kind = "WHOLE_FILE";
+    return;
+  }
+  if (file.role !== "TARGET" || !wholeFileEligible(file.path, content)) return;
+  file.ranges = [{
+    startLine: 1,
+    endLine: lineCount,
+    label: `WHOLE_FILE (${lineCount} lines, ~${estimateRangeTokens(content, [{ startLine: 1, endLine: lineCount }])} est. tokens)`,
+    confidence: "High",
+    reason: "Small document: read it once, whole.",
+    kind: "WHOLE_FILE"
+  }];
+}
+
+/** Planned initial reading: TARGET ranges as delivered (up to 3 each), CANDIDATEs' first range. Characters / 4, not provider tokens. */
+function buildReadPlan(files: PreparedTaskContextFile[], contents: Map<string, string>, explicit: { accepted: string[]; warnings: string[] }, requested: number): PreparedReadPlan {
+  const estimate = (file: PreparedTaskContextFile, count: number) => {
+    const content = contents.get(file.path) ?? "";
+    const ranges = file.ranges.slice(0, count);
+    return ranges.length > 0 ? estimateRangeTokens(content, ranges) : estimateRangeTokens(content, [{ startLine: 1, endLine: Number.MAX_SAFE_INTEGER }]);
+  };
+  const targets = files.filter((file) => file.role === "TARGET");
+  const candidates = files.filter((file) => file.role === "CANDIDATE");
+  return {
+    required: { files: targets.length, estimatedTokens: targets.reduce((sum, file) => sum + estimate(file, 3), 0) },
+    ifNeeded: { files: candidates.length, estimatedTokens: candidates.reduce((sum, file) => sum + estimate(file, 1), 0) },
+    explicitInputs: { captured: explicit.accepted.length, rejected: Math.max(0, requested - explicit.accepted.length) },
+    references: files.filter((file) => file.source === "reference").length
+  };
 }
 
 // Constraints for the MCP result, each tagged with its source ([task] from
@@ -2212,8 +2483,9 @@ function previousTaskOpenValidation(runtime: RuntimeState): string[] {
 function preparedNextAction(files: PreparedTaskContextFile[], openValidation: string[]): string {
   const targets = files.filter((file) => file.role === "TARGET");
   const first = targets[0];
+  const listed = targets.slice(0, 4).map((file) => `${file.path}${file.ranges[0] ? `:${file.ranges[0].startLine}-${file.ranges[0].endLine}` : ""}`).join(", ");
   const start = first
-    ? `Read the TARGET ranges first (${targets.map((file) => `${file.path}${file.ranges[0] ? `:${file.ranges[0].startLine}-${file.ranges[0].endLine}` : ""}`).join(", ")}), then implement; open CANDIDATE files only if needed.`
+    ? `Read the TARGET ranges first (${listed}${targets.length > 4 ? `, +${targets.length - 4} more TARGETs` : ""}), then implement; open CANDIDATE files only if needed.`
     : files.some((file) => file.role === "CANDIDATE")
       ? "No high-confidence target: open only the CANDIDATE that best matches the task, or search one specific area."
       : "No routed file — read the task's explicitly named files, then search only for the concrete gap.";
@@ -2311,8 +2583,9 @@ function workstreamPriorFiles(state: ProjectState, records: HistoryRecord[], sum
   // The direct predecessor is the most recent record that closed a TASK. A
   // later taskless follow-up finalization (a Stop hook catching edits made
   // after `dev-guard done`) has no taskScopedChangedFiles and must not mask
-  // it — it used to, which emptied continuity after every real task.
-  const previousFiles = [...records].reverse().find((record) => record.taskScopedChangedFiles?.length)?.taskScopedChangedFiles ?? [];
+  // it — it used to, which emptied continuity after every real task. A
+  // follow-up's own files (edits after `done`) belong to that same task.
+  const previousFiles = previousTaskScopedFiles(records);
   if (!previousGoal || previousFiles.length === 0) return [];
   const currentTokens = withoutNegatedTokens(meaningfulRankingTokens(summary.goal ?? ""), summary);
   const weights = taskTokenWeights(summary, currentTokens);
@@ -2341,6 +2614,17 @@ function workstreamPriorFiles(state: ProjectState, records: HistoryRecord[], sum
   const selected = [...prior].sort((a, b) => rank(a) - rank(b)).slice(0, 4);
   if (directIds.length > 0) workstreamDirectBySummary.set(summary, new Set(selected.filter(namesDirectId)));
   return selected;
+}
+
+/** The last closed task's task-scoped files plus those of any follow-up finalizations after it. */
+function previousTaskScopedFiles(records: HistoryRecord[]): string[] {
+  const files: string[] = [];
+  for (const record of [...records].reverse()) {
+    if (!record.taskScopedChangedFiles?.length) continue;
+    files.push(...record.taskScopedChangedFiles);
+    if (!record.followUp) break;
+  }
+  return [...new Set(files)];
 }
 
 /** Structured identifiers a task names itself by: those in its title (before the first ":" or within its first 80 characters). */
@@ -4088,8 +4372,9 @@ function documentReadRanges(path: string, content: string, summary?: Documentati
       priority: 1
     }];
   }
-  const sections = isMarkdown ? markdownSections(content) : jsonSections(content);
+  const sections = isMarkdown ? markdownSections(content) : jsonSectionsForReading(jsonSections(content));
   if (sections.length === 0) return undefined;
+  const lines = content.split(/\r?\n/);
   const taskTokens = withoutNegatedTokens(meaningfulRankingTokens(taskText), summary);
   const weights = taskTokenWeights(summary, taskTokens);
   const identifiers = [...withoutNegatedTokens(explicitCodeTokens(taskText), summary)].filter((token) => isIdentifierShaped(token));
@@ -4102,20 +4387,87 @@ function documentReadRanges(path: string, content: string, summary?: Documentati
     .filter((entry) => entry.score > 0)
     .sort((a, b) => b.score - a.score || a.section.startLine - b.section.startLine);
   if (scored.length === 0) return undefined;
-  const ranges = scored.map(({ section, matched, score }) => {
-    const label = section.kind === "markdown" ? `markdown heading: ${section.name}` : section.kind === "json-key" ? `json key: ${section.name}` : `json item: ${section.name}`;
+  // A 1-line JSON range is only useful when that line is a complete
+  // decision ("status": "BLOCKED"); an object/array opening line alone was
+  // always followed by a whole-file read.
+  // Weak single-word matches never ride along next to a strong section.
+  const floor = scored[0].score * WEAK_SECTION_SCORE_RATIO;
+  const usable = scored.filter(({ section, score }) => score >= floor && (isMarkdown || section.endLine > section.startLine || isCompleteJsonLine(lines[section.startLine - 1] ?? "")));
+  if (usable.length === 0) return undefined;
+  const spans = usable.map(({ section, matched, score }) => {
+    const span = section.kind === "markdown" ? readableMarkdownSpan(section, sections) : { startLine: section.startLine, endLine: section.endLine };
+    return { ...span, names: [section.name], kind: section.kind, matched, score };
+  });
+  const ranges = (isMarkdown ? mergeAdjacentSpans(spans) : spans).map(({ startLine, endLine, names, kind, matched, score }) => {
+    const prefix = kind === "markdown" ? (names.length > 1 || endLine > startLine ? "markdown section" : "markdown heading") : kind === "json-item" ? "json item" : "json key";
     const reason = `Matches ${matched.slice(0, 4).join(", ")}.`;
     return {
-      name: truncateLine(label, 64),
+      name: truncateLine(`${prefix}: ${names.join("; ")}`, 64),
       kind: "block" as const,
-      startLine: section.startLine,
-      endLine: section.endLine,
+      startLine,
+      endLine,
       summary: reason,
       editPoint: reason,
-      priority: score >= 8 ? 0 : 2
+      priority: score >= 8 ? 0 : 2,
+      score
     };
   });
-  return dedupeOverlappingRanges(ranges).slice(0, DOCUMENT_RANGE_LIMIT);
+  const best = ranges.sort((a, b) => b.score - a.score || a.startLine - b.startLine).map(({ score: _score, ...range }) => range);
+  return dedupeOverlappingRanges(best).slice(0, DOCUMENT_RANGE_LIMIT);
+}
+
+const WEAK_SECTION_SCORE_RATIO = 0.4;
+/** Below this a Markdown section cannot carry a decision with its reasons; agents re-read the whole file instead. */
+const MIN_MARKDOWN_SECTION_LINES = 12;
+const MAX_MARKDOWN_SECTION_LINES = 80;
+/** A top-level JSON object value longer than this is offered by its own properties (one level, never deeper). */
+const LARGE_JSON_OBJECT_LINES = 200;
+
+/**
+ * Extends a too-short section through the sibling sections that follow it
+ * (never past its parent's end) until it is a readable unit — heading,
+ * body and the immediately related sections — capped in length.
+ */
+function readableMarkdownSpan(section: DocumentSection, all: DocumentSection[]): { startLine: number; endLine: number } {
+  let endLine = section.endLine;
+  if (endLine - section.startLine + 1 >= MIN_MARKDOWN_SECTION_LINES) return { startLine: section.startLine, endLine };
+  for (const next of all) {
+    if (next.startLine <= endLine) continue;
+    if (next.level < section.level) break;
+    if (next.endLine - section.startLine + 1 > MAX_MARKDOWN_SECTION_LINES) break;
+    endLine = Math.max(endLine, next.endLine);
+    if (endLine - section.startLine + 1 >= MIN_MARKDOWN_SECTION_LINES) break;
+  }
+  return { startLine: section.startLine, endLine };
+}
+
+function mergeAdjacentSpans<T extends { startLine: number; endLine: number; names: string[]; matched: string[]; score: number }>(spans: T[]): T[] {
+  const merged: T[] = [];
+  for (const span of [...spans].sort((a, b) => a.startLine - b.startLine)) {
+    const last = merged.at(-1);
+    if (last && span.startLine <= last.endLine + 2 && Math.max(last.endLine, span.endLine) - last.startLine + 1 <= MAX_MARKDOWN_SECTION_LINES) {
+      last.endLine = Math.max(last.endLine, span.endLine);
+      last.names = [...last.names, ...span.names];
+      last.matched = [...new Set([...last.matched, ...span.matched])];
+      last.score = Math.max(last.score, span.score);
+    } else merged.push({ ...span, names: [...span.names] });
+  }
+  return merged;
+}
+
+/** Top-level sections, with a very large top-level object replaced by its own properties. */
+function jsonSectionsForReading(sections: DocumentSection[]): DocumentSection[] {
+  const large = sections.filter((section) => section.kind === "json-key" && section.endLine - section.startLine + 1 > LARGE_JSON_OBJECT_LINES);
+  const insideLarge = (section: DocumentSection) => large.find((parent) => section.startLine > parent.startLine && section.endLine <= parent.endLine);
+  const split = new Set(large.filter((parent) => sections.some((section) => section.kind === "json-child" && insideLarge(section) === parent)));
+  return sections.filter((section) => (section.kind === "json-child" ? split.has(insideLarge(section) as DocumentSection) : !split.has(section)));
+}
+
+function isCompleteJsonLine(line: string): boolean {
+  const text = line.trim().replace(/,$/, "");
+  if (/^"(?:[^"\\]|\\.)*"\s*:\s*(?![[{])\S/.test(text)) return true;
+  const opens = (text.match(/[[{]/g) ?? []).length;
+  return opens > 0 && opens === (text.match(/[\]}]/g) ?? []).length && !/^"[^"]*"\s*:\s*(?:\[\s*\]|\{\s*\})$/.test(text);
 }
 
 function scoreDocumentSection(section: DocumentSection, taskTokens: Set<string>, weights: Map<string, number> | undefined, identifiers: string[], structuredIds: Set<string>): { section: DocumentSection; score: number; matched: string[] } {

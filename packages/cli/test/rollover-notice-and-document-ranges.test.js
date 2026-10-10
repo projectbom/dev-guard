@@ -252,13 +252,14 @@ test("E. Markdown: recommended docs come with heading sections, not zero ranges"
   const result = await prepareTaskContext({ root, task: "Close the Group B blockers: check the DB role cap feasibility and the hard connection budget in the phase5i closure doc.", persistTask: false });
   const doc = result.files.find((file) => file.path === "docs/phase5i-group-b-blocker-closure.md");
   assert.ok(doc, result.files.map((file) => file.path).join(", "));
-  const labels = doc.ranges.map((range) => range.label);
-  assert.ok(labels.includes("markdown heading: DB Role Cap Feasibility"), labels.join(" | "));
-  assert.ok(labels.includes("markdown heading: Hard Budget"), labels.join(" | "));
-  assert.ok(!labels.some((label) => /Appendix|Background|not a heading/.test(label)), labels.join(" | "));
-  const roleCap = doc.ranges.find((range) => range.label === "markdown heading: DB Role Cap Feasibility");
-  assert.equal(roleCap.startLine, 21);
-  assert.ok(roleCap.endLine < 33, `section must end before the next heading: ${roleCap.endLine}`);
+  // Rehydration policy: a small TARGET document is one WHOLE_FILE read —
+  // 3–10 line heading ranges were re-read whole in every real session.
+  // Section ranges for large documents: see rehydration-plan.test.js.
+  assert.equal(doc.role, "TARGET");
+  assert.equal(doc.ranges.length, 1, doc.ranges.map((range) => range.label).join(" | "));
+  assert.equal(doc.ranges[0].kind, "WHOLE_FILE");
+  assert.equal(doc.ranges[0].startLine, 1);
+  assert.match(doc.ranges[0].label, /^WHOLE_FILE \(\d+ lines, ~\d+ est\. tokens\)$/);
 });
 
 test("F. a CANDIDATE document carries exactly one section in the agent payload; a TARGET at most three", async () => {
@@ -286,10 +287,9 @@ test("G/H. JSON: top-level key and array-item ranges with real line numbers; bra
   const result = await prepareTaskContext({ root, task: "Group B blockers: review the aggregate budget and blockers, and the C3 role cap change in group-b-execution-package.json.", persistTask: false });
   const pkg = result.files.find((file) => file.path === "infra/phase5i/group-b-execution-package.json");
   assert.ok(pkg, result.files.map((file) => file.path).join(", "));
-  const labels = pkg.ranges.map((range) => range.label);
-  assert.ok(labels.some((label) => label.startsWith("json item: changes[1] C3")), labels.join(" | "));
-  assert.ok(labels.some((label) => /json (?:key|item): (?:budget|blockers)/.test(label)), labels.join(" | "));
-  assert.ok(!labels.some((label) => /history/.test(label)), labels.join(" | "));
+  // A small JSON TARGET is one WHOLE_FILE read; key/item ranges apply to large JSON (rehydration-plan.test.js).
+  assert.equal(pkg.role, "TARGET");
+  assert.deepEqual(pkg.ranges.map((range) => range.kind), ["WHOLE_FILE"]);
 });
 
 test("I. minified JSON gets no invented line ranges", async () => {
