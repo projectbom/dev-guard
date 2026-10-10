@@ -28,10 +28,11 @@ import { discoverWorkspaceSourceRoots, ensureProjectKnowledge, readProjectKnowle
 import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
 import { loadConfig, resolveOpenAIApiKey } from "./config.js";
 import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
-import { recordTaskTelemetry } from "./task-telemetry.js";
-import { jsonSections, markdownSections, type DocumentSection } from "./document-ranges.js";
-import { estimateRangeTokens, isStructuredDocument, planReferences, resolveExplicitInputs, wholeFileEligible, type ContextFileSource } from "./rehydration-plan.js";
-import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, threadUserNotice, toOwner, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
+import { readTaskTelemetry, recordTaskTelemetry } from "./task-telemetry.js";
+import { jsonSections, markdownSections, scriptSections, type DocumentSection } from "./document-ranges.js";
+import { estimateRangeTokens, estimateTextTokens, isStructuredDocument, planReferences, resolveExplicitInputs, SCRIPT_RANGE_FILE, WHOLE_FILE_SCRIPT_TOKENS, wholeFileEligible, type ContextFileSource } from "./rehydration-plan.js";
+import { collectExecutionLineage, planExecutionLineage, type ExecutionLineage } from "./execution-lineage.js";
+import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, taskBoundaryHeadroom, threadUserNotice, toOwner, type BoundaryHeadroom, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
 import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
 
 const execFileAsync = promisify(execFile);
@@ -270,6 +271,11 @@ export interface PostCompletionBaseline {
   fileHashes: Record<string, string>;
   /** The completed task's own files (task-scoped, plus its follow-ups'), capped. */
   taskFiles: string[];
+  /**
+   * False once untasked work (files outside taskFiles) was finalized after
+   * the task closed: later evidence can no longer be the task's follow-up.
+   */
+  followUpOpen?: boolean;
 }
 
 const POST_COMPLETION_BASELINE_LIMIT = 5000;
@@ -417,6 +423,8 @@ export interface PreparedTaskContextResult extends BeforeAgentPreparationResult 
   openValidation: string[];
   /** The canonical read order for a fresh thread — see rehydration-plan.ts. */
   readPlan: PreparedReadPlan;
+  /** A new task in an already-used thread: does it likely fit (see taskBoundaryHeadroom)? */
+  boundary?: BoundaryHeadroom;
 }
 
 export interface PreparedReadPlan {
@@ -468,7 +476,9 @@ export function toAgentContextPayload(result: PreparedTaskContextResult): Record
     rollover: {
       status: result.rollover.status,
       thread: { status: result.rollover.thread.status, reason: result.rollover.thread.reason },
-      advice: result.rollover.advice
+      advice: result.rollover.advice,
+      // Only when this new task likely does not fit the thread it started in.
+      ...(result.boundary && (result.boundary.status === "SOON" || result.boundary.status === "NEW_THREAD") ? { boundary: { status: result.boundary.status, reason: result.boundary.reason } } : {})
     },
     // Size of DevGuard's resume packet for a NEW thread — not thread pressure.
     resumeCostTokens: result.resumeCost.totalEstimatedTokens,
@@ -680,6 +690,10 @@ export interface HistoryRecord {
   carriedOverChangedFiles?: string[];
   /** A follow-up finalization of the task closed just before it (edits made after `done`), not a task of its own. */
   followUp?: boolean;
+  /** Work finalized with no task open that is not the closed task's own files — never anyone's task. */
+  untasked?: boolean;
+  /** What the task ran, read and built (paths only, bounded) — carried into the next same-workstream plan. */
+  executionLineage?: ExecutionLineage;
 }
 
 interface PackageJson {
@@ -793,20 +807,58 @@ const defaultRuntime: RuntimeState = {
   changeCountSinceIdle: 0
 };
 
+type RuntimeFileRead = { kind: "ok"; state: RuntimeState } | { kind: "missing" } | { kind: "unreadable"; error: string };
+
+/**
+ * runtime.json as it is on disk, telling "absent" apart from "could not be
+ * read right now". A transient read failure (fd exhaustion under heavy
+ * parallel I/O, a busy file) used to read as "defaults", and the next write
+ * then replaced the real file with them — losing the session lineage and
+ * every recorded validation at once (a real PartnerFlow incident: the late
+ * Stop hook then finalized the whole 1,022-file dirty tree under a brand-new
+ * session). Retries briefly before giving up.
+ */
+async function loadRuntimeFile(root: string): Promise<RuntimeFileRead> {
+  const path = fromRoot(root, runtimePath);
+  let lastError = "";
+  for (let attempt = 1; attempt <= RUNTIME_READ_ATTEMPTS; attempt += 1) {
+    try {
+      const text = await readTextFile(path, MISSING_RUNTIME_MARKER);
+      if (text === MISSING_RUNTIME_MARKER) return { kind: "missing" };
+      if (!text.trim()) return { kind: "missing" };
+      return { kind: "ok", state: JSON.parse(text) as RuntimeState };
+    } catch (error) {
+      lastError = errorMessage(error);
+      if (attempt < RUNTIME_READ_ATTEMPTS) await sleep(20 * attempt);
+    }
+  }
+  return { kind: "unreadable", error: lastError };
+}
+
+const RUNTIME_READ_ATTEMPTS = 3;
+const MISSING_RUNTIME_MARKER = "\u0000missing-runtime\u0000";
+
 export async function readRuntimeState(root: string): Promise<RuntimeState> {
   await ensureDevguardWorkspace(root);
-  try {
-    const state = await readJsonFile<RuntimeState>(fromRoot(root, runtimePath), defaultRuntime);
-    return { ...state, qaResults: normalizeQaResults(state.qaResults) };
-  } catch {
-    return defaultRuntime;
-  }
+  const loaded = await loadRuntimeFile(root);
+  if (loaded.kind !== "ok") return defaultRuntime;
+  return { ...loaded.state, qaResults: normalizeQaResults(loaded.state.qaResults) };
 }
 
 export async function writeRuntimeState(root: string, state: RuntimeState, options: { replacePending?: boolean } = {}): Promise<void> {
   await ensureDevguardWorkspace(root);
   try {
-    const current = options.replacePending ? undefined : await readJsonFile<RuntimeState>(fromRoot(root, runtimePath), defaultRuntime).catch(() => undefined);
+    let current: RuntimeState | undefined;
+    if (!options.replacePending) {
+      const loaded = await loadRuntimeFile(root);
+      // Never merge onto (or replace) a runtime file we could not read: the
+      // caller's view of it may be defaults, and writing would erase it.
+      if (loaded.kind === "unreadable") {
+        await logRuntimeWriteWarning(root, `runtime_write=skipped reason=unreadable_runtime error=${quoteLogValue(loaded.error)}`);
+        return;
+      }
+      current = loaded.kind === "ok" ? loaded.state : undefined;
+    }
     const next = current ? mergeRuntimeStateForWrite(current, state) : state;
     await writeAtomicTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(next), null, 2)}\n`);
   } catch (error) {
@@ -849,13 +901,15 @@ async function gatherCurrentChangeState(root: string, runtime: RuntimeState): Pr
   const changeFiles = filterDevGuardContextFiles(gitChanges.changeFiles, false);
   const rawChangedFiles = [...new Set(gitChanges.changeFiles.map((file) => file.path))].sort();
   const runtimeChangedFiles = runtime.pendingChangedFiles.filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file));
-  const changedFiles = [
+  // A watcher-reported directory (a new untracked folder) is not a change of
+  // its own; its files are. Keeping it made the next round see it "vanish".
+  const changedFiles = (await withoutDirectories(root, [
     ...new Set(
       [...runtimeChangedFiles, ...changeFiles.map((file) => file.path)].filter(
         (file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file)
       )
     )
-  ].sort();
+  ])).sort();
   const diffText = changeFiles.length > 0 ? await getDiffForChangeFiles(root, changeFiles).catch(() => gitChanges.diffText) : gitChanges.diffText;
   return { gitHead, changeFiles, changedFiles, diffText, gitChanges, rawChangedFiles };
 }
@@ -901,7 +955,7 @@ async function resolveCurrentCodeState(root: string): Promise<{ gitHead: string;
  */
 async function isCompletedTaskFollowUp(root: string, runtime: RuntimeState, caller: ObservedThreadIdentity | undefined): Promise<boolean> {
   const baseline = (await readProjectState(root)).postCompletionBaseline;
-  if (!baseline || !runtime.sessionId || baseline.sessionId !== runtime.sessionId) return false;
+  if (!baseline || baseline.followUpOpen === false || !runtime.sessionId || baseline.sessionId !== runtime.sessionId) return false;
   const age = Date.now() - Date.parse(baseline.completedAt);
   if (!(age >= 0 && age <= FOLLOW_UP_VALIDATION_WINDOW_MS)) return false;
   if (caller && baseline.ownerThreadHash && toOwner(caller).threadIdHash !== baseline.ownerThreadHash) return false;
@@ -910,8 +964,7 @@ async function isCompletedTaskFollowUp(root: string, runtime: RuntimeState, call
   // must not be credited to the closed task.
   const { changedFiles } = await gatherCurrentChangeState(root, runtime);
   const { changed, reverted } = await changedSinceCompletion(root, changedFiles, baseline);
-  const own = new Set(baseline.taskFiles ?? []);
-  return [...changed, ...reverted].every((file) => own.has(file));
+  return [...changed, ...reverted].every((file) => ownedByTask(baseline.taskFiles ?? [], file));
 }
 
 export async function recordQAExecutionResult(root: string, result: QAExecutionResult, caller?: ObservedThreadIdentity): Promise<QAExecutionResult> {
@@ -1217,7 +1270,17 @@ export async function refreshRuntimeLocale(root: string): Promise<DevGuardLocale
 }
 
 export async function resetRuntimeState(root: string, options: { preserveQaResults?: boolean } = {}): Promise<void> {
-  const current = options.preserveQaResults ? await readRuntimeState(root) : undefined;
+  let current: RuntimeState | undefined;
+  if (options.preserveQaResults) {
+    const loaded = await loadRuntimeFile(root);
+    // The done-time partial reset keeps the session lineage and evidence; if
+    // the file cannot be read it must not be replaced by an empty runtime.
+    if (loaded.kind === "unreadable") {
+      await logRuntimeWriteWarning(root, `runtime_write=skipped reason=unreadable_runtime_on_reset error=${quoteLogValue(loaded.error)}`);
+      return;
+    }
+    current = loaded.kind === "ok" ? loaded.state : undefined;
+  }
   await writeRuntimeState(root, {
     ...defaultRuntime,
     idleSinceAt: new Date().toISOString(),
@@ -1560,7 +1623,12 @@ export async function processDoneEvent(root: string, options: { completionSource
   }
   runtime = await readRuntimeState(root);
   if (!runtime.sessionId) {
-    runtime = { ...runtime, sessionId: generateSessionId() };
+    // A completion with no session but no open task either is, if anything,
+    // a late signal for the task finalized last: keep THAT lineage (so it is
+    // compared against its completion baseline) instead of minting a new
+    // session that would see the whole dirty tree as its own work.
+    const lineage = runtime.currentTask ? undefined : (await readProjectState(root)).postCompletionBaseline?.sessionId;
+    runtime = { ...runtime, sessionId: lineage ?? generateSessionId() };
     await writeRuntimeState(root, runtime);
   }
   const [currentChangeState, codeStateHash] = await Promise.all([
@@ -1596,7 +1664,7 @@ export async function processDoneEvent(root: string, options: { completionSource
   // duplicate case above, re-reading ProjectState (which the winner may
   // have just updated) rather than assuming it's a duplicate.
   let previousFinalizedSessionId: string | undefined;
-  let followUpDelta: { changed: string[]; reverted: string[]; ownerThreadHash?: string; taskFiles?: string[] } | undefined;
+  let followUpDelta: { changed: string[]; reverted: string[]; foreign: string[]; ownerThreadHash?: string; taskFiles?: string[] } | undefined;
   if (!(await acquireFinalizeLock(root))) {
     await recordSignal(true);
     return buildAlreadyProcessedResult(await readProjectState(root));
@@ -1613,7 +1681,8 @@ export async function processDoneEvent(root: string, options: { completionSource
     // through files outside the dirty set) is a no-op, not a follow-up.
     const completed = postLockProjectState.postCompletionBaseline;
     if (!runtime.currentTask && completed && completed.sessionId === runtime.sessionId) {
-      followUpDelta = { ...(await changedSinceCompletion(root, changedFiles, completed)), ownerThreadHash: completed.ownerThreadHash, taskFiles: completed.taskFiles };
+      const delta = await changedSinceCompletion(root, changedFiles, completed);
+      followUpDelta = { ...delta, foreign: [...delta.changed, ...delta.reverted].filter((file) => !ownedByTask(completed.taskFiles ?? [], file)), ownerThreadHash: completed.ownerThreadHash, taskFiles: completed.taskFiles };
       if (followUpDelta.changed.length === 0 && followUpDelta.reverted.length === 0) {
         await recordSignal(true);
         await writeProjectState(root, { ...postLockProjectState, lastFinalizedCodeStateHash: codeStateHash });
@@ -1702,7 +1771,11 @@ export async function processDoneEvent(root: string, options: { completionSource
   });
   const areas = classifyAreas(documentFiles);
   const judgments = buildJudgments({ areas, clusters, checkFindings: checkReport.findings.map((finding) => finding.message), architectureMarkdown, decisionsMarkdown });
-  if (followUpDelta) {
+  if (followUpDelta && followUpDelta.foreign.length > 0) {
+    judgments.push(
+      `No task was open: ${followUpDelta.changed.length} file(s) changed since the last \`done\`, ${followUpDelta.foreign.length} of them outside the closed task's files — finalized as untasked work, not as that task's follow-up. Call prepare_task_context before starting new work. The other ${carriedOverChangedFiles?.length ?? 0} dirty file(s) were already finalized and are excluded.`
+    );
+  } else if (followUpDelta) {
     judgments.push(
       `Follow-up of the task closed just before: only the ${followUpDelta.changed.length} file(s) changed since its \`done\` are this round's changes${followUpDelta.reverted.length > 0 ? `; ${followUpDelta.reverted.length} file(s) returned to their committed state` : ""}. The other ${carriedOverChangedFiles?.length ?? 0} dirty file(s) were already finalized and are excluded.`
     );
@@ -1777,6 +1850,16 @@ export async function processDoneEvent(root: string, options: { completionSource
   const testCandidates = await inferTestCandidates(root, { areas, changedFiles: documentFiles });
   const projectContext = summarizeProjectContext({ projectMarkdown, architectureMarkdown, decisionsMarkdown });
   const docUpdateCandidates = [updateSuggestions.summary];
+  // Execution lineage of the task closing now (not of a follow-up/untasked
+  // round): what its own thread ran and read during the task, plus what it built.
+  const executionLineage = runtime.currentTask
+    ? await collectExecutionLineage(root, {
+        sinceIso: runtime.currentTask.createdAt,
+        produced: taskScopedChangedFiles ?? [],
+        ownerThreadHash: runtime.currentTask.owner?.threadIdHash
+      }).catch(() => undefined)
+    : undefined;
+  perfMark("done:executionLineage-collected");
   const historyRecord: HistoryRecord = {
     id: `run_${timestamp.replace(/[-:.]/g, "").slice(0, 15)}_${hashRuntimeFiles(changedFiles).slice(0, 6)}`,
     timestamp,
@@ -1791,7 +1874,8 @@ export async function processDoneEvent(root: string, options: { completionSource
     reportPath,
     taskScopedChangedFiles,
     carriedOverChangedFiles,
-    ...(followUpDelta ? { followUp: true } : {})
+    ...(followUpDelta ? (followUpDelta.foreign.length > 0 ? { untasked: true } : { followUp: true }) : {}),
+    ...(executionLineage ? { executionLineage } : {})
   };
   const previousHistory = await readHistoryRecords(root, 20);
   const nextHistory = [...previousHistory, historyRecord];
@@ -1882,7 +1966,9 @@ export async function processDoneEvent(root: string, options: { completionSource
         sessionId: runtime.sessionId ?? "",
         codeStateHash,
         ownerThreadHash: runtime.currentTask?.owner?.threadIdHash ?? followUpDelta?.ownerThreadHash,
-        taskFiles: [...(followUpDelta?.taskFiles ?? []), ...(taskScopedChangedFiles ?? [])]
+        // Untasked work never joins the closed task's own files.
+        taskFiles: followUpDelta && followUpDelta.foreign.length > 0 ? followUpDelta.taskFiles ?? [] : [...(followUpDelta?.taskFiles ?? []), ...(taskScopedChangedFiles ?? [])],
+        followUpOpen: !(followUpDelta && followUpDelta.foreign.length > 0)
       })
     : undefined;
   await Promise.all([
@@ -1966,8 +2052,12 @@ export async function processDoneEvent(root: string, options: { completionSource
   // `dev-guard done`, caught by the next Stop hook) is real work and is
   // still finalized, but it is a follow-up, not a second completion.
   const isFollowUp = !runtime.currentTask && Boolean(runtime.sessionId) && previousFinalizedSessionId === runtime.sessionId;
+  const isUntasked = Boolean(followUpDelta && followUpDelta.foreign.length > 0);
+  // Thread usage when the task closes, for task-growth history (boundary headroom).
+  const pressureAtDone = runtime.currentTask?.owner ? await observeThreadPressure({ owner: runtime.currentTask.owner }).catch(() => undefined) : undefined;
   await recordTaskTelemetry(root, {
-    event: isFollowUp ? "TASK_FOLLOWUP_FINALIZED" : "TASK_DONE",
+    ...(pressureAtDone?.observedInputTokens && pressureAtDone.contextWindow ? { observedInputTokens: pressureAtDone.observedInputTokens, contextWindow: pressureAtDone.contextWindow } : {}),
+    event: isUntasked ? "UNTASKED_FINALIZED" : isFollowUp ? "TASK_FOLLOWUP_FINALIZED" : "TASK_DONE",
     sessionId: runtime.sessionId,
     completionSource,
     changedFileDeltaCount: taskScopedChangedFiles?.length,
@@ -2005,8 +2095,10 @@ export async function processDoneEvent(root: string, options: { completionSource
   } // end finalizeOnce
 }
 
-async function buildPostCompletionBaseline(root: string, changedFiles: string[], identity: { sessionId: string; codeStateHash?: string; ownerThreadHash?: string; taskFiles: string[] }): Promise<PostCompletionBaseline> {
-  const files = changedFiles.slice(0, POST_COMPLETION_BASELINE_LIMIT);
+async function buildPostCompletionBaseline(root: string, changedFiles: string[], identity: { sessionId: string; codeStateHash?: string; ownerThreadHash?: string; taskFiles: string[]; followUpOpen: boolean }): Promise<PostCompletionBaseline> {
+  // Files only: a directory has no content hash, and a watcher-reported
+  // directory entry that later disappears is not a change.
+  const files = (await withoutDirectories(root, changedFiles)).slice(0, POST_COMPLETION_BASELINE_LIMIT);
   const hashes = await hashWorkingFiles(root, files);
   return {
     sessionId: identity.sessionId,
@@ -2014,7 +2106,8 @@ async function buildPostCompletionBaseline(root: string, changedFiles: string[],
     ...(identity.codeStateHash ? { codeStateHash: identity.codeStateHash } : {}),
     ...(identity.ownerThreadHash ? { ownerThreadHash: identity.ownerThreadHash } : {}),
     fileHashes: Object.fromEntries(files.map((file) => [file, hashes[file] ?? MISSING_FILE_HASH])),
-    taskFiles: [...new Set(identity.taskFiles)].slice(0, POST_COMPLETION_BASELINE_LIMIT)
+    taskFiles: [...new Set(identity.taskFiles)].slice(0, POST_COMPLETION_BASELINE_LIMIT),
+    ...(identity.followUpOpen ? {} : { followUpOpen: false })
   };
 }
 
@@ -2025,13 +2118,43 @@ async function buildPostCompletionBaseline(root: string, changedFiles: string[],
  */
 async function changedSinceCompletion(root: string, changedFiles: string[], baseline: PostCompletionBaseline): Promise<{ changed: string[]; reverted: string[] }> {
   const recorded = baseline.fileHashes;
-  const known = changedFiles.filter((file) => recorded[file] !== undefined);
+  const files = await withoutDirectories(root, changedFiles);
+  const known = files.filter((file) => recorded[file] !== undefined);
   const now = await hashWorkingFiles(root, known);
-  const current = new Set(changedFiles);
+  const current = new Set(files);
+  // Baselines written before directories were excluded can hold a directory
+  // entry; it is not a file that "returned to its committed state".
+  const reverted = await withoutDirectories(root, Object.keys(recorded).filter((file) => !current.has(file)));
   return {
-    changed: changedFiles.filter((file) => recorded[file] === undefined || recorded[file] !== (now[file] ?? MISSING_FILE_HASH)),
-    reverted: Object.keys(recorded).filter((file) => !current.has(file))
+    changed: files.filter((file) => recorded[file] === undefined || recorded[file] !== (now[file] ?? MISSING_FILE_HASH)),
+    reverted
   };
+}
+
+/**
+ * Whether a file changed after `done` belongs to the closed task: one of its
+ * own files, a new file beside them (same directory, not the repository
+ * root — e.g. a validation artifact written next to the task's output), or
+ * at the root a file sharing a task file's stem (`f-validation.json` ↔
+ * `f.js`). Anything else is different work.
+ */
+function ownedByTask(taskFiles: string[], file: string): boolean {
+  if (taskFiles.includes(file)) return true;
+  const dir = posixDirname(file);
+  if (dir !== "." && taskFiles.some((own) => posixDirname(own) === dir)) return true;
+  const stem = (path: string) => path.split("/").pop()!.split(/[-._]/)[0].toLowerCase();
+  return dir === "." && stem(file).length > 0 && taskFiles.some((own) => posixDirname(own) === "." && stem(own) === stem(file));
+}
+
+function posixDirname(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index < 0 ? "." : path.slice(0, index);
+}
+
+/** Drops paths that are directories on disk (deleted paths stay: a deletion is a change). */
+async function withoutDirectories(root: string, paths: string[]): Promise<string[]> {
+  const isDirectory = await Promise.all(paths.map((path) => stat(fromRoot(root, path)).then((info) => info.isDirectory(), () => false)));
+  return paths.filter((_, index) => !isDirectory[index]);
 }
 
 async function baselineFilesEditedSince(root: string, task: BeforeAgentTask | undefined, changedFiles: string[]): Promise<Set<string>> {
@@ -2103,6 +2226,8 @@ export async function currentThreadPressure(root: string, caller?: ObservedThrea
 export interface ThreadStateForAgent {
   status: ThreadPressure["status"];
   reason: string;
+  /** At a task boundary only: does a typical next task still fit (see taskBoundaryHeadroom)? */
+  boundary?: Pick<BoundaryHeadroom, "status" | "reason">;
   /**
    * Present only for SOON / NEW_THREAD observed on the CALLING thread
    * itself, freshly at this call: the sentence to end the task's final
@@ -2117,11 +2242,44 @@ export interface ThreadStateForAgent {
  * reported identity); a fallback to the task owner's thread (caller
  * unknown) reports status only, since it may be a different thread.
  */
-export async function threadStateForAgent(root: string, caller?: ObservedThreadIdentity): Promise<ThreadStateForAgent> {
+export async function threadStateForAgent(root: string, caller?: ObservedThreadIdentity, options: { taskBoundary?: boolean } = {}): Promise<ThreadStateForAgent> {
   const pressure = await currentThreadPressure(root, caller);
   const locale = await resolveDevGuardLocale(root).catch(() => "en-US" as DevGuardLocale);
-  const userNotice = caller ? threadUserNotice(pressure.status, locale) : undefined;
-  return { status: pressure.status, reason: pressure.reason, ...(userNotice ? { userNotice } : {}) };
+  // At the task boundary (the agent's own `dev-guard done`), a thread under
+  // the in-task SOON line can still be too full for a typical next task.
+  const boundary = options.taskBoundary && pressure.status !== "UNKNOWN"
+    ? taskBoundaryHeadroom({ ratio: pressureRatio(pressure), recentGrowth: await recentTaskGrowth(root) })
+    : undefined;
+  const escalate = boundary && (boundary.status === "NEW_THREAD" || (boundary.status === "SOON" && pressure.status === "LOW"));
+  const status: ThreadPressure["status"] = escalate ? (boundary.status as "SOON" | "NEW_THREAD") : pressure.status;
+  const userNotice = caller ? threadUserNotice(status, locale) : undefined;
+  return {
+    status,
+    reason: escalate ? `${pressure.reason} Task boundary: ${boundary.reason}` : pressure.reason,
+    ...(boundary ? { boundary: { status: boundary.status, reason: boundary.reason } } : {}),
+    ...(userNotice ? { userNotice } : {})
+  };
+}
+
+function pressureRatio(pressure: ThreadPressure): number | undefined {
+  return pressure.observedInputTokens && pressure.contextWindow ? pressure.observedInputTokens / pressure.contextWindow : undefined;
+}
+
+/** Observed per-task growth (share of the window) of the most recent completed tasks, from DevGuard's own telemetry. */
+export async function recentTaskGrowth(root: string, limit = 8): Promise<number[]> {
+  const events = await readTaskTelemetry(root, 2000).catch(() => []);
+  const prepared = new Map<string, { tokens: number; window: number }>();
+  const growth: number[] = [];
+  for (const event of events) {
+    if (!event.sessionId || !event.observedInputTokens || !event.contextWindow) continue;
+    if ((event.event === "TASK_PREPARED" || event.event === "TASK_CONTINUED" || event.event === "TASK_REPLACED") && !prepared.has(event.sessionId)) {
+      prepared.set(event.sessionId, { tokens: event.observedInputTokens, window: event.contextWindow });
+    } else if (event.event === "TASK_DONE") {
+      const start = prepared.get(event.sessionId);
+      if (start && event.observedInputTokens > start.tokens) growth.push((event.observedInputTokens - start.tokens) / start.window);
+    }
+  }
+  return growth.slice(-limit);
 }
 
 export async function prepareTaskContext(input: PrepareTaskContextInput): Promise<PreparedTaskContextResult> {
@@ -2267,7 +2425,23 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       return file;
     }));
     perfMark("prepare:references-planned");
-    const structuredFiles = selectPlannedFiles({ firstPass, referenceFiles, explicitInputs, taskPathHints, prior: context.workstreamPrior });
+    // Tier C: the previous same-workstream task's execution lineage.
+    const lineagePlan = await planExecutionLineage(root, previousExecutionLineage(raw.records), {
+      planned: new Set([...firstPass, ...referenceFiles].map((file) => file.path)),
+      anchors: [...tierA, ...firstPass.filter((file) => file.role === "TARGET").map((file) => file.path)],
+      taskText: text,
+      sameWorkstream: Boolean(context.summary && workstreamGateBySummary.get(context.summary)),
+      isExcluded: isExcludedContextPath
+    });
+    const lineageFiles = await Promise.all(lineagePlan.map(async (entry) => {
+      const file = await build(entry.path);
+      file.role = entry.target ? "TARGET" : "CANDIDATE";
+      file.source = "execution-lineage";
+      file.reason = `${entry.kind === "executed" ? "Executed" : entry.kind === "produced" ? "Written" : "Read"} by the previous task in this workstream.`;
+      return file;
+    }));
+    perfMark("prepare:lineage-planned");
+    const structuredFiles = selectPlannedFiles({ firstPass, referenceFiles, lineageFiles, explicitInputs, taskPathHints, prior: context.workstreamPrior });
     for (const file of structuredFiles) applyWholeFilePlan(file, contents.get(file.path) ?? "");
     perfMark("prepare:structuredFiles-built");
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
@@ -2282,6 +2456,9 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     }
     const threadPressure = await observeThreadPressure({ identity: caller, owner });
     perfMark("prepare:threadPressure-observed");
+    const boundary = !isContinuing && threadPressure.observedInputTokens && threadPressure.contextWindow
+      ? taskBoundaryHeadroom({ ratio: threadPressure.observedInputTokens / threadPressure.contextWindow, recentGrowth: await recentTaskGrowth(root), nextTaskText: text })
+      : undefined;
     const rollover = computeRolloverAssessment({
       changedFileCount: runtimeWithTask.pendingChangedFiles.length,
       qaResultCount: currentSessionQaCount(runtimeWithTask),
@@ -2327,6 +2504,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       },
       openValidation,
       readPlan: buildReadPlan(structuredFiles, contents, explicitResolution, input.explicitInputs?.length ?? 0),
+      ...(boundary ? { boundary } : {}),
       readMapPath,
       codeMapPath,
       workingContextPath,
@@ -2342,6 +2520,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       estimatedResumeTokens: resumeCost.totalEstimatedTokens,
       rolloverStatus: rollover.status,
       threadPressure: threadPressure.status,
+      ...(threadPressure.observedInputTokens && threadPressure.contextWindow ? { observedInputTokens: threadPressure.observedInputTokens, contextWindow: threadPressure.contextWindow } : {}),
       ownerSource: currentTask.owner?.source,
       providedFiles: structuredFiles.map((file) => file.path).slice(0, 16),
       explicitInputCount: explicitInputs.length,
@@ -2391,7 +2570,7 @@ function isExcludedContextPath(path: string): boolean {
  * routed CANDIDATEs. Generic suggestions never take a slot ahead of a
  * stronger tier.
  */
-function selectPlannedFiles(input: { firstPass: PreparedTaskContextFile[]; referenceFiles: PreparedTaskContextFile[]; explicitInputs: string[]; taskPathHints: string[]; prior?: string[] }): PreparedTaskContextFile[] {
+function selectPlannedFiles(input: { firstPass: PreparedTaskContextFile[]; referenceFiles: PreparedTaskContextFile[]; lineageFiles?: PreparedTaskContextFile[]; explicitInputs: string[]; taskPathHints: string[]; prior?: string[] }): PreparedTaskContextFile[] {
   const explicit = new Set(input.explicitInputs);
   const taskPaths = new Set(input.taskPathHints);
   const tierA = input.firstPass.filter((file) => explicit.has(file.path) || taskPaths.has(file.path));
@@ -2411,7 +2590,11 @@ function selectPlannedFiles(input: { firstPass: PreparedTaskContextFile[]; refer
     ? [...namedReferences, ...ranked.filter((file) => prior.has(file.path)), ...otherReferences, ...ranked.filter((file) => !prior.has(file.path))]
     : [...namedReferences, ...ranked.filter((file) => file.role === "TARGET"), ...otherReferences, ...ranked.filter((file) => file.role !== "TARGET")];
   const slots = readingList ? Math.max(3, SUGGESTED_FILE_LIMIT - input.explicitInputs.length) : Math.max(0, SUGGESTED_FILE_LIMIT - tierA.length);
-  const planned = [...tierA, ...order.slice(0, slots)];
+  // Execution lineage (tier C) has its own bounded slots: it never pushes
+  // out user inputs, direct previous artifacts or references, and generic
+  // suggestions never push it out.
+  const lineage = (input.lineageFiles ?? []).filter((file) => !tierA.some((planned) => planned.path === file.path));
+  const planned = [...tierA, ...lineage, ...order.filter((file) => !lineage.some((entry) => entry.path === file.path)).slice(0, slots)];
   return planned.sort((a, b) => roleRank(a.role) - roleRank(b.role));
 }
 
@@ -2423,7 +2606,8 @@ function applyWholeFilePlan(file: PreparedTaskContextFile, content: string): voi
     file.ranges[0].kind = "WHOLE_FILE";
     return;
   }
-  if (file.role !== "TARGET" || !wholeFileEligible(file.path, content)) return;
+  const plannedScript = SCRIPT_RANGE_FILE.test(file.path) && (file.source === "execution-lineage" || file.source === "reference");
+  if ((file.role !== "TARGET" && !plannedScript) || !wholeFileEligible(file.path, content)) return;
   file.ranges = [{
     startLine: 1,
     endLine: lineCount,
@@ -2495,6 +2679,8 @@ function preparedNextAction(files: PreparedTaskContextFile[], openValidation: st
 // --- TARGET vs CANDIDATE --------------------------------------------------
 
 const workstreamPriorBySummary = new WeakMap<DocumentationSummary, Set<string>>();
+/** The workstream gate passed (same workstream as the previous task), whether or not prior files survived filtering. */
+const workstreamGateBySummary = new WeakMap<DocumentationSummary, boolean>();
 /** Previous-task artifacts the new task referenced directly by identifier — ranked above plain continuity. */
 const workstreamDirectBySummary = new WeakMap<DocumentationSummary, Set<string>>();
 const TARGET_LIMIT = 3;
@@ -2599,6 +2785,7 @@ function workstreamPriorFiles(state: ProjectState, records: HistoryRecord[], sum
   // because a structured identifier always carries a number.
   const directIds = previousTaskIdentifiers(previousGoal).filter((id) => currentTokens.has(id));
   if (directIds.length === 0 && sharedRare.length < 2) return [];
+  workstreamGateBySummary.set(summary, true);
   const currentRare = new Set([...currentTokens].filter(rare));
   const wordsOf = (file: string) => {
     const entry = index.files[file];
@@ -2616,11 +2803,26 @@ function workstreamPriorFiles(state: ProjectState, records: HistoryRecord[], sum
   return selected;
 }
 
+/** Execution lineage of the last closed task; its follow-ups' own files count as produced. */
+function previousExecutionLineage(records: HistoryRecord[]): ExecutionLineage | undefined {
+  const followUpFiles: string[] = [];
+  for (const record of [...records].reverse()) {
+    if (record.untasked) continue;
+    if (record.followUp) {
+      followUpFiles.push(...(record.taskScopedChangedFiles ?? []));
+      continue;
+    }
+    if (!record.executionLineage) return undefined;
+    return { ...record.executionLineage, produced: [...new Set([...followUpFiles, ...record.executionLineage.produced])] };
+  }
+  return undefined;
+}
+
 /** The last closed task's task-scoped files plus those of any follow-up finalizations after it. */
 function previousTaskScopedFiles(records: HistoryRecord[]): string[] {
   const files: string[] = [];
   for (const record of [...records].reverse()) {
-    if (!record.taskScopedChangedFiles?.length) continue;
+    if (record.untasked || !record.taskScopedChangedFiles?.length) continue;
     files.push(...record.taskScopedChangedFiles);
     if (!record.followUp) break;
   }
@@ -4356,6 +4558,7 @@ const DOCUMENT_RANGE_LIMIT = 3;
  */
 function documentReadRanges(path: string, content: string, summary?: DocumentationSummary): CodeIndexSymbol[] | undefined {
   if (!summary || !content.trim()) return undefined;
+  if (SCRIPT_RANGE_FILE.test(path)) return scriptReadRanges(path, content, summary);
   const isMarkdown = /\.mdx?$/i.test(path);
   if (!isMarkdown && !/\.json$/i.test(path)) return undefined;
   const lineCount = content.replace(/\n+$/, "").split(/\r?\n/).length;
@@ -4417,6 +4620,39 @@ function documentReadRanges(path: string, content: string, summary?: Documentati
 }
 
 const WEAK_SECTION_SCORE_RATIO = 0.4;
+/**
+ * A script: whole when small (see WHOLE_FILE_SCRIPT_TOKENS); otherwise the
+ * top-level sections that match the task, else its header and main block —
+ * never a blind top-of-file slice. Undefined when no structure is found.
+ */
+function scriptReadRanges(path: string, content: string, summary: DocumentationSummary): CodeIndexSymbol[] | undefined {
+  const lineCount = content.replace(/\n+$/, "").split(/\r?\n/).length;
+  if (estimateTextTokens(content) <= WHOLE_FILE_SCRIPT_TOKENS) {
+    return [{ name: `whole script (${lineCount} lines)`, kind: "block", startLine: 1, endLine: lineCount, summary: "Small script; read it whole.", editPoint: "Small script; read it whole.", priority: 1 }];
+  }
+  const sections = scriptSections(path, content);
+  if (sections.length === 0) return undefined;
+  const taskText = taskRoutingText(summary);
+  const taskTokens = withoutNegatedTokens(meaningfulRankingTokens(taskText), summary);
+  const weights = taskTokenWeights(summary, taskTokens);
+  const identifiers = [...withoutNegatedTokens(explicitCodeTokens(taskText), summary)].filter((token) => isIdentifierShaped(token));
+  const structuredIds = new Set(structuredIdentifierTokens(taskText));
+  const scored = sections.map((section) => scoreDocumentSection(section, taskTokens, weights, identifiers, structuredIds)).filter((entry) => entry.score > 0).sort((a, b) => b.score - a.score);
+  const floor = (scored[0]?.score ?? 0) * WEAK_SECTION_SCORE_RATIO;
+  const chosen = scored.length > 0
+    ? scored.filter((entry) => entry.score >= floor).map(({ section, matched }) => ({ section, reason: `Matches ${matched.slice(0, 4).join(", ")}.` }))
+    : sections.filter((section) => section.name === "module header" || section.name === "main block").map((section) => ({ section, reason: "Script entry: header and main block." }));
+  return chosen.slice(0, DOCUMENT_RANGE_LIMIT).map(({ section, reason }) => ({
+    name: truncateLine(`script ${section.name}`, 64),
+    kind: "block" as const,
+    startLine: section.startLine,
+    endLine: section.endLine,
+    summary: reason,
+    editPoint: reason,
+    priority: 2
+  }));
+}
+
 /** Below this a Markdown section cannot carry a decision with its reasons; agents re-read the whole file instead. */
 const MIN_MARKDOWN_SECTION_LINES = 12;
 const MAX_MARKDOWN_SECTION_LINES = 80;

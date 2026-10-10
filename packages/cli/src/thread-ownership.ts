@@ -327,3 +327,51 @@ export async function observeThreadPressure(input: { identity?: ObservedThreadId
   }
   return unknownThreadPressure();
 }
+
+/**
+ * Task-boundary headroom: whether the NEXT separate task fits in this
+ * thread, from its current usage plus the growth DevGuard actually observed
+ * for recent tasks (provider-reported input at prepare vs at done). Not a
+ * prediction of the provider's future usage — a headroom risk. Separate from
+ * the in-task 50/75 thresholds, which stay as they are: in real use tasks
+ * ended at 42–49% (LOW, no notice), the next task started in the same
+ * thread and ended at 67–88%.
+ */
+export type BoundaryStatus = "CONTINUE" | "SOON" | "NEW_THREAD" | "UNKNOWN";
+
+export interface BoundaryHeadroom {
+  status: BoundaryStatus;
+  /** Current usage + typical (hint-scaled) growth, as a share of the window. */
+  projected?: number;
+  /** Median observed per-task growth (share of the window), when known. */
+  typicalGrowth?: number;
+  samples: number;
+  reason: string;
+}
+
+const BOUNDARY_SOON_PROJECTED = 0.75;
+const BOUNDARY_NEW_THREAD_PROJECTED = 0.9;
+const BOUNDARY_MIN_SAMPLES = 2;
+/** With no growth history, a thread this full is already a risk for a medium task. */
+const BOUNDARY_CONSERVATIVE_RATIO = 0.4;
+const HEAVY_TASK_HINT = /\b(?:execute|execution|preflight|production|full audit|audit|migration|re-?run|rollout|deploy|forensics)\b|실행|프로덕션|감사|마이그레이션|배포|재실행/i;
+const LIGHT_TASK_HINT = /\b(?:small|tiny|typo|rename|single file|one-line|wording|follow-?up fix|minor)\b|오타|문구|작은|한 줄|간단/i;
+
+export function taskBoundaryHeadroom(input: { ratio?: number; recentGrowth: number[]; nextTaskText?: string }): BoundaryHeadroom {
+  const { ratio, recentGrowth } = input;
+  if (ratio === undefined) return { status: "UNKNOWN", samples: recentGrowth.length, reason: "Thread usage is not observable." };
+  const pct = (value: number) => `${Math.round(value * 100)}%`;
+  if (ratio >= PRESSURE_NEW_THREAD_RATIO) return { status: "NEW_THREAD", samples: recentGrowth.length, reason: `Thread is already at ${pct(ratio)}.` };
+  const growth = [...recentGrowth].filter((value) => value > 0).sort((a, b) => a - b);
+  if (growth.length < BOUNDARY_MIN_SAMPLES) {
+    return ratio >= BOUNDARY_CONSERVATIVE_RATIO
+      ? { status: "SOON", samples: growth.length, reason: `Thread is at ${pct(ratio)} and DevGuard has too little task-growth history to show a typical next task fits; start a separate task in a fresh thread.` }
+      : { status: "UNKNOWN", samples: growth.length, reason: `Thread is at ${pct(ratio)}; not enough task-growth history yet.` };
+  }
+  const typical = growth[Math.floor((growth.length - 1) / 2)];
+  const scale = input.nextTaskText ? (HEAVY_TASK_HINT.test(input.nextTaskText) ? 1.25 : LIGHT_TASK_HINT.test(input.nextTaskText) ? 0.4 : 1) : 1;
+  const projected = ratio + typical * scale;
+  const basis = `${pct(ratio)} now + typical task growth ${pct(typical)}${scale !== 1 ? ` ×${scale} (${scale > 1 ? "heavy" : "light"} task)` : ""} ≈ ${pct(projected)}`;
+  const status: BoundaryStatus = projected >= BOUNDARY_NEW_THREAD_PROJECTED ? "NEW_THREAD" : projected >= BOUNDARY_SOON_PROJECTED ? "SOON" : "CONTINUE";
+  return { status, projected, typicalGrowth: typical, samples: growth.length, reason: `${basis} of the window.` };
+}

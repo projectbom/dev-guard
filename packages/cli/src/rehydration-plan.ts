@@ -43,7 +43,7 @@ const MIN_REFERENCE_SCORE = 4;
 const SCRIPT_EXTENSION = /\.(?:py|sql|sh|bash|zsh|ts|tsx|mts|cts|js|mjs|cjs|go|rb|rs|java|kt|php|ps1)$/i;
 const BINARY_EXTENSION = /\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|tgz|tar|bz2|xz|7z|woff2?|ttf|eot|otf|mp[34]|mov|wav|bin|exe|dll|so|dylib|jar|class|wasm|sqlite3?|db|lockb)$/i;
 
-export type ContextFileSource = "explicit-user-input" | "task-path" | "reference";
+export type ContextFileSource = "explicit-user-input" | "task-path" | "reference" | "execution-lineage";
 
 export interface ExplicitInputResolution {
   accepted: string[];
@@ -269,8 +269,18 @@ export function wholeFileEligible(path: string, content: string): boolean {
   const tokens = estimateTextTokens(content);
   if (/\.mdx?$/i.test(path)) return tokens <= WHOLE_FILE_MARKDOWN_TOKENS;
   if (/\.json$/i.test(path)) return tokens <= WHOLE_FILE_JSON_TOKENS;
+  if (SCRIPT_RANGE_FILE.test(path)) return tokens <= WHOLE_FILE_SCRIPT_TOKENS;
   return false;
 }
+
+/**
+ * Scripts DevGuard plans by structure (def/function/statement sections),
+ * not by the Code Index. Measured on PartnerFlow's 151 infra scripts: p50
+ * ~1.4K, p75 ~3.2K, p90 ~5.1K, max ~12K estimated tokens — so a script up
+ * to ~p75 is read once, whole; a larger one by its relevant sections.
+ */
+export const SCRIPT_RANGE_FILE = /\.(?:py|sh|bash|zsh|sql|rb)$/i;
+export const WHOLE_FILE_SCRIPT_TOKENS = 3000;
 
 export function isStructuredDocument(path: string): boolean {
   return /\.(?:mdx?|json)$/i.test(path);

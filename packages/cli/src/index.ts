@@ -426,7 +426,7 @@ async function runDone(root: string): Promise<void> {
     }
     // The agent's own `dev-guard done` is the task boundary: report its
     // thread's fresh state so the final reply can carry the notice.
-    const threadState = completionSource === "cli-done" ? await threadStateForAgent(root, identityFromShellEnv(process.env)).catch(() => undefined) : undefined;
+    const threadState = completionSource === "cli-done" ? await threadStateForAgent(root, identityFromShellEnv(process.env), { taskBoundary: true }).catch(() => undefined) : undefined;
     console.log("dev-guard done (manual finalization)");
     console.log("Note: dev-guard watch auto-finalizes sessions normally. Use done only for manual recovery.");
     console.log("");

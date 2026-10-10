@@ -67,15 +67,17 @@ async function eventsOf(root, name) {
 test("A: a follow-up `done` after TASK_DONE reports only the files changed since that done — never the pre-existing dirty tree", async () => {
   const root = await makeDirtyRepo();
   await prepareTaskContext({ root, task: "Task A: add the x module.", caller: THREAD });
-  await writeFile(join(root, "x.js"), "export const x = 1;\n");
+  await mkdir(join(root, "work"), { recursive: true });
+  await writeFile(join(root, "work/x.js"), "export const x = 1;\n");
   const first = await processDoneEvent(root, { completionSource: "cli-done" });
   assert.equal(first.alreadyProcessed, false);
-  assert.deepEqual(first.taskScopedChangedFiles, ["x.js"], "TASK_DONE scope: X only");
+  assert.deepEqual(first.taskScopedChangedFiles, ["work/x.js"], "TASK_DONE scope: X only");
 
-  await writeFile(join(root, "y.js"), "export const y = 2;\n");
+  // A file written next to the task's output after done is still its follow-up.
+  await writeFile(join(root, "work/y.js"), "export const y = 2;\n");
   const followUp = await processDoneEvent(root, { completionSource: "cli-done" });
   assert.equal(followUp.alreadyProcessed, false);
-  assert.deepEqual(followUp.taskScopedChangedFiles, ["y.js"], "follow-up scope: Y only, not X and not the 700 earlier files");
+  assert.deepEqual(followUp.taskScopedChangedFiles, ["work/y.js"], "follow-up scope: Y only, not X and not the 700 earlier files");
   assert.equal(followUp.carriedOverChangedFiles.length, DIRTY_FILES + 1, "earlier dirt and the already-finalized X are carried over");
   assert.ok(followUp.judgments.some((line) => /Follow-up of the task closed just before: only the 1 file/.test(line)), followUp.judgments.join("\n"));
 
@@ -85,9 +87,9 @@ test("A: a follow-up `done` after TASK_DONE reports only the files changed since
   assert.equal(followUps[0].changedFileDeltaCount, 1);
 
   // An edit to a file the task already finalized is a follow-up change too.
-  await writeFile(join(root, "x.js"), "export const x = 3;\n");
+  await writeFile(join(root, "work/x.js"), "export const x = 3;\n");
   const second = await processDoneEvent(root, { completionSource: "cli-done" });
-  assert.deepEqual(second.taskScopedChangedFiles, ["x.js"]);
+  assert.deepEqual(second.taskScopedChangedFiles, ["work/x.js"]);
 });
 
 test("B: repeated `done` with no change after TASK_DONE (or after a follow-up) is a NO-OP — no follow-up finalization", async () => {

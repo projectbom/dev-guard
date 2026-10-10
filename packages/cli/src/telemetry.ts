@@ -2,7 +2,7 @@ import { readTaskTelemetry } from "./task-telemetry.js";
 import { devguardPaths } from "./paths.js";
 import { readDriftTelemetryStats, summarizeDriftTelemetry } from "./drift-telemetry.js";
 
-const TASK_EVENT_ORDER = ["TASK_PREPARED", "TASK_DONE", "TASK_FOLLOWUP_FINALIZED", "COMPLETION_SIGNAL_RECEIVED", "COMPLETION_IGNORED", "VALIDATION_RECORDED"] as const;
+const TASK_EVENT_ORDER = ["TASK_PREPARED", "TASK_DONE", "TASK_FOLLOWUP_FINALIZED", "UNTASKED_FINALIZED", "COMPLETION_SIGNAL_RECEIVED", "COMPLETION_IGNORED", "VALIDATION_RECORDED"] as const;
 
 export async function runTelemetry(root: string): Promise<void> {
   const [summary, stats, taskEvents] = await Promise.all([summarizeDriftTelemetry(root), readDriftTelemetryStats(root), readTaskTelemetry(root, 1000)]);

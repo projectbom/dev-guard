@@ -44,6 +44,8 @@ export type TaskTelemetryEventType =
    * closed (edits made after `dev-guard done`). Real work, not a completion.
    */
   | "TASK_FOLLOWUP_FINALIZED"
+  /** Work finalized with no task open that is not the closed task's own files (delta only, never the whole tree). */
+  | "UNTASKED_FINALIZED"
   /**
    * A hook completion that was NOT acted on because it came from a provider
    * thread other than the current task's owner (diagnostic only — nothing
@@ -98,6 +100,10 @@ export interface TaskTelemetryEvent {
   providedRangeCount?: number;
   /** TASK_PREPARED/CONTINUED/REPLACED: estimated tokens of the MCP agent payload as delivered (single copy). Never provider-billed. */
   mcpPayloadTokens?: number;
+  /** TASK_PREPARED/CONTINUED/REPLACED and TASK_DONE: provider-reported input tokens of the owning thread at that moment (OBSERVED), for task-growth history. */
+  observedInputTokens?: number;
+  /** The provider context window those input tokens were reported against. */
+  contextWindow?: number;
   /** TASK_PREPARED/CONTINUED/REPLACED: observed provider thread pressure (see thread-ownership.ts). */
   threadPressure?: string;
   /** TASK_PREPARED/CONTINUED/REPLACED: how the task's owning thread was identified, if at all. */

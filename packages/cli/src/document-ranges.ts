@@ -11,7 +11,7 @@
 
 export interface DocumentSection {
   /** "markdown heading" | "json key" | "json item" | one nested key of a top-level object ("json child") */
-  kind: "markdown" | "json-key" | "json-item" | "json-child";
+  kind: "markdown" | "json-key" | "json-item" | "json-child" | "script";
   /** Heading text, top-level key, `key[index]` (with an id hint when the element has one), or `parent.child`. */
   name: string;
   startLine: number;
@@ -242,4 +242,46 @@ export function jsonSections(content: string): DocumentSection[] {
   }
   if (current && depth <= 1) closeCurrent(content.length - 1, line);
   return sections.filter((section) => section.endLine >= section.startLine);
+}
+
+/**
+ * Top-level structure of a script, by line patterns only (no parser): a
+ * Python module header (imports/constants) and each top-level def/class and
+ * `if __name__ == "__main__"` block; shell functions; SQL statements (named
+ * by the comment line before them). Sections are contiguous and cover the
+ * file; anything not recognized returns [] and the caller falls back.
+ */
+export function scriptSections(path: string, content: string): DocumentSection[] {
+  const lines = content.split(/\r?\n/);
+  const starts: Array<{ line: number; name: string }> = [];
+  if (/\.py$/i.test(path)) {
+    lines.forEach((line, index) => {
+      const match = /^(?:async\s+)?def\s+(\w+)|^class\s+(\w+)|^(if\s+__name__\s*==)/.exec(line);
+      if (match) starts.push({ line: index + 1, name: match[1] ? `def ${match[1]}` : match[2] ? `class ${match[2]}` : "main block" });
+    });
+  } else if (/\.(?:sh|bash|zsh)$/i.test(path)) {
+    lines.forEach((line, index) => {
+      const match = /^(?:function\s+)?([A-Za-z_][\w-]*)\s*\(\)\s*\{?\s*$|^function\s+([A-Za-z_][\w-]*)/.exec(line);
+      if (match) starts.push({ line: index + 1, name: `function ${match[1] ?? match[2]}` });
+    });
+  } else if (/\.sql$/i.test(path)) {
+    let begin = 1;
+    lines.forEach((line, index) => {
+      if (/;\s*(?:--.*)?$/.test(line)) {
+        const comment = lines.slice(begin - 1, index + 1).find((entry) => /^\s*--\s*\S/.test(entry));
+        const statement = lines.slice(begin - 1, index + 1).find((entry) => entry.trim() && !/^\s*--/.test(entry)) ?? "statement";
+        starts.push({ line: begin, name: (comment ?? statement).replace(/^\s*--\s*/, "").trim().slice(0, 60) });
+        begin = index + 2;
+      }
+    });
+  } else return [];
+  if (starts.length === 0) return [];
+  const sections: DocumentSection[] = [];
+  if (starts[0].line > 3) starts.unshift({ line: 1, name: "module header" });
+  starts.forEach((start, position) => {
+    const next = starts[position + 1]?.line ?? lines.length + 1;
+    const end = Math.max(start.line, trimTrailingBlank(lines, start.line, next - 1));
+    sections.push({ kind: "script", name: start.name, startLine: start.line, endLine: end, text: `${start.name}\n${lines.slice(start.line - 1, end).join("\n")}`.slice(0, MAX_SECTION_TEXT), level: 1 });
+  });
+  return sections;
 }

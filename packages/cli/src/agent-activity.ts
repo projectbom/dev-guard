@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { estimateTokens } from "@dev-guard/core";
+import { hashThreadId as ownerThreadHash } from "./thread-ownership.js";
 
 /**
  * Agent activity observability — METADATA ONLY.
@@ -50,6 +51,8 @@ export interface ActivityEvent {
   contextWindow?: number;
   /** MCP prepare_task_context result: the files it provided (repo-relative). */
   providedPaths?: string[];
+  /** Repository scripts this command executed (e.g. `python3 infra/x/run.py`), repo-relative. */
+  executedPaths?: string[];
   /** OTHER only: a non-sensitive label of what it was (MCP server/tool name, "web", "inline script", "shell"). */
   otherLabel?: string;
   durationMs?: number;
@@ -60,6 +63,8 @@ export interface ThreadInfo {
   provider: "codex" | "claude";
   /** "user" = a real user thread; "subagent" = e.g. Codex guardian review. */
   source: "user" | "subagent";
+  /** The same thread as DevGuard task ownership hashes it (thread-ownership.ts), to match a task's owner. */
+  ownerHash?: string;
   startedAt: string;
 }
 
@@ -123,6 +128,8 @@ export interface CommandClassification {
   /** Scope of each search segment in the command (empty when none). */
   searchScopes: SearchScope[];
   otherLabel?: string;
+  /** Repository scripts the command executed (interpreter + script path, or ./script). */
+  executed?: string[];
 }
 
 interface ParsedCommandPart {
@@ -139,6 +146,48 @@ interface ParsedCommandPart {
  * scope is "unknown", never "broad".
  */
 export function classifyCommand(command: string, parsed: ParsedCommandPart[], cwd: string, root: string, fileExists: (absolutePath: string) => boolean = existsSync): CommandClassification {
+  const classified = classifyCommandText(command, parsed, cwd, root, fileExists);
+  const executed = executedScripts(command, cwd, root, fileExists);
+  return executed.length > 0 ? { ...classified, executed } : classified;
+}
+
+const INTERPRETER_VALUE_FLAGS = new Set(["--import", "--require", "-r", "--loader", "--experimental-loader", "-W", "-X", "--env-file"]);
+const INTERPRETERS = new Set(["python", "python3", "node", "bash", "sh", "zsh", "ruby", "tsx", "ts-node", "deno", "bun", "perl"]);
+
+/**
+ * Repository scripts a command runs: `python3 path/run.py`, `node x.mjs`,
+ * `bash x.sh`, `./x.sh` (after `cd`/`env` prefixes). Inline programs
+ * (`-c`, `-e`, heredocs) are not script files and are not reported.
+ */
+export function executedScripts(command: string, cwd: string, root: string, fileExists: (absolutePath: string) => boolean = existsSync): string[] {
+  const found = new Set<string>();
+  let workingDir = cwd;
+  for (const statement of splitStatements(command.split(/<<-?\s*['"]?\w+['"]?/)[0])) {
+    for (const segment of splitPipeline(statement)) {
+      let words = shellWords(segment);
+      if (words[0] === "cd" && words[1]) {
+        workingDir = isAbsolute(words[1]) ? words[1] : join(workingDir, words[1]);
+        continue;
+      }
+      // `env -i A=1 python3 x.py` / `A=1 python3 x.py`: skip to the command.
+      if (words[0] === "env") words = words.slice(1);
+      while (words.length && (/^\w+=/.test(words[0]) || words[0].startsWith("-"))) words = words.slice(1);
+      const head = words[0]?.split("/").pop() ?? "";
+      let target: string | undefined;
+      if (INTERPRETERS.has(head) || /^python3?\.\d+$/.test(head)) {
+        if (words.some((word) => word === "-c" || word === "-e" || word === "-m")) continue;
+        const args = words.slice(1);
+        target = args.find((word, index) => !word.startsWith("-") && !INTERPRETER_VALUE_FLAGS.has(args[index - 1] ?? ""));
+      } else if (/^\.{1,2}\//.test(words[0] ?? "")) {
+        target = words[0];
+      }
+      if (target && /\.[A-Za-z0-9]{1,6}$/.test(target)) addRead(found, target, workingDir, root, fileExists);
+    }
+  }
+  return [...found];
+}
+
+function classifyCommandText(command: string, parsed: ParsedCommandPart[], cwd: string, root: string, fileExists: (absolutePath: string) => boolean): CommandClassification {
   const text = command.trim();
   const reads = new Set<string>();
   const fallbackDocs = new Set<string>();
@@ -425,7 +474,12 @@ export class CodexLocalActivitySource implements AgentActivitySource {
     const files: string[] = [];
     for (const dir of [...new Set(days)]) {
       const names = await readdir(dir).catch(() => [] as string[]);
-      for (const name of names) if (name.startsWith("rollout-") && name.endsWith(".jsonl")) files.push(join(dir, name));
+      for (const name of names) {
+        if (!name.startsWith("rollout-") || !name.endsWith(".jsonl")) continue;
+        // A log last written before the window holds nothing from it.
+        const modified = await stat(join(dir, name)).then((info) => info.mtimeMs, () => Number.POSITIVE_INFINITY);
+        if (modified >= sinceMs) files.push(join(dir, name));
+      }
     }
     return files;
   }
@@ -493,6 +547,7 @@ export class CodexLocalActivitySource implements AgentActivitySource {
         const id = String(payload.id ?? payload.session_id ?? "");
         state.thread = {
           thread: hashThreadId(id),
+          ownerHash: ownerThreadHash("codex", id),
           provider: "codex",
           source: payload.thread_source === "user" || !payload.parent_thread_id ? "user" : "subagent",
           startedAt: String(payload.timestamp ?? entry.timestamp ?? "")
@@ -561,6 +616,7 @@ export function codexItemToEvent(item: Record<string, unknown>, ts: string, thre
         ...(classified.broadSearch ? { broadSearch: true } : {}),
         ...(classified.searchScopes.length ? { searchScopes: classified.searchScopes } : {}),
         ...(classified.otherLabel ? { otherLabel: classified.otherLabel } : {}),
+        ...(classified.executed?.length ? { executedPaths: classified.executed.slice(0, 8) } : {}),
         durationMs: durationMs(item.duration)
       };
     }
