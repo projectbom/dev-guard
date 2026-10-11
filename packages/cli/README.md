@@ -29,7 +29,7 @@ cd my-project
 dev-guard watch
 ```
 
-The first `watch` prepares DevGuard automatically — `.devguard/` configuration, Code Index, Project Knowledge, the DevGuard section of `AGENTS.md` / `CLAUDE.md`, the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`), completion hooks (best-effort) — then opens the local dashboard and starts watching. Later runs reuse fresh artifacts and start immediately. No setup step and no API key are needed.
+The first `watch` prepares DevGuard automatically — `.devguard/` configuration, Code Index, Project Knowledge, the DevGuard section of `AGENTS.md` / `CLAUDE.md`, the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`), completion hooks (best-effort) — then opens the local dashboard and starts watching. Later runs reuse fresh artifacts and start immediately. No setup step and no API key are needed. Discovery is lightweight and deterministic: inside git it uses `git ls-files` (`.gitignore`d files are never analyzed), outside git it walks the tree, and content reads are budgeted and sampled across workspace packages.
 
 Optional: `dev-guard setup` runs the same preparation without starting the watcher and prints a summary (CI/scripts, inspection, `--dry-run` preview). It is never required before `watch`.
 

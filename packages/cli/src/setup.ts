@@ -31,7 +31,7 @@ export async function runSetup(root: string, args: string[] = []): Promise<void>
   console.log("");
   let result: PrepareResult;
   try {
-    result = await prepareProject(root, { onProgress: (line) => console.log(`  ${line}`) });
+    result = await prepareProject(root, { verifyMcp: "always", onProgress: (line) => console.log(`  ${line}`) });
   } catch (error) {
     console.error(`dev-guard setup: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;

@@ -209,6 +209,17 @@ Current local layers:
 - completion quality verdict
 - handoff prompt rendering
 
+## First-Run Project Analysis
+
+`watch` (and the optional `setup`) run one preparation engine, `prepareProject`. It is local, deterministic, and makes no network calls:
+
+1. Enumerate the project once (`project-files.ts`): `git ls-files --cached --others --exclude-standard` minus deleted files inside git — `.gitignore` is honored — or a directory walk otherwise. Metadata only, no cap below a 200K-path safety ceiling.
+2. Code Index bootstrap: up to 1200 indexable files, spread across source roots and workspace packages (up to 300 per root), read with bounded concurrency.
+3. Project Knowledge: path-based detection (source roots, routes, migrations, important files, modules) over the full list; content-based detection (components, route methods, Express routes, SQL tables) within fixed budgets sampled across workspace packages. A structural fingerprint of the full list decides later freshness.
+4. Agent instructions, MCP config, completion hooks — written only when missing or changed; the MCP server is re-verified only when its config changed (`setup` always verifies).
+
+No accelerator dependency is used. `fdir` was benchmarked for enumeration (≈3× faster than the walk, but it would only help the non-git fallback, by <150 ms at 25K files). Hash (xxhash) and parser (oxc, ast-grep) accelerators were not benchmarked because profiling showed hashing and regex extraction each well under 20% of a sub-second first run; most of the time is file I/O, addressed with bounded concurrency instead.
+
 ## Safety Boundaries
 
 - No source files are modified by `watch`, `done`, `status`, or `reset`.

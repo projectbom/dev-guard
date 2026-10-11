@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-import { access, readdir } from "node:fs/promises";
+import { access } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
-import { isDevGuardArtifactPath, isGeneratedArtifactPath } from "@dev-guard/core";
 import { readJsonFile, readTextFile, writeTextFile, fromRoot } from "./fs.js";
+import { enumerateProjectFiles, groupByRoots, mapLimit, spreadAcross, type ProjectFileList } from "./project-files.js";
 import { devguardPaths } from "./paths.js";
 
 export interface ProjectKnowledge {
@@ -81,21 +81,14 @@ export interface ProjectKnowledgeRefreshStatus {
   };
 }
 
-// Delegates to the shared, cross-package policy (@dev-guard/core) instead of
-// its own list — this also fixes backup/temp copies of DevGuard's own
-// output (e.g. ".devguard.backup-<ts>") leaking into Project Knowledge as
-// if they were project source, which a bare-name Set only matching the
-// exact ".devguard"/"devguard" names could not catch.
-function isIgnoredProjectDirectory(name: string): boolean {
-  return isGeneratedArtifactPath(name) || isDevGuardArtifactPath(name);
-}
-
 // Informational only (reported in the generated ProjectKnowledge.extraction.ignored
-// field) — the actual enforcement is isIgnoredProjectDirectory above.
+// field) — the actual enforcement is enumerateProjectFiles (project-files.ts):
+// .gitignore inside git, plus the shared generated/DevGuard path policy.
 const IGNORED_DIRECTORY_LABELS = [".git", ".devguard", ".devguard.*", "devguard", "devguard.*", "node_modules", "dist", "build", ".next", "coverage", ".turbo", ".cache"];
 
 const sourceExtensions = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".mdx", ".sql"]);
-const maxFiles = 2_000;
+const MAX_WORKSPACE_PACKAGES = 500;
+const READ_CONCURRENCY = 16;
 
 const knowledgeRefreshCandidates = [
   "package.json",
@@ -149,17 +142,22 @@ export async function runKnowledge(root: string): Promise<void> {
  * `services/api`, `modules/auth`, ...) come from `readWorkspacePackages`,
  * not from guessing a directory-name convention.
  */
-export async function discoverWorkspaceSourceRoots(root: string): Promise<string[]> {
-  const files = await listProjectFiles(root);
+export async function discoverWorkspaceSourceRoots(root: string, enumeration?: ProjectFileList): Promise<string[]> {
+  const files = await listProjectFiles(root, enumeration);
   const workspacePackages = await readWorkspacePackages(root, files);
   return detectSourceRoots(files, workspacePackages);
 }
 
-export async function generateProjectKnowledge(root: string): Promise<ProjectKnowledge> {
-  const files = await listProjectFiles(root);
+export async function generateProjectKnowledge(root: string, enumeration?: ProjectFileList): Promise<ProjectKnowledge> {
+  const files = await listProjectFiles(root, enumeration);
   const fingerprint = await computeKnowledgeFingerprint(root, files);
   const rootPackage = await readJsonFile<PackageJson>(fromRoot(root, "package.json"), {});
   const workspacePackages = await readWorkspacePackages(root, files);
+  // Content-reading detectors sample round-robin across workspace packages
+  // (or top-level directories), so a large repo yields a representative
+  // Knowledge instead of the first N files of one subtree.
+  const workspaceDirs = workspacePackages.map((pkg) => pkg.path.slice(0, -"/package.json".length));
+  const groupOf = groupByRoots(workspaceDirs);
   const packageJsons = [rootPackage, ...workspacePackages.map((entry) => entry.packageJson)];
   const knowledge: ProjectKnowledge = {
     schemaVersion: 1,
@@ -173,10 +171,10 @@ export async function generateProjectKnowledge(root: string): Promise<ProjectKno
       sourceRoots: detectSourceRoots(files, workspacePackages),
       filesIndexed: files.length
     },
-    pages: detectPages(files),
-    components: await detectComponents(root, files),
-    apis: await detectApis(root, files),
-    database: await detectDatabase(root, files),
+    pages: detectPages(files, workspaceDirs, groupOf),
+    components: await detectComponents(root, files, groupOf),
+    apis: await detectApis(root, files, workspaceDirs, groupOf),
+    database: await detectDatabase(root, files, groupOf),
     commands: await detectCommands(root, files, rootPackage, workspacePackages),
     importantFiles: detectImportantFiles(files),
     architecture: {
@@ -219,7 +217,7 @@ export async function ensureProjectKnowledge(root: string): Promise<{
   }
 }
 
-export async function getProjectKnowledgeRefreshStatus(root: string): Promise<ProjectKnowledgeRefreshStatus> {
+export async function getProjectKnowledgeRefreshStatus(root: string, enumeration?: ProjectFileList): Promise<ProjectKnowledgeRefreshStatus> {
   const [stored, detected] = await Promise.all([
     readJsonFile<Partial<ProjectKnowledge> | null>(fromRoot(root, devguardPaths.projectKnowledge), null),
     detectProjectBasics(root)
@@ -227,7 +225,7 @@ export async function getProjectKnowledgeRefreshStatus(root: string): Promise<Pr
   if (!stored || typeof stored !== "object" || !stored.summary) {
     return { exists: false, shouldGenerate: true, reason: "missing", staleFiles: [], detected };
   }
-  const current = await computeKnowledgeFingerprint(root);
+  const current = await computeKnowledgeFingerprint(root, await listProjectFiles(root, enumeration));
   const previous = stored.fingerprint;
   // Knowledge written before fingerprints existed is refreshed once.
   const staleFiles = previous?.version === 1 ? diffFingerprints(previous, current) : ["fingerprint missing (older DevGuard)"];
@@ -339,30 +337,18 @@ async function filterExisting(root: string, paths: string[]): Promise<string[]> 
   return result;
 }
 
-async function listProjectFiles(root: string): Promise<string[]> {
-  const files: string[] = [];
-  async function walk(dir: string): Promise<void> {
-    if (files.length >= maxFiles) return;
-    const entries = await readdir(join(root, dir), { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (files.length >= maxFiles) return;
-      const rel = dir ? `${dir}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        if (!isIgnoredProjectDirectory(entry.name)) {
-          await walk(rel);
-        }
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      if (sourceExtensions.has(extname(entry.name)) || importantFileNames.has(entry.name)) {
-        files.push(rel);
-      }
-    }
-  }
-  await walk("");
-  return files.sort();
+/**
+ * Every project file Knowledge cares about (by extension or well-known
+ * name), from the shared enumeration — no file-count cap: enumeration is
+ * metadata-only, and content reads are budgeted per detector instead.
+ */
+async function listProjectFiles(root: string, enumeration?: ProjectFileList): Promise<string[]> {
+  const { files } = enumeration ?? (await enumerateProjectFiles(root));
+  return files.filter((file) => {
+    const name = file.slice(file.lastIndexOf("/") + 1);
+    return sourceExtensions.has(extname(name)) || importantFileNames.has(name);
+  });
 }
-
 const importantFileNames = new Set([
   "README.md",
   "README.ko.md",
@@ -376,7 +362,7 @@ const importantFileNames = new Set([
 ]);
 
 async function readWorkspacePackages(root: string, files: string[]): Promise<Array<{ path: string; packageJson: PackageJson }>> {
-  const packageFiles = files.filter((file) => file.endsWith("/package.json"));
+  const packageFiles = files.filter((file) => file.endsWith("/package.json")).slice(0, MAX_WORKSPACE_PACKAGES);
   const packages = await Promise.all(
     packageFiles.map(async (file) => ({
       path: file,
@@ -440,26 +426,44 @@ function detectSourceRoots(files: string[], workspacePackages: Array<{ path: str
   return [...roots].sort();
 }
 
-function detectPages(files: string[]): ProjectKnowledge["pages"] {
-  const pages: ProjectKnowledge["pages"] = [];
-  for (const file of files) {
-    if (!/^(app|src\/app|pages)\//.test(file)) continue;
-    if (/\/route\.(ts|js)$/.test(file)) {
-      pages.push({ route: routeFromAppFile(file), file, type: "api" });
-    } else if (/\/page\.(tsx|jsx|ts|js|mdx)$/.test(file) || /^pages\/.*\.(tsx|jsx|ts|js|mdx)$/.test(file)) {
-      pages.push({ route: routeFromPageFile(file), file, type: "page" });
-    } else if (/\/layout\.(tsx|jsx|ts|js)$/.test(file)) {
-      pages.push({ route: routeFromAppFile(file), file, type: "layout" });
-    }
+/**
+ * Splits `file` into (app directory, path inside it) when it lives in a
+ * Next.js-style `app/`, `src/app/` or `pages/` directory at the project root
+ * or at the root of a workspace package (e.g. `apps/web/app/...`).
+ */
+function appRelativePath(file: string, workspaceDirs: string[]): { kind: "app" | "pages"; rel: string } | undefined {
+  for (const prefix of ["", ...workspaceDirs.map((dir) => `${dir}/`)]) {
+    if (!file.startsWith(prefix)) continue;
+    const rest = file.slice(prefix.length);
+    const match = rest.match(/^(?:src\/)?app\/(.+)$/);
+    if (match) return { kind: "app", rel: `app/${match[1]}` };
+    if (rest.startsWith("pages/")) return { kind: "pages", rel: rest };
   }
-  return pages.slice(0, 200);
+  return undefined;
 }
 
-async function detectComponents(root: string, files: string[]): Promise<ProjectKnowledge["components"]> {
+function detectPages(files: string[], workspaceDirs: string[], groupOf: (file: string) => string): ProjectKnowledge["pages"] {
+  const pages: ProjectKnowledge["pages"] = [];
+  for (const file of files) {
+    const located = appRelativePath(file, workspaceDirs);
+    if (!located) continue;
+    if (located.kind === "app" && /\/route\.(ts|js)$/.test(located.rel)) {
+      pages.push({ route: routeFromAppFile(located.rel), file, type: "api" });
+    } else if ((located.kind === "app" && /\/page\.(tsx|jsx|ts|js|mdx)$/.test(located.rel)) || (located.kind === "pages" && /\.(tsx|jsx|ts|js|mdx)$/.test(located.rel))) {
+      pages.push({ route: routeFromPageFile(located.rel), file, type: "page" });
+    } else if (located.kind === "app" && /\/layout\.(tsx|jsx|ts|js)$/.test(located.rel)) {
+      pages.push({ route: routeFromAppFile(located.rel), file, type: "layout" });
+    }
+  }
+  return spreadAcross(pages, 200, (page) => groupOf(page.file));
+}
+async function detectComponents(root: string, files: string[], groupOf: (file: string) => string): Promise<ProjectKnowledge["components"]> {
   const candidates = files.filter((file) => /\.(tsx|jsx)$/.test(file) && /(^components\/|\/components\/|^app\/|^src\/)/.test(file));
   const components: ProjectKnowledge["components"] = [];
-  for (const file of candidates.slice(0, 400)) {
-    const text = await readTextFile(fromRoot(root, file));
+  const sample = spreadAcross(candidates, 400, groupOf);
+  const texts = await mapLimit(sample, READ_CONCURRENCY, (file) => readTextFile(fromRoot(root, file)));
+  for (const [index, file] of sample.entries()) {
+    const text = texts[index];
     for (const match of text.matchAll(/export\s+function\s+([A-Z][A-Za-z0-9_]*)/g)) {
       components.push({ name: match[1], file, exportType: "function" });
     }
@@ -471,22 +475,29 @@ async function detectComponents(root: string, files: string[]): Promise<ProjectK
       components.push({ name: defaultMatch[1] ?? componentNameFromFile(file), file, exportType: "default" });
     }
   }
-  return dedupeBy(components, (item) => `${item.name}:${item.file}`).slice(0, 200);
+  return spreadAcross(dedupeBy(components, (item) => `${item.name}:${item.file}`), 200, (item) => groupOf(item.file));
 }
 
-async function detectApis(root: string, files: string[]): Promise<ProjectKnowledge["apis"]> {
+async function detectApis(root: string, files: string[], workspaceDirs: string[], groupOf: (file: string) => string): Promise<ProjectKnowledge["apis"]> {
   const apis: ProjectKnowledge["apis"] = [];
+  const nextRoutes: Array<{ file: string; rel: string }> = [];
   for (const file of files) {
-    if (/^(app|src\/app)\/.*\/route\.(ts|js)$/.test(file)) {
-      const text = await readTextFile(fromRoot(root, file));
-      apis.push({ kind: "next-route", route: routeFromAppFile(file), file, methods: detectHttpMethods(text) });
-    } else if (/^pages\/api\/.*\.(ts|js)$/.test(file)) {
-      apis.push({ kind: "pages-api", route: routeFromPagesApi(file), file });
+    const located = appRelativePath(file, workspaceDirs);
+    if (located?.kind === "app" && /\/route\.(ts|js)$/.test(located.rel)) {
+      nextRoutes.push({ file, rel: located.rel });
+    } else if (located?.kind === "pages" && /^pages\/api\/.*\.(ts|js)$/.test(located.rel)) {
+      apis.push({ kind: "pages-api", route: routeFromPagesApi(located.rel), file });
     }
   }
-  const routeFiles = files.filter((file) => /\.(ts|js)$/.test(file) && !file.includes(".d.ts")).slice(0, 600);
-  for (const file of routeFiles) {
-    const text = await readTextFile(fromRoot(root, file));
+  const routeSample = spreadAcross(nextRoutes, 300, (entry) => groupOf(entry.file));
+  const routeTexts = await mapLimit(routeSample, READ_CONCURRENCY, (entry) => readTextFile(fromRoot(root, entry.file)));
+  routeSample.forEach(({ file, rel }, index) => {
+    apis.push({ kind: "next-route", route: routeFromAppFile(rel), file, methods: detectHttpMethods(routeTexts[index]) });
+  });
+  const routeFiles = spreadAcross(files.filter((file) => /\.(ts|js)$/.test(file) && !file.includes(".d.ts")), 600, groupOf);
+  const routeFileTexts = await mapLimit(routeFiles, READ_CONCURRENCY, (file) => readTextFile(fromRoot(root, file)));
+  for (const [index, file] of routeFiles.entries()) {
+    const text = routeFileTexts[index];
     for (const match of text.matchAll(/\b(?:app|router)\.(get|post|put|patch|delete)\(["'`]([^"'`]+)["'`]/g)) {
       apis.push({ kind: "express", route: match[2], file, methods: [match[1].toUpperCase()] });
     }
@@ -495,20 +506,20 @@ async function detectApis(root: string, files: string[]): Promise<ProjectKnowled
   for (const command of cliCommands) {
     apis.push({ kind: "cli-command", route: `dev-guard ${command}`, file: "packages/cli/src/index.ts" });
   }
-  return dedupeBy(apis, (item) => `${item.kind}:${item.route}:${item.file}`).slice(0, 250);
+  return spreadAcross(dedupeBy(apis, (item) => `${item.kind}:${item.route}:${item.file}`), 250, (item) => groupOf(item.file));
 }
 
-async function detectDatabase(root: string, files: string[]): Promise<ProjectKnowledge["database"]> {
+async function detectDatabase(root: string, files: string[], groupOf: (file: string) => string): Promise<ProjectKnowledge["database"]> {
   const database: ProjectKnowledge["database"] = [];
-  for (const file of files) {
-    if (/^supabase\/.*\.(sql|ts)$/.test(file)) {
-      database.push({ kind: "supabase", path: file, tables: await detectSqlTables(root, file) });
-    } else if (/^prisma\/.*\.(prisma|sql)$/.test(file)) {
-      database.push({ kind: "prisma", path: file, tables: await detectSqlTables(root, file) });
-    } else if (/migrations\/.*\.sql$/.test(file)) {
-      database.push({ kind: "sql-migration", path: file, tables: await detectSqlTables(root, file) });
-    }
-  }
+  // Newest first (migration names are sortable), spread across directories,
+  // so the 100 recorded entries describe the current schema, not the oldest.
+  const candidates = files.filter((file) => /^supabase\/.*\.(sql|ts)$/.test(file) || /^prisma\/.*\.(prisma|sql)$/.test(file) || /migrations\/.*\.sql$/.test(file)).reverse();
+  const sample = spreadAcross(candidates, 100, (file) => file.slice(0, file.lastIndexOf("/")) || groupOf(file));
+  const tables = await mapLimit(sample, READ_CONCURRENCY, (file) => detectSqlTables(root, file));
+  sample.forEach((file, index) => {
+    const kind = /^supabase\//.test(file) ? "supabase" : /^prisma\//.test(file) ? "prisma" : "sql-migration";
+    database.push({ kind, path: file, tables: tables[index] });
+  });
   return database.slice(0, 100);
 }
 

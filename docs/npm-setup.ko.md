@@ -41,7 +41,7 @@ dev-guard watch
 
 1. 프로젝트 루트 확인 (홈 디렉터리나 `/`는 거부)
 2. 없는 `.devguard/` 설정 파일 생성 (기존 파일 유지)
-3. Code Index 생성 (`.devguard/memory/code-index.json`)
+3. 프로젝트 파일을 한 번 나열(git 안에서는 `git ls-files`로 `.gitignore`된 파일 제외, 그 외에는 디렉터리 순회)하고 Code Index 생성 (`.devguard/memory/code-index.json`)
 4. Project Knowledge 생성 (`.devguard/project/project-knowledge.json`)
 5. `AGENTS.md`, `CLAUDE.md`의 DevGuard 섹션 추가/갱신 (marker 밖 텍스트 유지)
 6. Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버 등록 — 다른 서버/테이블 유지

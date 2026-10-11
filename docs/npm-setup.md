@@ -41,7 +41,7 @@ The first `watch` prepares the project, then opens the local dashboard and start
 
 1. validates the project root (refuses your home directory or `/`)
 2. creates `.devguard/` config files that are missing (existing files are kept)
-3. builds the Code Index (`.devguard/memory/code-index.json`)
+3. enumerates the project once (`git ls-files` inside git, so `.gitignore`d files are never analyzed; a directory walk otherwise) and builds the Code Index (`.devguard/memory/code-index.json`)
 4. generates Project Knowledge (`.devguard/project/project-knowledge.json`)
 5. adds/refreshes the DevGuard section of `AGENTS.md` and `CLAUDE.md` (text outside the markers is kept)
 6. registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) — other servers and tables are kept

@@ -148,6 +148,8 @@ dev-guard watch
 
 The first `watch` prepares DevGuard automatically — creates the `.devguard/` config, indexes the project (Code Index), analyzes its structure (Project Knowledge), adds the DevGuard section to `AGENTS.md` / `CLAUDE.md`, registers the DevGuard MCP server for Claude Code and Codex, installs completion hooks best-effort — then opens the local dashboard and starts watching. Later runs find everything fresh and start immediately ("Project ready."); only missing or stale parts are refreshed.
 
+DevGuard performs lightweight deterministic project discovery on first watch and reuses cached analysis on later runs. Inside git it lists files with `git ls-files`, so anything `.gitignore`d (local secrets, scratch folders, build output) is never analyzed; outside git it walks the tree. Content reads are budgeted and sampled across workspace packages, so large monorepos stay fast without losing packages. In our benchmark, a 25K-file synthetic monorepo was watching in under a second on first run.
+
 Optional — `dev-guard setup` runs the same preparation without starting the watcher and prints a summary (useful for CI/scripts, inspecting what DevGuard detected, or `dev-guard setup --dry-run` to preview changes without writing). It is never required before `watch`.
 
 Daily loop:

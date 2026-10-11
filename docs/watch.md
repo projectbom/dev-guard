@@ -2,7 +2,7 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-`dev-guard watch` is the entry point for AI-agent work. The first run prepares the project (Code Index, Project Knowledge, MCP, agent instructions, completion hooks) automatically; later runs start immediately. Automatic completion is agent-specific and must be runtime verified.
+`dev-guard watch` is the entry point for AI-agent work. The first run prepares the project (Code Index, Project Knowledge, MCP, agent instructions, completion hooks) automatically; later runs start immediately. Preparation enumerates the project once (`git ls-files --cached --others --exclude-standard` inside git, a directory walk otherwise), reads file contents only within fixed budgets sampled across workspace packages, and re-verifies the MCP server only when its config changed. Automatic completion is agent-specific and must be runtime verified.
 
 ```bash
 dev-guard watch

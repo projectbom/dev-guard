@@ -25,7 +25,7 @@ export interface McpSetupResult {
  * `.mcp.json` servers and other `.codex/config.toml` tables are preserved.
  * `dryRun` reports what would change without writing or spawning anything.
  */
-export async function ensureMcpSetup(root: string, options: { dryRun?: boolean } = {}): Promise<McpSetupResult> {
+export async function ensureMcpSetup(root: string, options: { dryRun?: boolean; verify?: "always" | "on-change" } = {}): Promise<McpSetupResult> {
   const warnings: string[] = [];
   const dryRun = Boolean(options.dryRun);
   const [claude, codex] = await Promise.all([
@@ -39,6 +39,8 @@ export async function ensureMcpSetup(root: string, options: { dryRun?: boolean }
     })
   ]);
   if (dryRun) return { claude, codex, verification: "skipped", warnings };
+  const changed = [claude, codex].some((state) => state === "created" || state === "updated");
+  if (options.verify === "on-change" && !changed) return { claude, codex, verification: "skipped", warnings };
   const verification = await verifyMcpServer(root).catch((error) => {
     warnings.push(`MCP server check failed: ${errorMessage(error)}. Agents may not be able to call prepare_task_context; run \`dev-guard doctor\` to diagnose.`);
     return "warning" as const;

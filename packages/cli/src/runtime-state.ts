@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { dirname, join, relative } from "node:path";
-import { mkdir, readdir, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { promisify } from "node:util";
 import {
   analyzeDiff,
@@ -22,6 +22,7 @@ import {
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTailLines, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
 import { appendBoundedJsonl, CHANGE_LOG_RETENTION, HISTORY_RETENTION, readBoundedJsonlTail } from "./artifact-retention.js";
+import { enumerateProjectFiles, groupByRoots, spreadAcross, type ProjectFileList } from "./project-files.js";
 import { computeWorkingTreeContentHash, getDiffForChangeFiles, getFileContentAtRef, getGitChanges, getGitIdentity, hashWorkingFiles, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
@@ -3010,7 +3011,7 @@ export async function generateReadMap(root: string, preloaded?: ResumeRawInputs,
   return readMapPath;
 }
 
-export async function ensureCodeIndex(root: string): Promise<{ path: string; generated: boolean; filesIndexed: number; warning?: string }> {
+export async function ensureCodeIndex(root: string, enumeration?: ProjectFileList): Promise<{ path: string; generated: boolean; filesIndexed: number; warning?: string }> {
   await ensureDevguardWorkspace(root);
   const current = await readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), {
     schemaVersion: 1,
@@ -3021,16 +3022,19 @@ export async function ensureCodeIndex(root: string): Promise<{ path: string; gen
     return { path: codeIndexPath, generated: false, filesIndexed: Object.keys(current.files).length };
   }
   try {
-    const files = await listInitialCodeIndexFiles(root);
+    const files = await listInitialCodeIndexFiles(root, enumeration);
     const next: CodeIndex = {
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
       files: {}
     };
-    for (const file of files) {
-      const content = await readIndexableFileContent(root, file);
+    // Reads overlap (bounded) — the bootstrap was I/O-wait bound when each
+    // file awaited the previous one. Insertion order stays the sorted order.
+    const contents = await mapWithConcurrency(files, 16, (file) => readIndexableFileContent(root, file));
+    files.forEach((file, index) => {
+      const content = contents[index];
       if (content?.trim()) next.files[file] = buildCodeIndexFile(file, content);
-    }
+    });
     await writeTextFile(fromRoot(root, codeIndexPath), `${JSON.stringify(next, null, 2)}\n`);
     return { path: codeIndexPath, generated: true, filesIndexed: Object.keys(next.files).length };
   } catch (error) {
@@ -6147,52 +6151,41 @@ async function readIndexableFileContent(root: string, file: string): Promise<str
  * workspace package directory gets its own indexing pass regardless of
  * what its parent folder happens to be named.
  */
-async function listInitialCodeIndexFiles(root: string): Promise<string[]> {
+async function listInitialCodeIndexFiles(root: string, enumeration?: ProjectFileList): Promise<string[]> {
+  const projectFiles = enumeration ?? (await enumerateProjectFiles(root));
   const staticRoots = ["app", "pages", "components", "src", "lib", "hooks", "utils", "packages", "docs"];
-  const discoveredRoots = await discoverWorkspaceSourceRoots(root).catch(() => [] as string[]);
+  const discoveredRoots = await discoverWorkspaceSourceRoots(root, projectFiles).catch(() => [] as string[]);
   const roots = [...new Set([...staticRoots, ...discoveredRoots])];
   const rootFiles = ["README.md", "README.ko.md", "package.json", "AGENTS.md", "CLAUDE.md"];
   const files = new Set<string>();
   for (const file of rootFiles) {
     if ((await fileExists(fromRoot(root, file))) && isIndexableSourceFile(file)) files.add(file);
   }
-  for (const dir of roots) {
-    if (await fileExists(fromRoot(root, dir))) {
-      for (const file of await listIndexableFiles(root, dir, 300)) files.add(file);
-    }
+  // Each indexable file belongs to its most specific root (a workspace
+  // package before the static `packages` root). Up to 300 per root, then a
+  // round-robin across roots up to the 1200 budget — every workspace
+  // package is represented, not just the first few in sort order.
+  const groupOf = groupByRoots(roots);
+  const rootSet = new Set(roots);
+  const perRoot = new Map<string, string[]>();
+  for (const file of projectFiles.files) {
+    if (!isIndexableSourceFile(file)) continue;
+    const group = groupOf(file);
+    if (!rootSet.has(group)) continue;
+    const bucket = perRoot.get(group) ?? [];
+    bucket.push(file);
+    perRoot.set(group, bucket);
   }
-  return [...files].sort().slice(0, 1200);
+  // Within a root, spread across its subdirectories too.
+  const subdirOf = (rootDir: string) => (file: string) => {
+    const rest = rootDir === "." ? file : file.slice(rootDir.length + 1);
+    return rest.includes("/") ? rest.slice(0, rest.indexOf("/")) : ".";
+  };
+  const sampled = [...perRoot.entries()].flatMap(([rootDir, bucket]) => spreadAcross(bucket, 300, subdirOf(rootDir)));
+  const budget = 1200 - files.size;
+  for (const file of spreadAcross(sampled, budget, groupOf)) files.add(file);
+  return [...files].sort();
 }
-
-async function listIndexableFiles(root: string, dir: string, limit: number): Promise<string[]> {
-  const out: string[] = [];
-  async function visit(relativeDir: string): Promise<void> {
-    if (out.length >= limit) return;
-    // Canonical exclusion policy (@dev-guard/core), not a second ad-hoc list
-    // — this now also covers `.turbo`/`.cache`, which matters once this
-    // walk runs inside discovered workspace package directories (DG-01)
-    // and not just a handful of well-known root-level names.
-    if (isIgnoredWatchPath(relativeDir)) return;
-    let entries: Array<{ name: string; isDirectory: () => boolean; isFile: () => boolean }>;
-    try {
-      entries = await readdir(fromRoot(root, relativeDir), { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (out.length >= limit) return;
-      const child = `${relativeDir}/${entry.name}`;
-      if (entry.isDirectory()) {
-        await visit(child);
-      } else if (entry.isFile() && isIndexableSourceFile(child)) {
-        out.push(child);
-      }
-    }
-  }
-  await visit(dir);
-  return out;
-}
-
 function hashText(content: string): string {
   return createHash("sha1").update(content).digest("hex");
 }

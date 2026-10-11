@@ -11,6 +11,7 @@ import { installHooks, refreshGeneratedHookScripts } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
 import { ensureCodeIndex, readRuntimeState, writeRuntimeState, type SetupStatus, type SetupStatusStep } from "./runtime-state.js";
 import { ensureMcpSetup, type McpSetupResult } from "./mcp-setup.js";
+import { enumerateProjectFiles } from "./project-files.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -32,6 +33,12 @@ export interface PrepareResult {
 }
 
 export interface PrepareOptions {
+  /**
+   * "always" (setup, explicit diagnosis) or "on-change" (watch default):
+   * spawning the MCP server to list its tools costs ~180 ms, so a watch
+   * whose MCP config is already in place does not re-verify it every start.
+   */
+  verifyMcp?: "always" | "on-change";
   /** Present only for `watch`: the dashboard is a watch-runtime concern, not setup. */
   dashboard?: { enabled: boolean; ready: boolean };
   onProgress?: (line: string) => void;
@@ -76,8 +83,12 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   steps.push({ key: "config", label: "Initialized project", status: "done", changed: initChanged });
   await markStep(root, startedAt, setupSteps, "config", "done");
 
+  // One enumeration of the project (git-aware, .gitignore honored) shared
+  // by the Code Index bootstrap, the Knowledge fingerprint and generation.
+  const enumeration = await enumerateProjectFiles(root);
+
   await markStep(root, startedAt, setupSteps, "code_index", "running");
-  const indexResult = await ensureCodeIndex(root);
+  const indexResult = await ensureCodeIndex(root, enumeration);
   didWork = didWork || indexResult.generated;
   if (indexResult.warning) warnings.push(`Code Index not built: ${indexResult.warning}. Task context has fewer file suggestions until it exists; DevGuard retries on the next watch/setup.`);
   steps.push({
@@ -90,13 +101,13 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   await markStep(root, startedAt, setupSteps, "code_index", indexResult.warning ? "warning" : "done", indexResult.warning);
 
   await markStep(root, startedAt, setupSteps, "knowledge", "running");
-  const knowledgeStatus = await getProjectKnowledgeRefreshStatus(root);
+  const knowledgeStatus = await getProjectKnowledgeRefreshStatus(root, enumeration);
   let knowledgeChanged = false;
   let knowledgeWarning: string | undefined;
   if (knowledgeStatus.shouldGenerate) {
     try {
       options.onProgress?.(knowledgeStatus.exists ? "Refreshing Project Knowledge..." : "Analyzing project structure...");
-      await generateProjectKnowledge(root);
+      await generateProjectKnowledge(root, enumeration);
       knowledgeChanged = true;
       didWork = true;
     } catch (error) {
@@ -172,7 +183,7 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   await markStep(root, startedAt, setupSteps, "hooks", hookWarning ? "warning" : "done", hookWarning);
 
   await markStep(root, startedAt, setupSteps, "mcp", "running");
-  const mcpResult = await ensureMcpSetup(root);
+  const mcpResult = await ensureMcpSetup(root, { verify: options.verifyMcp ?? "on-change" });
   const mcpChanged = mcpResult.claude === "created" || mcpResult.claude === "updated" || mcpResult.codex === "created" || mcpResult.codex === "updated";
   didWork = didWork || mcpChanged;
   warnings.push(...mcpResult.warnings);

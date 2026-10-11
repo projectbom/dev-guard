@@ -149,6 +149,8 @@ dev-guard watch
 
 첫 `watch`가 DevGuard를 자동으로 준비합니다 — `.devguard/` 설정 생성, 프로젝트 색인(Code Index), 구조 분석(Project Knowledge), `AGENTS.md` / `CLAUDE.md`에 DevGuard 섹션 추가, Claude Code와 Codex에 DevGuard MCP 서버 등록, completion hook best-effort 설치 — 그 뒤 로컬 대시보드를 열고 감시를 시작합니다. 이후 실행에서는 모두 최신이면 바로 시작하고("Project ready."), 없거나 오래된 부분만 갱신합니다.
 
+DevGuard는 첫 watch에서 가볍고 결정적인 프로젝트 탐색을 수행하고, 이후 실행에서는 캐시된 분석을 재사용합니다. git 안에서는 `git ls-files`로 파일을 나열하므로 `.gitignore`된 파일(로컬 secret, 임시 폴더, 빌드 산출물)은 분석하지 않고, git 밖에서는 디렉터리를 순회합니다. 파일 내용 읽기는 예산 안에서 workspace package 전반에 고르게 샘플링되어, 큰 monorepo에서도 빠르면서 package가 누락되지 않습니다. 벤치마크에서 25K 파일 synthetic monorepo는 첫 실행에서 1초 안에 감시를 시작했습니다.
+
 선택 사항 — `dev-guard setup`은 같은 준비 과정을 watch 없이 실행하고 요약을 출력합니다(CI/스크립트, 감지 결과 확인, `dev-guard setup --dry-run`으로 쓰기 없이 미리보기). `watch` 전에 반드시 실행할 필요는 없습니다.
 
 일상 루프:
