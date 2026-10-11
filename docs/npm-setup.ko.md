@@ -43,9 +43,11 @@ dev-guard status
 각 명령의 역할:
 
 - `init`: `.devguard/` 기본 파일을 만듭니다. 기존 파일은 덮어쓰지 않습니다.
-- `install-agent-instructions`: `AGENTS.md`, `CLAUDE.md`에 dev-guard 컨텍스트를 먼저 읽으라는 섹션을 추가합니다.
+- `install-agent-instructions`: `AGENTS.md`, `CLAUDE.md`에 DevGuard workflow 섹션(MCP `prepare_task_context` 우선)을 추가합니다.
 - `install-hooks`: Claude Code / Codex 완료 전략 파일을 설치합니다.
 - `status`: pending 변경, 최근 작업, quality verdict, hook 상태를 확인합니다.
+
+`dev-guard watch`는 첫 실행 때 Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버도 등록합니다. `prepare_task_context`와 `record_validation_result`는 이 서버가 제공합니다.
 
 hook을 바로 신뢰할 수 없는 환경이면 수동 모드로 시작합니다.
 
@@ -58,7 +60,7 @@ dev-guard status
 
 ## 3. GPT 설정
 
-기본 `watch`, `done`, `status`, `handoff` 흐름은 GPT/API 설정 없이 동작합니다.
+기본 `watch`, `done`, `status`, MCP 흐름은 GPT/API 설정 없이 동작합니다.
 GPT 설정은 `review`, `task-ai` 같은 AI 보조 명령을 사용할 때만 필요합니다.
 
 OpenAI provider 설정:
@@ -156,18 +158,16 @@ dev-guard done
 dev-guard status
 ```
 
-새 Codex/Claude 세션으로 이어갈 때:
+다음 작업을 새 Codex/Claude thread에서 할 때: 구체적인 작업(과 반드시 읽을 파일)만 전달합니다. agent가 `prepare_task_context`를 호출하고, 반환된 read plan의 TARGET 범위부터 읽으며, `.devguard` markdown은 열지 않습니다. 작업이 `SOON` / `NEW_THREAD` thread 안내로 끝났다면 다음 작업은 새 thread에서 시작합니다.
+
+수동 복구용 — MCP를 쓸 수 없을 때, 이전 작업을 명시적으로 재개할 때, DevGuard 출력을 디버깅할 때만:
 
 ```bash
 dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-새 세션 첫 프롬프트:
-
-```txt
-Read .devguard/context/agent-context.md and continue.
-```
+MCP 없이 진행할 때는 agent에게 `.devguard/context/agent-brief.md` → `.devguard/reports/read-map.md` → `.devguard/reports/code-map.md` 순서로 읽게 합니다.
 
 문제 확인용 명령:
 

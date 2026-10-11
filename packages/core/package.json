@@ -1,6 +1,6 @@
 {
   "name": "@dev-guard/core",
-  "version": "0.8.4",
+  "version": "0.9.0",
   "private": false,
   "description": "Core analysis and prompt utilities for DevGuard AI coding session handoff.",
   "type": "module",

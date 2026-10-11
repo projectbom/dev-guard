@@ -35,14 +35,16 @@ grown without reading it.
 - `ROLL_OVER_SOON`
 - `ROLL_OVER_RECOMMENDED`
 
-from DevGuard-owned signals only — pending changed file count, validations
+from DevGuard-owned signals — pending changed file count, validations
 recorded for the CURRENT task (an all-time count used to pin every mature
 project at `ROLL_OVER_RECOMMENDED`), current task age, and the estimated
-resume-bundle size above. **It never reads or guesses any AI provider's actual context-window
-usage** — there is no portable, official API for that, and doing so would be
-exactly the kind of unverifiable claim this feature has to avoid. It is a
-recommendation for a human to act on (start a new AI session and call
-`prepare_task_context` there), not something DevGuard enforces automatically.
+resume-bundle size above — plus the observed thread pressure below when the
+provider records it. **It never guesses a context-window percentage**: there
+is no portable, official API for one, so DevGuard uses only figures the
+provider itself wrote to its local session log, and reports `UNKNOWN`
+otherwise. It is a recommendation for a human to act on (start a new AI
+session and call `prepare_task_context` there), not something DevGuard
+enforces automatically.
 
 Any single signal already past its own budget floors the status at
 `ROLL_OVER_SOON`, even if every other signal is quiet — an oversized resume
@@ -53,6 +55,43 @@ This is surfaced in two places, from the same computation:
 - `dev-guard status` — a human-readable `Context Rollover: ...` line.
 - `prepare_task_context`'s MCP result — a `rollover` field an agent can read
   directly, alongside the existing `files`/`constraints`/`warnings`.
+
+## Thread Pressure (Observed Only)
+
+`thread-ownership.ts` reads the calling (or task-owning) thread's own provider
+records:
+
+- **Codex** — the rollout's latest `token_count` (`last_token_usage.input_tokens`
+  and `model_context_window`) and its `compacted` events.
+- **Claude Code** — compaction boundaries only. Its transcripts record no
+  window size, so without a compaction the status stays `UNKNOWN`; DevGuard
+  never fills in an estimated percentage.
+
+During a task the status is `LOW` (<50% of the window), `SOON` (≥50%) or
+`NEW_THREAD` (≥75%, or any compaction). `record_validation_result` and the
+agent's own `dev-guard done` return it as `thread.status`; on `SOON` /
+`NEW_THREAD` they also return a one-line `userNotice` the agent puts at the end
+of its final reply for the task. `LOW` / `UNKNOWN` produce no thread talk.
+
+### Task-Boundary Headroom
+
+A task can end at 45% and the next one in the same thread at 85%. So at the
+boundary DevGuard also compares current usage with the **per-task growth it
+observed** in its own telemetry (provider-reported input at a task's
+`prepare_task_context` vs at that same task's `TASK_DONE`; a re-opened lineage
+is measured from its own re-open, never from the first task's start):
+
+- **At `done`** the next task is unknown, so this is a headroom risk, not a
+  forecast. It can raise a `LOW` thread to `SOON` ("start the next large task
+  in a fresh thread") but never to `NEW_THREAD`; the reason starts with
+  `Headroom risk:`.
+- **At the next `prepare_task_context`** the task text is known: typical
+  growth is scaled for heavy (execute/rerun/audit/migration…) or light
+  (typo/wording/small follow-up…) tasks, and the result is returned as
+  `rollover.boundary` (`SOON` from ~75% projected, `NEW_THREAD` from ~90%).
+
+With fewer than two growth samples a thread at ≥40% is treated as `SOON`;
+below that the boundary is `UNKNOWN`.
 
 ## Rollover-First Workflow
 
@@ -69,7 +108,9 @@ MCP context available. The intended loop is:
    for a concrete gap.
 
 `dev-guard done`, the Next Prompt, the Handoff resume prompt, the agent
-instructions, and the MCP result's `rollover.advice` all state this.
+instructions, and the MCP result's `rollover.advice` all state this. The
+thread notice above tells the user when the current thread should not take
+another task.
 
 ## Agent Payload
 
@@ -147,6 +188,18 @@ continuity: when the previous finalized goal shares ≥2 rare terms with the
 current task, that task's own changed files that share a rare term become
 low-cost candidates (never carried-over dirty files).
 
+**Execution lineage.** At `done` DevGuard records, paths only and bounded,
+which scripts the task's own thread executed and read and which files it
+wrote. In the next same-workstream task those scripts are planned as
+candidates (an executor of a task that re-runs it, or a script the task names,
+becomes a TARGET): up to 4 always, up to 8 while the lineage stays within an
+estimated 12K-token budget. Tests, validation helpers and disposable probes
+(scratch/attempt directories, probe-named files) rank last unless the task is
+about them. When the previous task ran no script (e.g. a documentation step),
+the scripts of the last execution step within two more same-workstream tasks
+are offered, ranked below any direct lineage. A different workstream inherits
+nothing.
+
 ## Context Efficiency Dashboard
 
 The dashboard's Context Efficiency panel is problem-first. The default view
@@ -169,8 +222,11 @@ the agent's task packet and sources are under "View details".
   multi-file `cat`/`sed`, shell loops and inline scripts' string-literal
   paths that exist in the repository; `git status/log` read no file.
 - **Health.** Deterministic issues — compaction or ≥60% observed context use,
-  DevGuard doc re-reads, repository-wide search, suggested files read once and
-  unused (≥3 files, ≥3K tokens), suggestions missed, context overhead ≥15%,
+  DevGuard doc re-reads, repository-wide search, scripts or inputs read outside
+  the plan (`MISSING_EXECUTION_CONTEXT` names the cause: the previous run's
+  scripts exceeded the lineage budget, an older executor beyond the look-back,
+  or scripts no task recorded), suggested files read once and unused (≥3
+  files, ≥3K tokens), suggestions missed, context overhead ≥15%,
   exploration-heavy. No issue → GOOD; ≥2 strong (or 1 strong + 2 more) → POOR;
   otherwise NEEDS ATTENTION.
 - **Thread.** CONTINUE / SOON / NEW THREAD from observed pressure (compaction,

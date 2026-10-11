@@ -43,9 +43,11 @@ dev-guard status
 Command roles:
 
 - `init`: creates initial `.devguard/` files without overwriting existing files.
-- `install-agent-instructions`: adds dev-guard startup guidance to `AGENTS.md` and `CLAUDE.md`.
+- `install-agent-instructions`: adds the DevGuard workflow section (MCP `prepare_task_context` first) to `AGENTS.md` and `CLAUDE.md`.
 - `install-hooks`: installs Claude Code / Codex completion strategy files.
 - `status`: checks pending changes, last work, quality verdict, and hook state.
+
+On first run, `dev-guard watch` also registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`); `prepare_task_context` and `record_validation_result` come from it.
 
 If hooks cannot be trusted or run yet, start in Manual Mode:
 
@@ -58,7 +60,7 @@ dev-guard status
 
 ## 3. GPT Setup
 
-The default `watch`, `done`, `status`, and `handoff` flow works without GPT/API setup.
+The default `watch`, `done`, `status`, and MCP flow works without GPT/API setup.
 Configure a provider only for AI-assisted commands such as `review` and `task-ai`.
 
 OpenAI provider setup:
@@ -156,18 +158,16 @@ dev-guard done
 dev-guard status
 ```
 
-Resume in a new Codex/Claude session:
+Next task in a new Codex/Claude thread: give it the concrete task (and the files it must read). The agent calls `prepare_task_context`, reads the TARGET ranges of the returned read plan, and does not open `.devguard` markdown. When a task ends with a `SOON` / `NEW_THREAD` thread notice, start the next task in a fresh thread.
+
+Manual recovery only — MCP unavailable, explicitly resuming earlier work, or debugging DevGuard output:
 
 ```bash
 dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-First prompt for the new session:
-
-```txt
-Read .devguard/context/agent-context.md and continue.
-```
+Without MCP, point the agent at `.devguard/context/agent-brief.md`, then `.devguard/reports/read-map.md` and `.devguard/reports/code-map.md`.
 
 Diagnostics:
 
