@@ -2,7 +2,7 @@
 
 ## DevGuard v0.10.0
 
-`@dev-guard/cli` 0.10.0 / `@dev-guard/core` 0.10.0 — zero-setup product flow (`dev-guard watch` prepares a new project itself; `dev-guard setup [--dry-run]` is an optional preflight on the same engine), API-keyless by contract (a shell-wide `OPENAI_API_KEY` no longer activates AI), structural Project Knowledge freshness, bounded and concurrency-safe JSONL logs, safer MCP/Codex/instruction config updates, and hybrid thread-policy wording. Full notes: [docs/release-notes-v0.10.0.md](docs/release-notes-v0.10.0.md).
+`@dev-guard/cli` 0.10.0 / `@dev-guard/core` 0.10.0 — zero-setup product flow (`dev-guard watch` prepares a new project itself; `dev-guard setup [--dry-run]` is an optional preflight on the same engine), API-keyless by contract (a shell-wide `OPENAI_API_KEY` no longer activates AI), structural Project Knowledge freshness, large-repo first run (git-aware single enumeration, no 2000-file cap, workspace-sampled content reads, no new dependencies), bounded and concurrency-safe JSONL logs, safer MCP/Codex/instruction config updates, and hybrid thread-policy wording. Full notes: [docs/release-notes-v0.10.0.md](docs/release-notes-v0.10.0.md).
 
 ## DevGuard v0.9.0
 
