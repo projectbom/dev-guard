@@ -133,7 +133,7 @@ function rolloverAdvice(status: RolloverStatus, thread: ThreadPressure, reusedFo
   if (thread.status === "SOON") return `${thread.reason} Finish this task here; start the next task in a fresh agent thread.`;
   if (status === "ROLL_OVER_SOON") return "Task weight is rising. Finish this task here; start the next task in a fresh agent thread.";
   if (thread.status === "LOW") return `${thread.reason} Continue in this thread.`;
-  return "Thread usage is not observable. Start each distinct task in a fresh agent thread with prepare_task_context; move to a fresh agent thread if this one was compacted.";
+  return "Thread usage is not observable. A small follow-up of the same work can continue here; start a separate or large task in a fresh agent thread with prepare_task_context, and move to a fresh thread if this one was compacted.";
 }
 
 function ratio(label: RolloverSignalRatio["label"], value: number, budget: number): RolloverSignalRatio {

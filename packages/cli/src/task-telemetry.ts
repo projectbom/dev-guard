@@ -1,4 +1,5 @@
-import { appendTextFile, fromRoot, readTailLines } from "./fs.js";
+import { fromRoot, readTailLines } from "./fs.js";
+import { appendBoundedJsonl, TELEMETRY_RETENTION } from "./artifact-retention.js";
 import { devguardPaths } from "./paths.js";
 import type { RolloverStatus } from "./rollover.js";
 
@@ -124,7 +125,7 @@ const TAIL_READ_BYTES = 1 * 1024 * 1024;
 
 export async function recordTaskTelemetry(root: string, event: Omit<TaskTelemetryEvent, "timestamp">): Promise<void> {
   const stamped: TaskTelemetryEvent = { timestamp: new Date().toISOString(), ...event };
-  await appendTextFile(fromRoot(root, telemetryPath), `${JSON.stringify(stamped)}\n`).catch(() => undefined);
+  await appendBoundedJsonl(fromRoot(root, telemetryPath), `${JSON.stringify(stamped)}\n`, TELEMETRY_RETENTION).catch(() => undefined);
 }
 
 /**

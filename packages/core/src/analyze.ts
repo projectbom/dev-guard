@@ -130,7 +130,7 @@ export function analyzeDiff(input: DiffInput): GuardReport {
       code: "docs_update_needed",
       title: "Project docs may need updates",
       message:
-        "Source files changed without docs changes. Consider updating PROJECT_STATE, CURRENT_TASK, DECISIONS, or DO_NOT_REPEAT."
+        "Source files changed without docs changes. Consider updating the project docs listed in docPaths (e.g. README.md) if behavior, setup, or decisions changed."
     });
   }
 

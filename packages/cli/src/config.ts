@@ -246,6 +246,35 @@ export async function resolveOpenAIApiKey(root: string, env: NodeJS.ProcessEnv =
   return { source: "none", configured: false };
 }
 
+/** Shared wording for AI-only commands run without the optional OpenAI setup. */
+export const AI_OPTIONAL_NOTICE = "OpenAI API is optional — DevGuard's core workflow does not need it. This command requires AI assistance.";
+
+export interface AIAssistOptIn {
+  /** True only when the user explicitly enabled OpenAI for DevGuard. */
+  enabled: boolean;
+  /** How it was enabled; "none" when it was not. */
+  via: "config-provider" | "DEV_GUARD_OPENAI_API_KEY" | "none";
+  apiKey?: string;
+}
+
+/**
+ * API-keyless contract: DevGuard's default workflow (setup, watch, MCP,
+ * done, reports) never calls OpenAI. Optional AI assistance inside that
+ * workflow (the Quality Report summary on `done`) runs only after an
+ * explicit opt-in — `ai.provider: "openai"` in .devguard/config.json (set by
+ * `dev-guard configure ai --provider openai` or `dev-guard config set
+ * openaiApiKey <key>`) or the DevGuard-specific DEV_GUARD_OPENAI_API_KEY.
+ * A shell-wide OPENAI_API_KEY alone is not an opt-in: it is commonly set
+ * for unrelated tools, and must not make DevGuard send diffs to OpenAI.
+ */
+export async function resolveAIAssistOptIn(root: string, env: NodeJS.ProcessEnv = process.env): Promise<AIAssistOptIn> {
+  const local = await readJsonFile<ConfigFileShape>(fromRoot(root, ".devguard/config.json"), {});
+  const key = await resolveOpenAIApiKey(root, env);
+  if (local.ai?.provider === "openai") return { enabled: true, via: "config-provider", apiKey: key.apiKey };
+  if (env.DEV_GUARD_OPENAI_API_KEY?.trim()) return { enabled: true, via: "DEV_GUARD_OPENAI_API_KEY", apiKey: key.apiKey };
+  return { enabled: false, via: "none" };
+}
+
 export async function readOpenAIApiKeyForRoot(root: string, env: NodeJS.ProcessEnv = process.env): Promise<string | undefined> {
   return (await resolveOpenAIApiKey(root, env)).apiKey;
 }

@@ -21,12 +21,13 @@ import {
   type DevGuardConfig
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTailLines, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
+import { appendBoundedJsonl, CHANGE_LOG_RETENTION, HISTORY_RETENTION } from "./artifact-retention.js";
 import { computeWorkingTreeContentHash, getDiffForChangeFiles, getFileContentAtRef, getGitChanges, getGitIdentity, hashWorkingFiles, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
 import { discoverWorkspaceSourceRoots, ensureProjectKnowledge, readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
 import { resolveDevGuardLocale, type DevGuardLocale } from "./locale.js";
-import { loadConfig, resolveOpenAIApiKey } from "./config.js";
+import { loadConfig, resolveAIAssistOptIn } from "./config.js";
 import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssessment, type ResumeBundleCost } from "./rollover.js";
 import { readTaskTelemetry, recordTaskTelemetry } from "./task-telemetry.js";
 import { jsonSections, markdownSections, scriptSections, type DocumentSection } from "./document-ranges.js";
@@ -490,7 +491,7 @@ export function toAgentContextPayload(result: PreparedTaskContextResult): Record
 }
 
 export const ROLLOVER_ADVICE =
-  "DevGuard cannot see the provider's context window. Start each distinct task in a fresh agent thread with prepare_task_context; if this thread already handled another task or was compacted, move to a fresh thread instead of waiting for compaction.";
+  "DevGuard cannot see the provider's context window. A small follow-up of the same work can continue in this thread; start a separate or large task in a fresh agent thread with prepare_task_context, and if this thread already handled another task or was compacted, move to a fresh thread instead of waiting for compaction.";
 
 export interface PreparedTaskContextFile {
   path: string;
@@ -1977,7 +1978,7 @@ export async function processDoneEvent(root: string, options: { completionSource
       })
     : undefined;
   await Promise.all([
-    perfSpan("done:write:history", () => appendTextFile(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`)),
+    perfSpan("done:write:history", () => appendBoundedJsonl(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`, HISTORY_RETENTION)),
     perfSpan("done:write:lastRunReport", () => writeTextFile(fromRoot(root, reportPath), reportMarkdown)),
     perfSpan("done:write:historySummary", () => writeTextFile(fromRoot(root, historySummaryPath), historySummaryMarkdown)),
     perfSpan("done:write:decisionCandidates", () => writeTextFile(fromRoot(root, decisionCandidatesPath), decisionCandidatesMarkdown)),
@@ -6659,7 +6660,7 @@ function inferParenBlockEndLine(lines: string[], startIndex: number): number {
 }
 
 async function appendChangeLog(root: string, entry: ChangeLogEntry): Promise<void> {
-  await appendTextFile(fromRoot(root, changeLogPath), `${JSON.stringify(entry)}\n`);
+  await appendBoundedJsonl(fromRoot(root, changeLogPath), `${JSON.stringify(entry)}\n`, CHANGE_LOG_RETENTION);
 }
 
 function relatedFilesFromCodeIndex(changedFiles: string[], index: CodeIndex): string[] {
@@ -6908,7 +6909,7 @@ function renderNextPrompt(input: {
     "",
     "## Next Task",
     `- ${reliableNextAction(input.qualityReport)}`,
-    "- Next distinct task: start a fresh agent thread and call `prepare_task_context` there instead of continuing this conversation.",
+    "- Next separate or large task: start a fresh agent thread and call `prepare_task_context` there; a small follow-up of this work can continue in the same thread.",
     "",
     "## Guardrails",
     ...taskGuardrails.map((line) => `- ${line}`),
@@ -6922,7 +6923,7 @@ function renderNextPrompt(input: {
  * unresolved recorded validation first, then concrete QA checks derived from
  * the task's own files. Never a generic guess — says so when nothing is known.
  */
-export const NO_RELIABLE_NEXT_TASK = "No reliable next task inferred — start the next task with `prepare_task_context` in a fresh agent thread.";
+export const NO_RELIABLE_NEXT_TASK = "No reliable next task inferred — start the next task with `prepare_task_context` (a separate task in a fresh agent thread).";
 
 function reliableNextAction(report: QualityReport): string {
   const open = canonicalValidationLines(report.qaResults, 10).find((line) => /: (FAIL|UNKNOWN)\b/.test(line));
@@ -7258,7 +7259,14 @@ async function enhanceQualityReportWithAI(
     documentationSummary: DocumentationSummary;
   }
 ): Promise<QualityReport> {
-  const key = await resolveOpenAIApiKey(root);
+  // API-keyless default: no OpenAI call unless the user explicitly opted in
+  // (see resolveAIAssistOptIn) — an ambient OPENAI_API_KEY alone never
+  // sends this task's diff to OpenAI.
+  const optIn = await resolveAIAssistOptIn(root);
+  if (!optIn.enabled) {
+    return markQualityReportAIFallback(input.report, "not_enabled");
+  }
+  const key = { apiKey: optIn.apiKey };
   if (!key.apiKey) {
     return markQualityReportAIFallback(input.report, "missing_key");
   }
@@ -7356,7 +7364,7 @@ export function stripHistoricalPhrases(lines: string[], historicalPhrases: strin
   return lines.filter((line) => !historicalSet.has(normalize(line)));
 }
 
-function markQualityReportAIFallback(report: QualityReport, reason: "missing_key" | "request_failed" | "invalid_response"): QualityReport {
+function markQualityReportAIFallback(report: QualityReport, reason: "not_enabled" | "missing_key" | "request_failed" | "invalid_response"): QualityReport {
   return {
     ...report,
     aiSummary: {
@@ -8777,11 +8785,14 @@ function formatAIQualityNote(report: QualityReport, locale: DevGuardLocale): str
         : "- OpenAI-assisted review summary was applied."
     ];
   }
+  // The deterministic report is the default product, not a degraded one:
+  // say nothing about AI unless the user opted in and it did not run.
+  if (report.aiSummary.reason === "not_enabled") return [];
   if (report.aiSummary.reason === "missing_key") {
     return [
       locale === "ko-KR"
-        ? "- AI 기반 요약은 생성하지 않았습니다. OpenAI API Key가 설정되어 있지 않아 기본 품질 규칙으로 보고서를 생성했습니다."
-        : "- AI summary was not generated. No OpenAI API key is configured, so this report was created with local quality rules."
+        ? "- AI 요약이 켜져 있지만 OpenAI API Key가 없어 기본 품질 규칙으로 보고서를 생성했습니다."
+        : "- AI summary is enabled but no OpenAI API key is configured, so this report was created with local quality rules."
     ];
   }
   return [

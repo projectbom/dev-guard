@@ -23,7 +23,7 @@ import {
   type ReviewMemorySummary
 } from "@dev-guard/core";
 import { copyTextToClipboard } from "./clipboard.js";
-import { loadConfig, readOpenAIApiKeyForRoot } from "./config.js";
+import { AI_OPTIONAL_NOTICE, loadConfig, readOpenAIApiKeyForRoot } from "./config.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getCommitGitChanges, getDiffForChangeFiles, getGitChanges, getStagedGitChanges, type GitChanges } from "./git.js";
 import {
@@ -325,7 +325,7 @@ async function executeReview(
       // Unreachable because heuristic returns above, but keeps the error path explicit.
       throw new Error("OpenAI API key가 설정되어 있지 않습니다. heuristic review에는 API key가 필요 없습니다.");
     }
-    throw new Error("OpenAI API key가 설정되어 있지 않습니다. `dev-guard config set openaiApiKey <key>`, `DEV_GUARD_OPENAI_API_KEY`, 또는 `OPENAI_API_KEY`를 사용하세요. 로컬 검토는 `dev-guard review --heuristic`를 사용하세요.");
+    throw new Error(`${AI_OPTIONAL_NOTICE} No OpenAI API key found: use \`dev-guard config set openaiApiKey <key>\`, DEV_GUARD_OPENAI_API_KEY, or OPENAI_API_KEY. For a local review without AI, run \`dev-guard review --heuristic\`.`);
   }
 
   const provider =

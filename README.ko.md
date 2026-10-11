@@ -11,15 +11,15 @@ IDE도 아니고, wrapper도 아니며, 스스로 코드를 수정하는 AI Agen
 
 DevGuard는 이 컨텍스트를 로컬 `.devguard/` 파일로 보존해서 Codex/Claude 작업을 레포지토리 재탐색 없이 이어갈 수 있게 합니다.
 
-설치 후 기본 워크플로우에 필요한 명령어는 단 하나입니다.
+설치 후 프로젝트를 한 번 준비하고 watch를 시작합니다.
 
 ```bash
-dev-guard watch
-# Claude/Codex가 파일 수정
-# 파일 시스템이 안정되면 DevGuard가 자동으로 세션을 완료 처리합니다 — done 불필요
-# context window 초과 시 새 스레드에서 이어가기
-dev-guard handoff
+dev-guard setup   # 1회: Code Index, Project Knowledge, MCP, agent instruction, hook
+dev-guard watch   # Claude/Codex가 파일 수정; 변경이 안정되면 DevGuard가 자동 완료 처리
+# 다음 작업: agent가 DevGuard MCP 도구 prepare_task_context를 호출
 ```
+
+OpenAI API key는 필요 없습니다. context broker는 결정적으로 동작합니다.
 
 context window가 끊기거나, 여러 Agent를 오가거나, 긴 AI 코딩 작업을 다음 세션으로 넘겨야 할 때 사용합니다.
 
@@ -83,7 +83,8 @@ Prepare
 **Core**
 
 - `.devguard/` 로컬 컨텍스트 저장소
-- `watch`, `done`, `status`, `handoff`
+- `setup`, `watch`, `done`, `status`, `handoff`
+- DevGuard MCP (`prepare_task_context`, `record_validation_result`) — 결정적 context broker, API key 불필요
 - Project Knowledge
 - Read Map, Code Map, Agent Brief
 - Change Intelligence
@@ -133,37 +134,40 @@ dev-guard는 이 흐름을 로컬에서 정리합니다.
 
 ## 빠른 시작
 
-CLI 설치:
+CLI 설치(설치 자체는 어떤 프로젝트도 분석하거나 변경하지 않습니다):
 
 ```bash
 npm install -g @dev-guard/cli
 ```
 
-프로젝트에서 시작:
+권장 — 프로젝트를 한 번 준비한 뒤 watch:
+
+```bash
+cd my-project
+dev-guard setup
+dev-guard watch
+```
+
+Zero-config — setup이 없거나 오래된 경우 `watch`만으로도 같은 준비 과정을 수행합니다:
 
 ```bash
 cd my-project
 dev-guard watch
 ```
 
-첫 실행에서 `watch`가 프로젝트를 자동으로 준비합니다. 기본 `.devguard/` 설정을 만들고, 안전한 경우 AI instruction 파일을 설치하며, completion hook을 best-effort로 설치하고, Project Knowledge를 생성한 뒤 대시보드를 시작하고 브라우저를 엽니다.
+`dev-guard setup`은 프로젝트 루트를 확인하고, `.devguard/` 설정을 만들고, Code Index와 Project Knowledge를 생성하고, `AGENTS.md` / `CLAUDE.md`에 DevGuard 섹션을 추가하고, Claude Code와 Codex에 DevGuard MCP 서버를 등록하고, completion hook을 best-effort로 설치하고, MCP 서버 응답을 확인한 뒤 요약을 출력하고 종료합니다. 결정적·비대화형이며 API key가 필요 없고, 다시 실행하면 없거나 오래된 부분만 갱신합니다. `dev-guard setup --dry-run`은 아무것도 쓰지 않고 변경 예정 항목만 보여 줍니다. `watch`는 같은 준비 엔진을 사용한 뒤 대시보드와 watcher를 시작합니다.
 
 일상 루프:
 
 ```bash
 dev-guard watch
-# AI Agent와 작업
+# AI Agent와 작업; 새 작업마다 agent가 prepare_task_context 호출
 # DevGuard가 변경을 감지하고 파일 시스템이 안정되면 자동으로
 # 보고서를 생성하고 모니터링으로 돌아갑니다
 dev-guard status  # 선택 사항: 품질 verdict 확인
 ```
 
-새 세션으로 이어가기:
-
-```bash
-dev-guard handoff
-cat .devguard/reports/project-handoff.md
-```
+고급/복구용: `dev-guard init`(`.devguard` 설정/템플릿만, 프로젝트 분석 없음), `dev-guard install-agent-instructions`, `dev-guard install-hooks`.
 
 이 monorepo를 개발할 때:
 
@@ -173,39 +177,27 @@ pnpm run build
 pnpm cli status
 ```
 
-npm 설치/업데이트 후 초기세팅, GPT 설정, `AGENTS.md`/`CLAUDE.md` 문구, 이후 CLI 흐름은 [npm 설치/업데이트 사용 가이드](./docs/npm-setup.ko.md)에 한 번에 정리되어 있습니다.
+npm 설치/업데이트 후 초기세팅, 선택적 AI 설정, `AGENTS.md`/`CLAUDE.md` 문구, 이후 CLI 흐름은 [npm 설치/업데이트 사용 가이드](./docs/npm-setup.ko.md)에 한 번에 정리되어 있습니다.
 
-## OpenAI GPT 설정
+## 선택 사항: AI (OpenAI)
 
-대부분의 세션 연속성 명령은 API key 없이 동작합니다: `init`, `watch`, `done`, `status`, `handoff`, 로컬 휴리스틱 검사. Key가 없으면 Quality Report는 로컬 품질 규칙으로 생성됩니다. Key가 있으면 `done`이 OpenAI 기반 품질 요약을 보강할 수 있습니다.
+DevGuard의 제품 계약은 API key 없이 동작하는 것입니다. `setup`, `init`, `watch`, `status`, `doctor`, Code Index, Project Knowledge, MCP(`prepare_task_context`, `record_validation_result`), execution lineage, rollover 안내, 검증 기록, `done`, Quality Report, Handoff, 대시보드, telemetry, hook은 key 없이 동작하며 OpenAI를 호출하지 않습니다. context broker는 결정적이며 기본 경로에 AI reranker는 없습니다.
 
-DevGuard는 OpenAI API key를 다음 순서로 읽습니다.
-
-1. `.devguard/config.json` (`dev-guard config set openaiApiKey <key>` 또는 Dashboard 설정)
-2. `DEV_GUARD_OPENAI_API_KEY`
-3. `OPENAI_API_KEY`
-4. 없음, 로컬 규칙 기반 fallback
-
-```bash
-dev-guard config set openaiApiKey "your_api_key_here"
-# 또는:
-export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
-# 또는:
-export OPENAI_API_KEY="your_api_key_here"
-```
-
-AI 보조 명령을 쓸 때 provider/model을 설정합니다.
+AI는 명시적 opt-in이며 `task-ai`, `review`(`--heuristic` 제외) / `fix-prompt`, 그리고 `done` Quality Report의 선택적 AI 요약에서만 사용됩니다.
 
 ```bash
 dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard config set openaiApiKey "your_api_key_here"
+# 또는: export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
 dev-guard doctor
 ```
 
-DevGuard는 key 값을 출력하거나 Dashboard API 응답에 포함하지 않습니다. `.devguard/config.json`에 key를 저장했다면 해당 파일을 git에 커밋하지 마세요.
+key는 `.devguard/config.json`, `DEV_GUARD_OPENAI_API_KEY`, `OPENAI_API_KEY` 순서로 읽습니다. 셸 전역 `OPENAI_API_KEY`만으로는 `done`의 AI 요약이 켜지지 않습니다(다른 도구용으로 설정된 경우가 많기 때문). `ai.provider: "openai"` 또는 `DEV_GUARD_OPENAI_API_KEY`로 켭니다. key가 없으면 `doctor`는 `OpenAI API: not configured (optional)`로 표시합니다. DevGuard는 key 값을 출력하거나 Dashboard API 응답에 포함하지 않습니다. `.devguard/config.json`에 key를 저장했다면 해당 파일을 git에 커밋하지 마세요.
 
 ## 핵심 명령어
 
 ```bash
+dev-guard setup [--dry-run]
 dev-guard watch [--depth 8] [--poll] [--stable-after 20]
 dev-guard watch --no-dashboard
 dev-guard watch --manual
@@ -216,7 +208,8 @@ dev-guard status
 dev-guard reset
 ```
 
-- `watch`: 권장 시작 명령. 첫 실행에서 `.devguard/`, AI instruction, completion hook, Project Knowledge, 대시보드를 자동 준비합니다.
+- `setup`: 권장 첫 실행 명령. `.devguard/`, Code Index, Project Knowledge, AI instruction, MCP, completion hook을 준비하고 요약을 출력한 뒤 종료합니다.
+- `watch`: 세션 모니터링. setup이 없거나 오래된 경우 같은 준비 과정을 먼저 수행하고 대시보드를 시작합니다.
 - `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
 - `handoff`: 현재 `.devguard/` 산출물만 읽어서 `project-handoff.md` 재생성
 - `status`: pending 상태, 최근 작업, quality verdict, 다음 권장 작업 출력
@@ -236,7 +229,7 @@ dev-guard install-agent-instructions
 dev-guard dashboard [--port 3737]
 ```
 
-일반 사용자는 위 명령을 직접 실행할 필요가 없습니다. `watch`가 누락된 설정을 자동으로 준비합니다. 기존 `AGENTS.md` 또는 `CLAUDE.md`가 사용자가 직접 관리하는 파일이면 DevGuard는 덮어쓰지 않고 경고만 표시합니다.
+일반 사용자는 위 명령을 직접 실행할 필요가 없습니다. `setup`(또는 `watch`)이 누락된 설정을 자동으로 준비합니다. `init`은 `.devguard` 설정/템플릿만 만들며 프로젝트를 분석하지 않습니다. 기존 `AGENTS.md` 또는 `CLAUDE.md`에는 DevGuard marker(`<!-- dev-guard-section-start -->` … `<!-- dev-guard-section-end -->`) 사이의 섹션만 추가/갱신하며, marker 밖의 사용자 텍스트는 바꾸지 않습니다.
 
 ## 생성되는 파일 구조
 
@@ -404,7 +397,7 @@ dev-guard status
 
 ## Context Overflow 복구
 
-긴 스레드가 compaction될 때까지 기다리거나 긴 history를 새 스레드에 붙여넣지 마세요. 서로 다른 작업은 새 agent 스레드에서 시작하고, 그곳에서 구체적인 작업으로 DevGuard MCP `prepare_task_context`를 호출합니다. 읽을 파일/범위, 제약, 이월된 dirty 작업, 이전 작업의 미해결 검증이 함께 반환됩니다. `record_validation_result` 응답에도 (provider가 기록하는 경우) 현재 스레드의 관측된 압박도가 포함되어 언제 넘어가야 할지 알 수 있습니다.
+긴 스레드가 compaction될 때까지 기다리거나 긴 history를 새 스레드에 붙여넣지 마세요. thread 정책은 hybrid입니다: 같은 작업의 작고 밀접한 후속 수정은 thread 부담이 낮으면(`LOW`, 또는 compaction 없는 `UNKNOWN`) 현재 스레드에서 이어가도 되고, 별도/큰 작업이나 `SOON` / `NEW_THREAD` 안내, compaction이 일어난 스레드는 새 agent 스레드로 옮깁니다. 어느 경우든 구체적인 작업으로 DevGuard MCP `prepare_task_context`를 호출합니다. 읽을 파일/범위, 제약, 이월된 dirty 작업, 이전 작업의 미해결 검증이 함께 반환됩니다. `record_validation_result` 응답에도 (provider가 기록하는 경우) 현재 스레드의 관측된 압박도가 포함되어 언제 넘어가야 할지 알 수 있습니다.
 
 이전 작업을 명시적으로 재개하거나 MCP를 쓸 수 없을 때만 handoff를 재생성해 읽습니다.
 
@@ -421,8 +414,8 @@ cat .devguard/reports/project-handoff.md
 
 1. `dev-guard watch` — watcher 시작
 2. Claude/Codex가 파일 수정; Stop Hook이 `done` 자동 실행 (작업을 준비한 스레드가 아닌 다른 스레드의 Stop은 무시됨)
-3. 다음 작업은 새 Agent 세션에서 시작
-4. 작업 내용으로 `prepare_task_context` 호출; TARGET 범위부터 읽기
+3. 다음 작업은 `prepare_task_context`로 시작 (별도/큰 작업이거나 `SOON` / `NEW_THREAD` 안내 이후면 새 agent 스레드에서)
+4. TARGET 범위부터 읽기
 
 ### Codex ↔ Claude 전환 시 (또는 다른 Agent로 전환)
 
@@ -483,7 +476,8 @@ Verdict:
 - `done`은 `.devguard/` runtime 산출물만 씁니다.
 - `decisions.md`는 자동 수정하지 않고 후보만 생성합니다.
 - `update`는 preview이며, `update --write`에서만 managed block을 수정합니다.
-- API provider는 선택 사항입니다.
+- API provider는 선택 사항이며, 명시적 opt-in 없이는 OpenAI를 호출하지 않습니다.
+- `.devguard`의 생성 markdown은 고정 경로 단일 파일로 덮어쓰고, `history.jsonl` / `memory/change-log.jsonl`(8 MB) / `telemetry.jsonl`(4 MB)은 한도를 넘으면 `<file>.1`로 회전하며 최근 기록을 유지합니다. 새 프로젝트에는 `docs/PROJECT_STATE.md` 등 루트 템플릿을 더 이상 만들지 않으며, 기존 파일은 삭제하지 않습니다.
 
 ## Advanced
 

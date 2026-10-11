@@ -11,15 +11,15 @@ It is not an IDE, wrapper, or autonomous coding agent. Its job is narrower:
 
 DevGuard keeps this context in local `.devguard/` files so Codex/Claude work can resume without rediscovering the repository.
 
-The default workflow requires only one command after installation:
+After installation, prepare a project once and start watching:
 
 ```bash
-dev-guard watch
-# let Claude/Codex edit files
-# DevGuard automatically finalizes after changes settle — no done required
-# if a session overflows, start a new thread with:
-dev-guard handoff
+dev-guard setup   # one-time: Code Index, Project Knowledge, MCP, agent instructions, hooks
+dev-guard watch   # let Claude/Codex edit files; DevGuard finalizes after changes settle
+# next task: the agent calls the DevGuard MCP tool prepare_task_context
 ```
+
+No OpenAI API key is required; the context broker is deterministic.
 
 Use it when an AI coding session spans multiple prompts, multiple agents, or a context window reset.
 
@@ -83,8 +83,9 @@ One Change Intelligence summary is generated after `done`; downstream documents 
 **Core**
 
 - `.devguard/` local context store
-- `watch`, `done`, `status`, `handoff`
-- Project Knowledge
+- `setup`, `watch`, `done`, `status`, `handoff`
+- DevGuard MCP (`prepare_task_context`, `record_validation_result`) — deterministic context broker, no API key
+- Code Index and Project Knowledge
 - Read Map, Code Map, Agent Brief
 - Change Intelligence
 - Quality Report
@@ -98,7 +99,7 @@ One Change Intelligence summary is generated after `done`; downstream documents 
 - `install-agent-instructions`
 - `install-hooks`
 - `knowledge`
-- OpenAI-assisted Quality Report summary
+- OpenAI-assisted Quality Report summary (optional, explicit opt-in)
 - `self-check`, `doctor`
 - locale-aware user-facing reports
 
@@ -132,37 +133,40 @@ Common use cases:
 
 ## Quick Start
 
-Install the CLI:
+Install the CLI (installing never scans or changes a project):
 
 ```bash
 npm install -g @dev-guard/cli
 ```
 
-Start using it in a project:
+Recommended — prepare the project once, then watch:
+
+```bash
+cd my-project
+dev-guard setup
+dev-guard watch
+```
+
+Zero-config — `watch` alone runs the same preparation when setup is missing or stale:
 
 ```bash
 cd my-project
 dev-guard watch
 ```
 
-On first launch, `watch` automatically prepares the project, creates default `.devguard/` configuration, installs DevGuard-managed AI instruction files when safe, installs completion hooks best-effort, generates Project Knowledge, starts the dashboard, and opens the browser.
+`dev-guard setup` validates the project root, creates the `.devguard/` config, builds the Code Index, generates Project Knowledge, adds the DevGuard section to `AGENTS.md` / `CLAUDE.md`, registers the DevGuard MCP server for Claude Code and Codex, installs completion hooks best-effort, checks that the MCP server answers, prints a summary, and exits. It is deterministic and non-interactive, needs no API key, and is idempotent: a second run only refreshes missing or stale parts. `dev-guard setup --dry-run` shows what would change without writing anything. `watch` uses the same preparation engine, then starts the dashboard and the watcher.
 
 Daily loop:
 
 ```bash
 dev-guard watch
-# work with an AI agent
-# DevGuard detects changes, waits for filesystem to settle,
+# work with an AI agent; for each new task the agent calls prepare_task_context
+# DevGuard detects changes, waits for the filesystem to settle,
 # then automatically generates reports and returns to monitoring
 dev-guard status  # optional: check quality verdict
 ```
 
-Resume a new session:
-
-```bash
-dev-guard handoff
-cat .devguard/reports/project-handoff.md
-```
+Advanced / recovery only: `dev-guard init` (only the `.devguard` config/templates, no project analysis), `dev-guard install-agent-instructions`, `dev-guard install-hooks`.
 
 Developing this monorepo locally:
 
@@ -172,43 +176,31 @@ pnpm run build
 pnpm cli status
 ```
 
-For npm install/update, initial setup, GPT setup, `AGENTS.md` / `CLAUDE.md` text, and ongoing CLI commands, see the [npm install and update guide](./docs/npm-setup.md).
+For npm install/update, initial setup, optional AI setup, `AGENTS.md` / `CLAUDE.md` text, and ongoing CLI commands, see the [npm install and update guide](./docs/npm-setup.md).
 
-## OpenAI GPT Setup
+## Optional AI (OpenAI)
 
-Most DevGuard session-continuity commands work without an API key: `init`, `watch`, `done`, `status`, `handoff`, and local heuristic checks. Without a key, Quality Reports use local rule-based guidance. With a key, `done` can add an OpenAI-assisted Quality Report summary.
+DevGuard's product contract is API-keyless: `setup`, `init`, `watch`, `status`, `doctor`, the Code Index, Project Knowledge, MCP (`prepare_task_context`, `record_validation_result`), execution lineage, rollover advice, validation recording, `done`, Quality Report, Handoff, the dashboard, telemetry, and hooks all work without a key and make no OpenAI calls. The context broker is deterministic; no AI reranker runs in the default path.
 
-DevGuard reads OpenAI API keys in this order:
-
-1. `.devguard/config.json` (`dev-guard config set openaiApiKey <key>` or Dashboard settings)
-2. `DEV_GUARD_OPENAI_API_KEY`
-3. `OPENAI_API_KEY`
-4. no key, local rule-based fallback
-
-```bash
-dev-guard config set openaiApiKey "your_api_key_here"
-# or:
-export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
-# or:
-export OPENAI_API_KEY="your_api_key_here"
-```
-
-Configure the provider/model when you want AI-backed commands:
+AI is an explicit opt-in, used only by `task-ai`, `review` (without `--heuristic`) / `fix-prompt`, and an optional AI summary on the `done` Quality Report:
 
 ```bash
 dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard config set openaiApiKey "your_api_key_here"
+# or: export DEV_GUARD_OPENAI_API_KEY="your_api_key_here"
 dev-guard doctor
 ```
 
-DevGuard does not print the key or return it from the dashboard API. If you store the key in `.devguard/config.json`, keep that file out of git.
+Keys are read from `.devguard/config.json`, then `DEV_GUARD_OPENAI_API_KEY`, then `OPENAI_API_KEY`. A shell-wide `OPENAI_API_KEY` alone does not enable the `done` AI summary (it is often set for other tools); enable it with `ai.provider: "openai"` or `DEV_GUARD_OPENAI_API_KEY`. Without a key, `doctor` shows `OpenAI API: not configured (optional)`. DevGuard never prints the key or returns it from the dashboard API; if you store it in `.devguard/config.json`, keep that file out of git.
 
 ## Recommended Workflow
 
-1. Start the watcher
+1. Prepare once, then start the watcher
    ```bash
+   dev-guard setup
    dev-guard watch
    ```
-   On first run, this prepares `.devguard/`, safe AI instruction files, completion hooks, Project Knowledge, and the local dashboard. On later runs, it starts immediately. After filesystem inactivity (default: 20s settle + 8s grace), DevGuard **automatically** runs the equivalent of `done` — writing quality-report, next-codex-prompt, and project-handoff — then returns to monitoring. No additional commands required.
+   `setup` prepares `.devguard/`, the Code Index, Project Knowledge, AI instruction sections, MCP, and completion hooks. `watch` runs the same preparation if anything is missing or stale, so `watch` alone also works on a new project; once prepared, it starts immediately. After filesystem inactivity (default: 20s settle + 8s grace), DevGuard **automatically** runs the equivalent of `done` — writing quality-report, next-codex-prompt, and project-handoff — then returns to monitoring. No additional commands required.
 
 2. Optional advanced recovery: reinstall agent completion hooks
    ```bash
@@ -229,11 +221,12 @@ DevGuard does not print the key or return it from the dashboard API. If you stor
    ```
    Shows pending changes, last run summary, quality verdict, recent history, hook state, the handoff path, and the next recommended action.
 
-5. Resume after context overflow
+5. Next task / resume
+   Give the agent the concrete task; it calls DevGuard MCP `prepare_task_context` and reads the returned ranges. Only to explicitly resume earlier work, or when MCP is unavailable:
    ```bash
    dev-guard handoff
    ```
-   Regenerates `.devguard/reports/project-handoff.md` from current `.devguard/` artifacts only. Start a new Claude/Codex thread and ask it to read that file.
+   Regenerates `.devguard/reports/project-handoff.md`; turn its next action into a concrete task for `prepare_task_context`.
 
 6. Reset only runtime state when needed
    ```bash
@@ -328,7 +321,8 @@ dev-guard watch --no-dashboard
 ## Core Commands
 
 ```bash
-dev-guard init
+dev-guard setup [--dry-run]
+dev-guard init   # advanced/recovery: .devguard config only, no analysis
 dev-guard install-hooks [--force]
 dev-guard install-hooks --agent claude
 dev-guard install-hooks --agent codex
@@ -499,7 +493,7 @@ dev-guard handoff
 
 ## Context Overflow Recovery
 
-Do not wait for a long thread to be compacted, and do not paste long history into a new thread. Start each distinct task in a fresh agent thread and call DevGuard MCP `prepare_task_context` there with the concrete task — it returns the files/ranges to read, constraints, carried-over dirty work, and the previous task's unresolved validation. `record_validation_result` responses also report the current thread's observed pressure (when the provider records it) so an agent knows when to move on.
+Do not wait for a long thread to be compacted, and do not paste long history into a new thread. The thread policy is hybrid: a small, closely related follow-up of the same work may stay in the current thread while thread pressure is low (`LOW`, or `UNKNOWN` with no compaction); a separate or large task, a `SOON` / `NEW_THREAD` notice, or a compacted thread means a fresh agent thread. Either way, call DevGuard MCP `prepare_task_context` with the concrete task — it returns the files/ranges to read, constraints, carried-over dirty work, and the previous task's unresolved validation. `record_validation_result` responses also report the current thread's observed pressure (when the provider records it) so an agent knows when to move on.
 
 To explicitly resume earlier work (or when MCP is unavailable), regenerate and read the handoff:
 
@@ -516,8 +510,8 @@ Turn its next action into a concrete task and call `prepare_task_context` with i
 
 1. `dev-guard watch` — start the watcher
 2. Claude/Codex edits files; Stop Hooks run `done` automatically (a Stop from a different thread than the one that prepared the task is ignored)
-3. Start a new agent session for the next task
-4. Call `prepare_task_context` with the task; read the TARGET ranges first
+3. For the next task, call `prepare_task_context` with it (in a fresh agent thread when it is a separate or large task, or after a `SOON` / `NEW_THREAD` notice)
+4. Read the TARGET ranges first
 
 ### When switching between Codex and Claude (or any agent)
 
@@ -540,7 +534,7 @@ Read `.devguard/reports/project-handoff.md` / `.devguard/reports/quality-report.
 
 ### AGENTS.md and CLAUDE.md
 
-`dev-guard watch` creates DevGuard-managed `AGENTS.md` and `CLAUDE.md` files automatically when they are missing. If those files already exist without DevGuard markers, DevGuard treats them as user-managed and leaves them unchanged. The advanced `install-agent-instructions` command is for recovery or explicit updates.
+`dev-guard setup` (and `watch`) create `AGENTS.md` and `CLAUDE.md` when they are missing. When they already exist, DevGuard appends or refreshes only its own section between `<!-- dev-guard-section-start -->` and `<!-- dev-guard-section-end -->`; text outside the markers is never changed. The advanced `install-agent-instructions` command is for recovery or explicit updates.
 
 ```bash
 dev-guard install-agent-instructions
@@ -554,7 +548,7 @@ These files are project-level guidance for:
 - Codex (reads `AGENTS.md`)
 - Other agents that honor project-level instruction files
 
-The files contain suggestions, not enforced rules. They recommend reading Read Map, Code Map, Agent Brief, and Working Context before repository-wide scans so agents can start from the right ranges and avoid rebuilding context. Existing content is preserved; dev-guard only appends or updates its own section (marked with HTML comment markers).
+The files contain suggestions, not enforced rules. They tell agents to call `prepare_task_context` first and read its TARGET ranges before any repository-wide search, not to read `.devguard` markdown when MCP succeeds (Agent Brief → Read Map → Code Map are the no-MCP fallback; handoff / quality report only on explicit request), and the hybrid thread policy above.
 
 ## Quality Flow
 
@@ -596,18 +590,19 @@ dev-guard watch --depth 4
 
 Watch excludes common heavy/generated paths such as `node_modules`, `.git`, `.next`, `dist`, `build`, `coverage`, and dev-guard runtime report/prompt files.
 
-## AI Provider Setup
+## Artifact Lifecycle
 
-The event-based workflow works without an AI provider. Configure one only for OpenAI-assisted Quality Report summaries or advanced task/review flows:
+| Class | Artifacts | Lifecycle |
+| --- | --- | --- |
+| Canonical current state | `.devguard/config.json`, `runtime.json`, `state.json`, `memory/code-index.json`, `project/project-knowledge.json`, `context/task-context.json`, `reports/quality-report-state.json`, `hook-state/*` | overwritten in place; one file each |
+| Append-only history | `history.jsonl`, `memory/change-log.jsonl`, `telemetry.jsonl` | bounded: past 8 MB (telemetry 4 MB) the file rotates to `<file>.1`, keeping the most recent records in the live file |
+| Diagnostic logs | `logs/*.log` | rotated at 2 MB, 2 generations |
+| Generated views (fallback / human) | `reports/*.md`, `prompts/*.md`, `context/agent-brief.md`, `context/agent-context.md` | singletons overwritten on every `done`; never read by agents when MCP succeeds |
+| Legacy helper inputs | `.devguard/task.md`, `rules.md`, `mistakes.md`, `AI_CONTEXT.md` | used only by `check` / `review` / `prompt` / `infer-task` / `task-ai`; not read by MCP or `done` |
+| Saved runs | `runs/*.json` | written only with `--save-run` |
+| User/project files | `AGENTS.md`, `CLAUDE.md` (outside the markers), `.mcp.json` / `.codex/config.toml` (other entries), `docs/*`, source | never deleted; only DevGuard's own marked section / `dev-guard` entry is changed |
 
-```bash
-dev-guard configure ai --provider openai --model gpt-4o-mini
-dev-guard config set openaiApiKey "your_api_key"
-# or:
-export OPENAI_API_KEY="your_api_key"
-```
-
-If you store a key in `.devguard/config.json`, keep that file out of git.
+New projects no longer get `docs/PROJECT_STATE.md`, `docs/CURRENT_TASK.md`, `docs/DECISIONS.md`, or `docs/DO_NOT_REPEAT.md` templates: MCP and `done` do not read them. Existing copies are kept and still read by the legacy `prompt` / `review` / `task-ai` / `update` helpers. `dev-guard doctor` prints a storage summary.
 
 ## Alpha Status
 

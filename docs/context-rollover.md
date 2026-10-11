@@ -102,8 +102,10 @@ thread cheap. A real downstream audit found one agent thread kept open for
 MCP context available. The intended loop is:
 
 1. Task done (`dev-guard done` or the Stop hook).
-2. Next distinct task → open a fresh agent thread (or move after the first
-   compaction at the latest).
+2. Next separate or large task → open a fresh agent thread (or move after the
+   first compaction at the latest). A small, closely related follow-up may stay
+   in the same thread while it is `LOW` (or `UNKNOWN` and never compacted);
+   `SOON` / `NEW_THREAD` always move the next task.
 3. `prepare_task_context` → read the returned ranges → targeted search only
    for a concrete gap.
 

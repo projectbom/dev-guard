@@ -15,6 +15,7 @@ import { runRefresh } from "./refresh.js";
 import { runReport } from "./report.js";
 import { runFixPrompt, runReview } from "./review.js";
 import { runScan } from "./scan.js";
+import { runSetup } from "./setup.js";
 import { runSelf, runSelfCheck, runRecordValidation } from "./self.js";
 import { runMcpServer } from "./mcp.js";
 import { runTaskAI } from "./task-ai.js";
@@ -54,6 +55,11 @@ async function main(): Promise<void> {
 
   if (process.argv.slice(3).some((arg) => arg === "--help" || arg === "-h")) {
     printHelp();
+    return;
+  }
+
+  if (command === "setup") {
+    await runSetup(root, process.argv.slice(3));
     return;
   }
 
@@ -212,20 +218,25 @@ function printHelp(): void {
 
 Getting Started
 
-  dev-guard watch
+  cd my-project
+  dev-guard setup     Prepare the project once: Code Index, Project Knowledge,
+                      MCP, agent instructions, completion hooks
+  dev-guard watch     Monitor your AI coding session
+                      (also prepares the project itself if setup was skipped)
 
-  Monitor your AI coding session.
-  Automatically prepares the project on first run.
+  No OpenAI API key is needed; AI assistance is optional.
 
 Other Commands
 
   doctor      Check setup and agent integration
+  status      Show watch state, quality verdict, and next action
   configure   Configure DevGuard settings
-  knowledge   Generate Project Knowledge
+  knowledge   Regenerate Project Knowledge
   update      Preview project documentation updates
 
 More
 
+  dev-guard setup --dry-run   Show what setup would change, without writing
   dev-guard --help-advanced
 `);
 }
@@ -273,6 +284,7 @@ Hooks (agent Stop Hook strategies):
   dev-guard install-agent-instructions [--force]
 
 All commands:
+  dev-guard setup [--dry-run]
   dev-guard init
   dev-guard "requirement"
   dev-guard done
@@ -313,7 +325,8 @@ All commands:
                                [--exit-code <n>] [--summary <text>] [--reason <text>]
 
 Commands:
-  watch                   Monitor AI coding session; prepares project on first run
+  setup                   Prepare the project (Code Index, Project Knowledge, MCP, instructions, hooks) and exit
+  watch                   Monitor AI coding session; runs the same preparation when setup is missing/stale
   "requirement"           Generate task.md and a compact Codex prompt
   done                    Manual recovery — normally watch auto-finalizes
   handoff                 Regenerate handoff/context; --task prepares Before-Agent context
@@ -325,9 +338,9 @@ Commands:
   doctor                  Print config/provider/git/hook diagnostics
 
 Advanced / recovery:
-  init                    Create .devguard and docs guard files; generated automatically by watch
-  install-hooks           Install agent completion strategy scripts/config; generated automatically by watch
-  install-agent-instructions  Create or update AGENTS.md / CLAUDE.md; generated automatically by watch when safe
+  init                    Create only the .devguard config/templates (no project analysis); setup/watch do this automatically
+  install-hooks           Install agent completion strategy scripts/config; done automatically by setup/watch
+  install-agent-instructions  Create or update the DevGuard section of AGENTS.md / CLAUDE.md; done automatically by setup/watch
   reset                   Clear watch runtime state without deleting project state
   check                   Analyze current git diff with rule-based checks
   scan                    Cache project structure and file summaries into .devguard
@@ -336,11 +349,11 @@ Advanced / recovery:
   mcp                     Start local stdio MCP server; intended for MCP hosts, not direct terminal use
   telemetry               Print privacy-safe drift telemetry summary
   report                  Print compact current-work summary for ChatGPT/Codex handoff
-  review                  AI-review current changes against task/rules/mistakes
-  fix-prompt              Generate a Codex-ready fix prompt from AI review
+  review                  Review current changes (--heuristic is local; otherwise needs the optional OpenAI API)
+  fix-prompt              Generate a Codex-ready fix prompt from AI review (optional OpenAI API)
   prompt                  Generate a Codex-ready task prompt from project context
   infer-task              Preview (or write) a task.md inferred from the current git diff
-  task-ai                 Generate .devguard/task.md from natural language
+  task-ai                 Generate .devguard/task.md from natural language (optional OpenAI API)
   self                    Dogfood dev-guard on this repo
   self-check              Run build, check, heuristic review, and doctor
   record-validation       Record external validation evidence (build/test/typecheck/manual QA/runtime smoke)
@@ -480,8 +493,8 @@ async function runDone(root: string): Promise<void> {
     console.log(copy.nextTask);
     console.log(
       locale === "ko-KR"
-        ? "  다음 작업이 별도 작업이면 새 agent thread를 열고 거기서 prepare_task_context를 호출하세요 (이 대화에서 계속하지 마세요)."
-        : "  If the next task is a separate task, open a fresh agent thread and call prepare_task_context there (do not continue in this conversation)."
+        ? "  다음 작업이 별도이거나 큰 작업이면 새 agent thread를 열고 거기서 prepare_task_context를 호출하세요. 같은 작업의 작은 후속 수정은 이 thread에서 이어가도 됩니다."
+        : "  If the next task is separate or large, open a fresh agent thread and call prepare_task_context there. A small follow-up of the same work can continue in this thread."
     );
     printThreadNotice(threadState);
   } catch (error) {
@@ -636,7 +649,7 @@ async function runStatus(root: string): Promise<void> {
   console.log(devguardPaths.agentContext);
   console.log("");
   console.log(copy.resumePrompt);
-  console.log("  In a fresh agent thread, call DevGuard MCP prepare_task_context with the concrete task and start from the returned files/ranges.");
+  console.log("  Call DevGuard MCP prepare_task_context with the concrete task (a separate task in a fresh agent thread) and start from the returned files/ranges.");
   if (initialized) {
     const resumeCost = await measureResumeBundleCost(root);
     const rollover = computeRolloverAssessment({
@@ -659,9 +672,8 @@ async function runStatus(root: string): Promise<void> {
   if (!initialized) {
     console.log("");
     console.log("Setup:");
-    console.log("  DevGuard project files are not initialized yet.");
-    console.log("  Run dev-guard init, then dev-guard install-agent-instructions.");
-    console.log("  Optional Auto Mode: dev-guard install-hooks");
+    console.log("  DevGuard is not set up in this project yet.");
+    console.log("  Run dev-guard setup (or just dev-guard watch, which prepares the project itself).");
   }
   const legacyWarning = legacyDevguardWarning(root);
   if (legacyWarning) {
@@ -680,9 +692,9 @@ async function runStatus(root: string): Promise<void> {
     }
   }
   console.log("");
-  console.log(`Next recommended action: ${initialized ? nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction) : "run dev-guard init"}`);
+  console.log(`Next recommended action: ${initialized ? nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction) : "run dev-guard setup"}`);
   console.log("Next:");
-  console.log(!initialized ? "  dev-guard init" : runtime.pendingChangedFiles.length > 0 ? "  dev-guard watch  (auto-finalizes pending changes; or: dev-guard done for manual recovery)" : "  dev-guard watch");
+  console.log(!initialized ? "  dev-guard setup" : runtime.pendingChangedFiles.length > 0 ? "  dev-guard watch  (auto-finalizes pending changes; or: dev-guard done for manual recovery)" : "  dev-guard watch");
 }
 
 async function runReset(root: string): Promise<void> {

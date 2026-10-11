@@ -9,7 +9,7 @@
 .devguard/reports/project-handoff.md
 ```
 
-`next-codex-prompt.md` is a compact execution prompt. `project-handoff.md` is the compressed context-overflow recovery file for a fresh Claude/Codex thread. The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
+`next-codex-prompt.md` is a compact execution prompt. `project-handoff.md` is the compressed recovery file for explicitly resuming earlier work (or working without MCP); the normal next-task path is DevGuard MCP `prepare_task_context`. The goal is to let the next Claude/Codex session continue safely without pasting a long chat history.
 
 ## Role In The Context Pipeline
 
@@ -84,4 +84,4 @@ dev-guard handoff
 cat .devguard/reports/project-handoff.md
 ```
 
-Start a new Claude/Codex thread and ask it to read `.devguard/reports/project-handoff.md`. The file includes `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, `Project`, and a short resume prompt.
+Use it only to explicitly resume earlier work or when MCP is unavailable: ask the agent to read `.devguard/reports/project-handoff.md`, then turn its next action into a concrete task for `prepare_task_context`. The file includes `Goal`, `Outstanding`, `Quality`, `Next`, `Changed`, `History`, `Project`, and a short resume prompt.

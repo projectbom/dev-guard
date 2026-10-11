@@ -30,7 +30,7 @@ import {
 import { buildAIContextPreamble, writeAIContext } from "./ai-context.js";
 import { copyTextToClipboard } from "./clipboard.js";
 import { filterCommandTargetCandidates, inferCommandTargetFiles, mergeCommandTargetCandidates } from "./command-targets.js";
-import { loadConfig, readOpenAIApiKeyForRoot } from "./config.js";
+import { AI_OPTIONAL_NOTICE, loadConfig, readOpenAIApiKeyForRoot } from "./config.js";
 import { fromRoot, readJsonFile, readTextFile, writeTextFile } from "./fs.js";
 import { getGitChanges, getProjectFiles } from "./git.js";
 import {
@@ -176,11 +176,11 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
   }
 
   if (providerName === "none") {
-    throw new Error("AI provider가 none입니다. `dev-guard configure ai --provider openai --model gpt-4o-mini`로 먼저 설정하세요.");
+    throw new Error(`${AI_OPTIONAL_NOTICE} Enable it with \`dev-guard configure ai --provider openai --model gpt-4o-mini\`, then set a key (\`dev-guard config set openaiApiKey <key>\` or DEV_GUARD_OPENAI_API_KEY).`);
   }
 
   if (providerName === "openai" && !openAIApiKey) {
-    throw new Error("OpenAI API key가 설정되어 있지 않습니다. `dev-guard config set openaiApiKey <key>`, `DEV_GUARD_OPENAI_API_KEY`, 또는 `OPENAI_API_KEY`를 사용하세요.");
+    throw new Error(`${AI_OPTIONAL_NOTICE} No OpenAI API key found: use \`dev-guard config set openaiApiKey <key>\`, DEV_GUARD_OPENAI_API_KEY, or OPENAI_API_KEY.`);
   }
 
   const provider =
@@ -228,7 +228,7 @@ export async function runTaskAI(root: string, args: string[]): Promise<void> {
         }).promptText
       : undefined;
 
-  // Prepend AI_CONTEXT.md reference so Codex/Claude reads it first
+  // Prepend the MCP-first / AI_CONTEXT.md-fallback preamble
   const codexPrompt = rawCodexPrompt ? buildAIContextPreamble() + rawCodexPrompt : undefined;
 
   if (options.copy && codexPrompt) {

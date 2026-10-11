@@ -3,7 +3,8 @@ import { access, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { loadConfig } from "./config.js";
+import { loadConfig, resolveAIAssistOptIn } from "./config.js";
+import { formatBytes, summarizeDevguardStorage } from "./artifact-retention.js";
 import { fromRoot, readTextFile } from "./fs.js";
 import { hasGitBaseline, getProjectFiles } from "./git.js";
 import { getHookStatus, hookConfigPaths, claudeHookCommand, codexHookCommand } from "./hooks.js";
@@ -44,22 +45,25 @@ export async function runDoctor(root: string, args: string[] = []): Promise<void
   const provider = resolved.config.ai?.provider ?? "none";
   const model = resolved.config.ai?.model ?? "gpt-4o-mini";
   const staleRuns = runs.filter((run) => isStale(run.createdAt)).length;
-  const apiKeyFound = provider === "openai" ? resolved.env.apiKey.found : false;
+  const aiOptIn = await resolveAIAssistOptIn(root);
 
   console.log("dev-guard doctor");
   if (!initialized) {
-    console.log("Setup: DevGuard project files are not initialized yet. Run dev-guard init, then dev-guard install-agent-instructions.");
+    console.log("Setup: DevGuard is not set up in this project yet. Run dev-guard setup (or just dev-guard watch).");
   }
-  console.log(`Provider: ${provider}`);
-  console.log(`Model: ${model}`);
-  console.log(`API Key: ${provider === "openai" ? (apiKeyFound ? "found" : "missing") : "not required"}`);
+  // API-keyless contract: the core workflow never needs OpenAI, so a
+  // missing key is never an error here. Only an explicit AI opt-in without
+  // a key earns a warning.
+  console.log("AI (optional):");
+  console.log("- Context broker: deterministic (no API key needed)");
+  console.log("- Semantic reranker: not enabled (not required)");
+  if (!aiOptIn.enabled) {
+    console.log("- OpenAI API: not configured (optional)");
+  } else {
+    console.log(`- OpenAI API: enabled via ${aiOptIn.via} (provider: ${provider}, model: ${model})`);
+    console.log(`- API key: ${aiOptIn.apiKey ? `found (${resolved.env.apiKey.selectedKey ?? "config"})` : "WARNING missing — AI-assisted commands will fail and done uses local rules"}`);
+  }
   console.log(`Config Source: ${resolved.source}`);
-  console.log("ENV:");
-  console.log(`- DEV_GUARD_OPENAI_API_KEY: ${resolved.env.apiKey.checked[0]?.found ? "found" : "missing"}`);
-  console.log(`- OPENAI_API_KEY: ${resolved.env.apiKey.checked[1]?.found ? "found" : "missing"}`);
-  console.log(`- selected provider: ${provider}`);
-  console.log(`- selected model: ${model}`);
-  console.log(`- selected API key source: ${resolved.env.apiKey.selectedKey ?? "none"}`);
   for (const warning of resolved.warnings) {
     console.log(`Config Warning: ${warning}`);
   }
@@ -79,6 +83,13 @@ export async function runDoctor(root: string, args: string[] = []): Promise<void
   console.log(`Stale Runs: ${staleRuns}`);
   console.log(`Memory Cache Size: ${cacheSize} bytes`);
   console.log(`Project Memory: ${(await fileExists(root, ".devguard/project-index.json")) ? "present" : "missing"}`);
+  const storage = await summarizeDevguardStorage(root);
+  console.log("DevGuard storage:");
+  console.log(`- current state: ${formatBytes(storage.currentBytes)}`);
+  console.log(`- history/telemetry (bounded, rotated): ${formatBytes(storage.historyBytes)}`);
+  console.log(`- diagnostic logs (rotated): ${formatBytes(storage.logBytes)}`);
+  if (storage.runFiles > 0) console.log(`- saved runs (--save-run): ${storage.runFiles} files, ${formatBytes(storage.runsBytes)}`);
+  console.log(`- retention: ${storage.overThreshold.length === 0 ? "healthy" : `rotates on next write: ${storage.overThreshold.join(", ")}`}`);
   console.log("");
   console.log("Hooks:");
   console.log(`- .devguard directory exists: ${await existsPath(root, ".devguard") ? "yes" : "no"}`);
@@ -381,7 +392,7 @@ function runHookScript(root: string, path: string, input?: string): { ok: boolea
 function expectedHookNextStep(status: Awaited<ReturnType<typeof getHookStatus>>, pendingCount: number, runtimeStatus?: string): string {
   const installed = (status.claudeInstalled && status.claudeHookFile) || (status.codexInstalled && status.codexHookFile);
   const verified = status.claudeLastSuccess === true || status.codexLastSuccess === true;
-  if (!installed) return "Run dev-guard install-hooks, then dev-guard watch.";
+  if (!installed) return "Run dev-guard setup (or dev-guard install-hooks), then dev-guard watch.";
   if (!verified) return "Hooks are installed but not verified. Run dev-guard doctor --hooks, trust Codex hooks with /hooks if needed, or fallback: dev-guard done.";
   if (pendingCount > 0 || runtimeStatus === "ready_for_done") return "Hook scripts are verified. Wait for the agent Stop Hook, or fallback: dev-guard done.";
   return "Hook scripts are verified. Run dev-guard watch before the next agent task.";

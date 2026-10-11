@@ -1,8 +1,8 @@
 import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { readJsonFile } from "./fs.js";
 
 const SERVER_NAME = "dev-guard";
 const MCP_COMMAND = "npx";
@@ -20,18 +20,25 @@ export interface McpSetupResult {
   warnings: string[];
 }
 
-export async function ensureMcpSetup(root: string): Promise<McpSetupResult> {
+/**
+ * Adds/refreshes only DevGuard's own `dev-guard` server entry: other
+ * `.mcp.json` servers and other `.codex/config.toml` tables are preserved.
+ * `dryRun` reports what would change without writing or spawning anything.
+ */
+export async function ensureMcpSetup(root: string, options: { dryRun?: boolean } = {}): Promise<McpSetupResult> {
   const warnings: string[] = [];
+  const dryRun = Boolean(options.dryRun);
   const [claude, codex] = await Promise.all([
-    ensureClaudeMcp(root).catch((error) => {
+    ensureClaudeMcp(root, dryRun).catch((error) => {
       warnings.push(`Claude MCP warning: ${errorMessage(error)}`);
       return "warning" as const;
     }),
-    ensureCodexMcp(root).catch((error) => {
+    ensureCodexMcp(root, dryRun).catch((error) => {
       warnings.push(`Codex MCP warning: ${errorMessage(error)}`);
       return "warning" as const;
     })
   ]);
+  if (dryRun) return { claude, codex, verification: "skipped", warnings };
   const verification = await verifyMcpServer(root).catch((error) => {
     warnings.push(`MCP verification warning: ${errorMessage(error)}`);
     return "warning" as const;
@@ -39,10 +46,10 @@ export async function ensureMcpSetup(root: string): Promise<McpSetupResult> {
   return { claude, codex, verification, warnings };
 }
 
-async function ensureClaudeMcp(root: string): Promise<McpSetupResult["claude"]> {
+async function ensureClaudeMcp(root: string, dryRun: boolean): Promise<McpSetupResult["claude"]> {
   const path = join(root, ".mcp.json");
   const exists = await fileExists(path);
-  const config = await readJsonFile<ClaudeMcpConfig>(path, {});
+  const config = exists ? await readExistingJson(path) : {};
   const servers = isPlainObject(config.mcpServers) ? { ...config.mcpServers } : {};
   const entry = {
     command: MCP_COMMAND,
@@ -52,11 +59,11 @@ async function ensureClaudeMcp(root: string): Promise<McpSetupResult["claude"]> 
     return "already_configured";
   }
   servers[SERVER_NAME] = entry;
-  await writeJson(path, { ...config, mcpServers: servers });
+  if (!dryRun) await writeJson(path, { ...config, mcpServers: servers });
   return exists ? "updated" : "created";
 }
 
-async function ensureCodexMcp(root: string): Promise<McpSetupResult["codex"]> {
+async function ensureCodexMcp(root: string, dryRun: boolean): Promise<McpSetupResult["codex"]> {
   const path = join(root, ".codex", "config.toml");
   const exists = await fileExists(path);
   const current = exists ? await readFile(path, "utf8") : "";
@@ -70,17 +77,20 @@ async function ensureCodexMcp(root: string): Promise<McpSetupResult["codex"]> {
   if (blockPattern.test(current)) {
     const next = current.replace(blockPattern, (match, prefix: string) => `${prefix}${block}`);
     if (next === current) return "already_configured";
-    await writeText(path, next.endsWith("\n") ? next : `${next}\n`);
+    if (!dryRun) await writeText(path, next.endsWith("\n") ? next : `${next}\n`);
     return "updated";
   }
   const separator = current.trim() ? (current.endsWith("\n") ? "\n" : "\n\n") : "";
-  await writeText(path, `${current}${separator}${block}`);
+  if (!dryRun) await writeText(path, `${current}${separator}${block}`);
   return exists ? "updated" : "created";
 }
 
 async function verifyMcpServer(root: string): Promise<McpSetupResult["verification"]> {
-  const entry = process.argv[1];
-  if (!entry) return "skipped";
+  // The CLI entry that ships next to this module — not process.argv[1],
+  // which is whatever script happens to be running (a test runner, a
+  // wrapper) and must never be re-spawned as an MCP server.
+  const entry = fileURLToPath(new URL("./index.js", import.meta.url));
+  if (!(await fileExists(entry))) return "skipped";
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [entry, "mcp"],
@@ -95,6 +105,24 @@ async function verifyMcpServer(root: string): Promise<McpSetupResult["verificati
   } finally {
     await client.close();
   }
+}
+
+/**
+ * A user-owned config file that exists but does not parse is left exactly
+ * as it is (warning) — never replaced by a DevGuard-only object, which
+ * would drop the user's other MCP servers.
+ */
+async function readExistingJson(path: string): Promise<ClaudeMcpConfig> {
+  const text = await readFile(path, "utf8");
+  if (!text.trim()) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`${path} is not valid JSON; left unchanged. Add the "dev-guard" server by hand or fix the file and rerun dev-guard setup.`);
+  }
+  if (!isPlainObject(parsed)) throw new Error(`${path} is not a JSON object; left unchanged.`);
+  return parsed as ClaudeMcpConfig;
 }
 
 async function fileExists(path: string): Promise<boolean> {

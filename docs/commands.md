@@ -5,6 +5,7 @@
 ## Main Commands
 
 ```bash
+dev-guard setup [--dry-run]
 dev-guard init
 dev-guard install-hooks
 dev-guard install-hooks --agent claude
@@ -22,7 +23,8 @@ dev-guard doctor --hooks
 dev-guard doctor --agents
 ```
 
-- `init`: create initial `.devguard` guard files. Existing files are not overwritten.
+- `setup`: recommended first-run command. Creates the `.devguard` config, builds the Code Index and Project Knowledge, installs the DevGuard section of `AGENTS.md`/`CLAUDE.md`, registers MCP for Claude Code/Codex, installs completion hooks best-effort, verifies the MCP server, prints a summary, and exits. Idempotent and non-interactive; `--dry-run` writes nothing. `watch` runs the same preparation when it is missing or stale.
+- `init`: advanced/recovery — create only the `.devguard` config/templates (no project analysis, no `docs/*` templates). Existing files are not overwritten.
 - `watch`: recommended watcher; finalizes via a runtime-verified Claude/Codex Stop hook once one exists, and falls back to its own inactivity-based auto-finalize until then — either way, finalization itself is idempotent, so a hook firing repeatedly (or racing a manual `done`) for the same unchanged code state never produces more than one real completion.
 - `install-hooks`: install Claude/Codex completion strategy scripts and supported config.
 - `done`: manually process pending changes and generate history, reports, quality verdict, and handoff prompt.
@@ -180,13 +182,14 @@ dev-guard config set locale en-US
 
 The dashboard, quality report, and project handoff follow this locale. The dashboard language toggle persists the same setting. AI-facing prompts such as `.devguard/prompts/next-codex-prompt.md` stay in English.
 
-OpenAI API keys are optional. Without a key, `done` still generates a rule-based Quality Report. To enable OpenAI-assisted Quality Report summaries and AI-backed commands, use one of:
+OpenAI API keys are optional; the core workflow makes no OpenAI calls. AI is an explicit opt-in for `task-ai`, `review`/`fix-prompt`, and the optional `done` Quality Report summary:
 
 ```bash
-dev-guard config set openaiApiKey <key>
-export DEV_GUARD_OPENAI_API_KEY="<key>"
-export OPENAI_API_KEY="<key>"
+dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard config set openaiApiKey <key>   # or: export DEV_GUARD_OPENAI_API_KEY="<key>"
 ```
+
+`OPENAI_API_KEY` is also read as a key source for AI commands, but on its own it does not enable the `done` AI summary.
 
 Stored keys are never printed. If you store a key in `.devguard/config.json`, keep that file out of git.
 

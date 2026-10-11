@@ -27,10 +27,11 @@ function sharedDevGuardInstructions(_agentName: "Codex" | "Claude"): string[] {
     "3. Do not immediately run repository-wide `rg`/`grep`/`find`. Search only for a concrete gap the returned ranges do not cover, and keep that search targeted.",
     `4. When \`prepare_task_context\` succeeds, do not also read DevGuard's markdown (\`${devguardPaths.projectHandoff}\`, \`${devguardPaths.qualityReport}\`, \`${devguardPaths.nextCodexPrompt}\`, \`${devguardPaths.nextClaudePrompt}\`, \`${devguardPaths.agentBrief}\`, \`${devguardPaths.workingContext}\`, \`${devguardPaths.agentContext}\`). They are fallback and human-diagnostic artifacts.`,
     "",
-    "Fresh thread per task (rollover-first):",
+    "Thread policy (hybrid, rollover-first):",
     "",
-    "- When a task is done and the next request is a separate task, recommend continuing in a fresh agent thread and call `prepare_task_context` there.",
-    "- If this thread has already handled another task or has been compacted once, move the next task to a fresh thread instead of waiting for another compaction.",
+    "- A small, closely related follow-up of the same work may continue in this thread while the latest thread state is `LOW` (or `UNKNOWN` and this thread was never compacted). Still call `prepare_task_context` for it.",
+    "- When the next request is a separate or large task, recommend continuing in a fresh agent thread and call `prepare_task_context` there.",
+    "- If this thread has already handled a different task or has been compacted once, move the next task to a fresh thread instead of waiting for another compaction.",
     "- Thread state: `record_validation_result` (and an agent-run `dev-guard done`) report this thread's freshly observed state as `thread.status` — `LOW`, `SOON`, `NEW_THREAD`, or `UNKNOWN` — read from the provider's own usage records. Only the latest one from this task and this thread counts.",
     "- Tell the user at the task boundary: when the latest state is `SOON` or `NEW_THREAD`, end your FINAL reply for the task with the provided `userNotice` sentence (one or two sentences, in the user's language) — `SOON`: start the next large task or separate step in a fresh thread; `NEW_THREAD`: switch to a fresh thread before continuing. Put it after the results, never first.",
     "- Say nothing about threads when the state is `LOW` or `UNKNOWN`, and do not warn in intermediate updates while you are still finishing the same task.",
@@ -116,10 +117,11 @@ async function installSection(filePath: string, section: string, force: boolean)
   return "section_added";
 }
 
-async function ensureGeneratedSection(filePath: string, section: string): Promise<AutoInstallResult> {
+async function ensureGeneratedSection(filePath: string, section: string, options: { dryRun?: boolean } = {}): Promise<AutoInstallResult> {
+  const write = options.dryRun ? async () => undefined : (content: string) => writeFile(filePath, content, "utf8");
   const exists = await fileExists(filePath);
   if (!exists) {
-    await writeFile(filePath, section + "\n", "utf8");
+    await write(section + "\n");
     return "created";
   }
 
@@ -127,15 +129,16 @@ async function ensureGeneratedSection(filePath: string, section: string): Promis
   const hasSection = existing.includes(SECTION_START) && existing.includes(SECTION_END);
   if (!hasSection) {
     const separator = existing.endsWith("\n") ? "\n" : "\n\n";
-    await writeFile(filePath, existing + separator + section + "\n", "utf8");
+    await write(existing + separator + section + "\n");
     return "section_added";
   }
   const startIdx = existing.indexOf(SECTION_START);
   const endIdx = existing.indexOf(SECTION_END) + SECTION_END.length;
   const currentSection = existing.slice(startIdx, endIdx);
   if (currentSection === section) return "already_installed";
-  const updated = existing.slice(0, startIdx) + section + existing.slice(endIdx);
-  await writeFile(filePath, updated, "utf8");
+  // Only the marker-delimited DevGuard section is replaced; user text
+  // before/after it is preserved byte-for-byte.
+  await write(existing.slice(0, startIdx) + section + existing.slice(endIdx));
   return "section_updated";
 }
 
@@ -176,12 +179,13 @@ export async function runInstallAgentInstructions(root: string, args: string[]):
   console.log(`  Read ${devguardPaths.agentBrief}, ${devguardPaths.readMap}, and ${devguardPaths.codeMap}; then continue.`);
 }
 
-export async function ensureAgentInstructions(root: string): Promise<AgentInstructionInstallSummary> {
+/** `dryRun` reports what would change without writing anything. */
+export async function ensureAgentInstructions(root: string, options: { dryRun?: boolean } = {}): Promise<AgentInstructionInstallSummary> {
   const agentsMdPath = join(root, "AGENTS.md");
   const claudeMdPath = join(root, "CLAUDE.md");
   const [agents, claude] = await Promise.all([
-    ensureGeneratedSection(agentsMdPath, agentsMdSection()),
-    ensureGeneratedSection(claudeMdPath, claudeMdSection())
+    ensureGeneratedSection(agentsMdPath, agentsMdSection(), options),
+    ensureGeneratedSection(claudeMdPath, claudeMdSection(), options)
   ]);
   const warnings: string[] = [];
   return { agents, claude, warnings };

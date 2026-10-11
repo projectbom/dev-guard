@@ -30,24 +30,46 @@ npx @dev-guard/cli --help
 
 ## 2. 프로젝트 초기 세팅
 
-사용할 프로젝트 루트에서 실행합니다.
+권장 — 프로젝트 루트에서 한 번 실행한 뒤 watch를 시작합니다.
 
 ```bash
 cd your-project
-dev-guard init
-dev-guard install-agent-instructions
-dev-guard install-hooks
-dev-guard status
+dev-guard setup
+dev-guard watch
 ```
 
-각 명령의 역할:
+Zero-config — setup을 건너뛰어도 `watch`가 setup이 없거나 오래된 경우 같은 준비 과정을 자동으로 수행합니다.
 
-- `init`: `.devguard/` 기본 파일을 만듭니다. 기존 파일은 덮어쓰지 않습니다.
-- `install-agent-instructions`: `AGENTS.md`, `CLAUDE.md`에 DevGuard workflow 섹션(MCP `prepare_task_context` 우선)을 추가합니다.
-- `install-hooks`: Claude Code / Codex 완료 전략 파일을 설치합니다.
-- `status`: pending 변경, 최근 작업, quality verdict, hook 상태를 확인합니다.
+```bash
+cd your-project
+dev-guard watch
+```
 
-`dev-guard watch`는 첫 실행 때 Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버도 등록합니다. `prepare_task_context`와 `record_validation_result`는 이 서버가 제공합니다.
+`dev-guard setup`은 결정적이고 비대화형입니다(질문, API key, 네트워크 없음). 수행 단계:
+
+1. 프로젝트 루트 확인 (홈 디렉터리나 `/`는 거부)
+2. 없는 `.devguard/` 설정 파일 생성 (기존 파일 유지)
+3. Code Index 생성 (`.devguard/memory/code-index.json`)
+4. Project Knowledge 생성 (`.devguard/project/project-knowledge.json`)
+5. `AGENTS.md`, `CLAUDE.md`의 DevGuard 섹션 추가/갱신 (marker 밖 텍스트 유지)
+6. Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버 등록 — 다른 서버 유지
+7. completion hook 설치 (best-effort)
+8. MCP 서버가 실행되어 `prepare_task_context`를 제공하는지 확인
+9. 요약 출력(package manager, framework, 명령어, 연동 상태, AI 상태) 후 종료
+
+watcher와 dashboard는 시작하지 않습니다. 다시 실행하면 없거나 오래된 부분만 갱신합니다(Project Knowledge는 `package.json`, lockfile, framework 설정이 더 새로울 때만 재생성). `dev-guard setup --dry-run`은 아무것도 쓰지 않고 생성/갱신될 항목만 보여 줍니다.
+
+`npm install -g` 자체는 어떤 프로젝트도 분석하거나 변경하지 않습니다 — 어느 프로젝트가 대상인지 알 수 없기 때문입니다.
+
+Git: setup, Code Index, Project Knowledge, MCP context는 git 없이도 동작합니다. `done`의 변경 파일 감지는 git이 필요합니다.
+
+고급 / 복구용 (보통 필요 없음 — setup과 watch가 모두 수행):
+
+```bash
+dev-guard init                        # .devguard 설정/템플릿만 생성, 프로젝트 분석 없음
+dev-guard install-agent-instructions  # AGENTS.md / CLAUDE.md 섹션만
+dev-guard install-hooks               # completion hook만
+```
 
 hook을 바로 신뢰할 수 없는 환경이면 수동 모드로 시작합니다.
 
@@ -58,33 +80,32 @@ dev-guard done
 dev-guard status
 ```
 
-## 3. GPT 설정
+## 3. 선택 사항: AI (OpenAI)
 
-기본 `watch`, `done`, `status`, MCP 흐름은 GPT/API 설정 없이 동작합니다.
-GPT 설정은 `review`, `task-ai` 같은 AI 보조 명령을 사용할 때만 필요합니다.
+API key는 필요 없습니다. `setup`, `init`, `watch`, `status`, `doctor`, Code Index, Project Knowledge, MCP(`prepare_task_context`, `record_validation_result`), 검증 기록, `done`, 보고서, dashboard, telemetry, hook은 모두 결정적으로 동작하며 OpenAI를 호출하지 않습니다. context broker는 결정적이며 기본 경로에 AI reranker는 없습니다.
 
-OpenAI provider 설정:
+AI는 명시적 opt-in입니다. OpenAI를 쓰는 기능은 다음뿐입니다(`scan --ai` / `refresh --ai`는 예약된 플래그로 rule-based 그대로입니다).
+
+- `dev-guard task-ai` — 자연어 task 생성
+- `dev-guard review`(`--heuristic` 제외)와 `dev-guard fix-prompt` — AI 리뷰
+- `done` 시 Quality Report에 붙는 선택적 AI 요약 — opt-in 후에만
+
+Opt-in:
 
 ```bash
-export DEV_GUARD_OPENAI_API_KEY="your_api_key"
-# 또는:
-export OPENAI_API_KEY="your_api_key"
 dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard config set openaiApiKey "your_api_key"   # 또는: export DEV_GUARD_OPENAI_API_KEY=...
 dev-guard doctor
 ```
 
-모델만 바꿀 때:
+key는 `.devguard/config.json`, `DEV_GUARD_OPENAI_API_KEY`, `OPENAI_API_KEY` 순서로 읽습니다. 셸 전역 `OPENAI_API_KEY`만으로는 `done`의 AI 요약이 켜지지 않습니다 — `ai.provider`를 `openai`로 설정하거나 `DEV_GUARD_OPENAI_API_KEY`를 사용하세요. key를 `.devguard/config.json`에 저장했다면 그 파일을 git에서 제외하세요.
+
+key가 없으면 `doctor`는 `OpenAI API: not configured (optional)`로 표시하고, AI 전용 명령은 "OpenAI API is optional — DevGuard's core workflow does not need it. This command requires AI assistance." 안내와 함께 멈춥니다.
+
+모델만 바꾸거나 AI를 다시 끄려면:
 
 ```bash
 dev-guard config set model gpt-5
-dev-guard config show
-```
-
-API 키는 `.devguard/config.json`, `.env`, markdown, git 추적 파일에 저장하지 않습니다. 런타임 환경 변수로만 전달합니다.
-
-AI provider를 끄거나 로컬 휴리스틱 중심으로만 쓰려면:
-
-```bash
 dev-guard configure ai --provider none --model gpt-4o-mini
 ```
 
@@ -95,7 +116,7 @@ dev-guard configure ai --provider none --model gpt-4o-mini
 - **MCP 사용 가능:** 새 작업마다 먼저 `prepare_task_context` 호출 → TARGET 범위 읽기 → 구체적인 공백이 있을 때만 CANDIDATE 열기 → 둘 다 다루지 못한 부분만 좁게 검색. `.devguard` markdown은 함께 읽지 않습니다.
 - **MCP 사용 불가:** `.devguard/context/agent-brief.md` → `.devguard/reports/read-map.md` → `.devguard/reports/code-map.md` 순서로 fallback.
 - `project-handoff.md` / `quality-report.md`는 명시적 요청(이전 작업 재개, QA 조사)이 있을 때만 읽습니다.
-- 서로 다른 작업은 새 agent thread에서 시작하고, 검증은 `record_validation_result`로 기록하며, `dev-guard done` 또는 Stop hook으로 마칩니다.
+- thread 정책은 hybrid입니다: 같은 작업의 작고 밀접한 후속 수정은 thread 부담이 낮으면 같은 thread에서 이어갈 수 있고, 별도/큰 작업, `SOON` / `NEW_THREAD` 안내, compaction이 일어난 thread는 새 agent thread로 옮깁니다. 검증은 `record_validation_result`로 기록하고 `dev-guard done` 또는 Stop hook으로 마칩니다.
 
 기존 dev-guard 섹션을 최신 문구로 갱신하려면:
 
@@ -140,7 +161,7 @@ Codex Stop Hook을 쓰는 고급 경로에서는 Codex TUI에서 `/hooks`를 열
 
 ## 7. 이후 CLI 명령어 흐름
 
-일상 작업 권장 흐름:
+일상 작업 권장 흐름(한 번 `dev-guard setup` 이후):
 
 ```bash
 dev-guard watch
@@ -158,7 +179,7 @@ dev-guard done
 dev-guard status
 ```
 
-다음 작업을 새 Codex/Claude thread에서 할 때: 구체적인 작업(과 반드시 읽을 파일)만 전달합니다. agent가 `prepare_task_context`를 호출하고, 반환된 read plan의 TARGET 범위부터 읽으며, `.devguard` markdown은 열지 않습니다. 작업이 `SOON` / `NEW_THREAD` thread 안내로 끝났다면 다음 작업은 새 thread에서 시작합니다.
+다음 작업: 구체적인 작업(과 반드시 읽을 파일)만 전달합니다. agent가 `prepare_task_context`를 호출하고, 반환된 read plan의 TARGET 범위부터 읽으며, `.devguard` markdown은 열지 않습니다. 같은 작업의 작은 후속 수정은 현재 thread에서 이어가도 되고, 별도/큰 작업이나 `SOON` / `NEW_THREAD` 안내·compaction 이후의 작업은 새 thread에서 시작합니다.
 
 수동 복구용 — MCP를 쓸 수 없을 때, 이전 작업을 명시적으로 재개할 때, DevGuard 출력을 디버깅할 때만:
 
@@ -185,14 +206,13 @@ dev-guard reset
 
 ## 8. 업데이트 후 점검 체크리스트
 
-npm 업데이트 뒤 프로젝트마다 한 번 확인합니다.
+npm 업데이트 뒤 프로젝트마다 한 번 확인합니다(`setup`이 관리 섹션, MCP 항목, 오래된 hook script를 제자리에서 갱신합니다).
 
 ```bash
-dev-guard --help
+dev-guard setup
 dev-guard status
 dev-guard doctor --agents
 dev-guard doctor --hooks --dry-run
-dev-guard install-agent-instructions --force
 ```
 
 hook script 자체가 바뀐 버전이면 필요한 프로젝트에서 다시 설치합니다.

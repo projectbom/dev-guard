@@ -18,14 +18,26 @@ npx @dev-guard/cli --help
 
 ## Quick Start
 
-Run from your project root:
+```bash
+npm install -g @dev-guard/cli   # installs the CLI only; no project is scanned
+```
+
+Recommended — from your project root, prepare once, then watch:
+
+```bash
+cd my-project
+dev-guard setup
+dev-guard watch
+```
+
+Zero-config — `watch` alone runs the same preparation when setup is missing or stale:
 
 ```bash
 cd my-project
 dev-guard watch
 ```
 
-On first launch, `watch` automatically creates default `.devguard/` configuration, registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`), installs DevGuard-managed AI instruction files when safe, installs completion hooks best-effort, generates Project Knowledge, starts the local dashboard, and opens the browser.
+`dev-guard setup` creates the `.devguard/` configuration, builds the Code Index, generates Project Knowledge, adds the DevGuard section to `AGENTS.md` / `CLAUDE.md`, registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`), installs completion hooks best-effort, checks the MCP server, prints a summary, and exits. It is non-interactive, needs no API key, and is idempotent; `--dry-run` previews changes without writing. `watch` uses the same engine and then starts the dashboard and watcher.
 
 Then work with your agent as usual. Each task runs through the MCP tool:
 
@@ -34,7 +46,7 @@ Then work with your agent as usual. Each task runs through the MCP tool:
 3. It reports real build/test/manual checks with `record_validation_result`.
 4. The Stop hook (or `dev-guard done`) closes the task.
 
-Start each distinct task in a fresh agent thread — DevGuard makes that start cheap instead of letting one long thread be compacted.
+Thread policy is hybrid: a small, closely related follow-up may continue in the same thread while thread pressure is low; a separate or large task, a `SOON` / `NEW_THREAD` notice, or a compacted thread moves to a fresh agent thread — DevGuard makes that start cheap instead of letting one long thread be compacted.
 
 ## How `prepare_task_context` Plans Reads
 
@@ -50,25 +62,22 @@ The result is one read plan (`readPlan`) with estimated sizes (characters / 4, n
 
 `record_validation_result` and the agent's own `dev-guard done` report the calling thread's state from the provider's own usage records: `LOW`, `SOON` (≥50% observed), `NEW_THREAD` (≥75% observed, or a compaction), or `UNKNOWN`. At a task boundary, a thread still under 50% can be raised to `SOON` when typical observed task growth would not fit. On `SOON` / `NEW_THREAD` the agent ends its final reply with a one-line notice recommending a fresh thread. DevGuard never estimates a context percentage it did not observe; Claude Code records no window size, so only compaction is observable there.
 
-## GPT Setup
+## Optional AI (OpenAI)
 
-The default `watch`, `done`, `status`, and MCP workflow does not require GPT/API setup. Without a key, `done` generates rule-based Quality Reports. With a key, DevGuard can add OpenAI-assisted Quality Report summaries and run AI-backed commands such as `review` and `task-ai`.
+No API key is needed. `setup`, `watch`, `done`, `status`, `doctor`, MCP, reports, the dashboard, and hooks are deterministic and make no OpenAI calls; the context broker is deterministic. AI is an explicit opt-in used only by `task-ai`, `review` (without `--heuristic`) / `fix-prompt`, and an optional AI summary on the `done` Quality Report.
 
 ```bash
-dev-guard config set openaiApiKey "your_api_key"
-# or:
-export DEV_GUARD_OPENAI_API_KEY="your_api_key"
-# or:
-export OPENAI_API_KEY="your_api_key"
 dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard config set openaiApiKey "your_api_key"
+# or: export DEV_GUARD_OPENAI_API_KEY="your_api_key"
 dev-guard doctor
 ```
 
-DevGuard checks `.devguard/config.json`, then `DEV_GUARD_OPENAI_API_KEY`, then `OPENAI_API_KEY`. It never prints the key or returns it from the dashboard API. If you store the key in `.devguard/config.json`, keep that file out of git.
+DevGuard checks `.devguard/config.json`, then `DEV_GUARD_OPENAI_API_KEY`, then `OPENAI_API_KEY`. A shell-wide `OPENAI_API_KEY` alone does not enable the `done` AI summary. It never prints the key or returns it from the dashboard API. If you store the key in `.devguard/config.json`, keep that file out of git.
 
 ## Agent Instruction Files
 
-`dev-guard watch` creates DevGuard-managed `AGENTS.md` and `CLAUDE.md` sections when they are missing; it never overwrites user-managed text outside the DevGuard marker. `dev-guard install-agent-instructions --force` refreshes the section. It describes one workflow:
+`dev-guard setup` (and `watch`) create or refresh the DevGuard-managed section of `AGENTS.md` and `CLAUDE.md`; text outside the DevGuard markers is never changed. `dev-guard install-agent-instructions --force` refreshes the section. It describes one workflow:
 
 - **MCP available (normal):** `prepare_task_context` first, then the returned ranges. Agents do not also read `.devguard` markdown.
 - **MCP unavailable:** fall back to `.devguard/context/agent-brief.md`, then `.devguard/reports/read-map.md`, then `.devguard/reports/code-map.md`.
@@ -94,7 +103,7 @@ dev-guard done
 dev-guard status
 ```
 
-Next task: open a fresh agent thread and give it the task — the agent calls `prepare_task_context` there. Only for manual recovery when MCP is unavailable, or to explicitly resume earlier work:
+Next task: give the agent the task — it calls `prepare_task_context` (in a fresh agent thread for a separate or large task, or after a `SOON` / `NEW_THREAD` notice). Only for manual recovery when MCP is unavailable, or to explicitly resume earlier work:
 
 ```bash
 dev-guard handoff
@@ -127,16 +136,14 @@ Advanced terminal-only mode:
 dev-guard watch --no-dashboard
 ```
 
-Advanced setup/recovery commands:
+Advanced setup/recovery commands (normally `dev-guard setup` covers all of these):
 
 ```bash
-dev-guard init
+dev-guard init                        # .devguard config/templates only, no project analysis
 dev-guard install-agent-instructions
 dev-guard install-hooks
 dev-guard dashboard
 ```
-
-Normal users should not need these for first run.
 
 Full documentation:
 

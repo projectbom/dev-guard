@@ -43,10 +43,13 @@ export async function writeAIContext(root: string): Promise<void> {
 }
 
 /**
- * Short preamble prepended to Codex/Claude prompts so they know to read AI_CONTEXT.md first.
+ * Preamble for the prompt printed by the explicit legacy `task-ai` command
+ * (the only caller). AI_CONTEXT.md is written only by refresh, infer-task
+ * --write and task-ai --write — never by the normal setup/watch/MCP path —
+ * so the preamble keeps MCP first and AI_CONTEXT.md as the no-MCP fallback.
  */
 export function buildAIContextPreamble(): string {
-  return "Start by reading `.devguard/AI_CONTEXT.md` for task anchor and project context.\n\n---\n\n";
+  return "If DevGuard MCP is available, call `prepare_task_context` with this task first. Without MCP, read `.devguard/AI_CONTEXT.md` for the task anchor.\n\n---\n\n";
 }
 
 function generateAIContextMarkdown(input: {

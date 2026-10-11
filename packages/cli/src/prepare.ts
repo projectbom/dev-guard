@@ -1,48 +1,68 @@
 import { access } from "node:fs/promises";
-import { fromRoot } from "./fs.js";
-import { ensureInitialProjectFiles } from "./init.js";
-import { ensureAgentInstructions } from "./install-agent-instructions.js";
-import { generateProjectKnowledge, getProjectKnowledgeRefreshStatus } from "./knowledge.js";
+import { fromRoot, readJsonFile } from "./fs.js";
+import { ensureInitialProjectFiles, planInitialProjectFiles } from "./init.js";
+import { ensureAgentInstructions, type AgentInstructionInstallSummary } from "./install-agent-instructions.js";
+import { generateProjectKnowledge, getProjectKnowledgeRefreshStatus, type ProjectKnowledgeRefreshStatus } from "./knowledge.js";
 import { installHooks, refreshGeneratedHookScripts } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
 import { ensureCodeIndex, readRuntimeState, writeRuntimeState, type SetupStatus, type SetupStatusStep } from "./runtime-state.js";
-import { ensureMcpSetup } from "./mcp-setup.js";
+import { ensureMcpSetup, type McpSetupResult } from "./mcp-setup.js";
 
 export interface PrepareResult {
   didWork: boolean;
   warnings: string[];
   steps: Array<{ key: SetupStatusStep["key"]; label: string; status: "done" | "warning" | "skipped"; changed: boolean; detail?: string }>;
+  /** Facts observed while preparing — what `dev-guard setup` prints. */
+  facts: {
+    filesIndexed: number;
+    knowledge: ProjectKnowledgeRefreshStatus;
+    instructions: AgentInstructionInstallSummary;
+    mcp: McpSetupResult;
+    hooksInstalled: boolean;
+  };
 }
 
-const setupSteps: SetupStatusStep[] = [
+export interface PrepareOptions {
+  /** Present only for `watch`: the dashboard is a watch-runtime concern, not setup. */
+  dashboard?: { enabled: boolean; ready: boolean };
+  onProgress?: (line: string) => void;
+}
+
+const baseSetupSteps: SetupStatusStep[] = [
   { key: "config", label: "Configuration", status: "pending" },
   { key: "code_index", label: "Code Index", status: "pending" },
   { key: "knowledge", label: "Project Knowledge", status: "pending" },
   { key: "agent_instructions", label: "AI Instructions", status: "pending" },
   { key: "hooks", label: "Git Hooks", status: "pending" },
-  { key: "mcp", label: "MCP", status: "pending" },
-  { key: "dashboard", label: "Dashboard", status: "pending" }
+  { key: "mcp", label: "MCP", status: "pending" }
 ];
 
-export async function prepareWatchProject(
-  root: string,
-  options: { dashboardEnabled: boolean; dashboardReady: boolean; onProgress?: (line: string) => void }
-): Promise<PrepareResult> {
+/**
+ * The single project-preparation engine. `dev-guard setup` runs it and
+ * exits; `dev-guard watch` runs it before starting the watch runtime, so a
+ * user who skips setup still gets the same zero-config first run. Every
+ * step is idempotent: fresh artifacts are reused (Code Index present,
+ * Project Knowledge newer than its inputs, managed sections unchanged,
+ * hooks/MCP already configured), and only missing or stale parts are
+ * written. Only DevGuard-owned files and marker-delimited sections change.
+ */
+export async function prepareProject(root: string, options: PrepareOptions = {}): Promise<PrepareResult> {
   const steps: PrepareResult["steps"] = [];
   const warnings: string[] = [];
   const startedAt = new Date().toISOString();
   let didWork = false;
+  const setupSteps: SetupStatusStep[] = options.dashboard ? [...baseSetupSteps, { key: "dashboard", label: "Dashboard", status: "pending" }] : baseSetupSteps;
 
   await writeSetupStatus(root, { active: true, startedAt, steps: setupSteps });
 
-  await markStep(root, startedAt, "config", "running");
+  await markStep(root, startedAt, setupSteps, "config", "running");
   const initResults = await ensureInitialProjectFiles(root);
   const initChanged = initResults.some((result) => result.status === "created");
   didWork = didWork || initChanged;
   steps.push({ key: "config", label: "Initialized project", status: "done", changed: initChanged });
-  await markStep(root, startedAt, "config", "done");
+  await markStep(root, startedAt, setupSteps, "config", "done");
 
-  await markStep(root, startedAt, "code_index", "running");
+  await markStep(root, startedAt, setupSteps, "code_index", "running");
   const indexResult = await ensureCodeIndex(root);
   didWork = didWork || indexResult.generated;
   if (indexResult.warning) warnings.push(`Code Index warning: ${indexResult.warning}`);
@@ -53,9 +73,9 @@ export async function prepareWatchProject(
     changed: indexResult.generated,
     detail: indexResult.warning ?? `${indexResult.filesIndexed} files indexed`
   });
-  await markStep(root, startedAt, "code_index", indexResult.warning ? "warning" : "done", indexResult.warning);
+  await markStep(root, startedAt, setupSteps, "code_index", indexResult.warning ? "warning" : "done", indexResult.warning);
 
-  await markStep(root, startedAt, "knowledge", "running");
+  await markStep(root, startedAt, setupSteps, "knowledge", "running");
   const knowledgeStatus = await getProjectKnowledgeRefreshStatus(root);
   let knowledgeChanged = false;
   let knowledgeWarning: string | undefined;
@@ -89,9 +109,9 @@ export async function prepareWatchProject(
     changed: knowledgeChanged,
     detail: knowledgeWarning ?? knowledgeDetail(knowledgeStatus)
   });
-  await markStep(root, startedAt, "knowledge", knowledgeWarning ? "warning" : "done", knowledgeWarning);
+  await markStep(root, startedAt, setupSteps, "knowledge", knowledgeWarning ? "warning" : "done", knowledgeWarning);
 
-  await markStep(root, startedAt, "agent_instructions", "running");
+  await markStep(root, startedAt, setupSteps, "agent_instructions", "running");
   const instructionResult = await ensureAgentInstructions(root);
   const instructionsChanged =
     instructionResult.agents === "created" ||
@@ -109,9 +129,9 @@ export async function prepareWatchProject(
     changed: instructionsChanged,
     detail: instructionResult.warnings.join(" ")
   });
-  await markStep(root, startedAt, "agent_instructions", instructionResult.warnings.length > 0 ? "warning" : "done", instructionResult.warnings.join(" "));
+  await markStep(root, startedAt, setupSteps, "agent_instructions", instructionResult.warnings.length > 0 ? "warning" : "done", instructionResult.warnings.join(" "));
 
-  await markStep(root, startedAt, "hooks", "running");
+  await markStep(root, startedAt, setupSteps, "hooks", "running");
   const hooksAlreadyInstalled = await hasAnyHookInstall(root);
   let hooksChanged = false;
   let hookWarning: string | undefined;
@@ -143,9 +163,9 @@ export async function prepareWatchProject(
     changed: hooksChanged,
     detail: hookWarning
   });
-  await markStep(root, startedAt, "hooks", hookWarning ? "warning" : "done", hookWarning);
+  await markStep(root, startedAt, setupSteps, "hooks", hookWarning ? "warning" : "done", hookWarning);
 
-  await markStep(root, startedAt, "mcp", "running");
+  await markStep(root, startedAt, setupSteps, "mcp", "running");
   const mcpResult = await ensureMcpSetup(root);
   const mcpChanged = mcpResult.claude === "created" || mcpResult.claude === "updated" || mcpResult.codex === "created" || mcpResult.codex === "updated";
   didWork = didWork || mcpChanged;
@@ -158,16 +178,19 @@ export async function prepareWatchProject(
     changed: mcpChanged,
     detail: mcpDetail
   });
-  await markStep(root, startedAt, "mcp", mcpResult.warnings.length > 0 || mcpResult.verification === "warning" ? "warning" : "done", mcpDetail);
+  await markStep(root, startedAt, setupSteps, "mcp", mcpResult.warnings.length > 0 || mcpResult.verification === "warning" ? "warning" : "done", mcpDetail);
 
-  steps.push({
-    key: "dashboard",
-    label: "Dashboard ready",
-    status: options.dashboardEnabled && !options.dashboardReady ? "warning" : options.dashboardEnabled ? "done" : "skipped",
-    changed: false,
-    detail: options.dashboardEnabled && !options.dashboardReady ? "Dashboard server could not start; watch continues." : undefined
-  });
-  await markStep(root, startedAt, "dashboard", options.dashboardEnabled && !options.dashboardReady ? "warning" : "done");
+  if (options.dashboard) {
+    const { enabled, ready } = options.dashboard;
+    steps.push({
+      key: "dashboard",
+      label: "Dashboard ready",
+      status: enabled && !ready ? "warning" : enabled ? "done" : "skipped",
+      changed: false,
+      detail: enabled && !ready ? "Dashboard server could not start; watch continues." : undefined
+    });
+    await markStep(root, startedAt, setupSteps, "dashboard", enabled && !ready ? "warning" : "done");
+  }
 
   const completedAt = new Date().toISOString();
   await writeSetupStatus(root, {
@@ -184,7 +207,80 @@ export async function prepareWatchProject(
     })
   });
 
-  return { didWork, warnings, steps };
+  return {
+    didWork,
+    warnings,
+    steps,
+    facts: {
+      filesIndexed: indexResult.filesIndexed,
+      knowledge: knowledgeStatus,
+      instructions: instructionResult,
+      mcp: mcpResult,
+      hooksInstalled: hooksAlreadyInstalled || hooksChanged
+    }
+  };
+}
+
+/** `watch`'s historical entry point — the same engine, plus the dashboard step. */
+export async function prepareWatchProject(
+  root: string,
+  options: { dashboardEnabled: boolean; dashboardReady: boolean; onProgress?: (line: string) => void }
+): Promise<PrepareResult> {
+  return prepareProject(root, { dashboard: { enabled: options.dashboardEnabled, ready: options.dashboardReady }, onProgress: options.onProgress });
+}
+
+export interface SetupPlanEntry {
+  key: SetupStatusStep["key"];
+  label: string;
+  action: "create" | "update" | "unchanged" | "warning";
+  detail?: string;
+}
+
+/**
+ * Read-only preview of what prepareProject would do (`setup --dry-run`):
+ * the same decisions, evaluated without writing a single file, starting a
+ * server, or recording setup status.
+ */
+export async function planProjectSetup(root: string): Promise<SetupPlanEntry[]> {
+  const plan: SetupPlanEntry[] = [];
+  const missing = (await planInitialProjectFiles(root)).filter((file) => file.status === "missing").map((file) => file.path);
+  plan.push({ key: "config", label: "DevGuard workspace", action: missing.length > 0 ? "create" : "unchanged", detail: missing.length > 0 ? missing.join(", ") : undefined });
+
+  const index = await readJsonFile<{ files?: Record<string, unknown> }>(fromRoot(root, devguardPaths.codeIndex), {});
+  const indexed = Object.keys(index.files ?? {}).length;
+  plan.push({ key: "code_index", label: "Code Index", action: indexed > 0 ? "unchanged" : "create", detail: indexed > 0 ? `${indexed} files indexed` : devguardPaths.codeIndex });
+
+  const knowledge = await getProjectKnowledgeRefreshStatus(root);
+  plan.push({
+    key: "knowledge",
+    label: "Project Knowledge",
+    action: knowledge.reason === "missing" ? "create" : knowledge.reason === "stale" ? "update" : "unchanged",
+    detail: knowledge.reason === "stale" ? `inputs changed: ${knowledge.staleFiles.join(", ")}` : knowledge.reason === "missing" ? devguardPaths.projectKnowledge : undefined
+  });
+
+  const instructions = await ensureAgentInstructions(root, { dryRun: true });
+  for (const [file, result] of [["AGENTS.md", instructions.agents], ["CLAUDE.md", instructions.claude]] as const) {
+    plan.push({
+      key: "agent_instructions",
+      label: `${file} DevGuard section`,
+      action: result === "created" || result === "section_added" ? "create" : result === "section_updated" ? "update" : "unchanged",
+      detail: result === "section_added" ? "appended after existing text" : result === "section_updated" ? "managed section only; text outside markers kept" : undefined
+    });
+  }
+
+  const hooksInstalled = await hasAnyHookInstall(root);
+  plan.push({ key: "hooks", label: "Completion hooks", action: hooksInstalled ? "unchanged" : "create", detail: hooksInstalled ? "outdated generated scripts are refreshed in place" : undefined });
+
+  const mcp = await ensureMcpSetup(root, { dryRun: true });
+  for (const [label, result] of [["Claude MCP (.mcp.json)", mcp.claude], ["Codex MCP (.codex/config.toml)", mcp.codex]] as const) {
+    plan.push({
+      key: "mcp",
+      label,
+      action: result === "created" ? "create" : result === "updated" ? "update" : result === "warning" ? "warning" : "unchanged",
+      detail: result === "warning" ? mcp.warnings.join(" ") : result === "updated" ? "dev-guard entry only; other servers kept" : undefined
+    });
+  }
+  return plan;
 }
 
 function knowledgeDetail(status: Awaited<ReturnType<typeof getProjectKnowledgeRefreshStatus>>): string | undefined {
@@ -194,7 +290,7 @@ function knowledgeDetail(status: Awaited<ReturnType<typeof getProjectKnowledgeRe
   return undefined;
 }
 
-async function markStep(root: string, startedAt: string, key: SetupStatusStep["key"], status: SetupStatusStep["status"], detail?: string): Promise<void> {
+async function markStep(root: string, startedAt: string, setupSteps: SetupStatusStep[], key: SetupStatusStep["key"], status: SetupStatusStep["status"], detail?: string): Promise<void> {
   const current = await readRuntimeState(root);
   const currentSetup = current.setupStatus?.steps.length ? current.setupStatus.steps : setupSteps;
   await writeRuntimeState(root, {

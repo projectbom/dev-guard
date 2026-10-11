@@ -30,24 +30,46 @@ npx @dev-guard/cli --help
 
 ## 2. Initial Project Setup
 
-Run these commands from the project root:
+Recommended — run once from the project root, then start watching:
 
 ```bash
 cd your-project
-dev-guard init
-dev-guard install-agent-instructions
-dev-guard install-hooks
-dev-guard status
+dev-guard setup
+dev-guard watch
 ```
 
-Command roles:
+Zero-config — `watch` alone runs the same preparation when setup is missing or stale:
 
-- `init`: creates initial `.devguard/` files without overwriting existing files.
-- `install-agent-instructions`: adds the DevGuard workflow section (MCP `prepare_task_context` first) to `AGENTS.md` and `CLAUDE.md`.
-- `install-hooks`: installs Claude Code / Codex completion strategy files.
-- `status`: checks pending changes, last work, quality verdict, and hook state.
+```bash
+cd your-project
+dev-guard watch
+```
 
-On first run, `dev-guard watch` also registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`); `prepare_task_context` and `record_validation_result` come from it.
+`dev-guard setup` is deterministic and non-interactive (no prompts, no API key, no network). It:
+
+1. validates the project root (refuses your home directory or `/`)
+2. creates `.devguard/` config files that are missing (existing files are kept)
+3. builds the Code Index (`.devguard/memory/code-index.json`)
+4. generates Project Knowledge (`.devguard/project/project-knowledge.json`)
+5. adds/refreshes the DevGuard section of `AGENTS.md` and `CLAUDE.md` (text outside the markers is kept)
+6. registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) — other servers are kept
+7. installs completion hooks best-effort
+8. checks that the MCP server starts and lists `prepare_task_context`
+9. prints a summary (package manager, framework, commands, integrations, AI status) and exits
+
+It does not start the watcher or the dashboard. Running it again only refreshes missing or stale parts (Project Knowledge is regenerated only when `package.json`, lockfiles, or framework config are newer than it). `dev-guard setup --dry-run` prints what would be created/updated without writing anything.
+
+`npm install -g` itself never scans or changes a project — it does not know which project you mean.
+
+Git: setup, the Code Index, Project Knowledge, and MCP context work without git; `done` needs git to detect changed files.
+
+Advanced / recovery (normally not needed — setup and watch do all of this):
+
+```bash
+dev-guard init                        # only the .devguard config/templates, no project analysis
+dev-guard install-agent-instructions  # only the AGENTS.md / CLAUDE.md section
+dev-guard install-hooks               # only the completion hooks
+```
 
 If hooks cannot be trusted or run yet, start in Manual Mode:
 
@@ -58,33 +80,32 @@ dev-guard done
 dev-guard status
 ```
 
-## 3. GPT Setup
+## 3. Optional AI (OpenAI)
 
-The default `watch`, `done`, `status`, and MCP flow works without GPT/API setup.
-Configure a provider only for AI-assisted commands such as `review` and `task-ai`.
+No API key is needed. `setup`, `init`, `watch`, `status`, `doctor`, the Code Index, Project Knowledge, MCP (`prepare_task_context`, `record_validation_result`), validation recording, `done`, reports, the dashboard, telemetry, and hooks are fully deterministic and make no OpenAI calls. The context broker is deterministic; there is no AI reranker in the default path.
 
-OpenAI provider setup:
+AI is an explicit opt-in. Only these use OpenAI (`scan --ai` / `refresh --ai` are reserved flags and stay rule-based):
+
+- `dev-guard task-ai` — natural-language task generation
+- `dev-guard review` (without `--heuristic`) and `dev-guard fix-prompt` — AI review
+- the optional AI summary added to the Quality Report on `done` — only after you opt in
+
+Opt in:
 
 ```bash
-export DEV_GUARD_OPENAI_API_KEY="your_api_key"
-# or:
-export OPENAI_API_KEY="your_api_key"
 dev-guard configure ai --provider openai --model gpt-4o-mini
+dev-guard config set openaiApiKey "your_api_key"   # or: export DEV_GUARD_OPENAI_API_KEY=...
 dev-guard doctor
 ```
 
-Change only the model:
+Keys are read from `.devguard/config.json`, `DEV_GUARD_OPENAI_API_KEY`, then `OPENAI_API_KEY`. A shell-wide `OPENAI_API_KEY` alone does not turn on the `done` AI summary — set `ai.provider` to `openai` or use `DEV_GUARD_OPENAI_API_KEY` for that. If you store a key in `.devguard/config.json`, keep that file out of git.
+
+Without a key, `doctor` shows `OpenAI API: not configured (optional)`, and AI-only commands stop with: "OpenAI API is optional — DevGuard's core workflow does not need it. This command requires AI assistance."
+
+Change only the model, or turn AI off again:
 
 ```bash
 dev-guard config set model gpt-5
-dev-guard config show
-```
-
-OpenAI API keys are optional. DevGuard checks `.devguard/config.json`, `DEV_GUARD_OPENAI_API_KEY`, then `OPENAI_API_KEY`. Environment variables are recommended for shared machines; if you store a key with `dev-guard config set openaiApiKey <key>`, keep `.devguard/config.json` out of git.
-
-To disable the AI provider and use local heuristics only:
-
-```bash
 dev-guard configure ai --provider none --model gpt-4o-mini
 ```
 
@@ -95,7 +116,7 @@ dev-guard configure ai --provider none --model gpt-4o-mini
 - **MCP available:** for every new task, call `prepare_task_context` first → read the TARGET ranges → open a CANDIDATE only for a concrete gap → targeted search only for what neither covers. Do not also read `.devguard` markdown.
 - **MCP unavailable:** fall back to `.devguard/context/agent-brief.md`, then `.devguard/reports/read-map.md`, then `.devguard/reports/code-map.md`.
 - `project-handoff.md` / `quality-report.md` are read only on explicit request (resume previous work, QA investigation).
-- Start each distinct task in a fresh agent thread; report checks with `record_validation_result`; finish with `dev-guard done` or the Stop hook.
+- Thread policy is hybrid: a small, closely related follow-up may continue in the same thread while thread pressure is low; a separate or large task, a `SOON` / `NEW_THREAD` notice, or a compacted thread means a fresh agent thread. Report checks with `record_validation_result`; finish with `dev-guard done` or the Stop hook.
 
 To refresh an existing dev-guard section:
 
@@ -140,7 +161,7 @@ If you use the advanced Codex Stop Hook path, open `/hooks` in the Codex TUI and
 
 ## 7. Ongoing CLI Flow
 
-Recommended daily flow:
+Recommended daily flow (after a one-time `dev-guard setup`):
 
 ```bash
 dev-guard watch
@@ -158,7 +179,7 @@ dev-guard done
 dev-guard status
 ```
 
-Next task in a new Codex/Claude thread: give it the concrete task (and the files it must read). The agent calls `prepare_task_context`, reads the TARGET ranges of the returned read plan, and does not open `.devguard` markdown. When a task ends with a `SOON` / `NEW_THREAD` thread notice, start the next task in a fresh thread.
+Next task: give the agent the concrete task (and the files it must read). The agent calls `prepare_task_context`, reads the TARGET ranges of the returned read plan, and does not open `.devguard` markdown. A small follow-up of the same work can stay in the current thread; start a separate or large task — or any task after a `SOON` / `NEW_THREAD` notice or a compaction — in a fresh thread.
 
 Manual recovery only — MCP unavailable, explicitly resuming earlier work, or debugging DevGuard output:
 
@@ -185,14 +206,13 @@ dev-guard reset
 
 ## 8. Post-Update Checklist
 
-After an npm update, check each project once:
+After an npm update, check each project once (`setup` refreshes the managed instruction section, MCP entry, and outdated hook scripts in place):
 
 ```bash
-dev-guard --help
+dev-guard setup
 dev-guard status
 dev-guard doctor --agents
 dev-guard doctor --hooks --dry-run
-dev-guard install-agent-instructions --force
 ```
 
 If the updated version changed hook scripts, reinstall them in the relevant project:
