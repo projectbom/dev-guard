@@ -215,3 +215,201 @@ test("K: the dashboard names the real gap — rediscovered execution files vs in
   const noExplicit = contextIssues({ ...base, explicitInputCount: 0, nonProvidedReads: { files: 9, estTokens: 20000, scriptTokens: 0 } });
   assert.match(noExplicit[0].action, /explicitInputs/);
 });
+
+// v0.9.0: Tier C was a fixed 4 files. Live: 11/15 offered lineage files were
+// used (73%) but only 11/24 lineage files the agents actually read were
+// offered (46%) — heavy tasks re-read 7–8 of the previous run's scripts, and
+// a documentation-only step in between dropped the older executor entirely.
+import { planExecutionLineage, LINEAGE_PLAN_LIMIT, LINEAGE_PLAN_MAX, LINEAGE_TOKEN_BUDGET } from "../dist/execution-lineage.js";
+
+async function scriptTree(files) {
+  const root = await mkdtemp(join(tmpdir(), "devguard-lineage-plan-"));
+  cleanup.push(root);
+  for (const [path, size] of Object.entries(files)) await put(root, path, "x".repeat(size));
+  return root;
+}
+const planInput = (overrides = {}) => ({ planned: new Set(), anchors: [], taskText: "Run7 rerun of the collector pipeline.", sameWorkstream: true, isExcluded: () => false, ...overrides });
+
+test("C/D: lineage grows past 4 only for strong same-workstream files inside the token budget, never past 8", async () => {
+  const small = Object.fromEntries(Array.from({ length: 12 }, (_, index) => [`run7/step_${index}.py`, 2000]));
+  const root = await scriptTree(small);
+  const lineage = { executed: Object.keys(small).slice(0, 4), produced: [], usedScripts: Object.keys(small).slice(4), used: [] };
+  const plan = await planExecutionLineage(root, lineage, planInput());
+  assert.equal(plan.length, LINEAGE_PLAN_MAX, "twelve small scripts: capped at the hard maximum");
+  assert.ok(plan.reduce((sum, file) => sum + file.estimatedTokens, 0) <= LINEAGE_TOKEN_BUDGET);
+
+  // Large scripts: the first 4 are always offered, the budget stops the rest.
+  const large = Object.fromEntries(Array.from({ length: 8 }, (_, index) => [`run7/big_${index}.py`, 24000]));
+  const bigRoot = await scriptTree(large);
+  const bigPlan = await planExecutionLineage(bigRoot, { executed: Object.keys(large), produced: [], usedScripts: [], used: [] }, planInput());
+  assert.equal(bigPlan.length, LINEAGE_PLAN_LIMIT, "no extra slot when the budget is already spent");
+
+  // Smaller files still fit after a large one was skipped.
+  const mixed = { "run7/a.py": 8000, "run7/b.py": 8000, "run7/c.py": 8000, "run7/d.py": 8000, "run7/huge.py": 60000, "run7/tiny.py": 400 };
+  const mixedRoot = await scriptTree(mixed);
+  const mixedPlan = await planExecutionLineage(mixedRoot, { executed: Object.keys(mixed).slice(0, 4), produced: [], usedScripts: ["run7/huge.py", "run7/tiny.py"], used: [] }, planInput());
+  assert.deepEqual(mixedPlan.slice(4).map((file) => file.path), ["run7/tiny.py"]);
+
+  // Anchored only (gate failed): the fixed 4, no adaptive extension.
+  const anchored = await planExecutionLineage(root, lineage, planInput({ sameWorkstream: false, anchors: ["run7/notes.md"] }));
+  assert.equal(anchored.length, LINEAGE_PLAN_LIMIT);
+});
+
+test("E: tests and disposable probes rank below executors and never take an extra slot", async () => {
+  const files = {
+    "run7/execute.py": 1200, "run7/prepare.py": 1200, "run7/runtime.py": 1200,
+    "run7/test_execute.py": 800, "run7/local-route-attempt2/first_read.py": 300, "scratch/probe_latency.py": 300,
+    "run7/collect.py": 1200, "run7/summarize.sql": 900
+  };
+  const root = await scriptTree(files);
+  const lineage = { executed: ["run7/execute.py", "run7/test_execute.py", "run7/local-route-attempt2/first_read.py"], produced: ["run7/prepare.py", "run7/runtime.py"], usedScripts: ["scratch/probe_latency.py", "run7/collect.py", "run7/summarize.sql"], used: [] };
+  const plan = await planExecutionLineage(root, lineage, planInput({ taskText: "Run7 rerun and 검증 of the collector pipeline." }));
+  const paths = plan.map((file) => file.path);
+  for (const low of ["run7/test_execute.py", "run7/local-route-attempt2/first_read.py", "scratch/probe_latency.py"]) assert.ok(!paths.includes(low), `${low} demoted: ${paths.join(", ")}`);
+  assert.deepEqual(paths.slice(0, 1), ["run7/execute.py"]);
+  // A task about tests still gets the test file.
+  const testTask = await planExecutionLineage(root, lineage, planInput({ taskText: "Fix the failing pytest for Run7 execute." }));
+  assert.ok(testTask.some((file) => file.path === "run7/test_execute.py"));
+});
+
+test("F/G: the last execution-bearing task's executor survives one documentation-only task in the same workstream — never across workstreams", async () => {
+  const root = await lineageRepo();
+  await runTaskA(root);
+  // A documentation-only step in the same workstream: no script executed.
+  const threadB = "01a12599-0000-7000-8000-00000000000b";
+  await prepareTaskContext({ root, task: "Group B Run6G corrective: document the run6g route latency gate result in the corrective report.", caller: caller(threadB) });
+  await put(root, "docs/hot-standby-group-b-run6g-corrective-20261010.md", "# Group B Run6G corrective\n\n## Result\n\nSTOP at the route latency gate. Operator review pending.\n");
+  await writeTaskRollout(root, threadB, ["cat docs/hot-standby-group-b-run6g-corrective-20261010.md"], 60000);
+  await processDoneEvent(root, { completionSource: "cli-done" });
+  const docRecord = await lastHistoryRecord(root);
+  assert.equal(docRecord.continuesWorkstream, true, "the documentation task recorded its workstream link");
+  assert.equal(docRecord.executionLineage?.executed.length ?? 0, 0);
+
+  const next = await prepareTaskContext({ root, task: "Group B Run6G corrective rerun: execute the run6g runtime again against the route latency gate.", persistTask: false });
+  const lineage = next.files.filter((file) => file.source === "execution-lineage");
+  const runtime = lineage.find((file) => file.path === "infra/standby/run6g/runtime.py");
+  assert.ok(runtime, lineage.map((file) => file.path).join(", "));
+  assert.match(runtime.reason, /earlier execution step/);
+
+  const unrelated = await prepareTaskContext({ root, task: "Update the billing invoice email template wording.", persistTask: false });
+  assert.deepEqual(unrelated.files.filter((file) => file.source === "execution-lineage").map((file) => file.path), []);
+});
+
+// v0.9.0: growth samples were "first start of a lineage → its last done", so
+// a lineage re-opened with continueCurrentTask (14% → done 58% → continued
+// 61% → done 74%) produced a 60% sample instead of 44% and 13%. And `done`
+// escalated a 58% thread to NEW_THREAD although the next task (unknown at
+// done) was a light one that ended at 74%.
+import { recentTaskGrowth } from "../dist/runtime-state.js";
+
+const W = 258400;
+async function telemetryRoot(sequence) {
+  const root = await mkdtemp(join(tmpdir(), "devguard-growth-"));
+  cleanup.push(root);
+  await ensureDevguardWorkspace(root);
+  for (const [event, sessionId, ratio] of sequence) {
+    await recordTaskTelemetry(root, { event, sessionId, ...(ratio === undefined ? {} : { observedInputTokens: Math.round(ratio * W), contextWindow: W }) });
+  }
+  return root;
+}
+const rounded = (values) => values.map((value) => Math.round(value * 100));
+
+test("H/I (D): growth is paired per task — a re-opened lineage never measures task B from task A's start", async () => {
+  const root = await telemetryRoot([
+    ["TASK_PREPARED", "s1", 0.14], ["TASK_DONE", "s1", 0.58],
+    ["TASK_CONTINUED", "s1", 0.61], ["TASK_DONE", "s1", 0.74],
+    // A resume inside an open task keeps the original start.
+    ["TASK_PREPARED", "s2", 0.2], ["TASK_CONTINUED", "s2", 0.3], ["TASK_DONE", "s2", 0.5],
+    // A start with no observed reading yields no sample, and is still consumed by its done.
+    ["TASK_PREPARED", "s3"], ["TASK_DONE", "s3", 0.4], ["TASK_DONE", "s3", 0.6]
+  ]);
+  assert.deepEqual(rounded(await recentTaskGrowth(root)), [44, 13, 30]);
+});
+
+test("J/K (A–C): boundary — heavy next task warns, light continuation is not over-warned at prepare, 69% + heavy is NEW_THREAD", () => {
+  // A: Task A 37% → 47% with heavy history; at done the next task is unknown.
+  const heavyHistory = [0.38, 0.44, 0.3];
+  const atDone = taskBoundaryHeadroom({ ratio: 0.47, recentGrowth: heavyHistory });
+  assert.equal(atDone.status, "SOON");
+  assert.match(atDone.reason, /^Headroom risk:/, "done-time verdict is a headroom risk, not a forecast");
+  // B: Task A 37% → 41%, light next task: done may show mild risk, prepare continues.
+  const lightHistory = [0.04, 0.13, 0.3];
+  assert.notEqual(taskBoundaryHeadroom({ ratio: 0.41, recentGrowth: lightHistory, nextTaskText: "Small follow-up: fix the wording in the summary table." }).status, "NEW_THREAD");
+  assert.equal(taskBoundaryHeadroom({ ratio: 0.41, recentGrowth: lightHistory, nextTaskText: "Small follow-up: fix the wording in the summary table." }).status, "CONTINUE");
+  // C: 69% and a heavy next task.
+  assert.equal(taskBoundaryHeadroom({ ratio: 0.69, recentGrowth: heavyHistory, nextTaskText: "Execute the production preflight rerun." }).status, "NEW_THREAD");
+});
+
+test("J: at done a 58% thread with large typical growth is SOON (headroom risk), not NEW_THREAD; ≥75% observed is still NEW_THREAD", async () => {
+  const root = await lineageRepo();
+  for (const [index, [start, end]] of [[0.14, 0.51], [0.14, 0.73], [0.14, 0.71], [0.14, 0.58]].entries()) {
+    await recordTaskTelemetry(root, { event: "TASK_PREPARED", sessionId: `g${index}`, observedInputTokens: Math.round(start * W), contextWindow: W });
+    await recordTaskTelemetry(root, { event: "TASK_DONE", sessionId: `g${index}`, observedInputTokens: Math.round(end * W), contextWindow: W });
+  }
+  const mid = "01a12581-e924-7dc2-ac0b-46f2945e4461";
+  await writeTaskRollout(root, mid, [], Math.round(0.58 * W));
+  const atDone = await threadStateForAgent(root, caller(mid), { taskBoundary: true });
+  assert.equal(atDone.status, "SOON", atDone.reason);
+  assert.equal(atDone.boundary.status, "NEW_THREAD", "the raw headroom projection is still reported");
+  assert.ok(atDone.userNotice);
+  const full = "01a12581-e924-7dc2-ac0b-46f2945e4462";
+  await writeTaskRollout(root, full, [], Math.round(0.8 * W));
+  assert.equal((await threadStateForAgent(root, caller(full), { taskBoundary: true })).status, "NEW_THREAD");
+});
+
+import { classifyExecutionGap } from "../dist/context-efficiency.js";
+
+test("L: MISSING_EXECUTION_CONTEXT names the actual lineage gap and never repeats what the user already does", () => {
+  const lineage = (executed, usedScripts = []) => ({ executed, produced: [], usedScripts, used: [] });
+  const records = [
+    { executionLineage: lineage(["run5/execute.py"]) },
+    { executionLineage: lineage([], []) , continuesWorkstream: true },
+    { followUp: true },
+    { executionLineage: lineage(["run6/prepare.py"], ["run6/collect.py", "run6/runtime.py", "run6/report.py", "run6/summary.py", "run6/load.py"]) }
+  ];
+  assert.equal(classifyExecutionGap(["run6/report.py", "run6/summary.py"], records), "LINEAGE_CAPACITY");
+  assert.equal(classifyExecutionGap(["run5/execute.py"], records.slice(0, 2)), "OLDER_EXECUTOR_GAP");
+  assert.equal(classifyExecutionGap(["tools/other.py"], records), "UNPLANNED_EXECUTION_CONTEXT");
+  assert.equal(classifyExecutionGap([], records), undefined);
+  assert.equal(classifyExecutionGap(["run6/report.py"], []), undefined, "no history: no cause claimed");
+
+  const base = {
+    sessionId: "s", label: "t", startedAt: "2026-10-10T00:00:00Z", estTokens: 69000,
+    costByCategory: { MCP: 2000, FALLBACK_DOCS: 0, SEARCH: 3000, CODE_READS: 50000, CODE_EDITS: 6000, VALIDATION: 2000, ADMIN: 3000, OTHER: 3000 },
+    modeTokens: { IMPLEMENTATION: 6000, EXPLORATION: 53000, VALIDATION: 2000, CONTEXT_ADMIN: 3000, RESUME_RECOVERY: 2000, OTHER: 3000 },
+    otherBreakdown: {}, provided: { files: 12 }, usedFiles: 26, providedUsed: 12, nonProvidedUsed: 14,
+    searchCalls: 1, broadSearchCalls: 0, searchBeforeProvidedRead: false, fallbackDocReads: 0, repeatedFallbackDocReads: 0,
+    validation: { pass: 1, fail: 0, unknown: 0 }, threads: ["a"], compactions: 0, activityEvents: 30, touchedFiles: [],
+    unusedSuggestionReads: { files: 0, estTokens: 0 }, providedDocRereads: { files: 0, estTokens: 0 }, explicitInputCount: 9,
+    nonProvidedReads: { files: 14, estTokens: 28100, scriptTokens: 21000 }
+  };
+  const capacity = contextIssues({ ...base, executionGapCause: "LINEAGE_CAPACITY" })[0];
+  assert.equal(capacity.id, "MISSING_EXECUTION_CONTEXT");
+  assert.equal(capacity.cause, "LINEAGE_CAPACITY");
+  assert.match(capacity.why, /Previous execution files exceeded the current lineage plan budget/);
+  const older = contextIssues({ ...base, executionGapCause: "OLDER_EXECUTOR_GAP" })[0];
+  assert.match(older.why, /An older same-workstream executor was rediscovered outside the read plan/);
+  for (const issue of [capacity, older, contextIssues(base)[0]]) {
+    assert.doesNotMatch(issue.action, /dev-guard done|keep one workstream|consecutive/i, "the user already finishes with done and keeps the workstream together");
+  }
+});
+
+test("M: history and runtime written before v0.9.0 (no workstream link) still plan — conservatively, with no older executor", async () => {
+  const root = await lineageRepo();
+  await runTaskA(root);
+  const threadB = "01a12599-0000-7000-8000-00000000000c";
+  await prepareTaskContext({ root, task: "Group B Run6G corrective: document the run6g route latency gate result in the corrective report.", caller: caller(threadB) });
+  await put(root, "docs/hot-standby-group-b-run6g-corrective-20261010.md", "# Group B Run6G corrective\n\nOperator review pending.\n");
+  await writeTaskRollout(root, threadB, ["cat docs/hot-standby-group-b-run6g-corrective-20261010.md"], 60000);
+  await processDoneEvent(root, { completionSource: "cli-done" });
+  const historyFile = join(root, devguardPaths.history);
+  const legacy = (await readFile(historyFile, "utf8")).trim().split("\n").map((line) => {
+    const record = JSON.parse(line);
+    delete record.continuesWorkstream;
+    return JSON.stringify(record);
+  });
+  await writeFile(historyFile, `${legacy.join("\n")}\n`);
+  const next = await prepareTaskContext({ root, task: "Group B Run6G corrective rerun: execute the run6g runtime again against the route latency gate.", persistTask: false });
+  assert.ok(next.files.length > 0);
+  assert.ok(!next.files.some((file) => /earlier execution step/.test(file.reason ?? "")), "no workstream link recorded: no look-back");
+});

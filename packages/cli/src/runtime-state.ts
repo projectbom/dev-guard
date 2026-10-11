@@ -31,7 +31,7 @@ import { computeRolloverAssessment, measureResumeBundleCost, type RolloverAssess
 import { readTaskTelemetry, recordTaskTelemetry } from "./task-telemetry.js";
 import { jsonSections, markdownSections, scriptSections, type DocumentSection } from "./document-ranges.js";
 import { estimateRangeTokens, estimateTextTokens, isStructuredDocument, planReferences, resolveExplicitInputs, SCRIPT_RANGE_FILE, WHOLE_FILE_SCRIPT_TOKENS, wholeFileEligible, type ContextFileSource } from "./rehydration-plan.js";
-import { collectExecutionLineage, planExecutionLineage, type ExecutionLineage } from "./execution-lineage.js";
+import { collectExecutionLineage, planExecutionLineage, type ExecutionLineage, type LineageSources } from "./execution-lineage.js";
 import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, taskBoundaryHeadroom, threadUserNotice, toOwner, type BoundaryHeadroom, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
 import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
 
@@ -76,6 +76,8 @@ export interface BeforeAgentTask {
   createdAt: string;
   /** Validated repo-relative paths the user named for this task (see PrepareTaskContextInput.explicitInputs). */
   explicitInputs?: string[];
+  /** The workstream gate passed against the previous closed task at prepare (see workstreamPriorFiles). */
+  workstreamContinued?: boolean;
   /**
    * Task Boundary baseline: the set of files already dirty (changed-but-
    * uncommitted) at the moment THIS task/session lineage began — i.e.
@@ -694,6 +696,8 @@ export interface HistoryRecord {
   untasked?: boolean;
   /** What the task ran, read and built (paths only, bounded) — carried into the next same-workstream plan. */
   executionLineage?: ExecutionLineage;
+  /** The task passed the workstream gate against the task before it — lets a later task reach one execution-bearing task further back. */
+  continuesWorkstream?: boolean;
 }
 
 interface PackageJson {
@@ -1875,7 +1879,8 @@ export async function processDoneEvent(root: string, options: { completionSource
     taskScopedChangedFiles,
     carriedOverChangedFiles,
     ...(followUpDelta ? (followUpDelta.foreign.length > 0 ? { untasked: true } : { followUp: true }) : {}),
-    ...(executionLineage ? { executionLineage } : {})
+    ...(executionLineage ? { executionLineage } : {}),
+    ...(runtime.currentTask?.workstreamContinued ? { continuesWorkstream: true } : {})
   };
   const previousHistory = await readHistoryRecords(root, 20);
   const nextHistory = [...previousHistory, historyRecord];
@@ -2123,8 +2128,9 @@ async function changedSinceCompletion(root: string, changedFiles: string[], base
   const now = await hashWorkingFiles(root, known);
   const current = new Set(files);
   // Baselines written before directories were excluded can hold a directory
-  // entry; it is not a file that "returned to its committed state".
-  const reverted = await withoutDirectories(root, Object.keys(recorded).filter((file) => !current.has(file)));
+  // entry, and older ones an ephemeral generated file (`__pycache__/*.pyc`)
+  // a run created and later deleted; neither "returned to its committed state".
+  const reverted = await withoutDirectories(root, Object.keys(recorded).filter((file) => !current.has(file) && !isIgnoredWatchPath(file)));
   return {
     changed: files.filter((file) => recorded[file] === undefined || recorded[file] !== (now[file] ?? MISSING_FILE_HASH)),
     reverted
@@ -2206,6 +2212,14 @@ export async function prepareBeforeAgentContext(root: string, task: string, cont
   };
 }
 
+// Stamps the workstream link onto the task that passed the gate — never onto
+// a newer task that replaced it in the meantime.
+async function persistTaskWorkstream(root: string, taskCreatedAt: string): Promise<void> {
+  const onDisk = await readRuntimeState(root);
+  if (!onDisk.currentTask || onDisk.currentTask.createdAt !== taskCreatedAt || onDisk.currentTask.workstreamContinued) return;
+  await writeRuntimeState(root, { ...onDisk, currentTask: { ...onDisk.currentTask, workstreamContinued: true } });
+}
+
 // Stamps a lazily resolved owner onto the task it was resolved for — never
 // onto a newer task that replaced it in the meantime.
 async function persistTaskOwner(root: string, taskCreatedAt: string, owner: ProviderThreadOwner): Promise<void> {
@@ -2247,11 +2261,15 @@ export async function threadStateForAgent(root: string, caller?: ObservedThreadI
   const locale = await resolveDevGuardLocale(root).catch(() => "en-US" as DevGuardLocale);
   // At the task boundary (the agent's own `dev-guard done`), a thread under
   // the in-task SOON line can still be too full for a typical next task.
+  // The next task is unknown here, so the boundary is a headroom risk, not a
+  // forecast: it can raise LOW to SOON ("start the next large task in a fresh
+  // thread") but never to NEW_THREAD — that stays with observed usage
+  // (≥75%) and with the task-aware check at the next prepare_task_context.
   const boundary = options.taskBoundary && pressure.status !== "UNKNOWN"
     ? taskBoundaryHeadroom({ ratio: pressureRatio(pressure), recentGrowth: await recentTaskGrowth(root) })
     : undefined;
-  const escalate = boundary && (boundary.status === "NEW_THREAD" || (boundary.status === "SOON" && pressure.status === "LOW"));
-  const status: ThreadPressure["status"] = escalate ? (boundary.status as "SOON" | "NEW_THREAD") : pressure.status;
+  const escalate = boundary && (boundary.status === "SOON" || boundary.status === "NEW_THREAD") && pressure.status === "LOW";
+  const status: ThreadPressure["status"] = escalate ? "SOON" : pressure.status;
   const userNotice = caller ? threadUserNotice(status, locale) : undefined;
   return {
     status,
@@ -2265,18 +2283,29 @@ function pressureRatio(pressure: ThreadPressure): number | undefined {
   return pressure.observedInputTokens && pressure.contextWindow ? pressure.observedInputTokens / pressure.contextWindow : undefined;
 }
 
-/** Observed per-task growth (share of the window) of the most recent completed tasks, from DevGuard's own telemetry. */
+/**
+ * Observed per-task growth (share of the window) of the most recent completed
+ * tasks, from DevGuard's own telemetry. One sample per task: the start
+ * (TASK_PREPARED/REPLACED, or a TASK_CONTINUED that re-opens a lineage after
+ * its TASK_DONE) paired with that task's own TASK_DONE, which consumes it. A
+ * TASK_CONTINUED inside an open task (resume after an interruption) keeps
+ * the original start. A later task in the same lineage is therefore never
+ * measured from an earlier task's start. A start or end without an observed
+ * reading yields no sample — never a guess.
+ */
 export async function recentTaskGrowth(root: string, limit = 8): Promise<number[]> {
   const events = await readTaskTelemetry(root, 2000).catch(() => []);
-  const prepared = new Map<string, { tokens: number; window: number }>();
+  const open = new Map<string, { tokens?: number; window?: number }>();
   const growth: number[] = [];
   for (const event of events) {
-    if (!event.sessionId || !event.observedInputTokens || !event.contextWindow) continue;
-    if ((event.event === "TASK_PREPARED" || event.event === "TASK_CONTINUED" || event.event === "TASK_REPLACED") && !prepared.has(event.sessionId)) {
-      prepared.set(event.sessionId, { tokens: event.observedInputTokens, window: event.contextWindow });
+    if (!event.sessionId) continue;
+    const reading = { tokens: event.observedInputTokens, window: event.contextWindow };
+    if (event.event === "TASK_PREPARED" || event.event === "TASK_REPLACED" || (event.event === "TASK_CONTINUED" && !open.has(event.sessionId))) {
+      open.set(event.sessionId, reading);
     } else if (event.event === "TASK_DONE") {
-      const start = prepared.get(event.sessionId);
-      if (start && event.observedInputTokens > start.tokens) growth.push((event.observedInputTokens - start.tokens) / start.window);
+      const start = open.get(event.sessionId);
+      open.delete(event.sessionId);
+      if (start?.tokens && start.window && event.observedInputTokens && event.observedInputTokens > start.tokens) growth.push((event.observedInputTokens - start.tokens) / start.window);
     }
   }
   return growth.slice(-limit);
@@ -2336,6 +2365,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     codeStateHashAtCreation: baseline.codeStateHashAtCreation,
     changedFileHashesAtCreation: baseline.changedFileHashesAtCreation,
     ...(explicitInputs.length > 0 ? { explicitInputs } : {}),
+    ...(isContinuing && current.currentTask?.workstreamContinued ? { workstreamContinued: true } : {}),
     ...(caller ? { owner: toOwner(caller) } : isContinuing && current.currentTask?.owner ? { owner: current.currentTask.owner } : {})
   };
   perfMark("prepare:baseline-computed");
@@ -2426,18 +2456,23 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     }));
     perfMark("prepare:references-planned");
     // Tier C: the previous same-workstream task's execution lineage.
+    const sameWorkstream = Boolean(context.summary && workstreamGateBySummary.get(context.summary));
+    if (sameWorkstream && persistTask && !currentTask.workstreamContinued) {
+      currentTask.workstreamContinued = true;
+      await persistTaskWorkstream(root, currentTask.createdAt);
+    }
     const lineagePlan = await planExecutionLineage(root, previousExecutionLineage(raw.records), {
       planned: new Set([...firstPass, ...referenceFiles].map((file) => file.path)),
       anchors: [...tierA, ...firstPass.filter((file) => file.role === "TARGET").map((file) => file.path)],
       taskText: text,
-      sameWorkstream: Boolean(context.summary && workstreamGateBySummary.get(context.summary)),
+      sameWorkstream,
       isExcluded: isExcludedContextPath
     });
     const lineageFiles = await Promise.all(lineagePlan.map(async (entry) => {
       const file = await build(entry.path);
       file.role = entry.target ? "TARGET" : "CANDIDATE";
       file.source = "execution-lineage";
-      file.reason = `${entry.kind === "executed" ? "Executed" : entry.kind === "produced" ? "Written" : "Read"} by the previous task in this workstream.`;
+      file.reason = `${entry.kind === "executed" ? "Executed" : entry.kind === "produced" ? "Written" : "Read"} by ${entry.older ? "an earlier execution step" : "the previous task"} in this workstream.`;
       return file;
     }));
     perfMark("prepare:lineage-planned");
@@ -2803,19 +2838,39 @@ function workstreamPriorFiles(state: ProjectState, records: HistoryRecord[], sum
   return selected;
 }
 
-/** Execution lineage of the last closed task; its follow-ups' own files count as produced. */
-function previousExecutionLineage(records: HistoryRecord[]): ExecutionLineage | undefined {
+/** How many closed tasks back an older executor may come from (previous task + this many more). */
+const OLDER_LINEAGE_LOOKBACK = 2;
+
+/**
+ * Execution lineage of the last closed task (its follow-ups' own files count
+ * as produced) and — only when that task ran no script and continued its
+ * predecessor's workstream — the last execution-bearing task's within
+ * OLDER_LINEAGE_LOOKBACK more closed tasks, each link workstream-continued.
+ * A fixed, short look-back; never a history traversal.
+ */
+function previousExecutionLineage(records: HistoryRecord[]): LineageSources | undefined {
+  const tasks: HistoryRecord[] = [];
   const followUpFiles: string[] = [];
   for (const record of [...records].reverse()) {
+    if (tasks.length > OLDER_LINEAGE_LOOKBACK) break;
     if (record.untasked) continue;
     if (record.followUp) {
-      followUpFiles.push(...(record.taskScopedChangedFiles ?? []));
+      if (tasks.length === 0) followUpFiles.push(...(record.taskScopedChangedFiles ?? []));
       continue;
     }
-    if (!record.executionLineage) return undefined;
-    return { ...record.executionLineage, produced: [...new Set([...followUpFiles, ...record.executionLineage.produced])] };
+    tasks.push(record);
   }
-  return undefined;
+  const [previous, ...earlier] = tasks;
+  if (!previous?.executionLineage) return undefined;
+  const recent = { ...previous.executionLineage, produced: [...new Set([...followUpFiles, ...previous.executionLineage.produced])] };
+  if (recent.executed.length > 0) return { recent };
+  let link = previous;
+  for (const record of earlier) {
+    if (!link.continuesWorkstream) break;
+    if (record.executionLineage?.executed.length) return { recent, older: record.executionLineage };
+    link = record;
+  }
+  return { recent };
 }
 
 /** The last closed task's task-scoped files plus those of any follow-up finalizations after it. */
@@ -3318,6 +3373,7 @@ function resolveBeforeAgentContext(input: {
     workstreamPriorBySummary.set(summary, new Set(workstreamPrior));
     const directPrior = workstreamDirectBySummary.get(baseSummary);
     if (directPrior) workstreamDirectBySummary.set(summary, directPrior);
+    if (workstreamGateBySummary.get(baseSummary)) workstreamGateBySummary.set(summary, true);
     return {
       summary,
       workstreamPrior,

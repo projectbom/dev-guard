@@ -1,7 +1,7 @@
 import { CodexLocalActivitySource, ClaudeLocalActivitySource, type ActivityEvent, type ActivitySnapshot, type AgentActivitySource, type ContextCostCategory, type EvidenceKind, type ThreadInfo, type WorkMode } from "./agent-activity.js";
-import { fromRoot, readJsonFile } from "./fs.js";
+import { fromRoot, readJsonFile, readTailLines } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { SCRIPT_FILE } from "./execution-lineage.js";
+import { SCRIPT_FILE, type ExecutionLineage } from "./execution-lineage.js";
 import { readTaskTelemetry, type TaskTelemetryEvent } from "./task-telemetry.js";
 
 /**
@@ -55,6 +55,10 @@ export interface TaskEfficiency {
   unusedSuggestionReads: { files: number; estTokens: number };
   /** Repo files the agent read that DevGuard did not provide (excluding files the task edits) — inputs it had to find itself. scriptTokens: the part that were scripts/code. */
   nonProvidedReads: { files: number; estTokens: number; scriptTokens?: number };
+  /** Repo-relative scripts among nonProvidedReads, largest first (max 20; paths only). */
+  missingScripts?: string[];
+  /** Why those scripts were not planned, from the recorded execution lineage of earlier tasks (see classifyExecutionGap). */
+  executionGapCause?: ExecutionGapCause;
   /** Validated user-named inputs the task was prepared with, when known. */
   explicitInputCount?: number;
   /** Provided Markdown/JSON read more than once without being edited — the given ranges were not enough; re-read cost only. */
@@ -94,8 +98,18 @@ export type IssueId =
   | "CONTEXT_OVERHEAD"
   | "EXPLORATION_HEAVY";
 
+/**
+ * MISSING_EXECUTION_CONTEXT, by cause: the scripts were in the previous
+ * task's recorded lineage (the plan's bounded lineage budget left them out),
+ * in an older task's lineage (beyond the one-step look-back), or in no
+ * recorded lineage at all.
+ */
+export type ExecutionGapCause = "LINEAGE_CAPACITY" | "OLDER_EXECUTOR_GAP" | "UNPLANNED_EXECUTION_CONTEXT";
+
 export interface ContextIssue {
   id: IssueId;
+  /** MISSING_EXECUTION_CONTEXT only, when the lineage history could tell. */
+  cause?: ExecutionGapCause;
   severity: "strong" | "mild";
   /** One sentence: what is wrong. */
   issue: string;
@@ -129,6 +143,39 @@ export function contextGroups(costs: Record<ContextCostCategory, number>): Recor
  * after them, healthy sessions showed 0 doc re-reads, 0 repository-wide
  * searches and 1.5–2% context overhead.
  */
+// Never "finish with done / keep the workstream together": the user already
+// does that whenever lineage exists to miss.
+const EXECUTION_GAP_WHY: Record<ExecutionGapCause | "UNKNOWN", string> = {
+  LINEAGE_CAPACITY: "Previous execution files exceeded the current lineage plan budget. ",
+  OLDER_EXECUTOR_GAP: "An older same-workstream executor was rediscovered outside the read plan. ",
+  UNPLANNED_EXECUTION_CONTEXT: "No earlier task's recorded execution lineage included these scripts. ",
+  UNKNOWN: ""
+};
+const EXECUTION_GAP_ACTION: Record<ExecutionGapCause | "UNKNOWN", string> = {
+  LINEAGE_CAPACITY: "Name the specific scripts this step re-runs in the request — DevGuard carries only a budget-bounded share of the previous run's scripts.",
+  OLDER_EXECUTOR_GAP: "Name the reused executor in the request — DevGuard reaches past at most one script-less task in the same workstream.",
+  UNPLANNED_EXECUTION_CONTEXT: "Name the scripts (or their run directory) in the request — no earlier task recorded them, so DevGuard could not plan them.",
+  UNKNOWN: "Name the scripts this step depends on in the request so they are planned up front."
+};
+
+/**
+ * Where the current task's rediscovered scripts sit in the recorded lineage
+ * of the tasks closed before it (previous task, then up to two older ones).
+ * Undefined when there were no such scripts or no task records to compare.
+ */
+export function classifyExecutionGap(missingScripts: readonly string[], recordsBeforeTask: ReadonlyArray<{ followUp?: boolean; untasked?: boolean; executionLineage?: ExecutionLineage }>): ExecutionGapCause | undefined {
+  if (missingScripts.length === 0) return undefined;
+  const tasks = [...recordsBeforeTask].reverse().filter((record) => !record.followUp && !record.untasked).slice(0, 3);
+  if (tasks.length === 0) return undefined;
+  const filesOf = (lineage?: ExecutionLineage) => new Set(lineage ? [...lineage.executed, ...lineage.produced, ...lineage.usedScripts] : []);
+  const recent = filesOf(tasks[0].executionLineage);
+  const older = new Set(tasks.slice(1).flatMap((record) => [...filesOf(record.executionLineage)]));
+  const inRecent = missingScripts.filter((path) => recent.has(path)).length;
+  const inOlder = missingScripts.filter((path) => !recent.has(path) && older.has(path)).length;
+  if (inRecent === 0 && inOlder === 0) return "UNPLANNED_EXECUTION_CONTEXT";
+  return inRecent >= inOlder ? "LINEAGE_CAPACITY" : "OLDER_EXECUTOR_GAP";
+}
+
 export function contextIssues(task: TaskEfficiency): ContextIssue[] {
   const issues: ContextIssue[] = [];
   const total = Math.max(1, task.estTokens);
@@ -157,12 +204,14 @@ export function contextIssues(task: TaskEfficiency): ContextIssue[] {
     // What was missing decides the action: executable code is execution
     // lineage (carried from the previous task), other files are inputs.
     if ((missing.scriptTokens ?? 0) * 2 >= missing.estTokens) {
+      const cause = task.executionGapCause;
       issues.push({
         id: "MISSING_EXECUTION_CONTEXT",
+        ...(cause ? { cause } : {}),
         severity,
         issue: "Execution files from earlier runs were rediscovered outside the read plan.",
-        why: `${why}, ~${fmtK(missing.scriptTokens ?? 0)} of it scripts/code.`,
-        action: "Finish each task with `dev-guard done` and keep one workstream's tasks consecutive, so the previous task's executed scripts are carried into the next plan.",
+        why: `${EXECUTION_GAP_WHY[cause ?? "UNKNOWN"]}${why}, ~${fmtK(missing.scriptTokens ?? 0)} of it scripts/code.`,
+        action: EXECUTION_GAP_ACTION[cause ?? "UNKNOWN"],
         evidence: "INFERRED",
         impactTokens: missing.estTokens
       });
@@ -454,6 +503,10 @@ export function aggregateTask(window: TaskWindow, events: ActivityEvent[], userT
         (sum, [path, estTokens]) => ({ files: sum.files + 1, estTokens: sum.estTokens + estTokens, scriptTokens: sum.scriptTokens + (SCRIPT_FILE.test(path) ? estTokens : 0) }),
         { files: 0, estTokens: 0, scriptTokens: 0 }
       ),
+    ...(() => {
+      const scripts = [...otherReadTokens.entries()].filter(([path]) => !editedPaths.has(path) && SCRIPT_FILE.test(path)).sort((a, b) => b[1] - a[1]).map(([path]) => path).slice(0, 20);
+      return scripts.length ? { missingScripts: scripts } : {};
+    })(),
     ...(window.explicitInputCount !== undefined ? { explicitInputCount: window.explicitInputCount } : {}),
     providedDocRereads: [...providedReadCounts.entries()]
       .filter(([path, entry]) => entry.reads > 1 && !editedPaths.has(path) && /\.(?:mdx?|json)$/i.test(path))
@@ -594,6 +647,20 @@ export function rolloverStateFor(
 }
 
 const TIMELINE_LIMIT = 200;
+const HISTORY_TAIL_BYTES = 512 * 1024;
+
+/** Lineage fields of recent history records — a bounded tail read, never the whole history. */
+async function readLineageRecords(root: string): Promise<Array<{ timestamp: string; followUp?: boolean; untasked?: boolean; executionLineage?: ExecutionLineage }>> {
+  const lines = await readTailLines(fromRoot(root, devguardPaths.history), HISTORY_TAIL_BYTES).catch(() => [] as string[]);
+  return lines.slice(-20).flatMap((line) => {
+    try {
+      const record = JSON.parse(line) as { timestamp?: string; followUp?: boolean; untasked?: boolean; executionLineage?: ExecutionLineage };
+      return typeof record.timestamp === "string" ? [{ timestamp: record.timestamp, followUp: record.followUp, untasked: record.untasked, executionLineage: record.executionLineage }] : [];
+    } catch {
+      return [];
+    }
+  });
+}
 
 export async function buildContextEfficiencyReport(
   root: string,
@@ -641,6 +708,10 @@ export async function buildContextEfficiencyReport(
   const largest = current ? COST_CATEGORIES.map((category) => ({ category, value: current.costByCategory[category] })).sort((a, b) => b.value - a.value)[0] : undefined;
   const dominantMode = current ? WORK_MODES.map((mode) => ({ mode, value: current.modeTokens[mode] })).sort((a, b) => b.value - a.value)[0] : undefined;
 
+  if (current?.missingScripts?.length) {
+    const cause = classifyExecutionGap(current.missingScripts, (await readLineageRecords(root)).filter((record) => record.timestamp < current.startedAt));
+    if (cause) current.executionGapCause = cause;
+  }
   const issues = current ? contextIssues(current) : [];
   const primaryIssue = issues[0];
   const openBlockers = (taskCard?.openValidation.length ?? 0) + (current ? current.validation.fail : 0);

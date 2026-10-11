@@ -1761,7 +1761,7 @@ const TL_COLOR = { TASK_PREPARED:'#2563eb', TASK_DONE:'#16a34a', VALIDATION:'#7c
 function fmtTok(n) { n = n || 0; return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'K' : String(n); }
 function pct(part, total) { return total > 0 ? Math.round(part / total * 100) : 0; }
 function issueText(i) { if (!i) return ''; const k = 'iss_' + i.id + (i.id === 'CONTEXT_PRESSURE' ? '_' + i.severity : ''); return STRINGS[lang]?.[k] && lang !== 'en' ? t(k) : i.issue; }
-function actionText(i) { if (!i) return ''; const k = 'act_' + i.id; return STRINGS[lang]?.[k] && lang !== 'en' ? t(k) : i.action; }
+function actionText(i) { if (!i) return ''; const k = ['act_' + i.id + (i.cause ? '_' + i.cause : ''), 'act_' + i.id].find((key) => STRINGS[lang]?.[key]); return k && lang !== 'en' ? t(k) : i.action; }
 function stackBar(costs, total, widthPct, order, colors, prefix) {
   const segs = order.filter(c => (costs[c] || 0) > 0).map(c => '<span title="' + esc(t(prefix + c) + ': ' + fmtTok(costs[c]) + ' (' + pct(costs[c], total) + '%)') + '" style="width:' + (costs[c] / total * 100).toFixed(2) + '%;background:' + colors[c] + '"></span>').join('');
   return '<div class="stack" style="width:' + (widthPct || 100) + '%">' + segs + '</div>';

@@ -24,7 +24,14 @@ const devGuardCachePaths = new Set([
  * root-level one is — a prefix-only check like `path.startsWith(".next/")`
  * misses exactly this monorepo-shaped case.
  */
-const GENERATED_DIRECTORY_SEGMENTS = new Set(["node_modules", ".git", ".next", "dist", "build", "coverage", ".turbo", ".cache"]);
+const GENERATED_DIRECTORY_SEGMENTS = new Set(["node_modules", ".git", ".next", "dist", "build", "coverage", ".turbo", ".cache", "__pycache__"]);
+
+/**
+ * Ephemeral generated files: interpreter bytecode caches a run writes (and
+ * may delete again) as a side effect. Never task output — a `.py`, `.json`,
+ * `.md`, `.sql` or `.sh` a task writes is always a real change.
+ */
+const EPHEMERAL_GENERATED_FILE = /\.py[co]$/i;
 
 /**
  * DevGuard's own artifact naming convention: the live `.devguard`/`devguard`
@@ -49,11 +56,10 @@ function isGeneratedDirectorySegment(segment: string): boolean {
   return GENERATED_DIRECTORY_SEGMENTS.has(segment);
 }
 
-/** True if any path segment is a known generated/build-output directory. */
+/** True if any path segment is a known generated/build-output directory, or the file is an ephemeral generated file. */
 export function isGeneratedArtifactPath(path: string): boolean {
-  return normalizePath(path)
-    .split("/")
-    .some((segment) => isGeneratedDirectorySegment(segment));
+  const normalized = normalizePath(path);
+  return EPHEMERAL_GENERATED_FILE.test(normalized) || normalized.split("/").some((segment) => isGeneratedDirectorySegment(segment));
 }
 
 /** True if any path segment matches DevGuard's own (live or backup) artifact naming. */

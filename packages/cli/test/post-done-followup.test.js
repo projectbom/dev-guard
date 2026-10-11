@@ -143,3 +143,49 @@ test("C: a validation recorded after `done` binds to the completed task without 
   assert.equal(afterReset.taskBinding, "UNBOUND", "a full reset drops the lineage; nothing to follow up");
   assert.equal((await eventsOf(root, "TASK_CONTINUED")).length, 0, "no re-prepare was needed");
 });
+
+// v0.9.0 audit: 1 of 7 live TASK_FOLLOWUP_FINALIZED events was a
+// `__pycache__/*.pyc` a validation run wrote and later deleted — no source
+// or task artifact moved. Ephemeral generated files are never task changes.
+test("D: an ephemeral `__pycache__/*.pyc` created and deleted after `done` is not a follow-up; real `.py` / evidence `.json` changes still are", async () => {
+  const root = await makeDirtyRepo();
+  await prepareTaskContext({ root, task: "Task D: add the collector script.", caller: THREAD });
+  await mkdir(join(root, "jobs"), { recursive: true });
+  await writeFile(join(root, "jobs/collector.py"), "def collect():\n    return 1\n");
+  await processDoneEvent(root, { completionSource: "cli-done" });
+
+  // A: bytecode written by a run after done, then deleted, then a late Stop.
+  await mkdir(join(root, "jobs/__pycache__"), { recursive: true });
+  await writeFile(join(root, "jobs/__pycache__/collector.cpython-312.pyc"), "bytecode");
+  const whilePresent = await processDoneEvent(root, { completionSource: "hook-codex-stop" });
+  assert.equal(whilePresent.alreadyProcessed, true, "a bytecode cache is not a change");
+  await rm(join(root, "jobs/__pycache__"), { recursive: true, force: true });
+  const afterDelete = await processDoneEvent(root, { completionSource: "hook-codex-stop" });
+  assert.equal(afterDelete.alreadyProcessed, true, "its deletion is not a revert");
+  assert.equal((await eventsOf(root, "TASK_FOLLOWUP_FINALIZED")).length, 0);
+
+  // A baseline written before this fix that still lists a .pyc: its later deletion is a no-op too.
+  const { writeProjectState } = await import("../dist/runtime-state.js");
+  const state = await readProjectState(root);
+  await writeProjectState(root, {
+    ...state,
+    lastFinalizedCodeStateHash: "legacy-hash",
+    postCompletionBaseline: { ...state.postCompletionBaseline, fileHashes: { ...state.postCompletionBaseline.fileHashes, "jobs/__pycache__/old.cpython-312.pyc": "abc" } }
+  });
+  const legacy = await processDoneEvent(root, { completionSource: "hook-codex-stop" });
+  assert.equal(legacy.alreadyProcessed, true, "a legacy baseline .pyc that vanished is not a revert");
+  assert.equal((await eventsOf(root, "TASK_FOLLOWUP_FINALIZED")).length, 0);
+
+  // B: an actual source edit after done is still the task's follow-up.
+  await writeFile(join(root, "jobs/collector.py"), "def collect():\n    return 2\n");
+  const source = await processDoneEvent(root, { completionSource: "hook-codex-stop" });
+  assert.equal(source.alreadyProcessed, false);
+  assert.deepEqual(source.taskScopedChangedFiles, ["jobs/collector.py"]);
+
+  // C: a generated-but-meaningful evidence file is a real follow-up change.
+  await writeFile(join(root, "jobs/evidence.json"), JSON.stringify({ status: "PASS" }));
+  const evidence = await processDoneEvent(root, { completionSource: "hook-codex-stop" });
+  assert.equal(evidence.alreadyProcessed, false);
+  assert.deepEqual(evidence.taskScopedChangedFiles, ["jobs/evidence.json"]);
+  assert.equal((await eventsOf(root, "TASK_FOLLOWUP_FINALIZED")).length, 2);
+});

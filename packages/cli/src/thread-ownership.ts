@@ -373,5 +373,7 @@ export function taskBoundaryHeadroom(input: { ratio?: number; recentGrowth: numb
   const projected = ratio + typical * scale;
   const basis = `${pct(ratio)} now + typical task growth ${pct(typical)}${scale !== 1 ? ` ×${scale} (${scale > 1 ? "heavy" : "light"} task)` : ""} ≈ ${pct(projected)}`;
   const status: BoundaryStatus = projected >= BOUNDARY_NEW_THREAD_PROJECTED ? "NEW_THREAD" : projected >= BOUNDARY_SOON_PROJECTED ? "SOON" : "CONTINUE";
-  return { status, projected, typicalGrowth: typical, samples: growth.length, reason: `${basis} of the window.` };
+  // Without the next task's text this is headroom risk for a typical task, not a forecast of the next one.
+  const risk = input.nextTaskText === undefined && status !== "CONTINUE" ? "Headroom risk: " : "";
+  return { status, projected, typicalGrowth: typical, samples: growth.length, reason: `${risk}${basis} of the window.` };
 }
