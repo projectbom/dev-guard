@@ -49,7 +49,7 @@ export async function runDoctor(root: string, args: string[] = []): Promise<void
 
   console.log("dev-guard doctor");
   if (!initialized) {
-    console.log("Setup: DevGuard is not set up in this project yet. Run dev-guard setup (or just dev-guard watch).");
+    console.log("Setup: DevGuard has not prepared this project yet. Run dev-guard watch (it prepares the project on first run), or dev-guard setup to prepare without watching.");
   }
   // API-keyless contract: the core workflow never needs OpenAI, so a
   // missing key is never an error here. Only an explicit AI opt-in without
@@ -392,7 +392,7 @@ function runHookScript(root: string, path: string, input?: string): { ok: boolea
 function expectedHookNextStep(status: Awaited<ReturnType<typeof getHookStatus>>, pendingCount: number, runtimeStatus?: string): string {
   const installed = (status.claudeInstalled && status.claudeHookFile) || (status.codexInstalled && status.codexHookFile);
   const verified = status.claudeLastSuccess === true || status.codexLastSuccess === true;
-  if (!installed) return "Run dev-guard setup (or dev-guard install-hooks), then dev-guard watch.";
+  if (!installed) return "Run dev-guard watch (installs hooks on first run), or dev-guard install-hooks for recovery.";
   if (!verified) return "Hooks are installed but not verified. Run dev-guard doctor --hooks, trust Codex hooks with /hooks if needed, or fallback: dev-guard done.";
   if (pendingCount > 0 || runtimeStatus === "ready_for_done") return "Hook scripts are verified. Wait for the agent Stop Hook, or fallback: dev-guard done.";
   return "Hook scripts are verified. Run dev-guard watch before the next agent task.";

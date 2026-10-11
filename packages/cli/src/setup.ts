@@ -1,21 +1,17 @@
-import { stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { parse, resolve } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { resolve } from "node:path";
 import { resolveAIAssistOptIn } from "./config.js";
 import { getHookStatus } from "./hooks.js";
 import { readProjectKnowledge } from "./knowledge.js";
-import { planProjectSetup, prepareProject, type PrepareResult, type SetupPlanEntry } from "./prepare.js";
+import { planProjectSetup, prepareProject, validateProjectRoot, type PrepareResult, type SetupPlanEntry } from "./prepare.js";
 
-const execFileAsync = promisify(execFile);
+export { validateProjectRoot };
 
 /**
- * `dev-guard setup` — the recommended first-run command. Runs the same
- * preparation engine as `watch` (prepareProject), prints what it found, and
- * exits without starting the watcher or dashboard. Deterministic and
- * non-interactive: running it in a project root is the consent to analyze
- * that project; no prompts and no OpenAI calls.
+ * `dev-guard setup` — OPTIONAL preflight. `dev-guard watch` is the normal
+ * entry point and runs the very same preparation (prepareProject) on its
+ * own; setup exists for preparing/inspecting a project without starting the
+ * watcher (CI, scripted environments, `--dry-run`, onboarding diagnosis).
+ * Deterministic and non-interactive: no prompts and no OpenAI calls.
  */
 export async function runSetup(root: string, args: string[] = []): Promise<void> {
   const invalid = await validateProjectRoot(root);
@@ -33,30 +29,16 @@ export async function runSetup(root: string, args: string[] = []): Promise<void>
   const startedAt = Date.now();
   console.log("DevGuard setup");
   console.log("");
-  const result = await prepareProject(root, { onProgress: (line) => console.log(`  ${line}`) });
+  let result: PrepareResult;
+  try {
+    result = await prepareProject(root, { onProgress: (line) => console.log(`  ${line}`) });
+  } catch (error) {
+    console.error(`dev-guard setup: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+    return;
+  }
   const elapsedMs = Date.now() - startedAt;
   await printSummary(root, result, elapsedMs);
-}
-
-/** Returns an error message when `root` must not be set up, else undefined. */
-export async function validateProjectRoot(root: string): Promise<string | undefined> {
-  const absolute = resolve(root);
-  const info = await stat(absolute).catch(() => undefined);
-  if (!info?.isDirectory()) return `${absolute} is not a directory.`;
-  // Indexing a whole home directory or filesystem root is never intended.
-  if (absolute === resolve(homedir()) || absolute === parse(absolute).root) {
-    return `${absolute} is not a project root. cd into a project directory and run dev-guard setup there.`;
-  }
-  return undefined;
-}
-
-async function gitTopLevel(root: string): Promise<string | undefined> {
-  try {
-    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: root });
-    return stdout.trim() || undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 function printPlan(plan: SetupPlanEntry[]): void {
@@ -77,12 +59,12 @@ function printPlan(plan: SetupPlanEntry[]): void {
 }
 
 async function printSummary(root: string, result: PrepareResult, elapsedMs: number): Promise<void> {
-  const [knowledge, hookStatus, aiOptIn, gitRoot] = await Promise.all([
+  const [knowledge, hookStatus, aiOptIn] = await Promise.all([
     readProjectKnowledge(root),
     getHookStatus(root).catch(() => undefined),
-    resolveAIAssistOptIn(root),
-    gitTopLevel(root)
+    resolveAIAssistOptIn(root)
   ]);
+  const gitRoot = result.facts.gitRoot;
   const detected = result.facts.knowledge.detected;
   // Only print what was actually detected — never "unknown" placeholders.
   const known = (value: string | undefined) => (value && !/^\(?unknown\)?$/i.test(value.trim()) ? value : undefined);
@@ -97,7 +79,7 @@ async function printSummary(root: string, result: PrepareResult, elapsedMs: numb
   printLine("Language", known(knowledge?.summary.language));
   if (knowledge && knowledge.summary.sourceRoots.length > 0) printLine("Source roots", String(knowledge.summary.sourceRoots.length));
   printLine("Files indexed", String(result.facts.filesIndexed));
-  printLine("Git", gitRoot ? (resolve(gitRoot) === resolve(root) ? "repository" : `inside ${gitRoot} (run setup at the repository root)`) : "not a git repository — MCP context works; done cannot detect changed files without git");
+  printLine("Git", gitRoot ? (resolve(gitRoot) === resolve(root) ? "repository" : `inside ${gitRoot} (run setup at the repository root)`) : "not a git repository (see warning below)");
 
   const commands = [
     ["Build", known(detected.buildCommand)],
@@ -138,7 +120,7 @@ async function printSummary(root: string, result: PrepareResult, elapsedMs: numb
   console.log(`${result.didWork ? "Prepared" : "Already up to date"} in ${(elapsedMs / 1000).toFixed(1)}s`);
   console.log("");
   console.log("Next");
-  console.log("  dev-guard watch");
+  console.log("  dev-guard watch   (no need to run setup again; watch keeps this up to date)");
 }
 
 function printLine(label: string, value: string | undefined): void {

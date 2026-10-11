@@ -77,7 +77,7 @@ Paste the content into Claude/Codex for the next focused task.
 
 ## Context Overflow Recovery
 
-If the Claude/Codex context window is full, regenerate only the compact project handoff:
+The normal next-task path is DevGuard MCP `prepare_task_context`, not this file. To explicitly resume earlier work (or without MCP), regenerate only the compact project handoff:
 
 ```bash
 dev-guard handoff

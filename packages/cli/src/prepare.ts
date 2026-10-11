@@ -1,12 +1,18 @@
-import { access } from "node:fs/promises";
+import { access, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { parse, resolve } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { fromRoot, readJsonFile } from "./fs.js";
 import { ensureInitialProjectFiles, planInitialProjectFiles } from "./init.js";
 import { ensureAgentInstructions, type AgentInstructionInstallSummary } from "./install-agent-instructions.js";
-import { generateProjectKnowledge, getProjectKnowledgeRefreshStatus, type ProjectKnowledgeRefreshStatus } from "./knowledge.js";
+import { generateProjectKnowledge, getProjectKnowledgeRefreshStatus, readProjectKnowledge, type ProjectKnowledgeRefreshStatus } from "./knowledge.js";
 import { installHooks, refreshGeneratedHookScripts } from "./hooks.js";
 import { devguardPaths } from "./paths.js";
 import { ensureCodeIndex, readRuntimeState, writeRuntimeState, type SetupStatus, type SetupStatusStep } from "./runtime-state.js";
 import { ensureMcpSetup, type McpSetupResult } from "./mcp-setup.js";
+
+const execFileAsync = promisify(execFile);
 
 export interface PrepareResult {
   didWork: boolean;
@@ -19,6 +25,9 @@ export interface PrepareResult {
     instructions: AgentInstructionInstallSummary;
     mcp: McpSetupResult;
     hooksInstalled: boolean;
+    /** Detected from the Project Knowledge file (absent if it could not be generated). */
+    summary?: { packageManager: string; language: string; framework: string; sourceRoots: string[] };
+    gitRoot?: string;
   };
 }
 
@@ -33,7 +42,7 @@ const baseSetupSteps: SetupStatusStep[] = [
   { key: "code_index", label: "Code Index", status: "pending" },
   { key: "knowledge", label: "Project Knowledge", status: "pending" },
   { key: "agent_instructions", label: "AI Instructions", status: "pending" },
-  { key: "hooks", label: "Git Hooks", status: "pending" },
+  { key: "hooks", label: "Completion Hooks", status: "pending" },
   { key: "mcp", label: "MCP", status: "pending" }
 ];
 
@@ -42,11 +51,16 @@ const baseSetupSteps: SetupStatusStep[] = [
  * exits; `dev-guard watch` runs it before starting the watch runtime, so a
  * user who skips setup still gets the same zero-config first run. Every
  * step is idempotent: fresh artifacts are reused (Code Index present,
- * Project Knowledge newer than its inputs, managed sections unchanged,
+ * Project Knowledge fingerprint unchanged, managed sections unchanged,
  * hooks/MCP already configured), and only missing or stale parts are
  * written. Only DevGuard-owned files and marker-delimited sections change.
  */
 export async function prepareProject(root: string, options: PrepareOptions = {}): Promise<PrepareResult> {
+  // Critical boundary: an invalid root stops here, before anything is
+  // written. Every later step is non-critical — it degrades to a warning
+  // and the remaining steps still run.
+  const invalidRoot = await validateProjectRoot(root);
+  if (invalidRoot) throw new Error(invalidRoot);
   const steps: PrepareResult["steps"] = [];
   const warnings: string[] = [];
   const startedAt = new Date().toISOString();
@@ -65,10 +79,10 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   await markStep(root, startedAt, setupSteps, "code_index", "running");
   const indexResult = await ensureCodeIndex(root);
   didWork = didWork || indexResult.generated;
-  if (indexResult.warning) warnings.push(`Code Index warning: ${indexResult.warning}`);
+  if (indexResult.warning) warnings.push(`Code Index not built: ${indexResult.warning}. Task context has fewer file suggestions until it exists; DevGuard retries on the next watch/setup.`);
   steps.push({
     key: "code_index",
-    label: "Generated Code Index",
+    label: "Code Index",
     status: indexResult.warning ? "warning" : indexResult.generated ? "done" : "skipped",
     changed: indexResult.generated,
     detail: indexResult.warning ?? `${indexResult.filesIndexed} files indexed`
@@ -81,30 +95,18 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   let knowledgeWarning: string | undefined;
   if (knowledgeStatus.shouldGenerate) {
     try {
-      options.onProgress?.("Learning project...");
-      options.onProgress?.(`Detected: ${knowledgeStatus.detected.packageManager}`);
-      options.onProgress?.(`Detected: ${knowledgeStatus.detected.framework}`);
-      if (knowledgeStatus.detected.buildCommand !== "Unknown") {
-        options.onProgress?.(`Detected: ${knowledgeStatus.detected.buildCommand}`);
-      }
-      if (knowledgeStatus.detected.testCommand !== "Unknown") {
-        options.onProgress?.(`Detected: ${knowledgeStatus.detected.testCommand}`);
-      }
-      if (knowledgeStatus.detected.typecheckCommand !== "Unknown") {
-        options.onProgress?.(`Detected: ${knowledgeStatus.detected.typecheckCommand}`);
-      }
-      options.onProgress?.("Generating Project Knowledge...");
+      options.onProgress?.(knowledgeStatus.exists ? "Refreshing Project Knowledge..." : "Analyzing project structure...");
       await generateProjectKnowledge(root);
       knowledgeChanged = true;
       didWork = true;
     } catch (error) {
       knowledgeWarning = errorMessage(error);
-      warnings.push(`Project Knowledge warning: ${knowledgeWarning}`);
+      warnings.push(`Project Knowledge not ${knowledgeStatus.exists ? "refreshed" : "generated"}: ${knowledgeWarning}. ${knowledgeStatus.exists ? "The previous Knowledge stays in use" : "Task context works without it"}; DevGuard retries on the next watch/setup.`);
     }
   }
   steps.push({
     key: "knowledge",
-    label: "Generated Project Knowledge",
+    label: "Project Knowledge",
     status: knowledgeWarning ? "warning" : knowledgeStatus.shouldGenerate ? "done" : "skipped",
     changed: knowledgeChanged,
     detail: knowledgeWarning ?? knowledgeDetail(knowledgeStatus)
@@ -112,7 +114,11 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   await markStep(root, startedAt, setupSteps, "knowledge", knowledgeWarning ? "warning" : "done", knowledgeWarning);
 
   await markStep(root, startedAt, setupSteps, "agent_instructions", "running");
-  const instructionResult = await ensureAgentInstructions(root);
+  const instructionResult = await ensureAgentInstructions(root).catch((error): AgentInstructionInstallSummary => ({
+    agents: "already_installed",
+    claude: "already_installed",
+    warnings: [`AGENTS.md / CLAUDE.md not updated: ${errorMessage(error)}. Agents will not see the DevGuard workflow until this is fixed; check the file permissions, then rerun dev-guard watch.`]
+  }));
   const instructionsChanged =
     instructionResult.agents === "created" ||
     instructionResult.agents === "section_added" ||
@@ -124,7 +130,7 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   warnings.push(...instructionResult.warnings);
   steps.push({
     key: "agent_instructions",
-    label: "Installed AI instructions",
+    label: "Agent instructions",
     status: instructionResult.warnings.length > 0 ? "warning" : "done",
     changed: instructionsChanged,
     detail: instructionResult.warnings.join(" ")
@@ -143,11 +149,11 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
       const failures = hookResult.skipped.filter((line) => /failed|\berror\b|\bdenied\b/i.test(line));
       if (failures.length > 0) {
         hookWarning = failures.join(" ");
-        warnings.push(`Hook installation warning: ${hookWarning}`);
+        warnings.push(hookWarningText(hookWarning));
       }
     } catch (error) {
       hookWarning = errorMessage(error);
-      warnings.push(`Hook installation warning: ${hookWarning}`);
+      warnings.push(hookWarningText(hookWarning));
     }
   } else {
     // Existing installs keep their hook scripts, but scripts generated by
@@ -158,7 +164,7 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   }
   steps.push({
     key: "hooks",
-    label: "Installed Git hooks",
+    label: "Completion hooks",
     status: hookWarning ? "warning" : hooksAlreadyInstalled ? "skipped" : "done",
     changed: hooksChanged,
     detail: hookWarning
@@ -173,7 +179,7 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   const mcpDetail = `Claude: ${mcpResult.claude}; Codex: ${mcpResult.codex}; verification: ${mcpResult.verification}`;
   steps.push({
     key: "mcp",
-    label: "Configured MCP",
+    label: "MCP",
     status: mcpResult.warnings.length > 0 || mcpResult.verification === "warning" ? "warning" : mcpChanged ? "done" : "skipped",
     changed: mcpChanged,
     detail: mcpDetail
@@ -190,6 +196,11 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
       detail: enabled && !ready ? "Dashboard server could not start; watch continues." : undefined
     });
     await markStep(root, startedAt, setupSteps, "dashboard", enabled && !ready ? "warning" : "done");
+  }
+
+  const [summary, gitRoot] = await Promise.all([readProjectKnowledge(root).then((knowledge) => knowledge?.summary).catch(() => undefined), gitTopLevel(root)]);
+  if (!gitRoot) {
+    warnings.push("Not a git repository: MCP task context works, but `done` cannot detect changed files, so reports stay empty. Run `git init` (and commit once) to enable change tracking.");
   }
 
   const completedAt = new Date().toISOString();
@@ -216,9 +227,65 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
       knowledge: knowledgeStatus,
       instructions: instructionResult,
       mcp: mcpResult,
-      hooksInstalled: hooksAlreadyInstalled || hooksChanged
+      hooksInstalled: hooksAlreadyInstalled || hooksChanged,
+      summary,
+      gitRoot
     }
   };
+}
+
+function hookWarningText(detail: string): string {
+  return `Completion hooks not installed: ${detail}. Watch falls back to finalizing after file inactivity; run \`dev-guard done\` yourself if needed, or \`dev-guard doctor --hooks --dry-run\` to diagnose.`;
+}
+
+/** Returns an error message when `root` must not be prepared, else undefined. */
+export async function validateProjectRoot(root: string): Promise<string | undefined> {
+  const absolute = resolve(root);
+  const info = await stat(absolute).catch(() => undefined);
+  if (!info?.isDirectory()) return `${absolute} is not a directory.`;
+  // Indexing a whole home directory or filesystem root is never intended.
+  if (absolute === resolve(homedir()) || absolute === parse(absolute).root) {
+    return `${absolute} is not a project root. cd into a project directory and run DevGuard there.`;
+  }
+  return undefined;
+}
+
+export async function gitTopLevel(root: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: root });
+    return stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Human output of one preparation run, shared by `watch` and `setup`.
+ * Only what this run actually did or detected is listed; an already
+ * prepared project collapses to "Project ready.".
+ */
+export function formatPreparation(result: PrepareResult): { headline: string; lines: string[] } {
+  const step = (key: SetupStatusStep["key"]) => result.steps.find((entry) => entry.key === key);
+  const firstRun = Boolean(step("config")?.changed);
+  const lines: string[] = [];
+  if (step("code_index")?.changed) lines.push(`✓ Indexed ${result.facts.filesIndexed} project files`);
+  if (step("knowledge")?.changed) {
+    const detected = [result.facts.summary?.packageManager, result.facts.summary?.language, result.facts.summary?.framework].filter(
+      (value): value is string => Boolean(value) && !/^\(?unknown\)?$/i.test(String(value))
+    );
+    if (detected.length > 0) lines.push(`✓ Detected ${detected.join(" / ")}`);
+    lines.push(result.facts.knowledge.exists ? `✓ Project Knowledge refreshed (${result.facts.knowledge.staleFiles.slice(0, 3).join(", ")})` : "✓ Project Knowledge ready");
+  }
+  const mcpLine = (label: string, value: McpSetupResult["claude"], file: string) =>
+    value === "created" || value === "updated" ? `✓ ${label} MCP configured (${file})` : undefined;
+  for (const line of [mcpLine("Claude", result.facts.mcp.claude, ".mcp.json"), mcpLine("Codex", result.facts.mcp.codex, ".codex/config.toml")]) {
+    if (line) lines.push(line);
+  }
+  if (step("agent_instructions")?.changed) lines.push("✓ Agent instructions ready (DevGuard section in AGENTS.md, CLAUDE.md)");
+  if (step("hooks")?.changed) lines.push(firstRun ? "✓ Completion hooks ready" : "✓ Completion hook scripts refreshed");
+  for (const warning of result.warnings) lines.push(`! ${warning}`);
+  const headline = lines.length === 0 ? "Project ready." : firstRun ? "First-time project preparation" : "Project preparation updated";
+  return { headline, lines };
 }
 
 /** `watch`'s historical entry point — the same engine, plus the dashboard step. */
@@ -286,7 +353,7 @@ export async function planProjectSetup(root: string): Promise<SetupPlanEntry[]> 
 function knowledgeDetail(status: Awaited<ReturnType<typeof getProjectKnowledgeRefreshStatus>>): string | undefined {
   if (status.reason === "fresh") return undefined;
   if (status.reason === "missing") return `${status.detected.packageManager}; ${status.detected.framework}`;
-  if (status.staleFiles.length > 0) return `Refreshed after config change: ${status.staleFiles.slice(0, 3).join(", ")}${status.staleFiles.length > 3 ? ", ..." : ""}`;
+  if (status.staleFiles.length > 0) return `Refreshed after project change: ${status.staleFiles.slice(0, 3).join(", ")}${status.staleFiles.length > 3 ? ", ..." : ""}`;
   return undefined;
 }
 

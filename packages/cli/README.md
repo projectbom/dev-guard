@@ -22,22 +22,16 @@ npx @dev-guard/cli --help
 npm install -g @dev-guard/cli   # installs the CLI only; no project is scanned
 ```
 
-Recommended — from your project root, prepare once, then watch:
-
-```bash
-cd my-project
-dev-guard setup
-dev-guard watch
-```
-
-Zero-config — `watch` alone runs the same preparation when setup is missing or stale:
+Run it in your project:
 
 ```bash
 cd my-project
 dev-guard watch
 ```
 
-`dev-guard setup` creates the `.devguard/` configuration, builds the Code Index, generates Project Knowledge, adds the DevGuard section to `AGENTS.md` / `CLAUDE.md`, registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`), installs completion hooks best-effort, checks the MCP server, prints a summary, and exits. It is non-interactive, needs no API key, and is idempotent; `--dry-run` previews changes without writing. `watch` uses the same engine and then starts the dashboard and watcher.
+The first `watch` prepares DevGuard automatically — `.devguard/` configuration, Code Index, Project Knowledge, the DevGuard section of `AGENTS.md` / `CLAUDE.md`, the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`), completion hooks (best-effort) — then opens the local dashboard and starts watching. Later runs reuse fresh artifacts and start immediately. No setup step and no API key are needed.
+
+Optional: `dev-guard setup` runs the same preparation without starting the watcher and prints a summary (CI/scripts, inspection, `--dry-run` preview). It is never required before `watch`.
 
 Then work with your agent as usual. Each task runs through the MCP tool:
 
@@ -77,7 +71,7 @@ DevGuard checks `.devguard/config.json`, then `DEV_GUARD_OPENAI_API_KEY`, then `
 
 ## Agent Instruction Files
 
-`dev-guard setup` (and `watch`) create or refresh the DevGuard-managed section of `AGENTS.md` and `CLAUDE.md`; text outside the DevGuard markers is never changed. `dev-guard install-agent-instructions --force` refreshes the section. It describes one workflow:
+`dev-guard watch` (and the optional `setup`) create or refresh the DevGuard-managed section of `AGENTS.md` and `CLAUDE.md`; text outside the DevGuard markers is never changed. `dev-guard install-agent-instructions --force` refreshes the section. It describes one workflow:
 
 - **MCP available (normal):** `prepare_task_context` first, then the returned ranges. Agents do not also read `.devguard` markdown.
 - **MCP unavailable:** fall back to `.devguard/context/agent-brief.md`, then `.devguard/reports/read-map.md`, then `.devguard/reports/code-map.md`.
@@ -136,7 +130,7 @@ Advanced terminal-only mode:
 dev-guard watch --no-dashboard
 ```
 
-Advanced setup/recovery commands (normally `dev-guard setup` covers all of these):
+Advanced setup/recovery commands (normally `dev-guard watch` covers all of these):
 
 ```bash
 dev-guard init                        # .devguard config/templates only, no project analysis

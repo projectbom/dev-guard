@@ -5,6 +5,7 @@
 ## Main Commands
 
 ```bash
+dev-guard watch
 dev-guard setup [--dry-run]
 dev-guard init
 dev-guard install-hooks
@@ -13,7 +14,6 @@ dev-guard install-hooks --agent codex
 dev-guard install-hooks --agent codex-notify
 dev-guard install-hooks --agent codex-notify --install-dispatcher
 dev-guard install-hooks --agent all
-dev-guard watch
 dev-guard done
 dev-guard handoff
 dev-guard status
@@ -23,7 +23,7 @@ dev-guard doctor --hooks
 dev-guard doctor --agents
 ```
 
-- `setup`: recommended first-run command. Creates the `.devguard` config, builds the Code Index and Project Knowledge, installs the DevGuard section of `AGENTS.md`/`CLAUDE.md`, registers MCP for Claude Code/Codex, installs completion hooks best-effort, verifies the MCP server, prints a summary, and exits. Idempotent and non-interactive; `--dry-run` writes nothing. `watch` runs the same preparation when it is missing or stale.
+- `setup`: optional. Runs the same preparation the first `watch` runs automatically (config, Code Index, Project Knowledge, `AGENTS.md`/`CLAUDE.md` section, Claude Code/Codex MCP, completion hooks, MCP check), prints a summary, and exits without watching. Idempotent and non-interactive; `--dry-run` writes nothing. Never required before `watch`.
 - `init`: advanced/recovery — create only the `.devguard` config/templates (no project analysis, no `docs/*` templates). Existing files are not overwritten.
 - `watch`: recommended watcher; finalizes via a runtime-verified Claude/Codex Stop hook once one exists, and falls back to its own inactivity-based auto-finalize until then — either way, finalization itself is idempotent, so a hook firing repeatedly (or racing a manual `done`) for the same unchanged code state never produces more than one real completion.
 - `install-hooks`: install Claude/Codex completion strategy scripts and supported config.

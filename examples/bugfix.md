@@ -20,8 +20,7 @@ VERIFY: pnpm run build
 ## Recommended Flow
 
 ```bash
-dev-guard init
-dev-guard status
+dev-guard watch   # in another terminal; prepares the project on first run
 dev-guard "Fix loading flicker on the dashboard"
 # paste prompt into Codex
 dev-guard done

@@ -21,7 +21,7 @@ import {
   type DevGuardConfig
 } from "@dev-guard/core";
 import { appendTextFile, fromRoot, readJsonFile, readTailLines, readTextFile, writeFileIfMissing, writeTextFile } from "./fs.js";
-import { appendBoundedJsonl, CHANGE_LOG_RETENTION, HISTORY_RETENTION } from "./artifact-retention.js";
+import { appendBoundedJsonl, CHANGE_LOG_RETENTION, HISTORY_RETENTION, readBoundedJsonlTail } from "./artifact-retention.js";
 import { computeWorkingTreeContentHash, getDiffForChangeFiles, getFileContentAtRef, getGitChanges, getGitIdentity, hashWorkingFiles, type GitChanges } from "./git.js";
 import { migrateLegacyDevguardDir } from "./migration.js";
 import { devguardPaths } from "./paths.js";
@@ -1320,19 +1320,9 @@ const HISTORY_TAIL_READ_BYTES = 4 * 1024 * 1024;
 
 export async function readHistoryRecords(root: string, limit = 20): Promise<HistoryRecord[]> {
   await ensureDevguardWorkspace(root);
-  const lines = await readTailLines(fromRoot(root, historyPath), HISTORY_TAIL_READ_BYTES);
-  const records = lines
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as HistoryRecord;
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((record): record is HistoryRecord => Boolean(record));
-  return records.slice(-limit);
+  // Live tail first, then the rotated `.1` generation when the live file
+  // is short (just after a rotation) — see artifact-retention.ts.
+  return readBoundedJsonlTail<HistoryRecord>(fromRoot(root, historyPath), HISTORY_TAIL_READ_BYTES, limit);
 }
 
 export async function recordRuntimeChange(root: string, path: string, options: { idleAfterMs?: number } = {}): Promise<RuntimeState> {

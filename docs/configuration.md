@@ -58,13 +58,13 @@ If a project wants to share rules with its team, it can explicitly unignore or c
 
 ## API Keys
 
-DevGuard works without an OpenAI API key. When no key is configured, Quality Reports use local rule-based guidance and commands still succeed.
+DevGuard works without an OpenAI API key — the full workflow (watch, MCP, done, reports, dashboard) is deterministic and fully supported without one. AI is an explicit opt-in used only by `task-ai`, `review` (without `--heuristic`) / `fix-prompt`, and the optional `done` Quality Report summary. That summary runs only when `ai.provider` is `openai` in `.devguard/config.json` (set by `dev-guard configure ai --provider openai` or `dev-guard config set openaiApiKey <key>`) or `DEV_GUARD_OPENAI_API_KEY` is set; a shell-wide `OPENAI_API_KEY` alone never enables it.
 
 OpenAI API key resolution order:
 
 1. `.devguard/config.json` via `dev-guard config set openaiApiKey <key>` or the dashboard setting
 2. `DEV_GUARD_OPENAI_API_KEY`
 3. `OPENAI_API_KEY`
-4. no key, local rule-based fallback
+4. no key: AI-only commands explain that AI is optional; everything else is unaffected
 
 DevGuard never prints the key and the dashboard API only reports whether a key is configured. If you store a key in `.devguard/config.json`, treat that file as a local secret and keep it out of git.

@@ -1,5 +1,7 @@
 # DevGuard v0.7.0 Release Notes Draft
 
+> **Historical record.** This document describes DevGuard as of v0.7.0 and is kept unchanged as release history. Some workflows here are superseded; for current usage see the [README](../README.md) and the [npm guide](./npm-setup.md).
+
 ## Highlights
 
 - Working Context is now part of the agent startup flow, so Claude/Codex can start from the relevant entry files instead of scanning broadly.

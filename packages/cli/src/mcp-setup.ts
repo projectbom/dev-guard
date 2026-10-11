@@ -30,17 +30,17 @@ export async function ensureMcpSetup(root: string, options: { dryRun?: boolean }
   const dryRun = Boolean(options.dryRun);
   const [claude, codex] = await Promise.all([
     ensureClaudeMcp(root, dryRun).catch((error) => {
-      warnings.push(`Claude MCP warning: ${errorMessage(error)}`);
+      warnings.push(`Claude MCP not configured: ${errorMessage(error)} Claude Code will not see prepare_task_context until this is fixed.`);
       return "warning" as const;
     }),
     ensureCodexMcp(root, dryRun).catch((error) => {
-      warnings.push(`Codex MCP warning: ${errorMessage(error)}`);
+      warnings.push(`Codex MCP not configured: ${errorMessage(error)} Codex will not see prepare_task_context until this is fixed.`);
       return "warning" as const;
     })
   ]);
   if (dryRun) return { claude, codex, verification: "skipped", warnings };
   const verification = await verifyMcpServer(root).catch((error) => {
-    warnings.push(`MCP verification warning: ${errorMessage(error)}`);
+    warnings.push(`MCP server check failed: ${errorMessage(error)}. Agents may not be able to call prepare_task_context; run \`dev-guard doctor\` to diagnose.`);
     return "warning" as const;
   });
   return { claude, codex, verification, warnings };
@@ -73,11 +73,10 @@ async function ensureCodexMcp(root: string, dryRun: boolean): Promise<McpSetupRe
     `args = ${JSON.stringify(MCP_ARGS)}`,
     ""
   ].join("\n");
-  const blockPattern = new RegExp(`(^|\\n)\\[mcp_servers\\.${escapeRegExp(SERVER_NAME)}\\]\\n(?:[^\\[]|\\[(?!mcp_servers\\.))*`, "m");
-  if (blockPattern.test(current)) {
-    const next = current.replace(blockPattern, (match, prefix: string) => `${prefix}${block}`);
-    if (next === current) return "already_configured";
-    if (!dryRun) await writeText(path, next.endsWith("\n") ? next : `${next}\n`);
+  const replaced = replaceTomlTable(current, `[mcp_servers.${SERVER_NAME}]`, block.trimEnd().split("\n"));
+  if (replaced !== undefined) {
+    if (replaced === current) return "already_configured";
+    if (!dryRun) await writeText(path, replaced.endsWith("\n") ? replaced : `${replaced}\n`);
     return "updated";
   }
   const separator = current.trim() ? (current.endsWith("\n") ? "\n" : "\n\n") : "";
@@ -147,8 +146,25 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Replaces exactly one TOML table — from its `[header]` line up to (not
+ * including) the next table header at column 0 — with `lines`. Comment and
+ * blank lines directly above the next header stay with that next table, and
+ * nested tables such as `[mcp_servers.dev-guard.env]` are separate headers,
+ * so every other table in the user's config is preserved byte-for-byte.
+ * Returns undefined when the header is absent.
+ */
+export function replaceTomlTable(text: string, header: string, lines: string[]): string | undefined {
+  const all = text.split("\n");
+  const start = all.findIndex((line) => line.trim() === header);
+  if (start < 0) return undefined;
+  let end = all.findIndex((line, index) => index > start && line.startsWith("["));
+  if (end < 0) end = all.length;
+  let bodyEnd = end;
+  while (bodyEnd > start + 1 && (all[bodyEnd - 1].trim() === "" || all[bodyEnd - 1].trim().startsWith("#"))) bodyEnd -= 1;
+  const currentBody = all.slice(start, bodyEnd).map((line) => line.trim()).filter(Boolean);
+  if (currentBody.join("\n") === lines.join("\n")) return text;
+  return [...all.slice(0, start), ...lines, ...all.slice(bodyEnd)].join("\n");
 }
 
 function errorMessage(error: unknown): string {

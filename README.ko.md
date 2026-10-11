@@ -11,15 +11,15 @@ IDE도 아니고, wrapper도 아니며, 스스로 코드를 수정하는 AI Agen
 
 DevGuard는 이 컨텍스트를 로컬 `.devguard/` 파일로 보존해서 Codex/Claude 작업을 레포지토리 재탐색 없이 이어갈 수 있게 합니다.
 
-설치 후 프로젝트를 한 번 준비하고 watch를 시작합니다.
+설치 후 프로젝트에서 명령 하나면 됩니다.
 
 ```bash
-dev-guard setup   # 1회: Code Index, Project Knowledge, MCP, agent instruction, hook
-dev-guard watch   # Claude/Codex가 파일 수정; 변경이 안정되면 DevGuard가 자동 완료 처리
-# 다음 작업: agent가 DevGuard MCP 도구 prepare_task_context를 호출
+cd my-project
+dev-guard watch   # 첫 실행에서 프로젝트를 자동 준비한 뒤 watch; Claude/Codex가 파일 수정
+# 작업마다 agent가 DevGuard MCP 도구 prepare_task_context를 호출
 ```
 
-OpenAI API key는 필요 없습니다. context broker는 결정적으로 동작합니다.
+별도 setup 단계와 OpenAI API key는 필요 없습니다. context broker는 결정적으로 동작합니다.
 
 context window가 끊기거나, 여러 Agent를 오가거나, 긴 AI 코딩 작업을 다음 세션으로 넘겨야 할 때 사용합니다.
 
@@ -140,22 +140,16 @@ CLI 설치(설치 자체는 어떤 프로젝트도 분석하거나 변경하지 
 npm install -g @dev-guard/cli
 ```
 
-권장 — 프로젝트를 한 번 준비한 뒤 watch:
-
-```bash
-cd my-project
-dev-guard setup
-dev-guard watch
-```
-
-Zero-config — setup이 없거나 오래된 경우 `watch`만으로도 같은 준비 과정을 수행합니다:
+프로젝트에서 실행:
 
 ```bash
 cd my-project
 dev-guard watch
 ```
 
-`dev-guard setup`은 프로젝트 루트를 확인하고, `.devguard/` 설정을 만들고, Code Index와 Project Knowledge를 생성하고, `AGENTS.md` / `CLAUDE.md`에 DevGuard 섹션을 추가하고, Claude Code와 Codex에 DevGuard MCP 서버를 등록하고, completion hook을 best-effort로 설치하고, MCP 서버 응답을 확인한 뒤 요약을 출력하고 종료합니다. 결정적·비대화형이며 API key가 필요 없고, 다시 실행하면 없거나 오래된 부분만 갱신합니다. `dev-guard setup --dry-run`은 아무것도 쓰지 않고 변경 예정 항목만 보여 줍니다. `watch`는 같은 준비 엔진을 사용한 뒤 대시보드와 watcher를 시작합니다.
+첫 `watch`가 DevGuard를 자동으로 준비합니다 — `.devguard/` 설정 생성, 프로젝트 색인(Code Index), 구조 분석(Project Knowledge), `AGENTS.md` / `CLAUDE.md`에 DevGuard 섹션 추가, Claude Code와 Codex에 DevGuard MCP 서버 등록, completion hook best-effort 설치 — 그 뒤 로컬 대시보드를 열고 감시를 시작합니다. 이후 실행에서는 모두 최신이면 바로 시작하고("Project ready."), 없거나 오래된 부분만 갱신합니다.
+
+선택 사항 — `dev-guard setup`은 같은 준비 과정을 watch 없이 실행하고 요약을 출력합니다(CI/스크립트, 감지 결과 확인, `dev-guard setup --dry-run`으로 쓰기 없이 미리보기). `watch` 전에 반드시 실행할 필요는 없습니다.
 
 일상 루프:
 
@@ -167,7 +161,7 @@ dev-guard watch
 dev-guard status  # 선택 사항: 품질 verdict 확인
 ```
 
-고급/복구용: `dev-guard init`(`.devguard` 설정/템플릿만, 프로젝트 분석 없음), `dev-guard install-agent-instructions`, `dev-guard install-hooks`.
+고급/복구용: `dev-guard init`(`.devguard` 설정/템플릿만, 프로젝트 분석 없음), `dev-guard install-agent-instructions`, `dev-guard install-hooks` — `watch`가 모두 수행합니다.
 
 이 monorepo를 개발할 때:
 
@@ -208,8 +202,8 @@ dev-guard status
 dev-guard reset
 ```
 
-- `setup`: 권장 첫 실행 명령. `.devguard/`, Code Index, Project Knowledge, AI instruction, MCP, completion hook을 준비하고 요약을 출력한 뒤 종료합니다.
-- `watch`: 세션 모니터링. setup이 없거나 오래된 경우 같은 준비 과정을 먼저 수행하고 대시보드를 시작합니다.
+- `watch`: 시작 명령. 첫 실행에서 `.devguard/`, Code Index, Project Knowledge, AI instruction, MCP, completion hook을 자동 준비하고 대시보드와 감시를 시작합니다. 이후에는 오래된 부분만 갱신합니다.
+- `setup`: 선택 사항. 같은 준비 과정을 watch 없이 실행하고 요약을 출력한 뒤 종료합니다(`--dry-run` 지원).
 - `done`: 작업 완료 이벤트 처리, history/report/quality/handoff 생성
 - `handoff`: 현재 `.devguard/` 산출물만 읽어서 `project-handoff.md` 재생성
 - `status`: pending 상태, 최근 작업, quality verdict, 다음 권장 작업 출력
@@ -229,7 +223,7 @@ dev-guard install-agent-instructions
 dev-guard dashboard [--port 3737]
 ```
 
-일반 사용자는 위 명령을 직접 실행할 필요가 없습니다. `setup`(또는 `watch`)이 누락된 설정을 자동으로 준비합니다. `init`은 `.devguard` 설정/템플릿만 만들며 프로젝트를 분석하지 않습니다. 기존 `AGENTS.md` 또는 `CLAUDE.md`에는 DevGuard marker(`<!-- dev-guard-section-start -->` … `<!-- dev-guard-section-end -->`) 사이의 섹션만 추가/갱신하며, marker 밖의 사용자 텍스트는 바꾸지 않습니다.
+일반 사용자는 위 명령을 직접 실행할 필요가 없습니다. `watch`가 누락된 설정을 자동으로 준비합니다. `init`은 `.devguard` 설정/템플릿만 만들며 프로젝트를 분석하지 않습니다. 기존 `AGENTS.md` 또는 `CLAUDE.md`에는 DevGuard marker(`<!-- dev-guard-section-start -->` … `<!-- dev-guard-section-end -->`) 사이의 섹션만 추가/갱신하며, marker 밖의 사용자 텍스트는 바꾸지 않습니다.
 
 ## 생성되는 파일 구조
 
@@ -477,7 +471,7 @@ Verdict:
 - `decisions.md`는 자동 수정하지 않고 후보만 생성합니다.
 - `update`는 preview이며, `update --write`에서만 managed block을 수정합니다.
 - API provider는 선택 사항이며, 명시적 opt-in 없이는 OpenAI를 호출하지 않습니다.
-- `.devguard`의 생성 markdown은 고정 경로 단일 파일로 덮어쓰고, `history.jsonl` / `memory/change-log.jsonl`(8 MB) / `telemetry.jsonl`(4 MB)은 한도를 넘으면 `<file>.1`로 회전하며 최근 기록을 유지합니다. 새 프로젝트에는 `docs/PROJECT_STATE.md` 등 루트 템플릿을 더 이상 만들지 않으며, 기존 파일은 삭제하지 않습니다.
+- `.devguard`의 생성 markdown은 고정 경로 단일 파일로 덮어쓰고, `history.jsonl` / `memory/change-log.jsonl`(8 MB) / `telemetry.jsonl`(4 MB)은 한도를 넘으면 원자적으로 `<file>.1`로 이름을 바꿔 회전합니다(1세대 보관, 읽을 때 두 파일을 합쳐 동시 쓰기나 중단에도 기록이 유실되지 않음). 새 프로젝트에는 `docs/PROJECT_STATE.md` 등 루트 템플릿을 더 이상 만들지 않으며, 기존 파일은 삭제하지 않습니다.
 
 ## Advanced
 

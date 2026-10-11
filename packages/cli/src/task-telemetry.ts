@@ -1,5 +1,5 @@
-import { fromRoot, readTailLines } from "./fs.js";
-import { appendBoundedJsonl, TELEMETRY_RETENTION } from "./artifact-retention.js";
+import { fromRoot } from "./fs.js";
+import { appendBoundedJsonl, readBoundedJsonlTail, TELEMETRY_RETENTION } from "./artifact-retention.js";
 import { devguardPaths } from "./paths.js";
 import type { RolloverStatus } from "./rollover.js";
 
@@ -134,17 +134,5 @@ export async function recordTaskTelemetry(root: string, event: Omit<TaskTelemetr
  * more than `limit` records regardless of how long the project has existed.
  */
 export async function readTaskTelemetry(root: string, limit = 50): Promise<TaskTelemetryEvent[]> {
-  const lines = await readTailLines(fromRoot(root, telemetryPath), TAIL_READ_BYTES);
-  const events = lines
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      try {
-        return JSON.parse(line) as TaskTelemetryEvent;
-      } catch {
-        return undefined;
-      }
-    })
-    .filter((event): event is TaskTelemetryEvent => Boolean(event));
-  return events.slice(-limit);
+  return readBoundedJsonlTail<TaskTelemetryEvent>(fromRoot(root, telemetryPath), TAIL_READ_BYTES, limit);
 }

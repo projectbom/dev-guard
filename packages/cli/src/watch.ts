@@ -19,7 +19,7 @@ import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard, formatWatchDashboardKey } from "./watch-format.js";
 import { openDashboardBrowser, startDashboardServer, type DashboardServerHandle } from "./dashboard.js";
 import { defaultWatchConfig, loadWatchConfig, type WatchConfig } from "./config.js";
-import { prepareWatchProject } from "./prepare.js";
+import { formatPreparation, prepareWatchProject, validateProjectRoot } from "./prepare.js";
 import { logMemSnapshot, logTopReads, memDebugEnabled } from "./mem-debug.js";
 
 type WatchStatus = "idle" | "active" | "ready_for_done" | "finalizing" | "processed";
@@ -40,6 +40,14 @@ const excludedSummary = `node_modules/**, .git/**, dist/**, build/**, .next/**, 
 
 export async function runWatch(root: string, args: string[]): Promise<void> {
   logMemSnapshot("runWatch:start");
+  // Checked before the dashboard server starts — an open server would keep
+  // a failed process alive.
+  const invalidRoot = await validateProjectRoot(root);
+  if (invalidRoot) {
+    console.error(`dev-guard watch: ${invalidRoot}`);
+    process.exitCode = 1;
+    return;
+  }
   const watchConfig = await loadWatchConfig(root);
   const options = parseWatchOptions(args, watchConfig);
   const locale = await refreshRuntimeLocale(root);
@@ -56,26 +64,17 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
   }
   logMemSnapshot("runWatch:after-dashboard-start");
 
-  let preparationStreamStarted = false;
+  console.log("DevGuard");
+  console.log("");
+  // Same engine as `dev-guard setup`: a first watch prepares the project
+  // itself; later watches find everything fresh and skip straight to watching.
   const prepareResult = await prepareWatchProject(root, {
     dashboardEnabled: options.dashboard,
     dashboardReady: Boolean(dashboard),
-    onProgress: (line) => {
-      if (!preparationStreamStarted) {
-        console.log("DevGuard");
-        console.log("");
-        console.log("Preparing project...");
-        console.log("");
-        preparationStreamStarted = true;
-      }
-      console.log(line);
-    }
+    onProgress: (line) => console.log(line)
   });
-  const showPreparation = prepareResult.didWork || prepareResult.warnings.length > 0;
   printStartup({
     prepareResult,
-    showPreparation,
-    preparationStreamStarted,
     locale,
     dashboard,
     dashboardOpenFailed,
@@ -417,79 +416,29 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
 
 function printStartup(input: {
   prepareResult: Awaited<ReturnType<typeof prepareWatchProject>>;
-  showPreparation: boolean;
-  preparationStreamStarted: boolean;
   locale: string;
   dashboard?: DashboardServerHandle;
   dashboardOpenFailed: boolean;
   dashboardWarning?: string;
   dashboardEnabled: boolean;
 }): void {
-  if (!input.preparationStreamStarted) {
-    console.log("DevGuard");
+  const { headline, lines } = formatPreparation(input.prepareResult);
+  console.log(headline);
+  if (lines.length > 0) {
     console.log("");
+    for (const line of lines) console.log(line);
   }
-
-  if (input.showPreparation && !input.preparationStreamStarted) {
-    console.log("Preparing project...");
-    console.log("");
-    for (const step of input.prepareResult.steps) {
-      if (!input.dashboardEnabled && step.key === "dashboard") {
-        continue;
-      }
-      const marker = step.status === "warning" ? "!" : "✓";
-      console.log(`${marker} ${step.label}`);
-      if (step.detail) {
-        console.log(`  ${step.detail}`);
-      }
-    }
-    if (input.dashboardWarning) {
-      console.log(`! Dashboard warning: ${input.dashboardWarning}`);
-    }
-    console.log("");
-  } else if (input.preparationStreamStarted) {
-    if (input.showPreparation) {
-      for (const step of input.prepareResult.steps) {
-        if (!input.dashboardEnabled && step.key === "dashboard") {
-          continue;
-        }
-        const marker = step.status === "warning" ? "!" : "✓";
-        console.log(`${marker} ${step.label}`);
-        if (step.detail) {
-          console.log(`  ${step.detail}`);
-        }
-      }
-    }
-    for (const warning of input.prepareResult.warnings) {
-      console.log(`! ${warning}`);
-    }
-    if (input.dashboardWarning) {
-      console.log(`! Dashboard warning: ${input.dashboardWarning}`);
-    }
-    console.log("");
-  } else if (!input.showPreparation) {
-    console.log("DevGuard already initialized.");
-    console.log("");
-  }
-
-  console.log("Watching project...");
-  console.log(`Locale: ${input.locale}`);
-
-  if (input.dashboardWarning) {
-    console.log("");
-    console.log(`Dashboard warning: ${input.dashboardWarning}`);
-  }
-
-  if (input.dashboardEnabled && input.dashboard && input.dashboardOpenFailed) {
-    console.log("");
-    console.log("Dashboard");
-    console.log(input.dashboard.url);
-  }
-
+  console.log("");
   if (!input.dashboardEnabled) {
-    console.log("");
-    console.log("Dashboard disabled by --no-dashboard.");
+    console.log("Dashboard: disabled (--no-dashboard)");
+  } else if (input.dashboard) {
+    console.log(`Dashboard: ${input.dashboard.url}${input.dashboardOpenFailed ? " (open it in your browser)" : ""}`);
+  } else {
+    console.log(`! Dashboard could not start: ${input.dashboardWarning ?? "unknown error"}. Watching continues without it; try \`dev-guard dashboard --port <port>\`.`);
   }
+  console.log(`Locale: ${input.locale}`);
+  console.log("");
+  console.log("Watching project...");
 }
 
 /**

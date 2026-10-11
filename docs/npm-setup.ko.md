@@ -28,42 +28,42 @@ dev-guard doctor
 npx @dev-guard/cli --help
 ```
 
-## 2. 프로젝트 초기 세팅
+## 2. 프로젝트에서 바로 사용하기
 
-권장 — 프로젝트 루트에서 한 번 실행한 뒤 watch를 시작합니다.
-
-```bash
-cd your-project
-dev-guard setup
-dev-guard watch
-```
-
-Zero-config — setup을 건너뛰어도 `watch`가 setup이 없거나 오래된 경우 같은 준비 과정을 자동으로 수행합니다.
+별도 setup 단계는 없습니다. 프로젝트 루트에서:
 
 ```bash
 cd your-project
 dev-guard watch
 ```
 
-`dev-guard setup`은 결정적이고 비대화형입니다(질문, API key, 네트워크 없음). 수행 단계:
+첫 `watch`가 프로젝트를 준비한 뒤 로컬 대시보드를 열고 감시를 시작합니다. 준비 과정은 결정적이고 비대화형입니다(질문, API key, 네트워크 없음).
 
 1. 프로젝트 루트 확인 (홈 디렉터리나 `/`는 거부)
 2. 없는 `.devguard/` 설정 파일 생성 (기존 파일 유지)
 3. Code Index 생성 (`.devguard/memory/code-index.json`)
 4. Project Knowledge 생성 (`.devguard/project/project-knowledge.json`)
 5. `AGENTS.md`, `CLAUDE.md`의 DevGuard 섹션 추가/갱신 (marker 밖 텍스트 유지)
-6. Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버 등록 — 다른 서버 유지
+6. Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버 등록 — 다른 서버/테이블 유지
 7. completion hook 설치 (best-effort)
 8. MCP 서버가 실행되어 `prepare_task_context`를 제공하는지 확인
-9. 요약 출력(package manager, framework, 명령어, 연동 상태, AI 상태) 후 종료
 
-watcher와 dashboard는 시작하지 않습니다. 다시 실행하면 없거나 오래된 부분만 갱신합니다(Project Knowledge는 `package.json`, lockfile, framework 설정이 더 새로울 때만 재생성). `dev-guard setup --dry-run`은 아무것도 쓰지 않고 생성/갱신될 항목만 보여 줍니다.
+이후 `watch`는 최신 상태인 항목을 재사용하고 "Project ready."만 출력합니다. Project Knowledge는 프로젝트 구조가 바뀔 때만 재생성됩니다(파일 추가/삭제 — 새 route, component, migration, workspace 등 — 또는 package manifest, framework/TS 설정, CLI router 변경). README 문구 수정만으로는 재생성하지 않습니다.
+
+선택 사항 — watch 없이 준비만:
+
+```bash
+dev-guard setup            # 같은 준비 과정 실행 후 요약(감지된 스택, 명령어, 연동) 출력하고 종료
+dev-guard setup --dry-run  # 생성/갱신될 항목만 표시, 아무것도 쓰지 않음
+```
+
+`setup`은 CI/스크립트 환경, 감지 결과 확인, watch 전 온보딩 진단용입니다. 필수가 아닙니다.
 
 `npm install -g` 자체는 어떤 프로젝트도 분석하거나 변경하지 않습니다 — 어느 프로젝트가 대상인지 알 수 없기 때문입니다.
 
-Git: setup, Code Index, Project Knowledge, MCP context는 git 없이도 동작합니다. `done`의 변경 파일 감지는 git이 필요합니다.
+Git: 준비 과정, Code Index, Project Knowledge, MCP context는 git 없이도 동작합니다. `done`의 변경 파일 감지는 git이 필요합니다(git이 아닌 디렉터리에서는 watch가 경고를 표시).
 
-고급 / 복구용 (보통 필요 없음 — setup과 watch가 모두 수행):
+고급 / 복구용 (보통 필요 없음 — watch가 모두 수행):
 
 ```bash
 dev-guard init                        # .devguard 설정/템플릿만 생성, 프로젝트 분석 없음
@@ -161,7 +161,7 @@ Codex Stop Hook을 쓰는 고급 경로에서는 Codex TUI에서 `/hooks`를 열
 
 ## 7. 이후 CLI 명령어 흐름
 
-일상 작업 권장 흐름(한 번 `dev-guard setup` 이후):
+일상 작업 권장 흐름:
 
 ```bash
 dev-guard watch
@@ -206,10 +206,10 @@ dev-guard reset
 
 ## 8. 업데이트 후 점검 체크리스트
 
-npm 업데이트 뒤 프로젝트마다 한 번 확인합니다(`setup`이 관리 섹션, MCP 항목, 오래된 hook script를 제자리에서 갱신합니다).
+npm 업데이트 뒤에는 각 프로젝트의 다음 `dev-guard watch`가 관리 섹션, MCP 항목, 오래된 hook script를 제자리에서 갱신합니다. watch 없이 확인하려면:
 
 ```bash
-dev-guard setup
+dev-guard setup --dry-run
 dev-guard status
 dev-guard doctor --agents
 dev-guard doctor --hooks --dry-run

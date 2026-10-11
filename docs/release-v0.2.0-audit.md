@@ -1,5 +1,7 @@
 # DevGuard v0.2.0 Product Polish Audit
 
+> **Historical record.** This document describes DevGuard as of v0.2.0 and is kept unchanged as release history. Some workflows here are superseded; for current usage see the [README](../README.md) and the [npm guide](./npm-setup.md).
+
 ## Installation Audit
 
 ### Friction Points

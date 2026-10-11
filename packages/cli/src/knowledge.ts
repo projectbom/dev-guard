@@ -1,4 +1,5 @@
-import { access, readdir, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { access, readdir } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { isDevGuardArtifactPath, isGeneratedArtifactPath } from "@dev-guard/core";
 import { readJsonFile, readTextFile, writeTextFile, fromRoot } from "./fs.js";
@@ -30,6 +31,27 @@ export interface ProjectKnowledge {
     ignored: string[];
     futureCompatible: string[];
   };
+  /** Structural fingerprint at generation time (absent on pre-0.10 files). */
+  fingerprint?: KnowledgeFingerprint;
+}
+
+/**
+ * What Project Knowledge is derived from, cheaply comparable at every
+ * `watch`/`setup` start:
+ * - `structure`: hash of the project file set (paths only, from the same
+ *   bounded walk generation uses) minus Markdown and dot-paths — so a new
+ *   route, component, migration, workspace or source root makes Knowledge
+ *   stale, while editing README text or DevGuard's own `.mcp.json` /
+ *   `.claude/` / `.codex/` setup does not.
+ * - `inputs`: content hashes of the few files whose CONTENT Knowledge
+ *   reads structurally — package manifests (scripts, deps, workspaces),
+ *   framework/TS config, and the CLI command router.
+ * No other file content is read or hashed.
+ */
+export interface KnowledgeFingerprint {
+  version: 1;
+  structure: string;
+  inputs: Record<string, string>;
 }
 
 interface PackageJson {
@@ -44,6 +66,7 @@ export interface ProjectKnowledgeRefreshStatus {
   exists: boolean;
   shouldGenerate: boolean;
   reason: "missing" | "stale" | "fresh";
+  /** Paths whose content changed, plus "project file set" when files were added/removed. */
   staleFiles: string[];
   detected: {
     packageManager: string;
@@ -134,6 +157,7 @@ export async function discoverWorkspaceSourceRoots(root: string): Promise<string
 
 export async function generateProjectKnowledge(root: string): Promise<ProjectKnowledge> {
   const files = await listProjectFiles(root);
+  const fingerprint = await computeKnowledgeFingerprint(root, files);
   const rootPackage = await readJsonFile<PackageJson>(fromRoot(root, "package.json"), {});
   const workspacePackages = await readWorkspacePackages(root, files);
   const packageJsons = [rootPackage, ...workspacePackages.map((entry) => entry.packageJson)];
@@ -162,7 +186,8 @@ export async function generateProjectKnowledge(root: string): Promise<ProjectKno
       strategy: "static",
       ignored: IGNORED_DIRECTORY_LABELS,
       futureCompatible: ["dependency graph", "symbol index", "cross-reference graph", "semantic relationships"]
-    }
+    },
+    fingerprint
   };
   await writeTextFile(fromRoot(root, devguardPaths.projectKnowledge), `${JSON.stringify(knowledge, null, 2)}\n`);
   return knowledge;
@@ -195,20 +220,17 @@ export async function ensureProjectKnowledge(root: string): Promise<{
 }
 
 export async function getProjectKnowledgeRefreshStatus(root: string): Promise<ProjectKnowledgeRefreshStatus> {
-  const knowledgePath = fromRoot(root, devguardPaths.projectKnowledge);
-  const [knowledgeInfo, detected] = await Promise.all([statOptional(knowledgePath), detectProjectBasics(root)]);
-  if (!knowledgeInfo) {
+  const [stored, detected] = await Promise.all([
+    readJsonFile<Partial<ProjectKnowledge> | null>(fromRoot(root, devguardPaths.projectKnowledge), null),
+    detectProjectBasics(root)
+  ]);
+  if (!stored || typeof stored !== "object" || !stored.summary) {
     return { exists: false, shouldGenerate: true, reason: "missing", staleFiles: [], detected };
   }
-
-  const staleFiles: string[] = [];
-  for (const file of knowledgeRefreshCandidates) {
-    const info = await statOptional(fromRoot(root, file));
-    if (info && info.mtimeMs > knowledgeInfo.mtimeMs) {
-      staleFiles.push(file);
-    }
-  }
-
+  const current = await computeKnowledgeFingerprint(root);
+  const previous = stored.fingerprint;
+  // Knowledge written before fingerprints existed is refreshed once.
+  const staleFiles = previous?.version === 1 ? diffFingerprints(previous, current) : ["fingerprint missing (older DevGuard)"];
   return {
     exists: true,
     shouldGenerate: staleFiles.length > 0,
@@ -216,6 +238,35 @@ export async function getProjectKnowledgeRefreshStatus(root: string): Promise<Pr
     staleFiles,
     detected
   };
+}
+
+const LOCKFILES = ["pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lockb"];
+
+export async function computeKnowledgeFingerprint(root: string, files?: string[]): Promise<KnowledgeFingerprint> {
+  const projectFiles = files ?? (await listProjectFiles(root));
+  const structural = projectFiles.filter((file) => !/\.mdx?$/i.test(file) && !file.split("/").some((segment) => segment.startsWith(".")));
+  // Lockfile presence decides the package manager; its content does not matter here.
+  const lockfiles = (await Promise.all(LOCKFILES.map(async (file) => ((await exists(join(root, file))) ? `lock:${file}` : undefined)))).filter(Boolean);
+  const cliRouter = projectFiles.includes("packages/cli/src/index.ts") ? "packages/cli/src/index.ts" : projectFiles.find((file) => file.endsWith("/index.ts"));
+  const contentInputs = [
+    ...new Set([
+      ...knowledgeRefreshCandidates.filter((file) => !LOCKFILES.includes(file) && projectFiles.includes(file)),
+      ...projectFiles.filter((file) => file === "package.json" || file.endsWith("/package.json")),
+      ...(cliRouter ? [cliRouter] : [])
+    ])
+  ].sort();
+  const inputs: Record<string, string> = {};
+  for (const file of contentInputs) inputs[file] = hashText(await readTextFile(fromRoot(root, file)));
+  return { version: 1, structure: hashText([...lockfiles, ...structural].join("\n")), inputs };
+}
+
+function diffFingerprints(previous: KnowledgeFingerprint, current: KnowledgeFingerprint): string[] {
+  const changed = [...new Set([...Object.keys(previous.inputs ?? {}), ...Object.keys(current.inputs)])].filter((file) => previous.inputs?.[file] !== current.inputs[file]).sort();
+  return previous.structure !== current.structure ? [...changed, "project file set"] : changed;
+}
+
+function hashText(text: string): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, 32);
 }
 
 export async function readProjectKnowledge(root: string): Promise<ProjectKnowledge | undefined> {
@@ -286,14 +337,6 @@ async function filterExisting(root: string, paths: string[]): Promise<string[]> 
     if (await exists(join(root, path))) result.push(path);
   }
   return result;
-}
-
-async function statOptional(path: string): Promise<{ mtimeMs: number } | undefined> {
-  try {
-    return await stat(path);
-  } catch {
-    return undefined;
-  }
 }
 
 async function listProjectFiles(root: string): Promise<string[]> {

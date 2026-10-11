@@ -100,15 +100,10 @@ async function installSection(filePath: string, section: string, force: boolean)
   const existing = await readFile(filePath, "utf8");
   const hasSection = existing.includes(SECTION_START) && existing.includes(SECTION_END);
   if (hasSection) {
-    const startIdx = existing.indexOf(SECTION_START);
-    const endIdx = existing.indexOf(SECTION_END) + SECTION_END.length;
-    const currentSection = existing.slice(startIdx, endIdx);
-    if (currentSection === section) {
-      return "already_installed";
-    }
     // Managed DevGuard sections are safe to refresh. User-authored content
     // outside the markers is preserved.
-    const updated = existing.slice(0, startIdx) + section + existing.slice(endIdx);
+    const updated = replaceManagedSections(existing, section);
+    if (updated === existing) return "already_installed";
     await writeFile(filePath, updated, "utf8");
     return "section_updated";
   }
@@ -132,14 +127,44 @@ async function ensureGeneratedSection(filePath: string, section: string, options
     await write(existing + separator + section + "\n");
     return "section_added";
   }
-  const startIdx = existing.indexOf(SECTION_START);
-  const endIdx = existing.indexOf(SECTION_END) + SECTION_END.length;
-  const currentSection = existing.slice(startIdx, endIdx);
-  if (currentSection === section) return "already_installed";
   // Only the marker-delimited DevGuard section is replaced; user text
   // before/after it is preserved byte-for-byte.
-  await write(existing.slice(0, startIdx) + section + existing.slice(endIdx));
+  const updated = replaceManagedSections(existing, section);
+  if (updated === existing) return "already_installed";
+  await write(updated);
   return "section_updated";
+}
+
+/**
+ * Replaces the first complete DevGuard marker section with `section` and
+ * drops any later complete duplicates (e.g. from a hand-merged file), so
+ * agents never see two different DevGuard workflows. Text outside complete
+ * marker pairs — including any unpaired marker — is left untouched.
+ */
+export function replaceManagedSections(existing: string, section: string): string {
+  const ranges: Array<[number, number]> = [];
+  let from = 0;
+  while (true) {
+    const start = existing.indexOf(SECTION_START, from);
+    if (start < 0) break;
+    const end = existing.indexOf(SECTION_END, start + SECTION_START.length);
+    if (end < 0) break;
+    ranges.push([start, end + SECTION_END.length]);
+    from = end + SECTION_END.length;
+  }
+  if (ranges.length === 0) return existing;
+  let result = existing.slice(0, ranges[0][0]) + section;
+  for (let index = 0; index < ranges.length; index += 1) {
+    const gapEnd = index + 1 < ranges.length ? ranges[index + 1][0] : existing.length;
+    let gap = existing.slice(ranges[index][1], gapEnd);
+    // After a removed duplicate, do not stack its blank-line separator on
+    // top of the one already in place.
+    if (index >= 1 && result.endsWith("\n\n")) gap = gap.replace(/^\n+/, "");
+    // A whitespace-only gap right before a removed duplicate goes with it.
+    if (index + 1 < ranges.length && gap.trim() === "") gap = "";
+    result += gap;
+  }
+  return result;
 }
 
 function describeResult(result: InstallResult): string {

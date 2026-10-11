@@ -76,5 +76,5 @@ export async function runInit(root: string): Promise<void> {
   }
   console.log("- write policy: existing files are preserved; missing files are created only");
   console.log("- note: init is the low-level/manual-recovery step; it does not analyze the project");
-  console.log("- next: run dev-guard setup (Code Index, Project Knowledge, MCP, agent instructions, hooks), then dev-guard watch");
+  console.log("- next: run dev-guard watch (prepares Code Index, Project Knowledge, MCP, agent instructions, hooks on first run)");
 }

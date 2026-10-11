@@ -39,7 +39,7 @@ The default managed docs are:
 - `docs/DECISIONS.md`
 - `docs/DO_NOT_REPEAT.md`
 
-If a file is missing, write mode creates it. If marker pairs are broken, dev-guard reports the issue instead of guessing how to rewrite the file.
+DevGuard no longer creates these files when preparing a new project; `update --write` creates a missing one only because you explicitly asked it to write. Existing files are never deleted. If marker pairs are broken, dev-guard reports the issue instead of guessing how to rewrite the file.
 
 ## What Update Looks For
 

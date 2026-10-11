@@ -265,7 +265,8 @@ test("setup refuses the home directory; a non-git project is supported with a st
   const root = await makeProject({ withGit: false });
   const result = await cli(root, ["setup"]);
   assert.equal(result.code, 0);
-  assert.match(result.stdout, /Git:\s+not a git repository — MCP context works; done cannot detect changed files without git/);
+  assert.match(result.stdout, /Git:\s+not a git repository/);
+  assert.match(result.stdout, /Not a git repository: MCP task context works, but `done` cannot detect changed files/);
   const payload = await prepareTaskContext({ root, task: "Fix computeInvoiceTotal in lib/billing.ts" });
   assert.ok(payload.files.some((file) => file.path === "lib/billing.ts"));
 });
@@ -415,28 +416,23 @@ test("O: repeated done overwrites singleton reports — markdown file set does n
   assert.equal((await readHistoryRecords(root, 20)).length, 3, "history keeps one record per done");
 });
 
-test("R: append-only logs rotate past their threshold and keep the recent tail readable", async () => {
+test("R: append-only logs rotate past their threshold and the recent tail stays readable", async () => {
   const root = await makeProject();
   const path = join(root, ".devguard/history.jsonl");
   await mkdir(dirname(path), { recursive: true });
-  const policy = { rotateBytes: 4096, keepRecords: 5, keepBytes: 2048 };
+  const policy = { rotateBytes: 4096 };
   for (let i = 0; i < 60; i += 1) {
     await appendBoundedJsonl(path, `${JSON.stringify({ id: `r${i}`, timestamp: new Date().toISOString(), changedFiles: ["x".repeat(80)] })}\n`, policy);
   }
-  const live = (await readFile(path, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-  assert.ok((await stat(path)).size <= policy.rotateBytes, "live file stays under the threshold");
-  assert.equal(live.at(-1).id, "r59", "the newest record is always kept");
-  assert.ok(live.length >= 1 && live.length <= 60);
+  assert.ok(((await stat(path).catch(() => undefined))?.size ?? 0) <= policy.rotateBytes, "live file stays under the threshold");
   assert.ok(await exists(`${path}.1`), "one rotated generation is kept");
   const records = await readHistoryRecords(root, 1);
   assert.equal(records.at(-1).id, "r59", "done's carried-over detection still sees the last record");
 
-  // A single oversized last record is still carried over whole.
-  const big = join(root, ".devguard/telemetry.jsonl");
-  await appendFile(big, `${JSON.stringify({ a: "y".repeat(5000) })}\n`);
-  await appendFile(big, `${JSON.stringify({ last: "z".repeat(3000) })}\n`);
-  assert.equal(await rotateJsonlIfNeeded(big, policy), true);
-  assert.equal(JSON.parse((await readFile(big, "utf8")).trim()).last.length, 3000);
+  // A file under the threshold is never rotated.
+  const small = join(root, ".devguard/telemetry.jsonl");
+  await appendFile(small, `${JSON.stringify({ a: 1 })}\n`);
+  assert.equal(await rotateJsonlIfNeeded(small, policy), false);
 });
 
 // --- T-W: instruction contract ----------------------------------------------

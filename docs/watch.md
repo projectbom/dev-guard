@@ -2,10 +2,9 @@
 
 [English](../README.md) | [한국어](../README.ko.md)
 
-`dev-guard watch` is the default watcher for AI-agent work. Automatic completion is agent-specific and must be runtime verified.
+`dev-guard watch` is the entry point for AI-agent work. The first run prepares the project (Code Index, Project Knowledge, MCP, agent instructions, completion hooks) automatically; later runs start immediately. Automatic completion is agent-specific and must be runtime verified.
 
 ```bash
-dev-guard install-hooks
 dev-guard watch
 ```
 
@@ -85,7 +84,7 @@ Run dev-guard install-hooks to enable Auto Mode.
 
 ## Auto Mode Recommended
 
-Install hooks once per repository:
+`watch` installs the completion hooks automatically on first run. To reinstall them manually (recovery):
 
 ```bash
 dev-guard install-hooks

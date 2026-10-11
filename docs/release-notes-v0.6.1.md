@@ -1,5 +1,7 @@
 # DevGuard v0.6.1
 
+> **Historical record.** This document describes DevGuard as of v0.6.1 and is kept unchanged as release history. Some workflows here are superseded; for current usage see the [README](../README.md) and the [npm guide](./npm-setup.md).
+
 ## Fixed
 
 - Dashboard could render blank due to invalid client regex escaping.

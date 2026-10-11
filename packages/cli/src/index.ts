@@ -219,24 +219,27 @@ function printHelp(): void {
 Getting Started
 
   cd my-project
-  dev-guard setup     Prepare the project once: Code Index, Project Knowledge,
-                      MCP, agent instructions, completion hooks
-  dev-guard watch     Monitor your AI coding session
-                      (also prepares the project itself if setup was skipped)
+  dev-guard watch
 
-  No OpenAI API key is needed; AI assistance is optional.
+  The first watch prepares the project automatically (Code Index, Project
+  Knowledge, MCP, agent instructions, completion hooks), opens the local
+  dashboard, and starts watching. No setup step and no API key are needed.
+
+Optional
+
+  setup       Prepare and inspect the project without starting watch
+              (CI/scripts, --dry-run to preview changes)
 
 Other Commands
 
   doctor      Check setup and agent integration
   status      Show watch state, quality verdict, and next action
-  configure   Configure DevGuard settings
+  configure   Configure DevGuard settings (AI is optional)
   knowledge   Regenerate Project Knowledge
   update      Preview project documentation updates
 
 More
 
-  dev-guard setup --dry-run   Show what setup would change, without writing
   dev-guard --help-advanced
 `);
 }
@@ -325,8 +328,8 @@ All commands:
                                [--exit-code <n>] [--summary <text>] [--reason <text>]
 
 Commands:
-  setup                   Prepare the project (Code Index, Project Knowledge, MCP, instructions, hooks) and exit
-  watch                   Monitor AI coding session; runs the same preparation when setup is missing/stale
+  watch                   Start here: prepares the project when needed (first run), then monitors the AI coding session
+  setup                   Optional: run the same preparation without starting watch, print a summary, exit
   "requirement"           Generate task.md and a compact Codex prompt
   done                    Manual recovery — normally watch auto-finalizes
   handoff                 Regenerate handoff/context; --task prepares Before-Agent context
@@ -338,9 +341,9 @@ Commands:
   doctor                  Print config/provider/git/hook diagnostics
 
 Advanced / recovery:
-  init                    Create only the .devguard config/templates (no project analysis); setup/watch do this automatically
-  install-hooks           Install agent completion strategy scripts/config; done automatically by setup/watch
-  install-agent-instructions  Create or update the DevGuard section of AGENTS.md / CLAUDE.md; done automatically by setup/watch
+  init                    Create only the .devguard config/templates (no project analysis); watch does this automatically
+  install-hooks           Install agent completion strategy scripts/config; done automatically by watch
+  install-agent-instructions  Create or update the DevGuard section of AGENTS.md / CLAUDE.md; done automatically by watch
   reset                   Clear watch runtime state without deleting project state
   check                   Analyze current git diff with rule-based checks
   scan                    Cache project structure and file summaries into .devguard
@@ -673,7 +676,7 @@ async function runStatus(root: string): Promise<void> {
     console.log("");
     console.log("Setup:");
     console.log("  DevGuard is not set up in this project yet.");
-    console.log("  Run dev-guard setup (or just dev-guard watch, which prepares the project itself).");
+    console.log("  Run dev-guard watch — the first run prepares the project automatically.");
   }
   const legacyWarning = legacyDevguardWarning(root);
   if (legacyWarning) {
@@ -692,9 +695,9 @@ async function runStatus(root: string): Promise<void> {
     }
   }
   console.log("");
-  console.log(`Next recommended action: ${initialized ? nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction) : "run dev-guard setup"}`);
+  console.log(`Next recommended action: ${initialized ? nextRecommendedAction(runtime.pendingChangedFiles.length, state.lastDrift, state.lastQualityVerdict, state.lastQualityNextAction) : "run dev-guard watch"}`);
   console.log("Next:");
-  console.log(!initialized ? "  dev-guard setup" : runtime.pendingChangedFiles.length > 0 ? "  dev-guard watch  (auto-finalizes pending changes; or: dev-guard done for manual recovery)" : "  dev-guard watch");
+  console.log(!initialized ? "  dev-guard watch" : runtime.pendingChangedFiles.length > 0 ? "  dev-guard watch  (auto-finalizes pending changes; or: dev-guard done for manual recovery)" : "  dev-guard watch");
 }
 
 async function runReset(root: string): Promise<void> {

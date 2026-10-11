@@ -28,42 +28,42 @@ If your team avoids global installs, run it on demand:
 npx @dev-guard/cli --help
 ```
 
-## 2. Initial Project Setup
+## 2. Start Using It In A Project
 
-Recommended — run once from the project root, then start watching:
-
-```bash
-cd your-project
-dev-guard setup
-dev-guard watch
-```
-
-Zero-config — `watch` alone runs the same preparation when setup is missing or stale:
+There is no separate setup step. From the project root:
 
 ```bash
 cd your-project
 dev-guard watch
 ```
 
-`dev-guard setup` is deterministic and non-interactive (no prompts, no API key, no network). It:
+The first `watch` prepares the project, then opens the local dashboard and starts watching. Preparation is deterministic and non-interactive (no prompts, no API key, no network):
 
 1. validates the project root (refuses your home directory or `/`)
 2. creates `.devguard/` config files that are missing (existing files are kept)
 3. builds the Code Index (`.devguard/memory/code-index.json`)
 4. generates Project Knowledge (`.devguard/project/project-knowledge.json`)
 5. adds/refreshes the DevGuard section of `AGENTS.md` and `CLAUDE.md` (text outside the markers is kept)
-6. registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) — other servers are kept
+6. registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) — other servers and tables are kept
 7. installs completion hooks best-effort
 8. checks that the MCP server starts and lists `prepare_task_context`
-9. prints a summary (package manager, framework, commands, integrations, AI status) and exits
 
-It does not start the watcher or the dashboard. Running it again only refreshes missing or stale parts (Project Knowledge is regenerated only when `package.json`, lockfiles, or framework config are newer than it). `dev-guard setup --dry-run` prints what would be created/updated without writing anything.
+Later `watch` runs reuse everything that is still fresh and print just "Project ready." Project Knowledge is regenerated only when the project's structure changes (files added/removed — e.g. a new route, component, migration or workspace — or package manifests, framework/TS config, or the CLI router change); editing README text does not trigger it.
+
+Optional — prepare without watching:
+
+```bash
+dev-guard setup            # same preparation, prints a summary (detected stack, commands, integrations), exits
+dev-guard setup --dry-run  # shows what would be created/updated, writes nothing
+```
+
+Use `setup` for CI/scripted environments, to inspect what DevGuard detected, or to diagnose onboarding before starting `watch`. It is never required.
 
 `npm install -g` itself never scans or changes a project — it does not know which project you mean.
 
-Git: setup, the Code Index, Project Knowledge, and MCP context work without git; `done` needs git to detect changed files.
+Git: preparation, the Code Index, Project Knowledge, and MCP context work without git; `done` needs git to detect changed files (watch prints a warning in a non-git directory).
 
-Advanced / recovery (normally not needed — setup and watch do all of this):
+Advanced / recovery (normally not needed — watch does all of this):
 
 ```bash
 dev-guard init                        # only the .devguard config/templates, no project analysis
@@ -161,7 +161,7 @@ If you use the advanced Codex Stop Hook path, open `/hooks` in the Codex TUI and
 
 ## 7. Ongoing CLI Flow
 
-Recommended daily flow (after a one-time `dev-guard setup`):
+Recommended daily flow:
 
 ```bash
 dev-guard watch
@@ -206,10 +206,10 @@ dev-guard reset
 
 ## 8. Post-Update Checklist
 
-After an npm update, check each project once (`setup` refreshes the managed instruction section, MCP entry, and outdated hook scripts in place):
+After an npm update, the next `dev-guard watch` in each project refreshes the managed instruction section, MCP entry, and outdated hook scripts in place. To check without starting watch:
 
 ```bash
-dev-guard setup
+dev-guard setup --dry-run
 dev-guard status
 dev-guard doctor --agents
 dev-guard doctor --hooks --dry-run

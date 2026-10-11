@@ -1,5 +1,7 @@
 # DevGuard v0.6.0 Release Notes Draft
 
+> **Historical record.** This document describes DevGuard as of v0.6.0 and is kept unchanged as release history. Some workflows here are superseded; for current usage see the [README](../README.md) and the [npm guide](./npm-setup.md).
+
 ## Highlights
 
 - Dashboard now guides the next action instead of only showing status.
