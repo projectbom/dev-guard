@@ -784,14 +784,19 @@ function renderPage(): string {
     .ov-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
     .ov-ev { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border-bottom: 1px dotted var(--line2); cursor: help; }
     .ov-details > summary, .ov-sub > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink2); }
-    .ov-details { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 14px; }
-    .ov-details-body { display: grid; gap: 6px; margin-top: 10px; }
-    .ov-sub { border-top: 1px solid var(--line); padding-top: 6px; }
-    .ov-sub > summary { font-weight: 500; font-size: 12.5px; }
-    .ov-sub-body { padding: 8px 0 4px; }
+    .ov-details { background: var(--surface); }
+    .ov-details-body { display: grid; padding: 0 14px 10px; }
+    /* Sections are light rows inside the one Details card, not nested boxes. */
+    .ov-sub { border: 0; border-top: 1px solid var(--line); border-radius: 0; overflow: visible; }
+    .ov-sub > summary { padding: 9px 4px; font-weight: 600; font-size: 12.5px; text-transform: none; letter-spacing: 0; color: var(--ink2); background: transparent; }
+    .ov-sub > summary:hover { background: transparent; color: var(--ink); }
+    .ov-sub-body { padding: 2px 4px 12px; }
+    .ov-sub-body svg { width: 100%; height: 120px; display: block; }
     .muted { color: var(--muted); }
     @media (max-width: 640px) {
       .ov-line { grid-template-columns: 1fr; gap: 2px; }
+      .ov-sub-body .eff-kv { grid-template-columns: 1fr; gap: 0; }
+      .ov-sub-body .eff-kv dd { margin-bottom: 8px; }
       .ov-pills { grid-template-columns: 1fr; }
     }
 

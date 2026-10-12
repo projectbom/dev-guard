@@ -212,3 +212,16 @@ test("details lists are bounded", async () => {
   assert.ok(count(html, "src/file") <= 12, "at most 12 rows per list");
   assert.ok(html.includes("+488 more"));
 });
+
+test("browser regressions: Details sections are light rows, the timeline is bounded, narrow key/values stack, Korean report term is consistent", async () => {
+  const { page } = await renderFirstScreen(overviewData());
+  // Found in the real-browser pass: the generic `details` card style made every section a nested box.
+  assert.match(page, /\.ov-sub \{ border: 0; border-top: 1px solid var\(--line\); border-radius: 0; overflow: visible; \}/);
+  assert.match(page, /\.ov-sub > summary \{[^}]*text-transform: none/);
+  // The timeline SVG had no height rule once it moved into Details.
+  assert.match(page, /\.ov-sub-body svg \{ width: 100%; height: 120px; display: block; \}/);
+  // At phone width, label/value pairs stack instead of squeezing values mid-word.
+  assert.match(page, /@media \(max-width: 640px\) \{[^@]*\.ov-sub-body \.eff-kv \{ grid-template-columns: 1fr; gap: 0; \}/);
+  const ko = dashboardTranslations.ko;
+  assert.ok(!Object.values(ko).some((value) => value.includes("리포트")), "Korean UI uses 보고서 consistently");
+});
