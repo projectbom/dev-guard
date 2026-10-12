@@ -6,7 +6,8 @@ import { fromRoot, readTextFile, readTextFileCapped, readTextFilePrefix } from "
 import { logMemSnapshot, memDebugEnabled } from "./mem-debug.js";
 import { devguardPaths } from "./paths.js";
 import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
-import { readProjectKnowledge } from "./knowledge.js";
+import { readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
+import { buildDashboardOverview } from "./dashboard-view.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
@@ -112,6 +113,8 @@ interface DashboardState {
     filesIndexed: number;
     architectureModules: number;
     framework?: string;
+    sourceRoots: number;
+    coverage?: ProjectKnowledge["coverage"];
   };
   setup?: RuntimeState["setupStatus"];
   openAI: {
@@ -274,8 +277,24 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
     }
     return;
   }
-  // Context Efficiency: separate from /api/state (polled every 1s) so the
-  // status loop never pays for activity aggregation; cached ~10s server-side.
+  // The dashboard's single poll: watch/setup state, the context-efficiency
+  // report (cached ~10s server-side) and the five-second overview built from
+  // both. /api/state and /api/efficiency stay available on their own.
+  if (url.pathname === "/api/overview") {
+    try {
+      const [state, efficiency] = await Promise.all([getDashboardState(root), getContextEfficiencyReport(root).catch(() => undefined)]);
+      const overview = buildDashboardOverview(
+        { initialized: state.initialized, watchRunning: state.watchRunning, setupActive: Boolean(state.setup?.active), qualityVerdict: state.qualityVerdict, sessionFileCount: state.sessionFileCount },
+        efficiency,
+        efficiency?.taskCard?.readPlan
+      );
+      sendJson(response, { state, efficiency: efficiency ?? null, overview });
+    } catch (error) {
+      sendJson(response, { error: errorMessage(error) }, 500);
+    }
+    return;
+  }
+  // Context Efficiency on its own (cached ~10s server-side).
   if (url.pathname === "/api/efficiency") {
     try {
       sendJson(response, await getContextEfficiencyReport(root));
@@ -392,7 +411,9 @@ async function readKnowledgeState(root: string): Promise<DashboardState["knowled
     updatedAt: file.updatedAt,
     filesIndexed: knowledge?.summary.filesIndexed ?? 0,
     architectureModules: knowledge?.architecture.modules.length ?? 0,
-    framework: knowledge?.summary.framework
+    framework: knowledge?.summary.framework,
+    sourceRoots: knowledge?.summary.sourceRoots?.length ?? 0,
+    ...(knowledge?.coverage ? { coverage: knowledge.coverage } : {})
   };
 }
 
@@ -737,42 +758,52 @@ function renderPage(): string {
       --r-sm: 6px;
     }
 
-    /* ── Context Efficiency ── */
+    /* ── Compact overview: NOW → this task → context flow → details ── */
+    #root { display: grid; gap: 12px; }
+    .ov-now { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--ok); border-radius: var(--r); padding: 14px 16px; display: grid; gap: 10px; }
+    .ov-now.health-SETTING_UP { border-left-color: var(--accent); }
+    .ov-now.health-ATTENTION { border-left-color: var(--bad); }
+    .ov-pills { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .ov-pill { display: flex; flex-direction: column; gap: 3px; padding: 8px 12px; border-radius: var(--r-sm); background: var(--ok-bg); border: 1px solid var(--ok-ring); min-width: 0; }
+    .ov-pill b { font-size: 16px; line-height: 1.25; }
+    .ov-pill.health-SETTING_UP { background: var(--accent-bg); border-color: #bfdbfe; }
+    .ov-pill.health-ATTENTION, .ov-pill.thread-NEW_THREAD { background: var(--bad-bg); border-color: var(--bad-ring); }
+    .ov-pill.thread-SOON { background: var(--warn-bg); border-color: var(--warn-ring); }
+    .ov-k { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+    .ov-line { display: grid; grid-template-columns: 116px minmax(0, 1fr); gap: 10px; align-items: baseline; }
+    .ov-task { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ov-issue { font-size: 14px; color: var(--ink2); }
+    .ov-issue.has-issue { color: var(--ink); font-weight: 700; }
+    .ov-action { padding-top: 8px; border-top: 1px solid var(--line); font-size: 14px; }
+    .ov-cmd { font: 12px var(--mono); background: var(--surface2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 6px; }
+    .ov-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .ov-block { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px 14px; display: grid; gap: 8px; }
+    .ov-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; }
+    .ov-metric { background: var(--surface2); border-radius: var(--r-sm); padding: 8px 10px; min-width: 0; }
+    .ov-v { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+    .ov-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .ov-ev { font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border-bottom: 1px dotted var(--line2); cursor: help; }
+    .ov-details > summary, .ov-sub > summary { cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink2); }
+    .ov-details { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 10px 14px; }
+    .ov-details-body { display: grid; gap: 6px; margin-top: 10px; }
+    .ov-sub { border-top: 1px solid var(--line); padding-top: 6px; }
+    .ov-sub > summary { font-weight: 500; font-size: 12.5px; }
+    .ov-sub-body { padding: 8px 0 4px; }
+    .muted { color: var(--muted); }
+    @media (max-width: 640px) {
+      .ov-line { grid-template-columns: 1fr; gap: 2px; }
+      .ov-pills { grid-template-columns: 1fr; }
+    }
+
+    /* ── Context Efficiency (detail rows, bars, legends) ── */
     .eff:empty { display: none; }
-    .eff-now { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--ok); border-radius: var(--r); padding: 12px 14px; display: grid; gap: 6px; }
-    .eff-now.health-NEEDS_ATTENTION { border-left-color: var(--warn); }
-    .eff-now.health-POOR { border-left-color: var(--bad); }
-    .eff-now-top { display: flex; gap: 10px; align-items: center; min-width: 0; }
-    .eff-health { font: 700 11px/1 var(--sans); letter-spacing: .05em; text-transform: uppercase; padding: 4px 8px; border-radius: 999px; background: var(--ok-bg); color: var(--ok); white-space: nowrap; }
-    .health-NEEDS_ATTENTION .eff-health { background: var(--warn-bg); color: var(--warn); }
-    .health-POOR .eff-health { background: var(--bad-bg); color: var(--bad); }
-    .eff-task { font-size: 12px; color: var(--ink2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-    .eff-issue { font-size: 15px; font-weight: 700; }
-    .eff-why { font-size: 12px; color: var(--muted); }
-    .eff-line { display: grid; grid-template-columns: 64px 1fr; gap: 8px; font-size: 13px; }
-    .eff-label { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; padding-top: 2px; }
-    .eff-focus { font-size: 12.5px; color: var(--ink2); }
-    .eff-more summary, .eff-details summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--ink2); }
-    .eff-details[open] summary { margin-bottom: 8px; }
     .eff { margin-bottom: 12px; display: grid; gap: 10px; }
-    .eff-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex-wrap: wrap; }
-    .eff-title { font-size: 13px; font-weight: 700; }
-    .eff-sub { font-size: 11px; color: var(--muted); }
-    .eff-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }
-    .eff-tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 9px 11px; min-width: 0; }
-    .eff-tile.wide { grid-column: span 2; }
-    .eff-k { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
-    .eff-v { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
-    .eff-v.sm { font-size: 13px; font-weight: 600; }
     .eff-note { font-size: 11.5px; color: var(--ink2); margin-top: 2px; }
-    .eff-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; }
     .stack { display: flex; height: 14px; border-radius: 4px; overflow: hidden; background: var(--line); }
     .stack span { height: 100%; min-width: 0; }
     .eff-row { display: grid; grid-template-columns: minmax(90px, 30%) 1fr auto; gap: 8px; align-items: center; font-size: 12px; margin: 5px 0; }
     .eff-row .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink2); }
     .eff-row .num { font: 11px/1 var(--mono); color: var(--muted); white-space: nowrap; }
-    .bar { height: 10px; border-radius: 3px; background: var(--line); overflow: hidden; }
-    .bar > span { display: block; height: 100%; background: var(--accent); }
     .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 11px; color: var(--ink2); margin-top: 8px; }
     .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
     .ev { display: inline-block; font: 9.5px/1 var(--mono); padding: 2px 4px; border-radius: 3px; border: 1px solid var(--line2); color: var(--muted); margin-left: 4px; vertical-align: 1px; cursor: help; }
@@ -796,9 +827,6 @@ function renderPage(): string {
 
     /* ── Page ── */
     .page { max-width: 1060px; margin: 0 auto; padding: 18px 18px 42px; }
-    .gap { display: grid; gap: 10px; }
-    .g2 { grid-template-columns: 1fr 1fr; }
-    .g2w { grid-template-columns: 1.5fr 1fr; }
 
     /* ── Top bar ── */
     .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -814,180 +842,64 @@ function renderPage(): string {
     .timestamp { font: 11px/1 var(--mono); color: var(--muted); }
 
     /* ── Status banner ── */
-    .banner { border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; border: 1px solid transparent; display: flex; align-items: flex-start; gap: 11px; }
     .banner.idle { background: var(--ok-bg); border-color: var(--ok-ring); }
     .banner.working { background: var(--warn-bg); border-color: var(--warn-ring); }
     .banner.finalizing, .banner.ready_for_done { background: var(--accent-bg); border-color: #bfdbfe; }
     .banner.processed { background: var(--purple-bg); border-color: var(--purple-ring); }
     .banner.setup { background: var(--accent-bg); border-color: #bfdbfe; }
     .banner.offline { background: var(--surface); border-color: var(--line2); }
-    .banner-icon { font-size: 20px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
-    .banner-text { flex: 1; min-width: 0; }
     .section-label { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: 6px; }
-    .banner-title { font-size: 17px; font-weight: 740; line-height: 1.22; letter-spacing: -.2px; }
-    .banner-body { color: var(--ink2); margin-top: 2px; font-size: 13px; }
-    .banner-cmd { display: inline-block; margin-top: 8px; font: 13px/1.4 var(--mono); background: rgba(0,0,0,.06); border-radius: 5px; padding: 4px 9px; }
     .setup-list { display: grid; gap: 6px; margin: -2px 0 12px; padding: 12px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); }
     .setup-item { display: flex; align-items: center; gap: 8px; color: var(--ink2); font-size: 13px; }
     .setup-mark { width: 18px; color: var(--accent); font-weight: 800; text-align: center; }
     .setup-item.warning .setup-mark { color: var(--warn); }
 
     /* ── Action Center ── */
-    .ac-section { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 18px; margin-bottom: 12px; }
-    .ac-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 14px; }
-    .ac-list { display: grid; gap: 8px; }
-    .ac-card { display: grid; grid-template-columns: 1fr auto; gap: 12px; align-items: center; padding: 14px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface); transition: border-color .12s, box-shadow .12s; }
-    .ac-card:hover { border-color: var(--line2); box-shadow: 0 1px 4px rgba(0,0,0,.06); }
     .ac-card.primary { border-color: #bfdbfe; background: var(--accent-bg); }
-    .ac-card.missing { background: var(--surface2); }
-    .ac-name { font-size: 14px; font-weight: 740; color: var(--ink); line-height: 1.3; }
-    .ac-reason { font-size: 12px; color: var(--muted); line-height: 1.45; margin-top: 3px; }
-    .ac-meta { font: 11px/1.4 var(--mono); color: var(--muted); margin-top: 5px; }
-    .ac-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-    .ac-btn { display: inline-flex; align-items: center; justify-content: center; font: 12px/1 var(--sans); font-weight: 650; padding: 6px 13px; border-radius: var(--r-sm); border: none; cursor: pointer; text-decoration: none; transition: background .1s, color .1s; white-space: nowrap; min-height: 30px; }
-    .ac-btn-primary { background: var(--accent); color: #fff; }
-    .ac-btn-primary:hover { background: var(--accent-dk); }
-    .ac-btn-secondary { background: var(--surface2); border: 1px solid var(--line2); color: var(--ink2); }
-    .ac-btn-secondary:hover { background: var(--line); color: var(--ink); }
-    .ac-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-    .setting-help { margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.45; }
-    .setting-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
     .mini-btn { border: 1px solid var(--line2); background: var(--ink); color: #fff; border-radius: var(--r-sm); padding: 7px 11px; font: 12px/1 var(--sans); font-weight: 700; cursor: pointer; }
     .mini-btn.ghost { background: var(--surface); color: var(--ink2); }
     .mini-btn:hover { filter: brightness(.96); }
-    .quick-bar { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 12px; margin-bottom: 10px; }
-    .quick-title { font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 12px; }
-    .quick-actions { display: flex; gap: 7px; flex-wrap: wrap; }
-    .quick-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 30px; border-radius: var(--r-sm); border: 1px solid var(--line2); background: var(--surface2); color: var(--ink); padding: 6px 10px; font: 12px/1 var(--sans); font-weight: 700; cursor: pointer; text-decoration: none; white-space: nowrap; }
     .quick-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-    .quick-btn:disabled { opacity: .55; cursor: not-allowed; }
-    .settings-panel { margin: 16px 0 10px; }
-    .settings-panel details { border: 1px solid var(--line); border-radius: var(--r); background: var(--surface); }
-    .settings-panel summary { padding: 10px 12px; font-size: 11px; }
-    .settings-body { padding: 0 12px 12px; display: grid; gap: 10px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
 
     /* ── Assistant prompt / summary ── */
-    .prompt-list { display: grid; gap: 7px; margin-top: 10px; }
-    .prompt-item { display: flex; gap: 8px; align-items: flex-start; color: var(--ink2); font-size: 13px; line-height: 1.45; }
-    .prompt-item span { color: var(--accent); font-weight: 800; line-height: 1.4; }
-    .summary-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-    .summary-item { border: 1px solid var(--line); background: var(--surface2); border-radius: var(--r-sm); padding: 10px 11px; min-width: 0; }
-    .summary-value { font-size: 15px; font-weight: 760; color: var(--ink); line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .summary-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-top: 3px; }
-    .summary-evidence { margin-top: 6px; display: grid; gap: 3px; }
-    .summary-evidence div { font: 11px/1.35 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
     /* ── Card ── */
     .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; }
-    .card-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 12px; }
 
     /* ── Activity card ── */
-    .activity-what { font-size: 15px; font-weight: 600; color: var(--ink); margin-bottom: 14px; }
-    .activity-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 8px 0; border-top: 1px solid var(--line); font-size: 13px; }
-    .activity-label { color: var(--muted); }
-    .activity-value { font-weight: 600; text-align: right; }
 
     /* ── Current session (files) card ── */
-    .file-list { display: grid; gap: 6px; margin-bottom: 8px; }
-    .file-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--surface2); border: 1px solid var(--line); border-radius: var(--r-sm); min-width: 0; }
-    .file-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }
-    .file-text { min-width: 0; flex: 1; }
-    .file-name { font: 13px/1.2 var(--mono); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .file-path { font: 11px/1.2 var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .file-more { font-size: 12px; color: var(--muted); padding: 4px 0; }
-    .no-files { padding: 14px; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; border: 1px dashed var(--line2); border-radius: var(--r-sm); }
-    .no-files strong { display: block; color: var(--ink2); font-size: 13px; margin-bottom: 2px; }
 
     /* ── Today's progress ── */
-    .stat-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
-    .stat-item { background: var(--surface2); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 12px; }
-    .stat-value { font-size: 22px; font-weight: 760; line-height: 1; color: var(--ink); margin-bottom: 3px; }
-    .stat-label { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
 
     /* ── Recent sessions ── */
-    .sessions-day { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); padding: 10px 0 6px; border-top: 1px solid var(--line); }
-    .sessions-day:first-child { border-top: none; padding-top: 0; }
-    .session-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: var(--r-sm); transition: background .1s; }
-    .session-row:hover { background: var(--surface2); }
-    .session-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--line2); flex-shrink: 0; }
     .session-dot.pass { background: var(--ok); }
-    .session-dot.warn { background: var(--warn); }
-    .session-dot.bad { background: var(--bad); }
-    .session-time { font: 13px/1 var(--mono); color: var(--muted); flex-shrink: 0; width: 40px; }
-    .session-label { flex: 1; font-size: 13px; font-weight: 500; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .session-meta { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
-    .session-files { font-size: 12px; color: var(--muted); }
-    .session-verdict { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 99px; }
     .session-verdict.pass { color: var(--ok); background: var(--ok-bg); }
-    .session-verdict.warn { color: var(--warn); background: var(--warn-bg); }
-    .session-verdict.bad { color: var(--bad); background: var(--bad-bg); }
-    .no-sessions { padding: 20px 10px; text-align: center; color: var(--muted); }
-    .no-sessions strong { display: block; font-size: 15px; color: var(--ink); margin-bottom: 4px; }
-    .no-sessions p { font-size: 13px; }
 
     /* ── Health card ── */
-    .health-list { display: grid; gap: 8px; }
-    .health-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 12px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface2); }
-    .health-label { font-size: 13px; color: var(--ink2); font-weight: 500; }
-    .health-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; padding: 3px 8px; border-radius: 99px; }
-    .health-badge.good { color: var(--ok); background: var(--ok-bg); }
-    .health-badge.warn { color: var(--warn); background: var(--warn-bg); }
-    .health-badge.missing { color: var(--muted); background: var(--surface2); }
-    .trend-dots { display: flex; gap: 6px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); align-items: center; }
-    .trend-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; flex-shrink: 0; }
-    .trend-list { display: flex; gap: 4px; align-items: center; }
-    .trend-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line2); }
     .trend-dot.pass { background: var(--ok); }
-    .trend-dot.warn { background: var(--warn); }
-    .trend-dot.bad { background: var(--bad); }
 
     /* ── Next action ── */
-    .next-card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; }
     .next-card.pass { border-color: var(--ok-ring); background: var(--ok-bg); }
-    .next-card.warn { border-color: var(--warn-ring); background: var(--warn-bg); }
-    .next-card.blocked { border-color: var(--bad-ring); background: var(--bad-bg); }
-    .next-top { display: flex; align-items: flex-start; gap: 13px; }
-    .next-icon { font-size: 20px; line-height: 1; flex-shrink: 0; margin-top: 1px; }
-    .next-title { font-size: 16px; line-height: 1.25; font-weight: 760; letter-spacing: -.2px; }
-    .next-body { font-size: 13px; color: var(--ink2); line-height: 1.4; font-weight: 500; margin-top: 3px; max-width: 720px; }
-    .next-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
     .next-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 34px; border-radius: var(--r-sm); border: 1px solid var(--line2); background: var(--surface); color: var(--ink); padding: 8px 13px; font: 13px/1 var(--sans); font-weight: 700; cursor: pointer; }
     .next-btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
     .next-card.blocked .next-btn.primary { min-height: 40px; padding: 10px 16px; font-size: 14px; box-shadow: 0 1px 6px rgba(37,99,235,.18); }
     .next-btn.danger { border-color: var(--bad); background: var(--bad); color: #fff; }
     .next-btn:disabled { opacity: .65; cursor: wait; }
-    .review-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; margin-top: 10px; max-width: 760px; }
-    .review-step { display: flex; align-items: center; background: rgba(255,255,255,.78); border: 1px solid rgba(0,0,0,.08); border-radius: var(--r-sm); padding: 8px 9px; font-size: 12px; font-weight: 680; color: var(--ink2); min-width: 0; }
-    .review-step span { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: var(--surface); border: 1px solid var(--line2); color: var(--muted); font: 11px/1 var(--mono); margin-right: 9px; flex-shrink: 0; }
-    .review-step:first-child { border-color: var(--accent); color: var(--ink); }
-    .review-step:first-child span { border-color: var(--accent); color: var(--accent); }
     .review-message { margin-top: 10px; color: var(--bad); font-size: 13px; font-weight: 600; }
 
     /* ── Timeline ── */
-    .tl-list { display: grid; gap: 0; }
-    .tl-item { display: flex; align-items: flex-start; gap: 10px; position: relative; padding: 8px 0; }
-    .tl-item:not(:last-child)::before { content: ''; position: absolute; left: 17px; top: 28px; bottom: 0; width: 1px; background: var(--line); }
-    .tl-icon { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 10px; flex-shrink: 0; margin-top: 2px; }
     .tl-icon.session { background: var(--ok-bg); border: 1px solid var(--ok-ring); color: var(--ok); }
     .tl-icon.watch_start { background: var(--accent-bg); border: 1px solid #bfdbfe; color: var(--accent); }
     .tl-icon.file_change { background: var(--surface2); border: 1px solid var(--line); color: var(--muted); }
-    .tl-event { font-size: 13px; font-weight: 500; color: var(--ink); }
-    .tl-time { font: 11px/1 var(--mono); color: var(--muted); margin-top: 2px; }
-    .tl-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
 
     /* ── Advanced details ── */
-    .adv-wrap { margin-top: 10px; }
     details { border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; }
     summary { display: flex; align-items: center; gap: 8px; padding: 13px 18px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); cursor: pointer; user-select: none; background: var(--surface); }
     summary::-webkit-details-marker { display: none; }
     summary::before { content: '▶'; font-size: 9px; transition: transform .15s; }
     details[open] summary::before { transform: rotate(90deg); }
     summary:hover { background: var(--surface2); }
-    .adv-body { padding: 0 18px 18px; background: var(--surface); }
-    .adv-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 16px; }
-    .adv-item { padding: 10px 12px; background: var(--surface2); border: 1px solid var(--line); border-radius: var(--r-sm); }
-    .adv-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; }
-    .adv-value { font: 13px/1.3 var(--mono); color: var(--ink); word-break: break-all; }
     .rpt-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
     .rpt-card { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 12px; }
     .rpt-name { font-size: 13px; font-weight: 760; margin-bottom: 3px; }
@@ -1006,14 +918,10 @@ function renderPage(): string {
 
     /* ── Responsive ── */
     @media (max-width: 860px) {
-      .ac-card { grid-template-columns: 1fr; }
-      .ac-btns { justify-content: flex-start; }
     }
     @media (max-width: 720px) {
       .page { padding: 14px 12px 40px; }
       .g2, .g2w, .adv-grid, .rpt-grid, .stat-row, .review-steps, .summary-grid, .settings-body { grid-template-columns: 1fr; }
-      .banner-title { font-size: 16px; }
-      .session-meta { flex-direction: column; align-items: flex-end; gap: 3px; }
     }
   </style>
 </head>
@@ -1033,7 +941,6 @@ function renderPage(): string {
       <div class="timestamp" id="ts"></div>
     </div>
   </div>
-  <div id="efficiency" class="eff"></div>
   <div id="root"></div>
 </div>
 
@@ -1048,8 +955,6 @@ let lang = initLang();
 let last = null;
 let reviewCompleteUntil = 0;
 let applyingServerLang = false;
-let settingsOpen = false;
-let advancedOpen = false;
 const previewOpen = {};
 
 function initLang() {
@@ -1070,8 +975,7 @@ function setLang(l, opts = {}) {
   langBtns.forEach(b => b.classList.toggle('active', b.dataset.lang === l));
   brandSub.textContent = t('appSubtitle');
   refreshBtn.textContent = t('refresh');
-  if (last) render(last); else root.textContent = t('loading');
-  if (typeof effLast !== 'undefined' && effLast) renderEff(effLast);
+  if (last) renderOverview(last); else root.textContent = t('loading');
   if (!opts.skipPersist) persistLocale(l);
 }
 async function persistLocale(l) {
@@ -1181,7 +1085,9 @@ function normalizeDashboardState(s) {
       updatedAt: knowledge.updatedAt,
       filesIndexed: Number.isFinite(knowledge.filesIndexed) ? knowledge.filesIndexed : 0,
       architectureModules: Number.isFinite(knowledge.architectureModules) ? knowledge.architectureModules : 0,
-      framework: knowledge.framework
+      framework: knowledge.framework,
+      sourceRoots: Number.isFinite(knowledge.sourceRoots) ? knowledge.sourceRoots : 0,
+      coverage: knowledge.coverage
     },
     setup: s?.setup,
     openAI: {
@@ -1211,12 +1117,6 @@ function statusView(s) {
 /* ─ Time helpers ─ */
 function ago(v) { return v ? (lang === 'ko' ? v + ' ' + t('timeAgoSuffix') : v + ' ago') : t('never'); }
 function dash(v) { return v || t('unknown'); }
-function basename(p) { return p.split('/').pop() || p; }
-function dirname(p) { const ps = p.split('/'); return ps.length > 1 ? ps.slice(0,-1).join('/') + '/' : ''; }
-function shortTime(ts) {
-  const d = new Date(ts);
-  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString(lang==='ko'?'ko-KR':'en-US', { hour:'2-digit', minute:'2-digit', hour12: false });
-}
 function relativeTime(ts) {
   if (!ts) return '';
   const sec = Math.floor((Date.now() - Date.parse(ts)) / 1000);
@@ -1227,48 +1127,8 @@ function relativeTime(ts) {
   if (hr < 24) return lang==='ko' ? hr+'시간 '+t('timeAgoSuffix') : hr+'h ago';
   return lang==='ko' ? Math.floor(hr/24)+'일 '+t('timeAgoSuffix') : Math.floor(hr/24)+'d ago';
 }
-function dayLabel(ts) {
-  const d = new Date(ts), now = new Date(), yest = new Date(now - 86400000);
-  if (d.toDateString() === now.toDateString()) return t('today');
-  if (d.toDateString() === yest.toDateString()) return t('yesterday');
-  return d.toLocaleDateString(lang==='ko'?'ko-KR':'en-US', { month:'short', day:'numeric' });
-}
 
-/* ─ Session label ─ */
-function sessionLabel(areas) {
-  if (!areas?.length) return t('sessionLabelGeneric');
-  if (areas.includes('docs')) return t('sessionLabelDocs');
-  if (areas.includes('test')) return t('sessionLabelTests');
-  if (areas.includes('cli') && areas.includes('config')) return t('sessionLabelCliConfig');
-  if (areas.includes('cli')) return t('sessionLabelCli');
-  if (areas.includes('config')) return t('sessionLabelConfig');
-  if (areas.includes('api')) return t('sessionLabelApi');
-  const first = areas[0];
-  const label = first.charAt(0).toUpperCase() + first.slice(1);
-  return areas.length > 1 ? label + ' +' + (areas.length - 1) : label;
-}
-function verdictInfo(v) {
-  if (!v) return { cls:'', text:t('verdictUnknown') };
-  if (v === 'PASS') return { cls:'pass', text:t('verdictHealthy') };
-  if (v === 'BLOCKED') return { cls:'bad', text:t('verdictBlocked') };
-  return { cls:'warn', text:t('verdictReview') };
-}
 
-/* ─ Health ─ */
-function qualityHealth(v) {
-  if (!v) return { cls:'missing', icon:'○', label:t('healthUnknown') };
-  if (v === 'PASS') return { cls:'good', icon:'✓', label:t('healthGood') };
-  return { cls:'warn', icon:'!', label:t('healthWarning') };
-}
-function boolHealth(exists) {
-  return exists ? { cls:'good', icon:'✓', label:t('healthGood') } : { cls:'missing', icon:'○', label:t('healthMissing') };
-}
-function reportsHealth(s) {
-  if (!s.reports.handoffExists && !s.reports.qualityReportExists && !s.reports.workingContextExists) return { cls:'missing', icon:'○', label:t('reportsNeverUpdated') };
-  const stamp = s.reports.qualityReportUpdatedAt || s.reports.handoffUpdatedAt;
-  return { cls:'good', icon:'✓', label: t('reportsUpdated') + (stamp ? ' ' + shortTime(stamp) : '') };
-}
-function healthBadge(h) { return '<span class="health-badge ' + h.cls + '">' + esc(h.icon) + ' ' + esc(h.label) + '</span>'; }
 
 /* ─ Copy file ─ */
 async function copyFile(key, btn) {
@@ -1307,215 +1167,26 @@ async function completeReview(btn) {
   }
 }
 
-/* ─ Recommended action builder ─ */
-function recommendedActionCard(opts, index) {
-  const { name, reason, meta, avail, openKey, copyKey, onClick, primary } = opts;
-  const cls = (avail ? '' : 'missing') + (primary ? ' primary' : '');
-  let btns = '';
-  if (avail) {
-    if (openKey) btns += '<a class="ac-btn ac-btn-primary" href="/api/file?path=' + esc(openKey) + '" target="_blank" rel="noopener">' + esc(t('actionOpen')) + '</a>';
-    if (copyKey) btns += '<button class="ac-btn ac-btn-secondary" onclick="copyFile(' + JSON.stringify(copyKey) + ', this)">' + esc(t('actionCopy')) + '</button>';
-    if (onClick) btns += '<button class="ac-btn ac-btn-secondary" onclick="' + esc(onClick) + '">' + esc(t('reviewComplete')) + '</button>';
-  }
-  return '<div class="ac-card ' + cls + '">' +
-    '<div><div class="ac-name">' + esc(index + 1) + '. ' + esc(name) + '</div>' +
-    '<div class="ac-reason">' + esc(reason) + '</div>' +
-    (meta ? '<div class="ac-meta">' + esc(meta) + '</div>' : '') + '</div>' +
-    (btns ? '<div class="ac-btns">' + btns + '</div>' : '') +
-    '</div>';
-}
 
 function fmt(key, vars) {
   return t(key).replace(/\\{(\\w+)\\}/g, (_, name) => vars[name] ?? '');
 }
 
-function shortFileList(files, max = 3) {
-  const names = (files || []).slice(0, max).map(f => basename(f));
-  const extra = Math.max(0, (files || []).length - max);
-  return extra > 0 ? names.concat('+' + extra).join(', ') : names.join(', ');
-}
 
-function sessionImpact(s) {
-  const files = s.sessionFiles || s.recentFiles || [];
-  const docsFiles = files.filter(f => /(^|\\/)(README[^\\/]*|docs\\/)|\\.(md|mdx)$/i.test(f));
-  const apiFiles = files.filter(f => /(^|\\/)(app|src\\/app|pages|src\\/pages)\\/api\\/|(^|\\/)api\\/.*\\.[tj]s$|(^|\\/)routes\\/.*\\.[tj]s$|\\/route\\.[tj]s$/i.test(f));
-  const dashboardFiles = files.filter(f => /(^|\\/)packages\\/cli\\/src\\/dashboard(?:-[^\\/]*)?\\.[tj]s$|(^|\\/)packages\\/cli\\/src\\/dashboard\\//i.test(f));
-  const configFiles = files.filter(f => /(^|\\/)(package\\.json|pnpm-lock\\.yaml|package-lock\\.json|yarn\\.lock|tsconfig[^\\/]*\\.json|vite\\.config\\.[tj]s|next\\.config\\.[tj]s|eslint\\.config\\.[tj]s|\\.env[^\\/]*)$/i.test(f) || /(^|\\/)config\\//i.test(f));
-  const cliFiles = files.filter(f => /^packages\\/cli\\/src\\/.+\\.[tj]s$/i.test(f) && !dashboardFiles.includes(f));
-  const primary =
-    apiFiles.length > 0 ? { key: 'api', label: t('architectureApiChanged'), files: apiFiles } :
-    cliFiles.length > 0 ? { key: 'cli', label: t('architectureCliChanged'), files: cliFiles } :
-    dashboardFiles.length > 0 ? { key: 'dashboard', label: t('architectureDashboardChanged'), files: dashboardFiles } :
-    configFiles.length > 0 ? { key: 'config', label: t('architectureConfigChanged'), files: configFiles } :
-    docsFiles.length > 0 ? { key: 'docs', label: t('architectureDocsChanged'), files: docsFiles } :
-    { key: 'none', label: t('architectureNoMajorChanges'), files: [] };
-  return {
-    files,
-    docsFiles,
-    apiFiles,
-    configFiles,
-    dashboardFiles,
-    cliFiles,
-    architecture: apiFiles.length + cliFiles.length + dashboardFiles.length + configFiles.length,
-    architectureText: primary.label,
-    primaryImpact: primary.key,
-    evidenceFiles: primary.files
-  };
-}
 
-function qualityReason(s, blocked) {
-  const q = s.reports.qualitySummary || {};
-  if (blocked) {
-    if (q.blockedCount > 0) return fmt('reasonBlockedCount', { count: q.blockedCount });
-    if (q.warningCount > 0) return fmt('reasonWarningsDetected', { count: q.warningCount });
-    return t('actionReasonBlocked');
-  }
-  if (q.warningCount > 0) return fmt('reasonWarningsDetected', { count: q.warningCount });
-  if (q.requiredVerificationCount > 0) return fmt('reasonVerificationCount', { count: q.requiredVerificationCount });
-  return t('actionReasonNeedsReview');
-}
 
-function knowledgeReason(s, impact) {
-  if (!s.knowledge.exists) return t('actionReasonKnowledgeMissing');
-  if (impact.evidenceFiles.length > 0) {
-    return fmt('reasonChangedFiles', { files: shortFileList(impact.evidenceFiles, 2) });
-  }
-  return t('actionReasonKnowledgeReady');
-}
 
-function handoffReason(s, impact) {
-  const count = s.sessionFileCount || impact.files.length || 0;
-  return count > 0 ? fmt('reasonFilesChanged', { count }) : t('actionReasonHandoff');
-}
 
-function impactEvidence(impact) {
-  if (!impact.evidenceFiles.length) return [t('summaryNoImpactEvidence')];
-  return impact.evidenceFiles.slice(0, 3).map(file => fmt('summaryFileChanged', { file: basename(file) }));
-}
 
-function recommendedActions(s) {
-  const impact = sessionImpact(s);
-  const promptExists = s.reports.nextClaudePromptExists || s.reports.nextCodexPromptExists;
-  const promptKey = s.reports.nextClaudePromptExists ? 'nextclaude' : s.reports.nextCodexPromptExists ? 'nextcodex' : null;
-  const knowledgeActionReason = knowledgeReason(s, impact);
-  const handoffActionReason = handoffReason(s, impact);
-  const actions = [];
-  if (s.qualityVerdict === 'BLOCKED') {
-    actions.push({ name: t('actionReviewQuality'), reason: qualityReason(s, true), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
-    actions.push({ name: t('reviewComplete'), reason: t('actionReasonReviewComplete'), avail: true, onClick: 'completeReview(this)' });
-    actions.push({ name: t('knowledgeTitle'), reason: knowledgeActionReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
-    actions.push({ name: t('actionPromptTitle'), reason: t('actionReasonPromptFix'), avail: promptExists, openKey: promptKey, copyKey: promptKey });
-    return actions;
-  }
-  if (s.qualityVerdict === 'NEEDS_REVIEW') {
-    actions.push({ name: t('actionReviewQuality'), reason: qualityReason(s, false), avail: s.reports.qualityReportExists, openKey: 'quality', primary: true });
-    actions.push({ name: t('actionContinueWorking'), reason: t('actionReasonContinue'), avail: promptExists, openKey: promptKey, copyKey: promptKey });
-    actions.push({ name: t('knowledgeTitle'), reason: knowledgeActionReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
-    actions.push({ name: t('actionHandoffTitle'), reason: handoffActionReason, avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
-    return actions;
-  }
-  actions.push({ name: t('actionContinueFeature'), reason: t('actionReasonPass'), avail: promptExists, openKey: promptKey, copyKey: promptKey, primary: true });
-  actions.push({ name: t('knowledgeTitle'), reason: knowledgeActionReason, avail: s.knowledge.exists, openKey: 'knowledge', copyKey: 'knowledge', meta: impact.architectureText });
-  actions.push({ name: t('actionHandoffTitle'), reason: handoffActionReason, avail: s.reports.handoffExists, openKey: 'handoff', copyKey: 'handoff' });
-  return actions;
-}
 
-function quickActionButton(label, key, opts = {}) {
-  const cls = 'quick-btn' + (opts.primary ? ' primary' : '');
-  if (!opts.available) return '<button class="' + cls + '" disabled>' + esc(label) + '</button>';
-  if (opts.settings) return '<button class="' + cls + '" onclick="toggleSettings()">' + esc(label) + '</button>';
-  return '<a class="' + cls + '" href="/api/file?path=' + esc(key) + '" target="_blank" rel="noopener">' + esc(label) + '</a>';
-}
 
-function toggleSettings() {
-  settingsOpen = !settingsOpen;
-  const panel = document.getElementById('settingsPanel');
-  if (panel) panel.open = settingsOpen;
-}
 
 function rememberDetails(name, open) {
-  if (name === 'settings') settingsOpen = open;
-  if (name === 'advanced') advancedOpen = open;
   if (name.startsWith('preview:')) previewOpen[name.slice(8)] = open;
 }
 
-function assistantPromptLines(s) {
-  if (s.qualityVerdict === 'BLOCKED') {
-    return [t('promptBlockedQuality'), t('promptBlockedValidate'), t('promptBlockedComplete')];
-  }
-  if (s.qualityVerdict === 'NEEDS_REVIEW') {
-    return [t('promptNeedsReviewReport'), t('promptNeedsReviewContinue')];
-  }
-  return [t('promptPassContinue')];
-}
 
-function sessionSummaryItems(s) {
-  const impact = sessionImpact(s);
-  const quality = s.qualityVerdict === 'PASS' ? t('verdictHealthy') : s.qualityVerdict === 'BLOCKED' ? t('verdictBlocked') : s.qualityVerdict === 'NEEDS_REVIEW' ? t('verdictReview') : t('verdictUnknown');
-  const q = s.reports.qualitySummary || {};
-  const fileEvidence = impact.files.length ? impact.files.slice(0, 3).map(f => basename(f)) : [t('summaryNoFiles')];
-  const qualityEvidence = q.blockedCount > 0
-    ? [fmt('reasonBlockedCount', { count: q.blockedCount })]
-    : q.warningCount > 0
-      ? [fmt('reasonWarningsDetected', { count: q.warningCount })]
-      : q.requiredVerificationCount > 0
-        ? [fmt('reasonVerificationCount', { count: q.requiredVerificationCount })]
-        : [t('summaryNoQualityIssues')];
-  return [
-    { label: t('summaryChanged'), value: String(s.sessionFileCount || impact.files.length || 0), evidence: fileEvidence },
-    { label: t('summaryQuality'), value: quality, evidence: qualityEvidence },
-    { label: t('summaryImpact'), value: impact.architectureText, evidence: impactEvidence(impact) }
-  ];
-}
 
-function nextActionView(s, v) {
-  if (Date.now() < reviewCompleteUntil) {
-    return {
-      cls: 'pass',
-      icon: '✓',
-      title: t('reviewCompletedTitle'),
-      body: t('reviewCompletedBody')
-    };
-  }
-  if (s.qualityVerdict === 'BLOCKED') {
-    return {
-      cls: 'blocked',
-      icon: '⛔',
-      title: t('reviewRequiredTitle'),
-      body: t('reviewRequiredBody'),
-      primary: t('openQualityReport'),
-      primaryHref: '/api/file?path=quality',
-      complete: true,
-      steps: [t('reviewStepReport'), t('reviewStepRunApp'), t('reviewStepComplete')]
-    };
-  }
-  if (s.qualityVerdict === 'NEEDS_REVIEW') {
-    return {
-      cls: 'warn',
-      icon: '!',
-      title: t('reviewRecommendedTitle'),
-      body: t('reviewRecommendedBody'),
-      primary: s.reports.qualityReportExists ? t('openQualityReport') : null,
-      primaryHref: '/api/file?path=quality',
-      steps: [t('reviewStepReport'), t('reviewStepRunApp'), t('reviewStepContinue')]
-    };
-  }
-  if (s.qualityVerdict === 'PASS' && (s.status === 'idle' || s.status === 'processed')) {
-    return {
-      cls: 'pass',
-      icon: '✓',
-      title: t('monitoringReadyTitle'),
-      body: '',
-      steps: [t('reviewStepContinue')]
-    };
-  }
-  return {
-    cls: s.status === 'working' || s.status === 'ready_for_done' || s.status === 'finalizing' ? 'warn' : '',
-    icon: s.status === 'working' || s.status === 'ready_for_done' || s.status === 'finalizing' ? '…' : '✓',
-    title: t('nextActionTitle'),
-    body: v.next
-  };
-}
 
 /* ─ Advanced report block ─ */
 function rptBlock(key, name, description, exists, updatedAt, preview) {
@@ -1530,240 +1201,26 @@ function rptBlock(key, name, description, exists, updatedAt, preview) {
     '</div>';
 }
 
-/* ─ Timeline icon/label ─ */
-function tlIcon(type) { return type==='session' ? '✓' : type==='watch_start' ? '◉' : '·'; }
-function tlLabel(type) { return type==='session' ? t('timelineSession') : type==='watch_start' ? t('timelineWatchStart') : t('timelineFileChange'); }
 
-/* ─ Main render ─ */
-function render(s) {
-  s = normalizeDashboardState(s);
-  applyServerLocale(s.locale);
-  last = s;
-  const v = statusView(s);
-
-  /* Status banner */
-  const banner = '<div class="banner ' + esc(v.cls) + '">' +
-    '<div class="banner-icon" aria-hidden="true">' + v.icon + '</div>' +
-    '<div class="banner-text"><div class="section-label">' + esc(t('statusSectionTitle')) + '</div><div class="banner-title">' + esc(v.title) + '</div>' +
-    '<div class="banner-body">' + esc(v.body) + '</div>' +
-    (v.cmd ? '<code class="banner-cmd">' + esc(v.cmd) + '</code>' : '') +
-    '</div></div>';
-
-  const setupList = s.setup?.active
-    ? '<div class="setup-list">' + (s.setup.steps || []).map(step => {
-        const mark = step.status === 'done' ? '✓' : step.status === 'warning' ? '!' : step.status === 'running' ? '…' : '○';
-        const cls = step.status === 'warning' ? ' warning' : '';
-        return '<div class="setup-item' + cls + '"><span class="setup-mark">' + esc(mark) + '</span><span>' + esc(step.label) + '</span></div>';
-      }).join('') + '</div>'
-    : '';
-
-  /* Action Center — always shown, cards disabled when file missing */
-  const handoffSub = s.reports.handoffExists
-    ? (s.reports.handoffUpdatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.reports.handoffUpdatedAt) : t('actionHandoffSubAvail'))
-    : t('actionHandoffSubMissing');
-  const qualitySub = s.reports.qualityReportExists
-    ? (s.reports.qualityReportUpdatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.reports.qualityReportUpdatedAt) : t('actionQualitySubAvail'))
-    : t('actionQualitySubMissing');
-  const contextSub = s.reports.agentContextExists
-    ? (s.reports.agentContextUpdatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.reports.agentContextUpdatedAt) : t('actionContextSubAvail'))
-    : t('actionContextSubMissing');
-  const promptExists = s.reports.nextClaudePromptExists || s.reports.nextCodexPromptExists;
-  const promptUpdatedAt = s.reports.nextClaudePromptUpdatedAt || s.reports.nextCodexPromptUpdatedAt;
-  const promptSub = promptExists
-    ? (promptUpdatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(promptUpdatedAt) : t('actionPromptSubAvail'))
-    : t('actionPromptSubMissing');
-  const promptOpenKey = s.reports.nextClaudePromptExists ? 'nextclaude' : s.reports.nextCodexPromptExists ? 'nextcodex' : null;
-  const promptCopyKey = promptOpenKey;
-  const knowledgeSub = s.knowledge.exists
-    ? t('knowledgeReady') + ' · ' + s.knowledge.filesIndexed + ' ' + t('knowledgeFiles') + ' · ' + s.knowledge.architectureModules + ' ' + t('knowledgeModules')
-    : t('knowledgeMissing');
-  const knowledgeHint = s.knowledge.exists
-    ? (s.knowledge.updatedAt ? t('actionUpdatedPrefix') + ' ' + relativeTime(s.knowledge.updatedAt) : s.knowledge.framework || null)
-    : t('knowledgeHint');
-  const actions = recommendedActions(s);
-  const quickActions = '<div class="quick-bar">' +
-    '<div class="quick-title">' + esc(t('quickActionsTitle')) + '</div>' +
-    '<div class="quick-actions">' +
-    quickActionButton(t('actionQualityTitle'), 'quality', { available: s.reports.qualityReportExists, primary: s.qualityVerdict === 'NEEDS_REVIEW' || s.qualityVerdict === 'BLOCKED' }) +
-    quickActionButton(t('actionHandoffTitle'), 'handoff', { available: s.reports.handoffExists }) +
-    quickActionButton(t('actionWorkingTitle'), 'working', { available: s.reports.workingContextExists }) +
-    quickActionButton(t('actionContextTitle'), 'context', { available: s.reports.agentContextExists }) +
-    quickActionButton(t('knowledgeTitle'), 'knowledge', { available: s.knowledge.exists }) +
-    quickActionButton(t('settingsTitle'), '', { available: true, settings: true }) +
-    '</div></div>';
-
-  const openAISettings = '<div class="settings-panel"><details id="settingsPanel"' + (settingsOpen ? ' open' : '') + ' ontoggle="rememberDetails(\\'settings\\', this.open)"><summary>' + esc(t('settingsTitle')) + '</summary><div class="settings-body">' +
-    '<div class="card openai-card"><div class="card-title">' + esc(t('openAIKeyTitle')) + '</div>' +
-    '<div class="activity-row"><span class="activity-label">' + esc(t('openAIKeyStatus')) + '</span><span class="activity-value">' +
-    esc(s.openAI.configured ? t('openAIKeyConfigured') : t('openAIKeyNotConfigured')) + '</span></div>' +
-    '<div class="setting-help">' + esc(s.openAI.configured ? t('openAIKeyConfiguredHelp') : t('openAIKeyMissingHelp')) + '</div>' +
-    '<div class="setting-actions">' +
-    '<button class="mini-btn" onclick="setOpenAIKey(this)">' + esc(s.openAI.configured ? t('openAIKeyUpdate') : t('openAIKeySet')) + '</button>' +
-    (s.openAI.configured && s.openAI.source === 'config' ? '<button class="mini-btn ghost" onclick="removeOpenAIKey(this)">' + esc(t('openAIKeyRemove')) + '</button>' : '') +
-    '</div></div>' +
-    '<div class="card"><div class="card-title">' + esc(t('dashboardSettingsTitle')) + '</div>' +
-    '<div class="activity-row"><span class="activity-label">' + esc(t('language')) + '</span><span class="activity-value">' + esc(s.locale || t('unknown')) + '</span></div>' +
-    '<div class="activity-row"><span class="activity-label">' + esc(t('internalStatus')) + '</span><span class="activity-value">' + esc(s.status || '—') + '</span></div>' +
-    '</div></div></details></div>';
-
-  /* Activity card */
-  const actRows = [
-    s.watchingSince ? '<div class="activity-row"><span class="activity-label">' + esc(t('sessionStarted')) + '</span><span class="activity-value">' + esc(s.watchingSince) + '</span></div>' : '',
-    s.lastActivity  ? '<div class="activity-row"><span class="activity-label">' + esc(t('lastChange')) + '</span><span class="activity-value">' + esc(ago(s.lastActivity)) + '</span></div>' : '',
-    s.changeCount > 0 ? '<div class="activity-row"><span class="activity-label">' + esc(t('changesCount')) + '</span><span class="activity-value">' + esc(s.changeCount) + '</span></div>' : ''
-  ].filter(Boolean).join('');
-  const actCard = '<div class="card"><div class="card-title">' + esc(t('currentActivityTitle')) + '</div>' +
-    '<div class="activity-what">' + esc(v.activity) + '</div>' + actRows + '</div>';
-
-  /* Files card */
-  let filesHtml = !s.recentFiles.length
-    ? '<div class="no-files"><strong>' + esc(t('noRecentFilesTitle')) + '</strong>' + esc(t('noRecentFilesBody')) + '</div>'
-    : '<div class="file-list">' + s.recentFiles.map(f =>
-        '<div class="file-item"><div class="file-dot"></div><div class="file-text"><div class="file-name">' + esc(basename(f)) + '</div>' +
-        (dirname(f) ? '<div class="file-path">' + esc(dirname(f)) + '</div>' : '') + '</div></div>'
-      ).join('') + '</div>' + (s.moreFileCount > 0 ? '<div class="file-more">+' + esc(s.moreFileCount) + ' ' + esc(t('moreFiles')) + '</div>' : '');
-  const filesCard = '<div class="card"><div class="card-title">' + esc(t('recentChangesTitle')) + '</div>' + filesHtml + '</div>';
-
-  /* Today's progress card */
-  const todayHas = s.todayStats.sessions > 0;
-  const statItems = [
-    { label: t('todaySessionsLabel'),   value: todayHas ? s.todayStats.sessions         : t('todayNone') },
-    { label: t('todayFilesLabel'),      value: todayHas ? s.todayStats.filesChanged      : t('todayNone') },
-    { label: t('todayReportsLabel'),    value: todayHas ? s.todayStats.reportsGenerated  : t('todayNone') },
-    { label: t('todayLastUpdateLabel'), value: todayHas ? s.todayStats.lastUpdate        : t('todayNone') }
-  ];
-  const progressCard = '<div class="card"><div class="card-title">' + esc(t('todayProgressTitle')) + '</div>' +
-    '<div class="stat-row">' + statItems.map(i => '<div class="stat-item"><div class="stat-value">' + esc(i.value) + '</div><div class="stat-label">' + esc(i.label) + '</div></div>').join('') + '</div></div>';
-
-  /* Recent sessions card */
-  let sessionsHtml;
-  if (!s.sessions.length) {
-    sessionsHtml = '<div class="no-sessions"><strong>' + esc(t('noSessionsTitle')) + '</strong><p>' + esc(t('noSessionsBody')) + '</p></div>';
-  } else {
-    const groups = {};
-    for (const sess of s.sessions) { const d = dayLabel(sess.timestamp); if (!groups[d]) groups[d] = []; groups[d].push(sess); }
-    sessionsHtml = Object.entries(groups).map(([day, items]) =>
-      '<div class="sessions-day">' + esc(day) + '</div>' +
-      items.map(sess => {
-        const vi = verdictInfo(sess.qualityVerdict);
-        return '<div class="session-row">' +
-          '<div class="session-dot ' + vi.cls + '"></div>' +
-          '<div class="session-time">' + esc(shortTime(sess.timestamp)) + '</div>' +
-          '<div class="session-label">' + esc(sessionLabel(sess.areas)) + '</div>' +
-          '<div class="session-meta"><span class="session-files">' + esc(sess.fileCount) + ' ' + esc(t('sessionFiles')) + '</span>' +
-          (sess.qualityVerdict ? '<span class="session-verdict ' + vi.cls + '">' + esc(vi.text) + '</span>' : '') +
-          '</div></div>';
-      }).join('')
-    ).join('');
-  }
-  const sessionsCard = '<div class="card"><div class="card-title">' + esc(t('recentSessionsTitle')) + '</div>' + sessionsHtml + '</div>';
-
-  /* Health card */
-  const qh = qualityHealth(s.qualityVerdict);
-  const ch = boolHealth(s.reports.agentContextExists);
-  const rh = reportsHealth(s);
-  const trendDots = s.qualityTrend.length
-    ? '<div class="trend-dots"><span class="trend-label">' + esc(t('qualityTrendTitle')) + '</span><div class="trend-list">' +
-      s.qualityTrend.map(item => {
-        const cls = item.verdict==='PASS' ? 'pass' : item.verdict==='BLOCKED' ? 'bad' : 'warn';
-        return '<div class="trend-dot ' + cls + '" title="' + esc(shortTime(item.timestamp)) + '"></div>';
-      }).join('') + '</div></div>' : '';
-  const healthCard = '<div class="card"><div class="card-title">' + esc(t('healthTitle')) + '</div>' +
-    '<div class="health-list">' +
-    '<div class="health-row"><span class="health-label">' + esc(t('healthQuality')) + '</span>' + healthBadge(qh) + '</div>' +
-    '<div class="health-row"><span class="health-label">' + esc(t('healthContext')) + '</span>' + healthBadge(ch) + '</div>' +
-    '<div class="health-row"><span class="health-label">' + esc(t('healthReports')) + '</span>' + healthBadge(rh) + '</div>' +
-    '</div>' + trendDots + '</div>';
-
-  const summaryCard = '<div class="card"><div class="card-title">' + esc(t('sessionSummaryTitle')) + '</div>' +
-    '<div class="summary-grid">' + sessionSummaryItems(s).map(item =>
-      '<div class="summary-item"><div class="summary-value">' + esc(item.value) + '</div><div class="summary-label">' + esc(item.label) + '</div>' +
-      '<div class="summary-evidence">' + (item.evidence || []).map(line => '<div>' + esc(line) + '</div>').join('') + '</div></div>'
-    ).join('') + '</div></div>';
-
-  /* Next action card */
-  const na = nextActionView(s, v);
-  const reviewSteps = na.steps?.length
-    ? '<div class="review-steps">' + na.steps.map((step, i) => '<div class="review-step"><span>' + (i + 1) + '</span>' + esc(step) + '</div>').join('') + '</div>'
-    : '';
-  const nextButtons = (na.primary || na.complete)
-    ? '<div class="next-actions">' +
-      (na.primary ? '<a class="next-btn primary" href="' + esc(na.primaryHref) + '" target="_blank" rel="noopener">' + esc(na.primary) + '</a>' : '') +
-      (na.complete ? '<button class="next-btn danger" onclick="completeReview(this)">' + esc(t('reviewComplete')) + '</button>' : '') +
-      '</div><div id="reviewMessage" class="review-message" aria-live="polite"></div>'
-    : '';
-  const nextCard = '<div class="next-card ' + esc(na.cls) + '">' +
-    '<div class="section-label">' + esc(t('nextActionTitle')) + '</div>' +
-    '<div class="next-top"><div class="next-icon" aria-hidden="true">' + esc(na.icon) + '</div><div>' +
-    '<div class="next-title">' + esc(na.title) + '</div>' +
-    (na.body ? '<div class="next-body">' + esc(na.body) + '</div>' : '') +
-    reviewSteps + nextButtons +
-    '</div></div></div>';
-
-  /* Timeline */
-  const tlHtml = !s.timeline.length
-    ? '<div class="tl-empty">' + esc(t('timelineEmpty')) + '</div>'
-    : '<div class="tl-list">' + s.timeline.map(ev =>
-        '<div class="tl-item"><div class="tl-icon ' + esc(ev.type) + '">' + esc(tlIcon(ev.type)) + '</div>' +
-        '<div><div class="tl-event">' + esc(tlLabel(ev.type)) + '</div><div class="tl-time">' + esc(shortTime(ev.time)) + '</div></div></div>'
-      ).join('') + '</div>';
-  const timelineCard = '<div class="card"><div class="card-title">' + esc(t('timelineTitle')) + '</div>' + tlHtml + '</div>';
-
-  /* Advanced details */
-  const advItems = [
-    { label: t('sessionDuration'), value: dash(s.elapsed) },
-    { label: t('internalStatus'), value: s.status || '—' },
-    { label: t('idleCountdown'), value: s.idleCountdown || t('noCountdown') }
-  ];
-  const advanced = '<div class="adv-wrap"><details id="advancedDetails"' + (advancedOpen ? ' open' : '') + ' ontoggle="rememberDetails(\\'advanced\\', this.open)">' +
-    '<summary>' + esc(t('advancedTitle')) + '</summary>' +
-    '<div class="adv-body">' +
-    '<div class="adv-grid">' + advItems.map(i => '<div class="adv-item"><div class="adv-label">' + esc(i.label) + '</div><div class="adv-value">' + esc(i.value) + '</div></div>').join('') + '</div>' +
-    '<div class="rpt-grid">' +
-    rptBlock('quality', t('reportQuality'), t('reportQualityDesc'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
-    rptBlock('handoff', t('reportHandoff'), t('reportHandoffDesc'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
-    rptBlock('working', t('reportWorking'), t('reportWorkingDesc'), s.reports.workingContextExists, s.reports.workingContextUpdatedAt, s.reports.workingContextPreview) +
-    rptBlock('context', t('reportContext'), t('reportContextDesc'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
-    '</div>' +
-    '<div class="gap g2w" style="margin-top:12px">' + actCard + filesCard + '</div>' +
-    '<div class="gap g2w" style="margin-top:12px">' + sessionsCard + progressCard + '</div>' +
-    '<div class="gap g2" style="margin-top:12px">' + healthCard + timelineCard + '</div>' +
-    '</div></details></div>';
-
-  root.innerHTML =
-    banner + nextCard + setupList + quickActions + summaryCard + openAISettings +
-    advanced;
-}
-
-async function tick() {
-  try {
-    const res = await fetch('/api/state', { cache: 'no-store' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    render(await res.json());
-    ts.textContent = t('dashboardUpdated') + ' ' + new Date().toLocaleTimeString(lang==='ko'?'ko-KR':'en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12: false });
-  } catch (e) {
-    root.innerHTML = '<div class="err"><div class="err-title">' + esc(t('dashboardUnavailableTitle')) + '</div><div class="err-msg">' + esc(e.message) + '</div></div>';
-  }
-}
-
-// ── Context Efficiency panel (polled separately, every 15s) ──
-// Problem-first: NOW (health / issue / action / thread) → current task
-// (4 numbers + focus) → one "where context went" bar → details (collapsed).
-const effRoot = document.getElementById('efficiency');
-let effLast = null;
-let effDetailsOpen = false;
+/* ─ Main render: NOW → THIS TASK → CONTEXT FLOW → DETAILS ─ */
+// One poll (/api/overview) answers the five-second questions (health,
+// task, thread, biggest problem, next action) from the server-side
+// overview; everything else is in collapsed details with bounded lists.
 const CAT_ORDER = ['MCP','FALLBACK_DOCS','SEARCH','CODE_READS','CODE_EDITS','VALIDATION','ADMIN','OTHER'];
 const CAT_COLOR = { MCP:'#2563eb', FALLBACK_DOCS:'#d97706', SEARCH:'#dc2626', CODE_READS:'#0891b2', CODE_EDITS:'#16a34a', VALIDATION:'#7c3aed', ADMIN:'#64748b', OTHER:'#cbd5e1' };
 const GROUP_ORDER = ['CODE','SEARCH','DEVGUARD','VALIDATION','CONTEXT_MANAGEMENT','OTHER'];
 const GROUP_COLOR = { DEVGUARD:'#2563eb', CODE:'#16a34a', SEARCH:'#dc2626', VALIDATION:'#7c3aed', CONTEXT_MANAGEMENT:'#d97706', OTHER:'#cbd5e1' };
 const MODE_ORDER = ['IMPLEMENTATION','EXPLORATION','VALIDATION','CONTEXT_ADMIN','RESUME_RECOVERY','OTHER'];
 const TL_COLOR = { TASK_PREPARED:'#2563eb', TASK_DONE:'#16a34a', VALIDATION:'#7c3aed', ROLLOVER_SOON:'#d97706', ROLLOVER_RECOMMENDED:'#dc2626', NEW_THREAD:'#0891b2', COMPACTION:'#111318' };
-function fmtTok(n) { n = n || 0; return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'K' : String(n); }
+const LIST_LIMIT = 12;
+const detailsOpen = {};
+// Estimates never show more precision than they have: ~18K, ~900.
+function fmtApprox(n) { n = n || 0; return '~' + (n >= 1000 ? Math.round(n / 1000) + 'K' : String(Math.round(n / 100) * 100)); }
 function pct(part, total) { return total > 0 ? Math.round(part / total * 100) : 0; }
 function issueText(i) { if (!i) return ''; const k = 'iss_' + i.id + (i.id === 'CONTEXT_PRESSURE' ? '_' + i.severity : ''); return STRINGS[lang]?.[k] && lang !== 'en' ? t(k) : i.issue; }
 function actionText(i) { if (!i) return ''; const k = ['act_' + i.id + (i.cause ? '_' + i.cause : ''), 'act_' + i.id].find((key) => STRINGS[lang]?.[key]); return k && lang !== 'en' ? t(k) : i.action; }
 function stackBar(costs, total, widthPct, order, colors, prefix) {
-  const segs = order.filter(c => (costs[c] || 0) > 0).map(c => '<span title="' + esc(t(prefix + c) + ': ' + fmtTok(costs[c]) + ' (' + pct(costs[c], total) + '%)') + '" style="width:' + (costs[c] / total * 100).toFixed(2) + '%;background:' + colors[c] + '"></span>').join('');
+  const segs = order.filter(c => (costs[c] || 0) > 0).map(c => '<span title="' + esc(t(prefix + c) + ': ' + fmtApprox(costs[c]) + ' (' + pct(costs[c], total) + '%)') + '" style="width:' + (costs[c] / total * 100).toFixed(2) + '%;background:' + colors[c] + '"></span>').join('');
   return '<div class="stack" style="width:' + (widthPct || 100) + '%">' + segs + '</div>';
 }
 function legendFor(costs, total, order, colors, prefix) {
@@ -1782,82 +1239,181 @@ function timelineSvg(tl) {
   const marks = evs.map(e => '<line x1="' + x(e.ts).toFixed(1) + '" x2="' + x(e.ts).toFixed(1) + '" y1="8" y2="120" stroke="' + (TL_COLOR[e.type] || '#999') + '" stroke-width="' + (e.type === 'COMPACTION' ? 2 : 1) + '"><title>' + esc(t('tl' + e.type) + (e.detail ? ' — ' + e.detail : '') + ' · ' + new Date(e.ts).toLocaleString()) + '</title></line>').join('');
   const types = [...new Set(evs.map(e => e.type))];
   return '<svg viewBox="0 0 600 130" preserveAspectRatio="none" role="img" aria-label="' + esc(t('effTimelineTitle')) + '">' + marks +
-    '<polyline points="' + line + '" fill="none" stroke="#111318" stroke-width="1.6"/></svg>' +
+    '<polyline points="' + line + '" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>' +
     '<div class="legend">' + types.map(k => '<span><i style="background:' + TL_COLOR[k] + '"></i>' + esc(t('tl' + k)) + '</span>').join('') + '</div>';
 }
 function kv(label, value) { return '<dt>' + esc(label) + '</dt><dd>' + value + '</dd>'; }
-function renderEff(d) {
-  if (!d || d.error || !d.now) { effRoot.innerHTML = ''; return; }
-  const n = d.now; const ct = d.currentTask; const cur = d.current;
-  const health = n.health || 'GOOD';
-  const nowCard = '<section class="eff-now health-' + health + '" data-testid="eff-now">' +
-    '<div class="eff-now-top"><span class="eff-health" data-testid="eff-health">' + esc(t('health' + health)) + '</span>' +
-    '<span class="eff-task" data-testid="eff-task" title="' + esc(n.task || '') + '">' + esc(n.task || t('effNoTask')) + '</span></div>' +
-    '<div class="eff-issue" data-testid="eff-issue">' + esc(n.primaryIssue ? issueText(n.primaryIssue) : t('effNoIssue')) + '</div>' +
-    (n.primaryIssue ? '<div class="eff-why">' + esc(n.primaryIssue.why) + '</div>' : '') +
-    '<div class="eff-line"><span class="eff-label">' + esc(t('effAction')) + '</span><span data-testid="eff-action">' + esc(n.primaryIssue ? actionText(n.primaryIssue) : (n.thread.state === 'CONTINUE' ? t('effActionContinue') : t('effActionNewThread'))) + '</span></div>' +
-    '<div class="eff-line"><span class="eff-label">' + esc(t('effThread')) + '</span><span data-testid="eff-thread"><b class="roll-' + esc(n.thread.state) + '">' + esc(t('roll' + n.thread.state)) + '</b> — ' + esc(n.thread.reason) + '</span></div>' +
-    '</section>';
-  if (!ct) { effRoot.innerHTML = '<div class="eff-title">' + esc(t('effTitle')) + '</div>' + nowCard; return; }
-  const su = ct.suggestionsUsed;
-  const metrics = '<div class="eff-tiles" data-testid="eff-metrics">' +
-    '<div class="eff-tile"><div class="eff-k">' + esc(t('mSuggestions')) + '</div><div class="eff-v">' + (su ? su.used + ' / ' + su.of : '—') + '</div></div>' +
-    '<div class="eff-tile"><div class="eff-k">' + esc(t('mSearches')) + '</div><div class="eff-v">' + ct.repositorySearches.total + '</div><div class="eff-note">' + esc(ct.repositorySearches.broad + ' ' + t('mBroad')) + '</div></div>' +
-    '<div class="eff-tile"><div class="eff-k">' + esc(t('mOverhead')) + '</div><div class="eff-v">' + ct.contextOverheadPct + '%</div></div>' +
-    '<div class="eff-tile"><div class="eff-k">' + esc(t('mBlockers')) + '</div><div class="eff-v">' + ct.openBlockers + '</div></div>' +
-    '</div><div class="eff-focus"><b>' + esc(t('focus' + ct.focus.mode)) + '</b> — ' + esc(ct.focus.sentence) + '</div>';
-  const groups = ct.whereContextWent; const gTotal = Object.values(groups).reduce((a, b) => a + b, 0);
-  const where = '<div class="card" data-testid="eff-where"><div class="card-title">' + esc(t('effWhere')) + ' · ' + fmtTok(ct.estimatedContextTokens) + ' ' + esc(t('effEstShort')) + '</div>' +
-    (gTotal > 0 ? stackBar(groups, gTotal, 100, GROUP_ORDER, GROUP_COLOR, 'grp') + legendFor(groups, gTotal, GROUP_ORDER, GROUP_COLOR, 'grp') : '<div class="eff-note">' + esc(t('effNoActivity')) + '</div>') + '</div>';
-  const others = (n.otherIssues || []).length ? '<details class="eff-more"><summary>' + esc(t('effOtherSuggestions')) + ' (' + n.otherIssues.length + ')</summary><ul class="eff-recs">' +
-    n.otherIssues.map(i => '<li>' + esc(issueText(i)) + '<div class="why">' + esc(actionText(i)) + ' · ' + esc(i.why) + '</div></li>').join('') + '</ul></details>' : '';
-  // ── Details (collapsed) ──
-  let details = '';
-  if (cur) {
-    const recent = d.recent || [];
-    const maxTask = Math.max(1, ...recent.map(r => r.estTokens || 0));
-    const trend = '<div class="card"><div class="card-title">' + esc(t('effCostRecent')) + '</div>' +
-      recent.map(r => '<div class="eff-row"><span class="lbl" title="' + esc(r.label) + '">' + esc(r.label) + '</span>' + (r.estTokens > 0 ? stackBar(r.costByCategory, r.estTokens, Math.max(2, r.estTokens / maxTask * 100), CAT_ORDER, CAT_COLOR, 'cat') : '<div></div>') + '<span class="num">' + fmtTok(r.estTokens) + (r.sameThreadAsPrevious ? ' ↺' : '') + (r.compactions ? ' ⧉' + r.compactions : '') + '</span></div>').join('') +
-      legendFor(cur.costByCategory, cur.estTokens, CAT_ORDER, CAT_COLOR, 'cat') + '<div class="eff-legend-line">↺ ' + esc(t('effSameThread')) + ' · ⧉ ' + esc(t('tlCOMPACTION')) + '</div></div>';
-    const u = cur.candidateUtilization;
-    const prov = '<div class="card"><div class="card-title">' + esc(t('effProvidedTitle')) + '</div><dl class="eff-kv">' +
-      kv(t('effProvidedFiles'), cur.provided.files + (cur.provided.ranges != null ? ' · ' + cur.provided.ranges + ' ranges' : '')) +
-      kv(t('effUsedFiles'), cur.usedFiles) + kv(t('effUsedFromDevGuard'), cur.providedUsed) + kv(t('effDiscovered'), cur.nonProvidedUsed) +
-      kv(t('effUtil'), u ? u.used + ' / ' + u.of : '—') + kv(t('effUnusedReads'), cur.unusedSuggestionReads.files + ' · ~' + fmtTok(cur.unusedSuggestionReads.estTokens)) +
-      kv(t('effBroad'), cur.broadSearchCalls + ' / ' + cur.searchCalls) + kv(t('effSearchFirst'), esc(cur.searchBeforeProvidedRead ? t('effYes') : t('effNo'))) +
-      kv(t('effFallbackReads'), cur.fallbackDocReads) + kv(t('effPeakUse'), cur.peakContextUse != null ? Math.round(cur.peakContextUse * 100) + '%' : '—') +
-      '</dl></div>';
-    const modes = '<div class="card"><div class="card-title">' + esc(t('effModeTitle')) + '</div>' +
-      MODE_ORDER.filter(m => (cur.modeTokens[m] || 0) > 0).sort((a, b) => cur.modeTokens[b] - cur.modeTokens[a]).map(m => '<div class="eff-row"><span class="lbl">' + esc(t('mode' + m)) + '</span><div class="bar"><span style="width:' + pct(cur.modeTokens[m], cur.estTokens) + '%"></span></div><span class="num">' + pct(cur.modeTokens[m], cur.estTokens) + '%</span></div>').join('') + '</div>';
-    const tl = '<div class="card tl"><div class="card-title">' + esc(t('effTimelineTitle')) + '</div>' + timelineSvg(d.timeline || {}) + '<div class="eff-legend-line">' + esc(t('effTimelineNote')) + '</div></div>';
-    const c = d.taskCard;
-    const list = a => (a && a.length) ? a.map(x => esc(x)).join('<br>') : esc(t('effNone'));
-    const packet = c ? '<div class="card"><div class="card-title">' + esc(t('effTaskCardTitle')) + '</div><dl class="eff-kv">' +
-      kv(t('effGoal'), esc(c.goal)) + kv(t('effNext'), esc(c.nextAction || '—')) + kv(t('effTargets'), list(c.edit)) + kv(t('effCandidatesList'), list(c.candidates)) +
-      kv(t('effReference'), list(c.reference)) + kv(t('effProtected'), list(c.protected)) + kv(t('effOpen'), list(c.openValidation)) +
-      kv(t('effCarried'), c.carriedOver != null ? c.carriedOver : '—') + '</dl></div>' : '';
-    const src = '<div class="card"><div class="card-title">' + esc(t('effSources')) + '</div><dl class="eff-kv">' +
-      (d.sources || []).map(x => kv(x.provider, esc(x.available ? x.userThreads + ' ' + t('effUserThreads') + (x.subagentThreads ? ', ' + x.subagentThreads + ' ' + t('effSubagents') : '') : (x.note || '—')))).join('') +
-      '</dl><div class="eff-legend-line">' + esc(t('effLegend')) + '</div></div>';
-    details = '<details class="eff-details" data-testid="eff-details"' + (effDetailsOpen ? ' open' : '') + ' ontoggle="effDetailsOpen=this.open"><summary>' + esc(t('effViewDetails')) + '</summary><div class="eff-grid">' + trend + prov + modes + tl + packet + src + '</div></details>';
-  }
-  effRoot.innerHTML = '<div class="eff-title">' + esc(t('effTitle')) + '</div>' + nowCard + metrics + where + others + details;
+function boundedList(items) {
+  if (!items || !items.length) return esc(t('effNone'));
+  const shown = items.slice(0, LIST_LIMIT).map(x => esc(x)).join('<br>');
+  return items.length > LIST_LIMIT ? shown + '<br><span class="muted">' + esc(fmt('dMore', { n: items.length - LIST_LIMIT })) + '</span>' : shown;
 }
-async function tickEff() {
+function evidenceTag(kind) { return '<span class="ov-ev ev-' + esc(kind) + '" title="' + esc(t('evHelp_' + kind)) + '">' + esc(t('ev_' + kind)) + '</span>'; }
+function toggleDetails(el) { detailsOpen[el.dataset.key] = el.open; }
+function section(key, title, body) {
+  return '<details class="ov-sub" data-key="' + esc(key) + '"' + (detailsOpen[key] ? ' open' : '') + ' ontoggle="toggleDetails(this)"><summary>' + esc(title) + '</summary><div class="ov-sub-body">' + body + '</div></details>';
+}
+function fmt(key, vars) {
+  return t(key).replace(/[{](\\w+)[}]/g, (_, name) => vars[name] ?? '');
+}
+function metricValue(m) {
+  const v = m.value;
+  if (!v) return { main: '—', note: m.key === 'context' ? t('ovNotObservable') : t('ovNotRecorded') };
+  if (m.key === 'context') return { main: v.percent + '%' };
+  if (m.key === 'readPlan') return { main: v.required + ' ' + t('ovRequired') + ' / ' + v.optional + ' ' + t('ovOptional') };
+  if (m.key === 'suggestions') return { main: v.used + ' / ' + v.of };
+  if (m.key === 'validation') {
+    const parts = [];
+    if (v.pass) parts.push(v.pass + ' PASS');
+    if (v.fail) parts.push(v.fail + ' FAIL');
+    if (v.unknown) parts.push(v.unknown + ' UNKNOWN');
+    return parts.length ? { main: parts.join(' / ') } : { main: '—', note: t('ovNotRecorded') };
+  }
+  return { main: String(v.count) };
+}
+function metricTile(m) {
+  const v = metricValue(m);
+  return '<div class="ov-metric" data-metric="' + esc(m.key) + '"><div class="ov-k">' + esc(t('m_' + m.key)) + '</div>' +
+    '<div class="ov-v">' + esc(v.main) + '</div>' +
+    '<div class="ov-note">' + (v.note ? esc(v.note) + ' · ' : '') + evidenceTag(m.evidence) + '</div></div>';
+}
+function actionBlock(o, s) {
+  const a = o.action;
+  const text = a.id === 'FIX_ISSUE' ? actionText(o.issue) : t('ovAct_' + a.id);
+  let extra = '';
+  if (a.command) extra += ' <code class="ov-cmd">' + esc(a.command) + '</code>';
+  if (a.id === 'REVIEW_QUALITY' && Date.now() >= reviewCompleteUntil) {
+    extra += '<div class="ov-btns">' +
+      (s.reports.qualityReportExists ? '<a class="next-btn primary" href="/api/file?path=quality" target="_blank" rel="noopener">' + esc(t('openQualityReport')) + '</a>' : '') +
+      (s.qualityVerdict === 'BLOCKED' ? '<button class="next-btn danger" onclick="completeReview(this)">' + esc(t('reviewComplete')) + '</button>' : '') +
+      '</div><div id="reviewMessage" class="review-message" aria-live="polite"></div>';
+  }
+  return '<span data-testid="ov-action-text">' + esc(text) + '</span>' + extra;
+}
+
+function renderOverview(data) {
+  const s = normalizeDashboardState(data.state);
+  const o = data.overview;
+  const d = data.efficiency && !data.efficiency.error ? data.efficiency : null;
+  applyServerLocale(s.locale);
+  last = data;
+  if (!o) { root.innerHTML = ''; return; }
+
+  /* NOW — health, thread, task, primary issue, one action */
+  const now = '<section class="ov-now health-' + esc(o.health.level) + '" data-testid="ov-now">' +
+    '<div class="section-label">' + esc(t('ovNow')) + '</div>' +
+    '<div class="ov-pills">' +
+      '<div class="ov-pill health-' + esc(o.health.level) + '" data-testid="ov-health" title="' + esc(t('ovHealthReason_' + o.health.reason)) + '"><span class="ov-k">' + esc(t('ovHealth')) + '</span><b>' + esc(t('ovHealth_' + o.health.level)) + '</b></div>' +
+      '<div class="ov-pill thread-' + esc(o.thread.level) + '" data-testid="ov-thread" title="' + esc(o.thread.reason) + '"><span class="ov-k">' + esc(t('ovThread')) + '</span><b>' + esc(t('ovThread_' + o.thread.level)) + '</b></div>' +
+    '</div>' +
+    '<div class="ov-line"><span class="ov-k">' + esc(t('ovTask')) + '</span><div class="ov-task" data-testid="ov-task" title="' + esc(o.task || '') + '">' + esc(o.task || t('ovNoTask')) + '</div></div>' +
+    '<div class="ov-line"><span class="ov-k">' + esc(t('ovIssue')) + '</span><div class="ov-issue' + (o.issue ? ' has-issue' : '') + '" data-testid="ov-issue"' + (o.issue ? ' title="' + esc(o.issue.why) + '"' : '') + '>' + esc(o.issue ? issueText(o.issue) : t('ovNoIssue')) + '</div></div>' +
+    '<div class="ov-line ov-action"><span class="ov-k">' + esc(t('ovAction')) + '</span><div data-testid="ov-action">' + actionBlock(o, s) + '</div></div>' +
+    '</section>';
+
+  /* THIS TASK — at most five numbers */
+  const metrics = o.metrics.length
+    ? '<section class="ov-block" data-testid="ov-metrics"><div class="section-label">' + esc(t('ovTaskSection')) + '</div><div class="ov-metrics">' + o.metrics.map(metricTile).join('') + '</div></section>'
+    : '';
+
+  /* CONTEXT FLOW — the one chart */
+  let flow = '';
+  if (o.flow) {
+    const total = Object.values(o.flow.groups).reduce((a, b) => a + b, 0);
+    flow = '<section class="ov-block" data-testid="ov-flow"><div class="section-label">' + esc(t('ovFlow')) + ' · ' + esc(fmtApprox(o.flow.approxTokens)) + ' ' + evidenceTag('ESTIMATED') + '</div>' +
+      (total > 0 ? stackBar(o.flow.groups, total, 100, GROUP_ORDER, GROUP_COLOR, 'grp') + legendFor(o.flow.groups, total, GROUP_ORDER, GROUP_COLOR, 'grp') : '<div class="eff-note">' + esc(t('effNoActivity')) + '</div>') +
+      '<div class="eff-legend-line">' + esc(t('ovFlowNote')) + '</div></section>';
+  }
+
+  /* DETAILS — collapsed, each section bounded */
+  const cur = d?.current;
+  const card = d?.taskCard;
+  const sections = [];
+  if (card) {
+    sections.push(section('readplan', t('dReadPlan'), '<dl class="eff-kv">' +
+      kv(t('effGoal'), esc(card.goal)) + kv(t('effNext'), esc(card.nextAction || '—')) +
+      kv(t('effTargets'), boundedList(card.edit)) + kv(t('effCandidatesList'), boundedList(card.candidates)) +
+      kv(t('effReference'), boundedList(card.reference)) + kv(t('effProtected'), boundedList(card.protected)) +
+      kv(t('effCarried'), card.carriedOver != null ? esc(card.carriedOver) : '—') + '</dl>'));
+  }
+  if (cur) {
+    sections.push(section('lineage', t('dLineage'), '<dl class="eff-kv">' +
+      kv(t('dPlanOutside'), esc(cur.nonProvidedReads.files + ' · ' + fmtApprox(cur.nonProvidedReads.estTokens))) +
+      kv(t('dMissingScripts'), boundedList(cur.missingScripts || [])) +
+      kv(t('dGapCause'), esc(cur.executionGapCause || '—')) + '</dl>'));
+    sections.push(section('search', t('dSearch'), '<dl class="eff-kv">' +
+      kv(t('mSearches'), esc(cur.searchCalls)) + kv(t('effBroad'), esc(cur.broadSearchCalls + ' / ' + cur.searchCalls)) +
+      kv(t('effSearchFirst'), esc(cur.searchBeforeProvidedRead ? t('effYes') : t('effNo'))) +
+      kv(t('effFallbackReads'), esc(cur.fallbackDocReads)) + '</dl>'));
+  }
+  sections.push(section('validation', t('dValidation'), '<dl class="eff-kv">' +
+    (cur ? kv(t('m_validation'), esc(cur.validation.pass + ' PASS · ' + cur.validation.fail + ' FAIL · ' + cur.validation.unknown + ' UNKNOWN')) : '') +
+    (card ? kv(t('effFresh'), boundedList(card.freshValidation)) + kv(t('effOpen'), boundedList(card.openValidation)) : '') +
+    kv(t('dQuality'), esc(s.qualityVerdict || '—')) + '</dl>'));
+  if (d) {
+    const recent = (d.recent || []).slice(-8);
+    const maxTask = Math.max(1, ...recent.map(r => r.estTokens || 0));
+    sections.push(section('timeline', t('dTimeline'), timelineSvg(d.timeline || {}) +
+      recent.map(r => '<div class="eff-row"><span class="lbl" title="' + esc(r.label) + '">' + esc(r.label) + '</span>' + (r.estTokens > 0 ? stackBar(r.costByCategory, r.estTokens, Math.max(2, r.estTokens / maxTask * 100), CAT_ORDER, CAT_COLOR, 'cat') : '<div></div>') + '<span class="num">' + fmtApprox(r.estTokens) + (r.sameThreadAsPrevious ? ' ↺' : '') + (r.compactions ? ' ⧉' + r.compactions : '') + '</span></div>').join('') +
+      '<div class="eff-legend-line">↺ ' + esc(t('effSameThread')) + ' · ⧉ ' + esc(t('tlCOMPACTION')) + ' · ' + esc(t('effTimelineNote')) + '</div>'));
+  }
+  if (o.secondaryIssues.length) {
+    sections.push(section('issues', t('dIssues') + ' (' + o.secondaryIssues.length + ')', '<ul class="eff-recs">' +
+      o.secondaryIssues.map(i => '<li>' + esc(issueText(i)) + '<div class="why">' + esc(actionText(i)) + ' · ' + esc(i.why) + '</div></li>').join('') + '</ul>'));
+  }
+  const promptKey = s.reports.nextClaudePromptExists ? 'nextclaude' : s.reports.nextCodexPromptExists ? 'nextcodex' : null;
+  sections.push(section('artifacts', t('dArtifacts'), '<div class="rpt-grid">' +
+    rptBlock('quality', t('reportQuality'), t('reportQualityDesc'), s.reports.qualityReportExists, s.reports.qualityReportUpdatedAt, s.reports.qualityReportPreview) +
+    rptBlock('handoff', t('reportHandoff'), t('reportHandoffDesc'), s.reports.handoffExists, s.reports.handoffUpdatedAt, s.reports.handoffPreview) +
+    rptBlock('working', t('reportWorking'), t('reportWorkingDesc'), s.reports.workingContextExists, s.reports.workingContextUpdatedAt, s.reports.workingContextPreview) +
+    rptBlock('context', t('reportContext'), t('reportContextDesc'), s.reports.agentContextExists, s.reports.agentContextUpdatedAt, s.reports.agentContextPreview) +
+    '</div>' + (promptKey ? '<div class="ov-btns"><button class="mini-btn" onclick="copyFile(\\'' + promptKey + '\\', this)">' + esc(t('actionPromptTitle')) + ' — ' + esc(t('actionCopy')) + '</button></div>' : '')));
+  const v = statusView(s);
+  const steps = s.setup?.steps?.length ? '<div class="setup-list">' + s.setup.steps.map(step => '<div class="setup-item' + (step.status === 'warning' ? ' warning' : '') + '"><span class="setup-mark">' + esc(step.status === 'done' ? '✓' : step.status === 'warning' ? '!' : step.status === 'running' ? '…' : '○') + '</span><span>' + esc(step.label) + '</span></div>').join('') + '</div>' : '';
+  sections.push(section('setup', t('dSetup'), '<dl class="eff-kv">' +
+    kv(t('dWatch'), esc(v.title)) + kv(t('sessionDuration'), esc(dash(s.elapsed))) + kv(t('lastChange'), esc(ago(s.lastActivity))) +
+    kv(t('language'), esc(s.locale || t('unknown'))) +
+    (d ? (d.sources || []).map(x => kv(x.provider, esc(x.available ? x.userThreads + ' ' + t('effUserThreads') + (x.subagentThreads ? ', ' + x.subagentThreads + ' ' + t('effSubagents') : '') : (x.note || '—')))).join('') : '') +
+    kv(t('openAIKeyTitle'), esc(s.openAI.configured ? t('openAIKeyConfigured') : t('openAIKeyNotConfigured')) +
+      ' <button class="mini-btn" onclick="setOpenAIKey(this)">' + esc(s.openAI.configured ? t('openAIKeyUpdate') : t('openAIKeySet')) + '</button>' +
+      (s.openAI.configured && s.openAI.source === 'config' ? ' <button class="mini-btn ghost" onclick="removeOpenAIKey(this)">' + esc(t('openAIKeyRemove')) + '</button>' : '')) +
+    '</dl>' + steps));
+  const k = s.knowledge;
+  sections.push(section('project', t('dProject'), '<dl class="eff-kv">' +
+    kv(t('dFramework'), esc(k.framework || t('unknown'))) + kv(t('dWorkspaces'), esc(k.sourceRoots)) +
+    kv(t('dIndexed'), esc(k.filesIndexed)) + kv(t('dFreshness'), esc(k.updatedAt ? relativeTime(k.updatedAt) : t('knowledgeMissing'))) +
+    (k.coverage ? kv(t('dCoverage'), esc(Object.entries(k.coverage).map(([name, c]) => t('cov_' + name) + ' ' + c.kept + '/' + c.detected).join(' · '))) : '') +
+    '</dl>' + (k.exists ? '<div class="ov-btns"><a class="mini-btn" href="/api/file?path=knowledge" target="_blank" rel="noopener">' + esc(t('actionOpen')) + '</a></div>' : '')));
+  if (d) {
+    const u = cur?.candidateUtilization;
+    sections.push(section('raw', t('dRaw'), '<dl class="eff-kv">' +
+      kv('health', esc(d.now.health)) + kv('thread', esc(o.thread.raw + ' (' + o.thread.evidence + ') — ' + o.thread.reason)) +
+      kv('status', esc(s.status)) +
+      (cur ? kv(t('effProvidedFiles'), esc(cur.provided.files + (cur.provided.ranges != null ? ' · ' + cur.provided.ranges + ' ranges' : ''))) +
+        kv(t('effUsedFiles'), esc(cur.usedFiles)) + kv(t('effUsedFromDevGuard'), esc(cur.providedUsed)) + kv(t('effDiscovered'), esc(cur.nonProvidedUsed)) +
+        kv(t('effUtil'), esc(u ? u.used + ' / ' + u.of : '—')) + kv(t('effUnusedReads'), esc(cur.unusedSuggestionReads.files + ' · ' + fmtApprox(cur.unusedSuggestionReads.estTokens))) +
+        kv(t('effPeakUse'), esc(cur.peakContextUse != null ? Math.round(cur.peakContextUse * 100) + '%' : '—')) +
+        kv(t('effModeTitle'), esc(MODE_ORDER.filter(m => (cur.modeTokens[m] || 0) > 0).map(m => t('mode' + m) + ' ' + pct(cur.modeTokens[m], cur.estTokens) + '%').join(' · ') || '—')) : '') +
+      '</dl><div class="eff-legend-line">' + esc(t('effLegend')) + '</div>'));
+  }
+  const details = '<details class="ov-details" data-testid="ov-details" data-key="details"' + (detailsOpen.details ? ' open' : '') + ' ontoggle="toggleDetails(this)"><summary>' + esc(t('ovDetails')) + '</summary><div class="ov-details-body">' + sections.join('') + '</div></details>';
+
+  root.innerHTML = now + metrics + flow + details;
+}
+
+async function tick() {
   try {
-    const res = await fetch('/api/efficiency', { cache: 'no-store' });
+    const res = await fetch('/api/overview', { cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
-    effLast = await res.json();
-    renderEff(effLast);
+    renderOverview(await res.json());
+    ts.textContent = t('dashboardUpdated') + ' ' + new Date().toLocaleTimeString(lang==='ko'?'ko-KR':'en-US', { hour:'2-digit', minute:'2-digit', second:'2-digit', hour12: false });
   } catch (e) {
-    effRoot.innerHTML = '';
+    root.innerHTML = '<div class="err"><div class="err-title">' + esc(t('dashboardUnavailableTitle')) + '</div><div class="err-msg">' + esc(e.message) + '</div></div>';
   }
 }
 setLang(lang);
 tick();
-setInterval(tick, 1000);
-tickEff();
-setInterval(tickEff, 15000);
+setInterval(tick, 2000);
 </script>
 </body>
 </html>`;

@@ -340,6 +340,8 @@ export interface TaskCard {
   freshValidation: string[];
   openValidation: string[];
   carriedOver?: number;
+  /** Planned files: required first reads vs optional (if-needed) ones. */
+  readPlan?: { required: number; optional: number };
 }
 
 const ACTIVITY_LOOKBACK_MS = 14 * 86_400_000;
@@ -813,6 +815,7 @@ interface StoredTaskContext {
   scope?: { carriedOverDirtyFiles?: number };
   validation?: { freshForThisTask?: string[] };
   openValidation?: string[];
+  readPlan?: { required?: { files?: number }; ifNeeded?: { files?: number } };
 }
 
 async function readTaskCard(root: string): Promise<(TaskCard & { sessionId?: string }) | undefined> {
@@ -828,7 +831,8 @@ async function readTaskCard(root: string): Promise<(TaskCard & { sessionId?: str
     protected: stored.constraints ?? [],
     freshValidation: stored.validation?.freshForThisTask ?? [],
     openValidation: stored.openValidation ?? [],
-    carriedOver: stored.scope?.carriedOverDirtyFiles
+    carriedOver: stored.scope?.carriedOverDirtyFiles,
+    ...(stored.readPlan ? { readPlan: { required: stored.readPlan.required?.files ?? 0, optional: stored.readPlan.ifNeeded?.files ?? 0 } } : {})
   };
 }
 

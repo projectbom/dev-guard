@@ -36,6 +36,7 @@ import { estimateRangeTokens, estimateTextTokens, isStructuredDocument, planRefe
 import { collectExecutionLineage, planExecutionLineage, type ExecutionLineage, type LineageSources } from "./execution-lineage.js";
 import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, taskBoundaryHeadroom, threadUserNotice, toOwner, type BoundaryHeadroom, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
 import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
+import { rankShallowCandidates } from "./shallow-index.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -2310,6 +2311,9 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   perfMark("prepare:ensureWorkspace-done");
   const text = task.trim();
   if (!text) throw new Error("--task requires a non-empty task description.");
+  // Shallow tier input (every project path, no content), enumerated
+  // concurrently with the git baseline below.
+  const enumerationPromise = enumerateProjectFiles(root).catch(() => undefined);
   const current = await readRuntimeState(root);
   perfMark("prepare:readRuntimeState-done");
   // Task boundary contract: `prepare_task_context` is the one explicit signal
@@ -2335,6 +2339,13 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   // the lineage's ORIGINAL baseline — recapturing it on every continue
   // would make the baseline creep forward and hide the task's own earlier
   // files as "carried over" from itself.
+  // Call-scope single resolution: the working-tree content hash (a full
+  // `git add -A` pass) is needed by both the task baseline and the
+  // validation summary. Nothing this call writes is part of it (.devguard is
+  // excluded), so it is resolved at most once per call — never cached across
+  // calls.
+  let codeStatePromise: Promise<{ gitHead: string; codeStateHash?: string }> | undefined;
+  const codeStateOnce = () => (codeStatePromise ??= resolveCurrentCodeState(root));
   const baseline = isContinuing && current.currentTask
     ? {
         changedFilesAtCreation: current.currentTask.changedFilesAtCreation,
@@ -2344,7 +2355,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     : await (async () => {
         const [{ changedFiles: baselineChangedFiles }, { codeStateHash: baselineCodeStateHash }] = await Promise.all([
           gatherCurrentChangeState(root, current),
-          resolveCurrentCodeState(root)
+          codeStateOnce()
         ]);
         const baselineHashes = await hashWorkingFiles(root, baselineChangedFiles);
         return { changedFilesAtCreation: baselineChangedFiles, codeStateHashAtCreation: baselineCodeStateHash, changedFileHashesAtCreation: baselineHashes };
@@ -2375,7 +2386,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
         .then((resolution) => (resolution.status === "found" ? { provider: "codex" as const, threadIdHash: hashThreadId("codex", resolution.threadId), source: "codex-rollout" as const } : undefined))
         .catch(() => undefined);
   try {
-    await hydrateCodeIndex(root);
+    const hydratedIndex = await hydrateCodeIndex(root);
     perfMark("prepare:hydrateCodeIndex-done");
     // Single Resolution Path: load the shared raw inputs and resolve the
     // task/file context ONCE for this call, instead of each of the four
@@ -2384,8 +2395,10 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     // and re-running resolveBeforeAgentContext. generateAgentContext and
     // generateNextClaudePrompt keep their own extra reads (quality report,
     // decisions, project.md) — those aren't part of this shared bag.
-    const raw = await loadResumeRawInputs(root, runtimeWithTask);
+    const loaded = await loadResumeRawInputs(root, runtimeWithTask, hydratedIndex);
     perfMark("prepare:loadResumeRawInputs-done");
+    const raw = { ...loaded, codeIndex: await withShallowCandidates(root, loaded.codeIndex, text, await enumerationPromise) };
+    perfMark("prepare:shallowCandidates-done");
     const context = resolveResumeContext(raw);
     perfMark("prepare:resolveResumeContext-done");
     const codeIndex = raw.codeIndex;
@@ -2495,7 +2508,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
         !isContinuing && owner && raw.state.lastTaskOwnerThreadHash === owner.threadIdHash && (context.workstreamPrior ?? []).length === 0
       )
     });
-    const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask);
+    const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask, codeStateOnce());
     perfMark("prepare:validationSummary-done");
     const openValidation = previousTaskOpenValidation(runtimeWithTask);
     const carriedOverDirtyFiles = currentTask.changedFilesAtCreation?.length ?? 0;
@@ -2579,6 +2592,35 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     if (!persistTask) await writeRuntimeState(root, { ...current, currentTask: current.currentTask, sessionId: current.sessionId });
     perfFlush();
   }
+}
+
+/** Out-of-index files read lazily per call when their path matches the task. */
+const SHALLOW_CANDIDATE_LIMIT = 6;
+
+/**
+ * Two-tier routing for repositories larger than the deep Code Index: the
+ * best path-level matches OUTSIDE the deep index (see rankShallowCandidates)
+ * are read now and added to THIS call's in-memory index as ordinary entries,
+ * so the normal ranking, role assignment and range planning decide whether
+ * they matter. Nothing is written back — the on-disk deep index keeps its
+ * representative budget. When every match is already deep-indexed (any repo
+ * the deep index fully covers), the index is returned unchanged.
+ */
+async function withShallowCandidates(root: string, index: CodeIndex, task: string, enumeration: ProjectFileList | undefined): Promise<CodeIndex> {
+  if (!enumeration || enumeration.files.length === 0) return index;
+  const taskTokens = new Set([...meaningfulRankingTokens(task), ...[...explicitCodeTokens(task)].map((token) => normalizeCodeToken(token))]);
+  const candidates = rankShallowCandidates(enumeration.files, taskTokens, {
+    limit: SHALLOW_CANDIDATE_LIMIT,
+    skip: (path) => Boolean(index.files[path]) || !isIndexableSourceFile(path) || isExcludedContextPath(path) || isBuildOutputPath(path)
+  });
+  if (candidates.length === 0) return index;
+  const contents = await Promise.all(candidates.map((candidate) => readIndexableFileContent(root, candidate.path).catch(() => undefined)));
+  const added: Record<string, CodeIndexFile> = {};
+  candidates.forEach((candidate, position) => {
+    const content = contents[position];
+    if (content?.trim()) added[candidate.path] = buildCodeIndexFile(candidate.path, content);
+  });
+  return Object.keys(added).length > 0 ? { ...index, files: { ...index.files, ...added } } : index;
 }
 
 /** Ranked (non-explicit) suggestions per call — the long-standing 8-file budget. */
@@ -2917,12 +2959,9 @@ function capReferenceOnlyFiles(files: string[], summary: DocumentationSummary | 
  * current-task-fresh), per the same fail-closed default used elsewhere in
  * this file for missing provenance.
  */
-async function buildPreparedTaskValidationSummary(root: string, runtime: RuntimeState): Promise<PreparedTaskValidationSummary> {
-  const [gitIdentity, codeStateHash] = await Promise.all([
-    getGitIdentity(root).catch(() => ({ gitHead: "", gitBranch: "" })),
-    computeWorkingTreeContentHash(root).catch(() => undefined)
-  ]);
-  const currentGitState = { gitHead: gitIdentity.gitHead, codeStateHash, sessionId: runtime.sessionId };
+async function buildPreparedTaskValidationSummary(root: string, runtime: RuntimeState, codeState?: Promise<{ gitHead: string; codeStateHash?: string }>): Promise<PreparedTaskValidationSummary> {
+  const { gitHead, codeStateHash } = await (codeState ?? resolveCurrentCodeState(root)).catch(() => ({ gitHead: "", codeStateHash: undefined }));
+  const currentGitState = { gitHead, codeStateHash, sessionId: runtime.sessionId };
   const { fresh, stale, unbound } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
   const taskFresh: Record<string, QAExecutionResult> = {};
   const otherTask: Record<string, QAExecutionResult> = {};
@@ -3097,7 +3136,8 @@ function hasStaleCardBlockLabel(entry: CodeIndexFile, content: string): boolean 
   return Boolean(contentSummary && entry.summary !== contentSummary);
 }
 
-async function hydrateCodeIndex(root: string): Promise<void> {
+/** Returns the Code Index as it stands after hydration, so the caller does not parse it again. */
+async function hydrateCodeIndex(root: string): Promise<CodeIndex> {
   const hydrateStart = performance.now();
   const current = await readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), {
     schemaVersion: 1,
@@ -3105,7 +3145,7 @@ async function hydrateCodeIndex(root: string): Promise<void> {
     files: {}
   });
   const stats = { indexEntries: 0, entriesReused: 0, entriesRehydrated: 0, filesRead: 0, bytesRead: 0, tokenExtractions: 0 };
-  if (Object.keys(current.files).length === 0) return;
+  if (Object.keys(current.files).length === 0) return current;
   const entries = Object.values(current.files).slice(0, 1200).filter((entry) => isIndexableSourceFile(entry.path));
   stats.indexEntries = entries.length;
   const next: CodeIndex = {
@@ -3146,6 +3186,7 @@ async function hydrateCodeIndex(root: string): Promise<void> {
     tokenExtractions: stats.tokenExtractions,
     duration: `${(performance.now() - hydrateStart).toFixed(1)}ms`
   });
+  return changed ? next : current;
 }
 
 export async function generateCodeMap(root: string, preloaded?: ResumeRawInputs, preloadedContext?: ResumeContext, readCandidatesCache?: Map<string, CodeIndexSymbol[]>): Promise<string> {
@@ -3320,14 +3361,14 @@ export interface ResumeRawInputs {
   codeIndex: CodeIndex;
 }
 
-export async function loadResumeRawInputs(root: string, runtimeOverride?: RuntimeState): Promise<ResumeRawInputs> {
+export async function loadResumeRawInputs(root: string, runtimeOverride?: RuntimeState, codeIndexOverride?: CodeIndex): Promise<ResumeRawInputs> {
   const locale = await refreshRuntimeLocale(root);
   const [state, runtime, records, projectKnowledge, codeIndex] = await Promise.all([
     readJsonFile<ProjectState>(fromRoot(root, statePath), {}),
     runtimeOverride ?? readRuntimeState(root),
     readHistoryRecords(root, 5),
     readTextFile(fromRoot(root, devguardPaths.projectKnowledge)),
-    readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
+    codeIndexOverride ?? readJsonFile<CodeIndex>(fromRoot(root, codeIndexPath), { schemaVersion: 1, generatedAt: "", files: {} })
   ]);
   return { locale, state, runtime, records, projectKnowledge, codeIndex };
 }
@@ -3867,7 +3908,7 @@ function readMapEntryFiles(files: string[], profile: { entryPoints: string[]; ar
 // argument. `taskWords`/`codeTokenSquashed` are precomputed ONCE per
 // taskRelevantIndexCandidates call, not per file.
 function cheapCandidatePrefilterPasses(file: CodeIndexFile, taskWords: string[], codeTokenSquashed: string[], codeTokens: Set<string>, summary: DocumentationSummary): boolean {
-  const usageTokens = new Set((file.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
+  const usageTokens = normalizedUsageTokens(file);
   if ([...codeTokens].some((token) => usageTokens.has(normalizeCodeToken(token)))) return true;
   if (routePathMatchScore(file.path, summary) !== 0) return true;
   const raw = indexedCandidateText(file).toLowerCase();
@@ -3919,7 +3960,7 @@ function taskIndexCandidateScore(file: CodeIndexFile, taskTokens: Set<string>, c
     ...file.symbols.map((symbol) => symbol.name),
     ...file.blocks.map((block) => block.name)
   ].join("\n"));
-  const usageTokens = new Set((file.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
+  const usageTokens = normalizedUsageTokens(file);
   const importTokens = meaningfulRankingTokens(file.imports.join("\n"));
   const tokenOverlap = [...taskTokens].filter((token) => candidateTokens.has(token)).length;
   const pathOverlap = [...taskTokens].filter((token) => pathTokens.has(token)).length;
@@ -3971,7 +4012,10 @@ function negatedTaskTerms(summary: DocumentationSummary): Set<string> {
 // something (small fixture repos keep the flat weights).
 const MIN_FILES_FOR_TOKEN_WEIGHTING = 50;
 const tokenWeightIndex = new WeakMap<DocumentationSummary, CodeIndex>();
-const tokenWeightCache = new WeakMap<DocumentationSummary, Map<string, number>>();
+// Keyed by the Code Index object itself (loaded once per call), not by the
+// summary: a token's weight depends only on the index, and every summary of
+// the call shares it. The lowercased per-file texts are built once per index.
+const tokenWeightCache = new WeakMap<CodeIndex, { texts: string[]; weights: Map<string, number> } | null>();
 
 function registerTokenWeightIndex(summary: DocumentationSummary, index: CodeIndex): DocumentationSummary {
   tokenWeightIndex.set(summary, index);
@@ -3981,23 +4025,38 @@ function registerTokenWeightIndex(summary: DocumentationSummary, index: CodeInde
 function taskTokenWeights(summary: DocumentationSummary, taskTokens: Set<string>): Map<string, number> | undefined {
   const index = tokenWeightIndex.get(summary);
   if (!index) return undefined;
-  const files = Object.values(index.files);
-  if (files.length < MIN_FILES_FOR_TOKEN_WEIGHTING) return undefined;
-  let weights = tokenWeightCache.get(summary);
-  if (!weights) {
-    weights = new Map();
-    tokenWeightCache.set(summary, weights);
+  // Called once per scored file: everything per-index is built once.
+  let cached = tokenWeightCache.get(index);
+  if (!cached) {
+    const files = Object.values(index.files);
+    cached = files.length < MIN_FILES_FOR_TOKEN_WEIGHTING
+      ? null
+      : { texts: files.map((file) => `${indexedCandidateText(file)}\n${(file.tokens ?? []).join(" ")}`.toLowerCase()), weights: new Map() };
+    tokenWeightCache.set(index, cached);
   }
-  const missing = [...taskTokens].filter((token) => !weights!.has(token));
-  if (missing.length > 0) {
-    const texts = files.map((file) => `${indexedCandidateText(file)}\n${(file.tokens ?? []).join(" ")}`.toLowerCase());
-    const scale = Math.log((files.length + 1) / 2);
-    for (const token of missing) {
-      const df = texts.reduce((count, text) => count + (text.includes(token) ? 1 : 0), 0);
-      weights.set(token, Math.min(1, Math.max(0.1, Math.log((files.length + 1) / (df + 1)) / scale)));
-    }
+  if (!cached) return undefined;
+  const { texts, weights } = cached;
+  const scale = Math.log((texts.length + 1) / 2);
+  for (const token of taskTokens) {
+    if (weights.has(token)) continue;
+    let df = 0;
+    for (const text of texts) if (text.includes(token)) df += 1;
+    weights.set(token, Math.min(1, Math.max(0.1, Math.log((texts.length + 1) / (df + 1)) / scale)));
   }
   return weights;
+}
+
+// Normalized code-usage tokens of an index entry, cached per entry object
+// (entries are immutable for the lifetime of the call's loaded index).
+const normalizedUsageCache = new WeakMap<CodeIndexFile, Set<string>>();
+
+function normalizedUsageTokens(file: CodeIndexFile): Set<string> {
+  let tokens = normalizedUsageCache.get(file);
+  if (!tokens) {
+    tokens = new Set((file.tokens ?? []).map((token) => normalizeCodeToken(token)).filter(Boolean));
+    normalizedUsageCache.set(file, tokens);
+  }
+  return tokens;
 }
 
 // Code identifiers split into words ("isStandbyMode" -> is/standby/mode), so
@@ -4281,12 +4340,22 @@ function addCodeToken(tokens: Set<string>, token: string): void {
   tokens.add(normalized);
 }
 
+// Pure string normalization, hit once per (task token x scored file): memoized
+// with a bounded map (no staleness possible — the output depends only on the input).
+const normalizedCodeTokenMemo = new Map<string, string>();
+
 function normalizeCodeToken(value: string): string {
-  return value
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/[^A-Za-z0-9가-힣]+/g, " ")
-    .toLowerCase()
-    .replace(/\s+/g, "");
+  let normalized = normalizedCodeTokenMemo.get(value);
+  if (normalized === undefined) {
+    normalized = value
+      .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+      .replace(/[^A-Za-z0-9가-힣]+/g, " ")
+      .toLowerCase()
+      .replace(/\s+/g, "");
+    if (normalizedCodeTokenMemo.size >= 50_000) normalizedCodeTokenMemo.clear();
+    normalizedCodeTokenMemo.set(value, normalized);
+  }
+  return normalized;
 }
 
 // Generated build/deploy output (e.g. AWS CDK's cdk.out) is never a task

@@ -33,7 +33,29 @@ export interface ProjectKnowledge {
   };
   /** Structural fingerprint at generation time (absent on pre-0.10 files). */
   fingerprint?: KnowledgeFingerprint;
+  /**
+   * Per-category detected vs kept counts (absent on pre-0.11 files). Every
+   * list above is a bounded, representative sample; `detected` says how much
+   * was found before the category's own budget was applied.
+   */
+  coverage?: Record<KnowledgeCategory, { detected: number; kept: number }>;
 }
+
+export type KnowledgeCategory = "pages" | "layouts" | "nextRoutes" | "httpRoutes" | "components";
+
+/**
+ * Independent per-category output budgets. UI pages, Next.js API routes and
+ * HTTP-framework handlers used to share one list budget, so in a large app
+ * the alphabetically-first `app/api/**` routes took every slot and pages
+ * dropped to zero. Each category is now sampled on its own.
+ */
+const KNOWLEDGE_BUDGETS: Record<KnowledgeCategory, number> = {
+  pages: 200,
+  layouts: 60,
+  nextRoutes: 200,
+  httpRoutes: 300,
+  components: 200
+};
 
 /**
  * What Project Knowledge is derived from, cheaply comparable at every
@@ -159,6 +181,8 @@ export async function generateProjectKnowledge(root: string, enumeration?: Proje
   const workspaceDirs = workspacePackages.map((pkg) => pkg.path.slice(0, -"/package.json".length));
   const groupOf = groupByRoots(workspaceDirs);
   const packageJsons = [rootPackage, ...workspacePackages.map((entry) => entry.packageJson)];
+  const coverage = {} as NonNullable<ProjectKnowledge["coverage"]>;
+  const httpRoots = httpFrameworkRoots(rootPackage, workspacePackages);
   const knowledge: ProjectKnowledge = {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
@@ -171,9 +195,9 @@ export async function generateProjectKnowledge(root: string, enumeration?: Proje
       sourceRoots: detectSourceRoots(files, workspacePackages),
       filesIndexed: files.length
     },
-    pages: detectPages(files, workspaceDirs, groupOf),
-    components: await detectComponents(root, files, groupOf),
-    apis: await detectApis(root, files, workspaceDirs, groupOf),
+    pages: detectPages(files, workspaceDirs, groupOf, coverage),
+    components: await detectComponents(root, files, groupOf, coverage),
+    apis: await detectApis(root, files, workspaceDirs, groupOf, httpRoots, coverage),
     database: await detectDatabase(root, files, groupOf),
     commands: await detectCommands(root, files, rootPackage, workspacePackages),
     importantFiles: detectImportantFiles(files),
@@ -185,7 +209,8 @@ export async function generateProjectKnowledge(root: string, enumeration?: Proje
       ignored: IGNORED_DIRECTORY_LABELS,
       futureCompatible: ["dependency graph", "symbol index", "cross-reference graph", "semantic relationships"]
     },
-    fingerprint
+    fingerprint,
+    coverage
   };
   await writeTextFile(fromRoot(root, devguardPaths.projectKnowledge), `${JSON.stringify(knowledge, null, 2)}\n`);
   return knowledge;
@@ -442,22 +467,65 @@ function appRelativePath(file: string, workspaceDirs: string[]): { kind: "app" |
   return undefined;
 }
 
-function detectPages(files: string[], workspaceDirs: string[], groupOf: (file: string) => string): ProjectKnowledge["pages"] {
+/**
+ * UI pages and layouts, each under its own budget. API routes are not listed
+ * here — they live in `apis` (next-route / pages-api) with their own budget,
+ * so they can no longer crowd pages out.
+ */
+function detectPages(files: string[], workspaceDirs: string[], groupOf: (file: string) => string, coverage: NonNullable<ProjectKnowledge["coverage"]>): ProjectKnowledge["pages"] {
   const pages: ProjectKnowledge["pages"] = [];
+  const layouts: ProjectKnowledge["pages"] = [];
   for (const file of files) {
     const located = appRelativePath(file, workspaceDirs);
     if (!located) continue;
-    if (located.kind === "app" && /\/route\.(ts|js)$/.test(located.rel)) {
-      pages.push({ route: routeFromAppFile(located.rel), file, type: "api" });
-    } else if ((located.kind === "app" && /\/page\.(tsx|jsx|ts|js|mdx)$/.test(located.rel)) || (located.kind === "pages" && /\.(tsx|jsx|ts|js|mdx)$/.test(located.rel))) {
+    if (located.kind === "pages" && located.rel.startsWith("pages/api/")) continue;
+    if ((located.kind === "app" && /\/page\.(tsx|jsx|ts|js|mdx)$/.test(located.rel)) || (located.kind === "pages" && /\.(tsx|jsx|ts|js|mdx)$/.test(located.rel))) {
       pages.push({ route: routeFromPageFile(located.rel), file, type: "page" });
     } else if (located.kind === "app" && /\/layout\.(tsx|jsx|ts|js)$/.test(located.rel)) {
-      pages.push({ route: routeFromAppFile(located.rel), file, type: "layout" });
+      layouts.push({ route: routeFromAppFile(located.rel), file, type: "layout" });
     }
   }
-  return spreadAcross(pages, 200, (page) => groupOf(page.file));
+  const keptPages = representativeRoutes(pages, KNOWLEDGE_BUDGETS.pages, groupOf);
+  const keptLayouts = representativeRoutes(layouts, KNOWLEDGE_BUDGETS.layouts, groupOf);
+  coverage.pages = { detected: pages.length, kept: keptPages.length };
+  coverage.layouts = { detected: layouts.length, kept: keptLayouts.length };
+  return [...keptPages, ...keptLayouts];
 }
-async function detectComponents(root: string, files: string[], groupOf: (file: string) => string): Promise<ProjectKnowledge["components"]> {
+
+/**
+ * Representative, bounded sample of route-shaped entries — never the
+ * alphabetically-first N: shallow (structurally central) routes first, then
+ * round-robin across workspaces and, inside each, across first route
+ * segments (`/orders/*`, `/settings/*`, ...).
+ */
+function representativeRoutes<T extends { route: string; file: string }>(items: T[], limit: number, groupOf: (file: string) => string): T[] {
+  if (items.length <= limit) return items;
+  const depth = (route: string) => route.split("/").filter(Boolean).length;
+  const ordered = [...items].sort((a, b) => depth(a.route) - depth(b.route) || a.file.localeCompare(b.file));
+  // The section is the first meaningful segment: `/api/orders/:id` and
+  // `/v1/orders` both belong to "orders".
+  const section = (item: T) => `${groupOf(item.file)}\0${item.route.split("/").filter((segment) => segment && !/^(?:api|v\d+)$/i.test(segment))[0] ?? ""}`;
+  return spreadAcross(roundRobin(ordered, section), limit, (item) => groupOf(item.file));
+}
+
+/** Round-robin order across `keyOf` groups (each group's own order kept), unbounded. */
+function roundRobin<T>(items: T[], keyOf: (item: T) => string): T[] {
+  const groups = new Map<string, T[]>();
+  for (const item of items) {
+    const key = keyOf(item);
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(item);
+    else groups.set(key, [item]);
+  }
+  const buckets = [...groups.values()];
+  const result: T[] = [];
+  for (let round = 0; result.length < items.length; round += 1) {
+    for (const bucket of buckets) if (round < bucket.length) result.push(bucket[round]);
+  }
+  return result;
+}
+
+async function detectComponents(root: string, files: string[], groupOf: (file: string) => string, coverage: NonNullable<ProjectKnowledge["coverage"]>): Promise<ProjectKnowledge["components"]> {
   const candidates = files.filter((file) => /\.(tsx|jsx)$/.test(file) && /(^components\/|\/components\/|^app\/|^src\/)/.test(file));
   const components: ProjectKnowledge["components"] = [];
   const sample = spreadAcross(candidates, 400, groupOf);
@@ -475,38 +543,126 @@ async function detectComponents(root: string, files: string[], groupOf: (file: s
       components.push({ name: defaultMatch[1] ?? componentNameFromFile(file), file, exportType: "default" });
     }
   }
-  return spreadAcross(dedupeBy(components, (item) => `${item.name}:${item.file}`), 200, (item) => groupOf(item.file));
+  const unique = dedupeBy(components, (item) => `${item.name}:${item.file}`);
+  const kept = spreadAcross(unique, KNOWLEDGE_BUDGETS.components, (item) => groupOf(item.file));
+  coverage.components = { detected: unique.length, kept: kept.length };
+  return kept;
 }
 
-async function detectApis(root: string, files: string[], workspaceDirs: string[], groupOf: (file: string) => string): Promise<ProjectKnowledge["apis"]> {
-  const apis: ProjectKnowledge["apis"] = [];
-  const nextRoutes: Array<{ file: string; rel: string }> = [];
+/**
+ * API surface, one independent budget per category: Next.js API routes
+ * (app `route.ts` + `pages/api`), HTTP-framework handlers, CLI commands.
+ */
+async function detectApis(
+  root: string,
+  files: string[],
+  workspaceDirs: string[],
+  groupOf: (file: string) => string,
+  httpRoots: string[],
+  coverage: NonNullable<ProjectKnowledge["coverage"]>
+): Promise<ProjectKnowledge["apis"]> {
+  const nextRoutes: Array<{ file: string; rel: string; route: string; kind: "next-route" | "pages-api" }> = [];
   for (const file of files) {
     const located = appRelativePath(file, workspaceDirs);
     if (located?.kind === "app" && /\/route\.(ts|js)$/.test(located.rel)) {
-      nextRoutes.push({ file, rel: located.rel });
+      nextRoutes.push({ file, rel: located.rel, route: routeFromAppFile(located.rel), kind: "next-route" });
     } else if (located?.kind === "pages" && /^pages\/api\/.*\.(ts|js)$/.test(located.rel)) {
-      apis.push({ kind: "pages-api", route: routeFromPagesApi(located.rel), file });
+      nextRoutes.push({ file, rel: located.rel, route: routeFromPagesApi(located.rel), kind: "pages-api" });
     }
   }
-  const routeSample = spreadAcross(nextRoutes, 300, (entry) => groupOf(entry.file));
-  const routeTexts = await mapLimit(routeSample, READ_CONCURRENCY, (entry) => readTextFile(fromRoot(root, entry.file)));
-  routeSample.forEach(({ file, rel }, index) => {
-    apis.push({ kind: "next-route", route: routeFromAppFile(rel), file, methods: detectHttpMethods(routeTexts[index]) });
-  });
-  const routeFiles = spreadAcross(files.filter((file) => /\.(ts|js)$/.test(file) && !file.includes(".d.ts")), 600, groupOf);
-  const routeFileTexts = await mapLimit(routeFiles, READ_CONCURRENCY, (file) => readTextFile(fromRoot(root, file)));
-  for (const [index, file] of routeFiles.entries()) {
-    const text = routeFileTexts[index];
-    for (const match of text.matchAll(/\b(?:app|router)\.(get|post|put|patch|delete)\(["'`]([^"'`]+)["'`]/g)) {
-      apis.push({ kind: "express", route: match[2], file, methods: [match[1].toUpperCase()] });
-    }
-  }
-  const cliCommands = await detectCliCommands(root, files);
-  for (const command of cliCommands) {
+  const routeSample = representativeRoutes(nextRoutes, KNOWLEDGE_BUDGETS.nextRoutes, groupOf);
+  coverage.nextRoutes = { detected: nextRoutes.length, kept: routeSample.length };
+  const appRoutes = routeSample.filter((entry) => entry.kind === "next-route");
+  const routeTexts = await mapLimit(appRoutes, READ_CONCURRENCY, (entry) => readTextFile(fromRoot(root, entry.file)));
+  const methodsOf = new Map(appRoutes.map((entry, index) => [entry.file, detectHttpMethods(routeTexts[index])]));
+  const apis: ProjectKnowledge["apis"] = routeSample.map((entry) =>
+    entry.kind === "next-route" ? { kind: entry.kind, route: entry.route, file: entry.file, methods: methodsOf.get(entry.file) } : { kind: entry.kind, route: entry.route, file: entry.file }
+  );
+  const routeFileSet = new Set(nextRoutes.map((entry) => entry.file));
+  const httpRoutes = await detectHttpRoutes(root, files.filter((file) => !routeFileSet.has(file) && !appRelativePath(file, workspaceDirs)), httpRoots, groupOf);
+  const keptHttp = representativeRoutes(httpRoutes, KNOWLEDGE_BUDGETS.httpRoutes, groupOf);
+  // Counted in handlers (method + path), the unit a reader cares about.
+  const handlers = (entries: ProjectKnowledge["apis"]) => entries.reduce((sum, entry) => sum + Math.max(1, entry.methods?.length ?? 0), 0);
+  coverage.httpRoutes = { detected: handlers(httpRoutes), kept: handlers(keptHttp) };
+  apis.push(...keptHttp);
+  for (const command of await detectCliCommands(root, files)) {
     apis.push({ kind: "cli-command", route: `dev-guard ${command}`, file: "packages/cli/src/index.ts" });
   }
-  return spreadAcross(dedupeBy(apis, (item) => `${item.kind}:${item.route}:${item.file}`), 250, (item) => groupOf(item.file));
+  return dedupeBy(apis, (item) => `${item.kind}:${item.methods?.join(",") ?? ""}:${item.route}:${item.file}`);
+}
+
+const HTTP_FRAMEWORK_DEPENDENCIES = ["express", "fastify", "koa", "@koa/router", "koa-router", "hono", "@hapi/hapi", "restify", "polka", "@nestjs/core"];
+const HTTP_PATH_TERM = /(?:^|\/)(?:server|servers|router|routers|routes?|api|apis|handlers?|controllers?|endpoints?|middlewares?)(?:\/|\.|-|_)/i;
+const HTTP_ROUTE_SYNTAX = /\b(?:app|router|server|fastify)\.(get|post|put|patch|delete)\(\s*["'`]([^"'`]+)["'`]/g;
+const TEST_FILE = /\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)(?:__tests__|tests?|__mocks__)\//;
+/** Total content reads for HTTP handler detection (was 600 spread evenly over every source root). */
+const HTTP_READ_BUDGET = 900;
+/** First-wave probe size; directories where it finds route syntax are read next. */
+const HTTP_PROBE_WAVE = 200;
+
+/** Package directories ("" = project root) that depend on an HTTP server framework. */
+function httpFrameworkRoots(rootPackage: PackageJson, workspacePackages: Array<{ path: string; packageJson: PackageJson }>): string[] {
+  const usesFramework = (pkg: PackageJson) => HTTP_FRAMEWORK_DEPENDENCIES.some((dep) => pkg.dependencies?.[dep] || pkg.devDependencies?.[dep]);
+  return [
+    ...(usesFramework(rootPackage) ? [""] : []),
+    ...workspacePackages.filter((entry) => usesFramework(entry.packageJson)).map((entry) => entry.path.slice(0, -"/package.json".length))
+  ];
+}
+
+/**
+ * Two-stage, bounded HTTP handler detection. Stage 1 ranks files by metadata
+ * only — inside a package that depends on an HTTP framework, and/or a
+ * server/router/routes/api/handlers/controllers path — without reading them.
+ * Stage 2 reads a probe wave of the likeliest files spread across
+ * directories, then the rest of the directories where route syntax was
+ * actually found, then other likely files, and only a small tail of
+ * unranked files. Never more than HTTP_READ_BUDGET reads.
+ */
+async function detectHttpRoutes(root: string, files: string[], httpRoots: string[], groupOf: (file: string) => string): Promise<ProjectKnowledge["apis"]> {
+  const inHttpRoot = (file: string) => httpRoots.some((dir) => dir === "" || file.startsWith(`${dir}/`));
+  const dirOf = (file: string) => file.slice(0, Math.max(0, file.lastIndexOf("/")));
+  const pool = files.filter((file) => /\.[cm]?[jt]s$/.test(file) && !file.endsWith(".d.ts") && !TEST_FILE.test(file));
+  const score = (file: string) => (inHttpRoot(file) ? 2 : 0) + (HTTP_PATH_TERM.test(file) ? 1 : 0);
+  const tiers = new Map<number, string[]>();
+  for (const file of pool) {
+    const tier = score(file);
+    const bucket = tiers.get(tier);
+    if (bucket) bucket.push(file);
+    else tiers.set(tier, [file]);
+  }
+  const likely = [3, 2, 1].flatMap((tier) => roundRobin(tiers.get(tier) ?? [], dirOf));
+  const unranked = tiers.get(0) ?? [];
+
+  const found: ProjectKnowledge["apis"] = [];
+  const read = new Set<string>();
+  const hitDirs = new Set<string>();
+  const scan = async (batch: string[], cap: number) => {
+    const fresh = batch.filter((file) => !read.has(file)).slice(0, Math.max(0, cap - read.size));
+    for (const file of fresh) read.add(file);
+    const texts = await mapLimit(fresh, READ_CONCURRENCY, (file) => readTextFile(fromRoot(root, file)));
+    fresh.forEach((file, index) => {
+      for (const match of texts[index].matchAll(HTTP_ROUTE_SYNTAX)) {
+        found.push({ kind: "express", route: match[2], file, methods: [match[1].toUpperCase()] });
+        hitDirs.add(dirOf(file));
+      }
+    });
+  };
+  // A small reserved tail of unranked files keeps unconventional layouts discoverable.
+  const tail = spreadAcross(unranked, Math.floor(HTTP_READ_BUDGET / 6), groupOf);
+  const likelyCap = HTTP_READ_BUDGET - tail.length;
+  await scan(likely.slice(0, HTTP_PROBE_WAVE), likelyCap);
+  await scan(likely.filter((file) => hitDirs.has(dirOf(file))), likelyCap);
+  await scan(likely, likelyCap);
+  await scan(tail, HTTP_READ_BUDGET);
+  // One entry per (route, file), its methods merged: `GET`+`POST /v1/orders`.
+  const byRoute = new Map<string, ProjectKnowledge["apis"][number]>();
+  for (const item of found) {
+    const key = `${item.route}\0${item.file}`;
+    const entry = byRoute.get(key);
+    if (!entry) byRoute.set(key, { ...item, methods: [...(item.methods ?? [])] });
+    else for (const method of item.methods ?? []) if (!entry.methods?.includes(method)) entry.methods?.push(method);
+  }
+  return [...byRoute.values()];
 }
 
 async function detectDatabase(root: string, files: string[], groupOf: (file: string) => string): Promise<ProjectKnowledge["database"]> {

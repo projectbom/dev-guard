@@ -148,7 +148,7 @@ dev-guard watch
 
 The first `watch` prepares DevGuard automatically — creates the `.devguard/` config, indexes the project (Code Index), analyzes its structure (Project Knowledge), adds the DevGuard section to `AGENTS.md` / `CLAUDE.md`, registers the DevGuard MCP server for Claude Code and Codex, installs completion hooks best-effort — then opens the local dashboard and starts watching. Later runs find everything fresh and start immediately ("Project ready."); only missing or stale parts are refreshed.
 
-DevGuard performs lightweight deterministic project discovery on first watch and reuses cached analysis on later runs. Inside git it lists files with `git ls-files`, so anything `.gitignore`d (local secrets, scratch folders, build output) is never analyzed; outside git it walks the tree. Content reads are budgeted and sampled across workspace packages, so large monorepos stay fast without losing packages. In our benchmark, a 25K-file synthetic monorepo was watching in under a second on first run.
+DevGuard performs lightweight deterministic project discovery on first watch and reuses cached analysis on later runs. Inside git it lists files with `git ls-files`, so anything `.gitignore`d (local secrets, scratch folders, build output) is never analyzed; outside git it walks the tree. Content reads are budgeted and sampled across workspace packages, so large monorepos stay fast without losing packages. Validated on synthetic repositories up to 25K files (not a guarantee for every repository): first `watch` ready in about 1s at 25K files, and `prepare_task_context` around 0.4s at 10K files and 0.6s at 25K. The deep Code Index stays bounded (~1,200 representative files with symbols and tokens); for files outside it, `prepare_task_context` also ranks every project path by filename/path terms, reads only the few best matches for that call, and lets the normal ranking decide — nothing extra is written to the index. Project Knowledge keeps separate bounded lists for UI pages, Next.js API routes, and HTTP-framework handlers (Express, Fastify, Koa, Hono, …), records how many of each were found versus kept, and samples handler files where the framework dependency and route-shaped paths are.
 
 Optional — `dev-guard setup` runs the same preparation without starting the watcher and prints a summary (useful for CI/scripts, inspecting what DevGuard detected, or `dev-guard setup --dry-run` to preview changes without writing). It is never required before `watch`.
 
@@ -299,13 +299,18 @@ Generated `AGENTS.md` and `CLAUDE.md` instructions tell agents to start with Rea
 
 ## Local Dashboard
 
-The local dashboard starts automatically when `dev-guard watch` runs. It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/state` once per second. It explains what DevGuard is doing now, why it is waiting, what happens next, recent file changes, and whether next-session, project-health, and project-context information is ready.
+The local dashboard starts automatically when `dev-guard watch` runs. It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/overview` every two seconds. It shows the current task and context status — not a telemetry wall. The first screen answers five questions:
+
+- **Now** — Health (is DevGuard set up and watching?), Thread (Room to continue / Next large task: new thread / New thread recommended), the current task in one line, the single biggest context problem, and one recommended action.
+- **This task** — at most five numbers: Context (the provider's observed usage only), Read plan (required / optional files), Suggestions used, Validation (recorded evidence), Files changed. Each is tagged observed, planned, inferred, or estimated.
+- **Context flow** — one chart of where this task's context went (estimated from file sizes, shown as `~18K`, never as exact tokens).
+- **Details** — collapsed: read plan, execution lineage, search activity, validation evidence, timeline, other issues, reports and prompts, setup and integration, project knowledge, raw telemetry.
 
 The UI follows the browser language automatically and includes an English/Korean language toggle.
 
 It does not expose arbitrary file browsing, environment variables, or shell execution. If DevGuard is not monitoring the project, it tells the user to run `dev-guard watch`.
 
-The dashboard is the normal user workflow: it recommends the next action based on quality state and session changes, shows the evidence behind each recommendation, and provides Review Complete when review is done. The CLI remains available for automation, terminal-only workflows, and recovery.
+The dashboard is the normal user workflow: it shows one next action (start watch, start a fresh thread, fix the primary issue, review the quality report, or keep going) and provides Review Complete when a blocked review is done. The CLI remains available for automation, terminal-only workflows, and recovery.
 
 Advanced terminal-only mode:
 

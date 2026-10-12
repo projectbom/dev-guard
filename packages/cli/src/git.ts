@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { rm, stat } from "node:fs/promises";
+import { copyFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -117,7 +117,14 @@ export async function computeWorkingTreeContentHash(cwd: string): Promise<string
   const tempIndexPath = join(tmpdir(), `devguard-idx-${randomUUID()}`);
   const env = { ...process.env, GIT_INDEX_FILE: tempIndexPath };
   try {
-    if (hasHead) {
+    // Seeding the temp index from a copy of the real index (instead of
+    // `read-tree HEAD`) keeps git's stat cache: `add -A` then re-hashes only
+    // files whose stat changed, not every tracked file — the difference
+    // between ~50ms and ~500ms on a 10K-file repository. The resulting tree
+    // is the same working-tree content (HEAD and index differ only in what
+    // `add -A` overwrites anyway), except for a gitignored path tracked in
+    // just one of them (force-added or `rm --cached`). Falls back to HEAD.
+    if (!(await seedFromRealIndex(cwd, tempIndexPath)) && hasHead) {
       await execFileAsync("git", ["read-tree", "HEAD"], { cwd, env });
     }
     await execFileAsync("git", ["add", "-A", "--", "."], { cwd, env });
@@ -128,6 +135,18 @@ export async function computeWorkingTreeContentHash(cwd: string): Promise<string
     return undefined;
   } finally {
     await rm(tempIndexPath, { force: true }).catch(() => undefined);
+  }
+}
+
+async function seedFromRealIndex(cwd: string, tempIndexPath: string): Promise<boolean> {
+  try {
+    const indexPath = (await git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "index"])).trim();
+    if (!indexPath) return false;
+    // git replaces its index by rename, so a copy is never a torn write.
+    await copyFile(indexPath, tempIndexPath);
+    return true;
+  } catch {
+    return false;
   }
 }
 

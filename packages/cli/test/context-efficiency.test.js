@@ -190,25 +190,27 @@ test("rollover: CONTINUE / SOON / NEW THREAD from pressure, thread reuse and wor
   assert.equal(rolloverStateFor(task({ doneAt: "x", peakContextUse: 0.5 }), counts, false).state, "NEW_THREAD_SOON");
 });
 
-test("5-second contract: health, task, issue, action and thread render first; everything else is collapsed", async () => {
+test("5-second contract: health, thread, task, issue and action render first; everything else is collapsed", async () => {
   const root = await repoRoot();
   const r = await report(root, await snapshotFrom(root, {
     "x.jsonl": meta("t", root, "2026-01-01T00:59:00Z") + item("2026-01-01T01:00:01Z", prepare(["src/a.ts"])) + item("2026-01-01T01:00:02Z", exec(root, "rg -n x")) + item("2026-01-01T01:00:03Z", exec(root, "rg -n y")) + item("2026-01-01T01:00:04Z", exec(root, "rg -n z")) + usageLine("2026-01-01T01:00:05Z", 150000)
   }), telemetry(["2026-01-01T01:00:00Z", "TASK_PREPARED", { sessionId: "s1", providedFiles: ["src/a.ts"] }]));
   const html = await renderPanel(r);
-  const order = ["eff-health", "eff-task", "eff-issue", "eff-action", "eff-thread", "eff-metrics", "eff-where", "eff-details"].map((id) => html.indexOf(`data-testid="${id}"`));
+  const order = ["ov-health", "ov-thread", "ov-task", "ov-issue", "ov-action", "ov-metrics", "ov-flow", "ov-details"].map((id) => html.indexOf(`data-testid="${id}"`));
   assert.ok(order.every((index) => index >= 0), `all contract elements present: ${order}`);
   assert.deepEqual([...order].sort((a, b) => a - b), order, "problem-first order");
-  const defaultView = html.slice(0, html.indexOf('data-testid="eff-details"'));
-  assert.equal((defaultView.match(/class="eff-tile"/g) || []).length, 4, "at most four numbers by default");
+  const defaultView = html.slice(0, html.indexOf('data-testid="ov-details"'));
+  assert.ok((defaultView.match(/class="ov-metric"/g) || []).length <= 5, "at most five numbers by default");
   assert.equal((defaultView.match(/<svg/g) || []).length, 0, "no timeline in the default view");
-  assert.match(html, /<details class="eff-details"/);
-  assert.ok(!/<details class="eff-details"[^>]* open/.test(html), "details are collapsed by default");
-  assert.match(defaultView, /repository-wide/);
+  assert.match(html, /<details class="ov-details"/);
+  assert.ok(!/<details class="ov-details"[^>]* open/.test(html), "details are collapsed by default");
+  assert.equal(r.now.primaryIssue.id, "BROAD_SEARCH");
+  assert.ok(defaultView.includes(r.now.primaryIssue.issue.slice(0, 30)), "the primary issue is on the first screen");
 });
 
 async function renderPanel(reportData) {
   const D = new URL("../dist/", import.meta.url).pathname;
+  const { buildDashboardOverview } = await import(`${D}dashboard-view.js`);
   const src = await readFile(`${D}dashboard.js`, "utf8");
   const probe = `${D}__panel_probe_${process.pid}.js`;
   await writeFile(probe, src + "\nexport { renderPage as __renderPage };\n");
@@ -218,10 +220,12 @@ async function renderPanel(reportData) {
     const script = html.slice(html.lastIndexOf("<script>") + 8, html.lastIndexOf("</script>"));
     const elements = {};
     const doc = { getElementById: (id) => (elements[id] ??= { innerHTML: "", textContent: "", classList: { toggle() {} } }), querySelectorAll: () => [], documentElement: {} };
-    const fakeFetch = async (url) => ({ ok: true, json: async () => (String(url).startsWith("/api/efficiency") ? reportData : { error: "stub" }) });
+    const state = { status: "idle", initialized: true, watchRunning: true, sessionFileCount: 1, reports: {}, knowledge: {}, openAI: {} };
+    const overview = buildDashboardOverview({ initialized: true, watchRunning: true, setupActive: false, sessionFileCount: 1 }, reportData, reportData.taskCard?.readPlan);
+    const fakeFetch = async (url) => ({ ok: true, json: async () => (String(url).startsWith("/api/overview") ? { state, efficiency: reportData, overview } : { ok: true }) });
     new Function("document", "localStorage", "navigator", "fetch", "setInterval", script)(doc, { getItem: () => "en", setItem() {} }, { languages: ["en"] }, fakeFetch, () => 0);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    return elements.efficiency.innerHTML;
+    return elements.root.innerHTML;
   } finally {
     await rm(probe, { force: true });
   }
@@ -250,6 +254,11 @@ test("prepare records targets and the canonical task card; /api/efficiency serve
     assert.ok(body.now && ["GOOD", "NEEDS_ATTENTION", "POOR"].includes(body.now.health));
     assert.equal(body.threadIdentity, "unavailable");
     assert.equal((await fetch(`${server.url}/api/state`)).status, 200);
+    const overview = await (await fetch(`${server.url}/api/overview`)).json();
+    assert.equal(overview.overview.task, card.task.replace(/\s+/g, " ").trim());
+    assert.deepEqual(overview.overview.metrics.find((m) => m.key === "readPlan").value, { required: card.readPlan.required.files, optional: card.readPlan.ifNeeded.files });
+    assert.equal(overview.overview.health.level, "ATTENTION", "no watch running in this test");
+    assert.equal(overview.overview.action.id, "START_WATCH");
   } finally {
     await server.close();
   }
