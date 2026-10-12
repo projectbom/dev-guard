@@ -12,6 +12,7 @@ import { devguardPaths } from "./paths.js";
 import { ensureCodeIndex, readRuntimeState, writeRuntimeState, type SetupStatus, type SetupStatusStep } from "./runtime-state.js";
 import { ensureMcpSetup, type McpSetupResult } from "./mcp-setup.js";
 import { enumerateProjectFiles } from "./project-files.js";
+import { ensureDevguardGitIgnore, type GitIgnoreResult } from "./git-ignore.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +27,8 @@ export interface PrepareResult {
     instructions: AgentInstructionInstallSummary;
     mcp: McpSetupResult;
     hooksInstalled: boolean;
+    /** Git ignore rules for local DevGuard state (Git work trees only). */
+    gitIgnore: GitIgnoreResult;
     /** Detected from the Project Knowledge file (absent if it could not be generated). */
     summary?: { packageManager: string; language: string; framework: string; sourceRoots: string[] };
     gitRoot?: string;
@@ -77,11 +80,19 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
   await writeSetupStatus(root, { active: true, startedAt, steps: setupSteps });
 
   await markStep(root, startedAt, setupSteps, "config", "running");
+  // Local state stays out of Git before anything else is prepared.
+  const gitIgnore = await ensureDevguardGitIgnore(root).catch((error): GitIgnoreResult => ({
+    status: "already-ignored",
+    added: [],
+    trackedDevguardFiles: 0,
+    warning: `.gitignore not updated: ${errorMessage(error)}. Add \`.devguard/\` to .gitignore yourself so DevGuard's local state stays out of Git.`
+  }));
+  if (gitIgnore.warning) warnings.push(gitIgnore.warning);
   const initResults = await ensureInitialProjectFiles(root);
   const initChanged = initResults.some((result) => result.status === "created");
-  didWork = didWork || initChanged;
-  steps.push({ key: "config", label: "Initialized project", status: "done", changed: initChanged });
-  await markStep(root, startedAt, setupSteps, "config", "done");
+  didWork = didWork || initChanged || gitIgnore.added.length > 0;
+  steps.push({ key: "config", label: "Initialized project", status: gitIgnore.warning ? "warning" : "done", changed: initChanged, detail: gitIgnore.warning });
+  await markStep(root, startedAt, setupSteps, "config", gitIgnore.warning ? "warning" : "done", gitIgnore.warning);
 
   // One enumeration of the project (git-aware, .gitignore honored) shared
   // by the Code Index bootstrap, the Knowledge fingerprint and generation.
@@ -239,6 +250,7 @@ export async function prepareProject(root: string, options: PrepareOptions = {})
       instructions: instructionResult,
       mcp: mcpResult,
       hooksInstalled: hooksAlreadyInstalled || hooksChanged,
+      gitIgnore,
       summary,
       gitRoot
     }
@@ -279,6 +291,8 @@ export function formatPreparation(result: PrepareResult): { headline: string; li
   const step = (key: SetupStatusStep["key"]) => result.steps.find((entry) => entry.key === key);
   const firstRun = Boolean(step("config")?.changed);
   const lines: string[] = [];
+  const ignore = result.facts.gitIgnore;
+  if (ignore.added.length > 0) lines.push(`✓ ${ignore.status === "created" ? "Created .gitignore with" : "Added to .gitignore:"} ${ignore.added.join(", ")} (local DevGuard state)`);
   if (step("code_index")?.changed) lines.push(`✓ Indexed ${result.facts.filesIndexed} project files`);
   if (step("knowledge")?.changed) {
     const detected = [result.facts.summary?.packageManager, result.facts.summary?.language, result.facts.summary?.framework].filter(
@@ -323,6 +337,15 @@ export async function planProjectSetup(root: string): Promise<SetupPlanEntry[]> 
   const plan: SetupPlanEntry[] = [];
   const missing = (await planInitialProjectFiles(root)).filter((file) => file.status === "missing").map((file) => file.path);
   plan.push({ key: "config", label: "DevGuard workspace", action: missing.length > 0 ? "create" : "unchanged", detail: missing.length > 0 ? missing.join(", ") : undefined });
+  const ignore = await ensureDevguardGitIgnore(root, { dryRun: true }).catch(() => undefined);
+  if (ignore && ignore.status !== "not-git") {
+    plan.push({
+      key: "config",
+      label: ".gitignore (local DevGuard state)",
+      action: ignore.warning ? "warning" : ignore.status === "created" ? "create" : ignore.status === "added" ? "update" : "unchanged",
+      detail: [ignore.status === "created" ? `would create .gitignore with ${ignore.added.join(", ")}` : ignore.status === "added" ? `would add ${ignore.added.join(", ")}` : "already ignored", ignore.warning].filter(Boolean).join(" — ")
+    });
+  }
 
   const index = await readJsonFile<{ files?: Record<string, unknown> }>(fromRoot(root, devguardPaths.codeIndex), {});
   const indexed = Object.keys(index.files ?? {}).length;

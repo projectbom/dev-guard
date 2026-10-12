@@ -40,13 +40,14 @@ dev-guard watch
 첫 `watch`가 프로젝트를 준비한 뒤 로컬 대시보드를 열고 감시를 시작합니다. 준비 과정은 결정적이고 비대화형입니다(질문, API key, 네트워크 없음).
 
 1. 프로젝트 루트 확인 (홈 디렉터리나 `/`는 거부)
-2. 없는 `.devguard/` 설정 파일 생성 (기존 파일 유지)
-3. 프로젝트 파일을 한 번 나열(git 안에서는 `git ls-files`로 `.gitignore`된 파일 제외, 그 외에는 디렉터리 순회)하고 Code Index 생성 (`.devguard/memory/code-index.json`)
-4. Project Knowledge 생성 (`.devguard/project/project-knowledge.json`)
-5. `AGENTS.md`, `CLAUDE.md`의 DevGuard 섹션 추가/갱신 (marker 밖 텍스트 유지)
-6. Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버 등록 — 다른 서버/테이블 유지
-7. completion hook 설치 (best-effort)
-8. MCP 서버가 실행되어 `prepare_task_context`를 제공하는지 확인
+2. Git 저장소라면 Git이 아직 무시하지 않을 때만 `.gitignore`에 `.devguard/`, `devguard.backup-*/` 추가 (기존 줄은 그대로; `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.codex/config.toml`은 제외하지 않음; 이미 추적 중인 `.devguard/`는 경고만 하고 Git index는 수정하지 않음)
+3. 없는 `.devguard/` 설정 파일 생성 (기존 파일 유지)
+4. 프로젝트 파일을 한 번 나열(git 안에서는 `git ls-files`로 `.gitignore`된 파일 제외, 그 외에는 디렉터리 순회)하고 Code Index 생성 (`.devguard/memory/code-index.json`)
+5. Project Knowledge 생성 (`.devguard/project/project-knowledge.json`)
+6. `AGENTS.md`, `CLAUDE.md`의 DevGuard 섹션 추가/갱신 (marker 밖 텍스트 유지)
+7. Claude Code(`.mcp.json`)와 Codex(`.codex/config.toml`)에 DevGuard MCP 서버 등록 — 다른 서버/테이블 유지
+8. completion hook 설치 (best-effort)
+9. MCP 서버가 실행되어 `prepare_task_context`를 제공하는지 확인
 
 이후 `watch`는 최신 상태인 항목을 재사용하고 "Project ready."만 출력합니다. Project Knowledge는 프로젝트 구조가 바뀔 때만 재생성됩니다(파일 추가/삭제 — 새 route, component, migration, workspace 등 — 또는 package manifest, framework/TS 설정, CLI router 변경). README 문구 수정만으로는 재생성하지 않습니다.
 

@@ -28,7 +28,7 @@ That's it. The first `watch` prepares the project automatically and starts watch
 - **During work** — `dev-guard watch` tracks changes and opens a local dashboard (`127.0.0.1` only).
 - **After a task** — DevGuard records what changed and what was verified, so the next session picks up from there.
 
-On first run, `watch` indexes the project (honoring `.gitignore`), builds Project Knowledge, registers the MCP server for Claude Code and Codex, adds a DevGuard section to `AGENTS.md` / `CLAUDE.md` (your own text is kept), and installs completion hooks.
+On first run, `watch` indexes the project (honoring `.gitignore`), builds Project Knowledge, registers the MCP server for Claude Code and Codex, adds a DevGuard section to `AGENTS.md` / `CLAUDE.md` (your own text is kept), and installs completion hooks. In a Git repository it also appends `.devguard/` and `devguard.backup-*/` to `.gitignore` when Git does not already ignore them (existing lines untouched; `AGENTS.md`, `CLAUDE.md` and MCP config are not ignored). An already-tracked `.devguard/` gets a warning — DevGuard never changes the Git index.
 
 ## Optional
 

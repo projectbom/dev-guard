@@ -80,6 +80,10 @@ async function printSummary(root: string, result: PrepareResult, elapsedMs: numb
   if (knowledge && knowledge.summary.sourceRoots.length > 0) printLine("Source roots", String(knowledge.summary.sourceRoots.length));
   printLine("Files indexed", String(result.facts.filesIndexed));
   printLine("Git", gitRoot ? (resolve(gitRoot) === resolve(root) ? "repository" : `inside ${gitRoot} (run setup at the repository root)`) : "not a git repository (see warning below)");
+  const ignore = result.facts.gitIgnore;
+  if (ignore.status !== "not-git") {
+    printLine("Local state", ignore.trackedDevguardFiles > 0 ? ".devguard/ tracked by Git (see warning below)" : ignore.added.length > 0 ? `ignored in Git (added ${ignore.added.join(", ")} to .gitignore)` : "ignored in Git");
+  }
 
   const commands = [
     ["Build", known(detected.buildCommand)],

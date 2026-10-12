@@ -40,13 +40,14 @@ dev-guard watch
 The first `watch` prepares the project, then opens the local dashboard and starts watching. Preparation is deterministic and non-interactive (no prompts, no API key, no network):
 
 1. validates the project root (refuses your home directory or `/`)
-2. creates `.devguard/` config files that are missing (existing files are kept)
-3. enumerates the project once (`git ls-files` inside git, so `.gitignore`d files are never analyzed; a directory walk otherwise) and builds the Code Index (`.devguard/memory/code-index.json`)
-4. generates Project Knowledge (`.devguard/project/project-knowledge.json`)
-5. adds/refreshes the DevGuard section of `AGENTS.md` and `CLAUDE.md` (text outside the markers is kept)
-6. registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) — other servers and tables are kept
-7. installs completion hooks best-effort
-8. checks that the MCP server starts and lists `prepare_task_context`
+2. in a Git repository, appends `.devguard/` and `devguard.backup-*/` to `.gitignore` unless Git already ignores them (existing lines are never changed; `AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.codex/config.toml` are not ignored; an already-tracked `.devguard/` only gets a warning — the Git index is never modified)
+3. creates `.devguard/` config files that are missing (existing files are kept)
+4. enumerates the project once (`git ls-files` inside git, so `.gitignore`d files are never analyzed; a directory walk otherwise) and builds the Code Index (`.devguard/memory/code-index.json`)
+5. generates Project Knowledge (`.devguard/project/project-knowledge.json`)
+6. adds/refreshes the DevGuard section of `AGENTS.md` and `CLAUDE.md` (text outside the markers is kept)
+7. registers the DevGuard MCP server for Claude Code (`.mcp.json`) and Codex (`.codex/config.toml`) — other servers and tables are kept
+8. installs completion hooks best-effort
+9. checks that the MCP server starts and lists `prepare_task_context`
 
 Later `watch` runs reuse everything that is still fresh and print just "Project ready." Project Knowledge is regenerated only when the project's structure changes (files added/removed — e.g. a new route, component, migration or workspace — or package manifests, framework/TS config, or the CLI router change); editing README text does not trigger it.
 

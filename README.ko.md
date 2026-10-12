@@ -149,6 +149,8 @@ dev-guard watch
 
 첫 `watch`가 DevGuard를 자동으로 준비합니다 — `.devguard/` 설정 생성, 프로젝트 색인(Code Index), 구조 분석(Project Knowledge), `AGENTS.md` / `CLAUDE.md`에 DevGuard 섹션 추가, Claude Code와 Codex에 DevGuard MCP 서버 등록, completion hook best-effort 설치 — 그 뒤 로컬 대시보드를 열고 감시를 시작합니다. 이후 실행에서는 모두 최신이면 바로 시작하고("Project ready."), 없거나 오래된 부분만 갱신합니다.
 
+Git 저장소에서는 첫 실행이 DevGuard 로컬 상태를 Git에서 제외합니다. Git이 아직 무시하지 않는 경우에만 `.gitignore`에 `.devguard/`와 `devguard.backup-*/`를 덧붙이고(파일이 없으면 생성), 기존 줄은 바꾸거나 순서를 바꾸지 않습니다. 프로젝트 연동 파일(`AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.codex/config.toml`)은 제외하지 않으니 필요하면 커밋해 공유하세요. `.devguard/`가 이미 Git에 추적되고 있으면 경고만 하고 Git index는 건드리지 않습니다(추적 해제는 직접 `git rm -r --cached .devguard`). Git 밖에서는 `.gitignore`를 만들지 않습니다.
+
 DevGuard는 첫 watch에서 가볍고 결정적인 프로젝트 탐색을 수행하고, 이후 실행에서는 캐시된 분석을 재사용합니다. git 안에서는 `git ls-files`로 파일을 나열하므로 `.gitignore`된 파일(로컬 secret, 임시 폴더, 빌드 산출물)은 분석하지 않고, git 밖에서는 디렉터리를 순회합니다. 파일 내용 읽기는 예산 안에서 workspace package 전반에 고르게 샘플링되어, 큰 monorepo에서도 빠르면서 package가 누락되지 않습니다. 최대 25K 파일의 synthetic 저장소에서 검증했습니다(모든 저장소에 대한 보장은 아닙니다). 첫 `watch`는 25K 파일에서 약 1초에 준비되고, `prepare_task_context`는 10K 파일에서 약 0.4초, 25K에서 약 0.6초입니다. deep Code Index는 대표 파일 약 1,200개(심볼·토큰 포함)로 제한되며, 그 밖의 파일은 `prepare_task_context`가 모든 프로젝트 경로를 파일명/경로 단어로 순위 매긴 뒤 상위 몇 개만 해당 호출에서 읽고 일반 순위 계산에 맡깁니다. 인덱스에는 아무것도 추가로 쓰지 않습니다. Project Knowledge는 UI 페이지, Next.js API 라우트, HTTP 프레임워크 핸들러(Express, Fastify, Koa, Hono 등)를 각각 별도 예산으로 보관하고, 발견한 개수와 보관한 개수를 함께 기록하며, 핸들러는 프레임워크 의존성과 라우트 형태의 경로가 있는 곳부터 샘플링합니다.
 
 선택 사항 — `dev-guard setup`은 같은 준비 과정을 watch 없이 실행하고 요약을 출력합니다(CI/스크립트, 감지 결과 확인, `dev-guard setup --dry-run`으로 쓰기 없이 미리보기). `watch` 전에 반드시 실행할 필요는 없습니다.
