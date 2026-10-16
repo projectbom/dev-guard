@@ -21,6 +21,9 @@ import { openDashboardBrowser, startDashboardServer, type DashboardServerHandle 
 import { defaultWatchConfig, loadWatchConfig, type WatchConfig } from "./config.js";
 import { formatPreparation, prepareWatchProject, validateProjectRoot } from "./prepare.js";
 import { logMemSnapshot, logTopReads, memDebugEnabled } from "./mem-debug.js";
+import { isWriteBackingOff } from "./write-health.js";
+
+const HEARTBEAT_FAILURE_BACKOFF_MS = 5_000;
 
 type WatchStatus = "idle" | "active" | "ready_for_done" | "finalizing" | "processed";
 
@@ -363,7 +366,11 @@ export async function runWatch(root: string, args: string[]): Promise<void> {
       }
       const runtime = await readRuntimeState(root);
       const now = Date.now();
-      if (!runtime.watchHeartbeatAt || now - Date.parse(runtime.watchHeartbeatAt) > 4_000) {
+      // While runtime.json writes are failing (e.g. disk full), retry the
+      // heartbeat at most every HEARTBEAT_FAILURE_BACKOFF_MS instead of every
+      // tick; the first success after that clears Write Health on its own.
+      const backingOff = isWriteBackingOff(join(root, devguardPaths.runtime), HEARTBEAT_FAILURE_BACKOFF_MS, now);
+      if (!backingOff && (!runtime.watchHeartbeatAt || now - Date.parse(runtime.watchHeartbeatAt) > 4_000)) {
         await writeRuntimeState(root, {
           ...runtime,
           watchHeartbeatAt: new Date(now).toISOString()

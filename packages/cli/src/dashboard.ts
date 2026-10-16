@@ -8,6 +8,8 @@ import { devguardPaths } from "./paths.js";
 import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
 import { readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
 import { buildDashboardOverview } from "./dashboard-view.js";
+import { detectLegacyGlobalInstructions, displayInstructionPath } from "./instruction-authority.js";
+import { getWriteHealth } from "./write-health.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
 import { formatWatchDashboard } from "./watch-format.js";
 import { dashboardTranslations } from "./dashboard-i18n.js";
@@ -282,9 +284,24 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
   // both. /api/state and /api/efficiency stay available on their own.
   if (url.pathname === "/api/overview") {
     try {
-      const [state, efficiency] = await Promise.all([getDashboardState(root), getContextEfficiencyReport(root).catch(() => undefined)]);
+      const [state, efficiency, legacy] = await Promise.all([
+        getDashboardState(root),
+        getContextEfficiencyReport(root).catch(() => undefined),
+        detectLegacyGlobalInstructions().catch(() => [])
+      ]);
+      // Write Health is in-process: this server runs inside the watch
+      // process, which is the one heartbeating runtime.json.
+      const writeFailure = getWriteHealth().failing[0]?.category;
       const overview = buildDashboardOverview(
-        { initialized: state.initialized, watchRunning: state.watchRunning, setupActive: Boolean(state.setup?.active), qualityVerdict: state.qualityVerdict, sessionFileCount: state.sessionFileCount },
+        {
+          initialized: state.initialized,
+          watchRunning: state.watchRunning,
+          setupActive: Boolean(state.setup?.active),
+          qualityVerdict: state.qualityVerdict,
+          sessionFileCount: state.sessionFileCount,
+          ...(writeFailure ? { writeFailure } : {}),
+          legacyInstructionPaths: legacy.map((entry) => displayInstructionPath(entry.path))
+        },
         efficiency,
         efficiency?.taskCard?.readPlan
       );
@@ -763,6 +780,9 @@ function renderPage(): string {
     .ov-now { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--ok); border-radius: var(--r); padding: 14px 16px; display: grid; gap: 10px; }
     .ov-now.health-SETTING_UP { border-left-color: var(--accent); }
     .ov-now.health-ATTENTION { border-left-color: var(--bad); }
+    .ov-now.health-WARNING { border-left-color: var(--warn); }
+    .ov-pill.health-WARNING { background: var(--warn-bg); border-color: var(--warn-ring); }
+    .ov-health-note { font-size: 13px; }
     .ov-pills { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .ov-pill { display: flex; flex-direction: column; gap: 3px; padding: 8px 12px; border-radius: var(--r-sm); background: var(--ok-bg); border: 1px solid var(--ok-ring); min-width: 0; }
     .ov-pill b { font-size: 16px; line-height: 1.25; }
@@ -1284,7 +1304,7 @@ function metricTile(m) {
 }
 function actionBlock(o, s) {
   const a = o.action;
-  const text = a.id === 'FIX_ISSUE' ? actionText(o.issue) : t('ovAct_' + a.id);
+  const text = a.id === 'FIX_ISSUE' ? actionText(o.issue) : a.id === 'FIX_HEALTH' ? t('ovHealthAction_' + o.health.reason) : t('ovAct_' + a.id);
   let extra = '';
   if (a.command) extra += ' <code class="ov-cmd">' + esc(a.command) + '</code>';
   if (a.id === 'REVIEW_QUALITY' && Date.now() >= reviewCompleteUntil) {
@@ -1311,6 +1331,9 @@ function renderOverview(data) {
       '<div class="ov-pill health-' + esc(o.health.level) + '" data-testid="ov-health" title="' + esc(t('ovHealthReason_' + o.health.reason)) + '"><span class="ov-k">' + esc(t('ovHealth')) + '</span><b>' + esc(t('ovHealth_' + o.health.level)) + '</b></div>' +
       '<div class="ov-pill thread-' + esc(o.thread.level) + '" data-testid="ov-thread" title="' + esc(o.thread.reason) + '"><span class="ov-k">' + esc(t('ovThread')) + '</span><b>' + esc(t('ovThread_' + o.thread.level)) + '</b></div>' +
     '</div>' +
+    ((o.health.level === 'WARNING' || String(o.health.reason).indexOf('runtime-write-') === 0)
+      ? '<div class="ov-line ov-health-note" data-testid="ov-health-note">' + esc(t('ovHealthReason_' + o.health.reason)) + (o.health.detail ? ' <code>' + esc(o.health.detail) + '</code>' : '') + '</div>'
+      : '') +
     '<div class="ov-line"><span class="ov-k">' + esc(t('ovTask')) + '</span><div class="ov-task" data-testid="ov-task" title="' + esc(o.task || '') + '">' + esc(o.task || t('ovNoTask')) + '</div></div>' +
     '<div class="ov-line"><span class="ov-k">' + esc(t('ovIssue')) + '</span><div class="ov-issue' + (o.issue ? ' has-issue' : '') + '" data-testid="ov-issue"' + (o.issue ? ' title="' + esc(o.issue.why) + '"' : '') + '>' + esc(o.issue ? issueText(o.issue) : t('ovNoIssue')) + '</div></div>' +
     '<div class="ov-line ov-action"><span class="ov-k">' + esc(t('ovAction')) + '</span><div data-testid="ov-action">' + actionBlock(o, s) + '</div></div>' +

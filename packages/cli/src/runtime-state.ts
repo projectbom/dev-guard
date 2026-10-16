@@ -37,6 +37,8 @@ import { collectExecutionLineage, planExecutionLineage, type ExecutionLineage, t
 import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, taskBoundaryHeadroom, threadUserNotice, toOwner, type BoundaryHeadroom, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
 import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
 import { rankShallowCandidates } from "./shallow-index.js";
+import { detectLegacyGlobalInstructions, legacyInstructionWarnings } from "./instruction-authority.js";
+import { isPersistentWriteError, noteWriteFailure, noteWriteSuccess } from "./write-health.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -869,7 +871,11 @@ export async function writeRuntimeState(root: string, state: RuntimeState, optio
     const next = current ? mergeRuntimeStateForWrite(current, state) : state;
     await writeAtomicTextFile(fromRoot(root, runtimePath), `${JSON.stringify(normalizeRuntimeState(next), null, 2)}\n`);
   } catch (error) {
-    await logRuntimeWriteWarning(root, `runtime_write=failed path=${runtimePath} error=${quoteLogValue(errorMessage(error))}`);
+    // writeAtomicTextFile already logged (rate-limited) and recorded Write
+    // Health; logging again here doubled every ENOSPC line.
+    if (!(error instanceof Error && reportedWriteErrors.has(error))) {
+      await logRuntimeWriteWarning(root, `runtime_write=failed path=${runtimePath} error=${quoteLogValue(errorMessage(error))}`);
+    }
   }
 }
 
@@ -1392,29 +1398,79 @@ export function isIgnoredWatchPath(path: string): boolean {
   );
 }
 
-async function writeAtomicTextFile(path: string, content: string): Promise<void> {
+export interface AtomicWriteOptions {
+  /** Injectable for tests (fault injection); defaults to node:fs/promises. */
+  ops?: {
+    writeFile: (path: string, content: string, encoding: "utf8") => Promise<unknown>;
+    stat: (path: string) => Promise<unknown>;
+    rename: (from: string, to: string) => Promise<unknown>;
+    unlink: (path: string) => Promise<unknown>;
+  };
+  /** Injectable for tests so backoff never sleeps for real. */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+/** Errors already logged (or deliberately suppressed) by writeAtomicTextFile. */
+const reportedWriteErrors = new WeakSet<object>();
+
+/**
+ * Bounded retry: transient errors get 3 attempts (25ms, 50ms backoff);
+ * errors a short retry cannot fix (disk full, permission, read-only FS) get
+ * 2 attempts with one 250ms pause — never a busy loop, never unbounded.
+ */
+export function atomicWriteRetryPlan(error: unknown): { attempts: number; delayMs: (attempt: number) => number } {
+  return isPersistentWriteError(error)
+    ? { attempts: 2, delayMs: () => 250 }
+    : { attempts: 3, delayMs: (attempt) => Math.min(25 * 2 ** (attempt - 1), 1000) };
+}
+
+/**
+ * create temp → write → stat → rename. The target is only ever replaced by
+ * rename, so a failed write can never corrupt it. On any failure the temp
+ * file THIS attempt created is unlinked (unique pid/time/random name, so it
+ * can never be another writer's temp or the target); a cleanup failure never
+ * masks the original error. Repeated identical failures are logged at most
+ * once per WRITE_FAILURE_LOG_INTERVAL_MS, and Write Health records the
+ * failing streak until the next successful write clears it.
+ */
+export async function writeAtomicTextFile(path: string, content: string, options: AtomicWriteOptions = {}): Promise<void> {
+  const ops = options.ops ?? { writeFile, stat, rename, unlink };
+  const pause = options.sleep ?? sleep;
+  const now = options.now ?? Date.now;
   perfMark(`atomicWrite:${path}:mkdir-start`);
   await mkdir(dirname(path), { recursive: true });
   perfMark(`atomicWrite:${path}:mkdir-done`);
   let lastError: unknown;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
+  let operation = "write";
+  for (let attempt = 1; ; attempt += 1) {
     const tempPath = `${path}.${process.pid}.${Date.now()}.${randomSuffix()}.tmp`;
     try {
-      await writeFile(tempPath, content, "utf8");
+      operation = "write";
+      await ops.writeFile(tempPath, content, "utf8");
       perfMark(`atomicWrite:${path}:writeFile-done:attempt${attempt}`);
-      await stat(tempPath);
+      operation = "stat";
+      await ops.stat(tempPath);
       perfMark(`atomicWrite:${path}:stat-done:attempt${attempt}`);
-      await rename(tempPath, path);
+      operation = "rename";
+      await ops.rename(tempPath, path);
       perfMark(`atomicWrite:${path}:rename-done:attempt${attempt}`);
+      const recovered = noteWriteSuccess(path, now());
+      if (recovered) await logAtomicWriteWarning(path, recovered);
       return;
     } catch (error) {
       lastError = error;
-      await logAtomicWriteWarning(path, `atomic_write=retry attempt=${attempt} path=${quoteLogValue(path)} error=${quoteLogValue(errorMessage(error))}`);
-      await sleep(25 * attempt);
+      await ops.unlink(tempPath).catch(() => undefined);
+      const plan = atomicWriteRetryPlan(error);
+      if (attempt >= plan.attempts) break;
+      await pause(plan.delayMs(attempt));
     }
   }
-  await logAtomicWriteWarning(path, `atomic_write=failed path=${quoteLogValue(path)} error=${quoteLogValue(errorMessage(lastError))}`);
-  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  const line = noteWriteFailure(path, operation, lastError, now());
+  if (line) await logAtomicWriteWarning(path, line);
+  const thrown = lastError instanceof Error ? lastError : new Error(String(lastError));
+  reportedWriteErrors.add(thrown);
+  throw thrown;
 }
 
 /**
@@ -2486,7 +2542,10 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
     perfMark("prepare:structuredFiles-built");
     const trusts = structuredFiles.map((file) => contextTrustForFile(file.path, codeIndex.files[file.path], undefined, "en-US"));
     const coverageGaps = preparedTaskCoverageGaps(structuredFiles, context.summary);
-    const warnings = [...explicitResolution.warnings, ...preparedTaskWarnings(structuredFiles, codeIndex)];
+    // Instruction Authority first: an obsolete user-level "read DevGuard
+    // markdown first" block is why agents pass stale handoff files as inputs.
+    const instructionWarnings = legacyInstructionWarnings(await detectLegacyGlobalInstructions().catch(() => []));
+    const warnings = [...instructionWarnings, ...explicitResolution.warnings, ...preparedTaskWarnings(structuredFiles, codeIndex)];
     const resumeCost = await measureResumeBundleCost(root);
     perfMark("prepare:measureResumeBundleCost-done");
     const owner = await ownerPromise;
@@ -5479,7 +5538,7 @@ function buildDocumentationSummary(input: {
     fileChanges,
     qaChecks: documentationQAChecks(fileChanges, changeTypes, input.qaResults, constraints),
     remainingWork: documentationRemainingWork(fileChanges, changeTypes, input.qaResults, input.staleQaResults, input.unboundQaResults),
-    structure: documentationStructure(changeTypes, fileChanges),
+    structure: documentationStructure(changeTypes),
     excludedAreas: taskScopeConstraints(input.currentTaskText),
     constraints
   };
@@ -5634,7 +5693,7 @@ function diffLines(diff: string, prefix: "+" | "-"): string[] {
 function inferDocumentationChangeTypes(file: string, added: string[], removed: string[]): ChangeType[] {
   const text = `${file}\n${added.join("\n")}\n${removed.join("\n")}`;
   const types = new Set<ChangeType>();
-  if (/\.(tsx|jsx)$|components\/|dashboard\.ts/i.test(file) || (!/runtime-state\.ts$/i.test(file) && /className|<details|<summary|aria-|button|card|layout|spacing|mobile|overflow/i.test(text))) types.add("UI");
+  if (/\.(tsx|jsx)$|components\//i.test(file) || /className|<details|<summary|aria-|button|card|layout|spacing|mobile|overflow/i.test(text)) types.add("UI");
   if (/dashboard-i18n|locale|translation/i.test(file)) types.add("i18n");
   if (/runtime-state|quality|handoff|context|report|prompt|summary|QA|documentation/i.test(file) || /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(text)) types.add("QA");
   if (/package\.json|pnpm-lock|package-lock|yarn\.lock|bun\.lockb?|\.npmrc|tsconfig/i.test(file)) types.add("Config");
@@ -5647,13 +5706,11 @@ function inferDocumentationChangeTypes(file: string, added: string[], removed: s
   return types.size > 0 ? [...types] : ["Logic"];
 }
 
+// Project-neutral by contract: purposes come from generic path/type signals
+// only, never from DevGuard's own source file names (an unrelated project's
+// `index.ts` or `dashboard.ts` is not DevGuard's CLI or Dashboard).
 function inferDocumentationFilePurpose(file: string, types: ChangeType[]): string {
-  if (/runtime-state\.ts$/.test(file)) return "generated documentation intelligence and DevGuard artifact generation";
-  if (/install-agent-instructions\.ts$/.test(file)) return "AGENTS.md / CLAUDE.md generated startup instructions";
-  if (/dashboard\.ts$/.test(file)) return "Dashboard API, rendering, Quick Actions, and preview interaction";
-  if (/dashboard-i18n\.ts$/.test(file)) return "Dashboard EN/KO user-facing labels";
-  if (/index\.ts$/.test(file)) return "CLI command output and generated artifact guidance";
-  if (/paths\.ts$/.test(file)) return "DevGuard managed artifact path constants";
+  if (/(^|\/)(AGENTS|CLAUDE)\.md$/.test(file)) return "agent startup instructions";
   if (/README|docs\//i.test(file)) return "user-facing documentation";
   if (/package\.json|pnpm-lock\.yaml/i.test(file)) return "release and package metadata";
   if (/\.sql$/i.test(file) || /(^|\/)migrations?\//i.test(file)) return "database schema migration";
@@ -5689,19 +5746,10 @@ function inferConcreteChanges(file: string, added: string[], removed: string[], 
   const fileSpecificChanges = inferFileSpecificPipelineChanges(file, added, removed);
   for (const change of fileSpecificChanges) changes.add(change);
   for (const change of inferFeatureLevelChanges(file, added, removed)) changes.add(change);
-  if (added.some((line) => /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(line))) {
-    changes.add("Builds a shared Change Intelligence summary before generated artifacts are rendered.");
-    changes.add("Uses the same feature-level summary in Quality Report, Handoff, Working Context, and Agent Context.");
-  }
-  if (fileSpecificChanges.length === 0 && !/runtime-state\.ts$/i.test(file)) {
+  if (fileSpecificChanges.length === 0) {
     for (const change of detectTextReplacements(added, removed)) changes.add(change);
   }
-  if (!/runtime-state\.ts$/i.test(file) && added.some((line) => /<details|<summary|collapsible details/i.test(line))) changes.add("Moves long supporting content into collapsible details sections.");
-  if (fileSpecificChanges.length === 0 && added.some((line) => /Working Context|working-context|작업 구조/i.test(line))) changes.add("Connects Working Context as an AI-readable startup artifact.");
-  if (fileSpecificChanges.length === 0 && added.some((line) => /Agent Context|에이전트 지침/i.test(line))) changes.add("Exposes Agent Context as a first-class assistant guidance artifact.");
-  if (fileSpecificChanges.length === 0 && added.some((line) => /Quick Actions|빠른 실행|quickAction/i.test(line))) changes.add("Updates Dashboard Quick Actions.");
-  if (fileSpecificChanges.length === 0 && added.some((line) => /0\.7\.0/.test(line))) changes.add("Prepares package metadata for version 0.7.0.");
-  if (fileSpecificChanges.length === 0 && added.some((line) => /DocumentationSummary|documentationSummary|buildDocumentationSummary/i.test(line))) changes.add("Introduces a shared documentation summary used by generated artifacts.");
+  if (added.some((line) => /<details|<summary|collapsible details/i.test(line))) changes.add("Moves long supporting content into collapsible details sections.");
   if (types.includes("Docs") && changes.size === 0) changes.add("Updates documentation text to match the current workflow.");
   if (types.includes("i18n") && changes.size === 0) changes.add("Updates localized user-facing copy.");
   if (types.includes("UI") && changes.size === 0) changes.add("Adjusts UI rendering or interaction behavior.");
@@ -5712,64 +5760,22 @@ function inferConcreteChanges(file: string, added: string[], removed: string[], 
 function inferFeatureLevelChanges(file: string, added: string[], removed: string[]): string[] {
   const text = [...added, ...removed].join("\n");
   const changes = new Set<string>();
-  if (/runtime-state\.ts$/i.test(file)) {
-    if (/Change Intelligence|feature-level|feature level|completion report|완료 보고|git diff|diff stat/i.test(text)) {
-      changes.add("Turns generated DevGuard documents from diff/code summaries into feature-level Change Intelligence.");
-      changes.add("Prioritizes completion report, user goal, diff, changed files, and QA results when generating document context.");
-    }
-    if (/userImpact|inferUserImpact|inferFeatureLevelChanges|documentationStructure/i.test(text)) {
-      changes.add("Adds file-level user and AI impact so generated documents explain why each change matters.");
-    }
-    if (/Quality Report|Handoff|Working Context|Agent Context/i.test(text)) {
-      changes.add("Keeps Quality Report, Handoff, Working Context, and Agent Context aligned on the same change summary.");
-    }
-    return [...changes].slice(0, 6);
-  }
-  if (/avoidThis/i.test(text) && /doThis/i.test(text)) changes.add("Uses doThis guidance instead of avoidThis guidance.");
-  if (/confidence/i.test(removed.join("\n")) && !/confidence/i.test(added.join("\n"))) changes.add("Removes the visible confidence display.");
-  if (/강점 활용법|strength usage|ability hero|hero card/i.test(text)) changes.add("Adds or updates the Ability Hero Card / strength-usage section.");
-  if (/보완하면 좋은 점/i.test(removed.join("\n")) && /강점 활용법/i.test(added.join("\n"))) changes.add("Renames the growth guidance from 보완하면 좋은 점 to 강점 활용법.");
-  if (/back card|Back Card|4장|four card|grid-cols-4|repeat\(4/i.test(text)) changes.add("Compresses the Back Card into a four-card structure.");
+  // Generic UI vocabulary only. Product-specific component names (from any
+  // one project, including DevGuard itself) must never be matched here: the
+  // sentence would be reported as a change in every unrelated project whose
+  // diff happens to contain the same word.
   if (/<details|<summary|collapsible details/i.test(text)) changes.add("Moves long secondary content into collapsible details sections.");
   if (/theme toggle|Theme Toggle|dark mode|light mode/i.test(text)) changes.add("Adds or adjusts the Theme Toggle.");
   if (/\bfooter\b|Footer|site footer/i.test(text)) changes.add("Adds or adjusts the Footer.");
-  if (/DocumentationSummary|documentationSummary|Change Intelligence|feature-level|feature level/i.test(text)) changes.add("Turns generated DevGuard documents from diff/code summaries into feature-level Change Intelligence.");
-  if (/completion report|완료 보고|git diff|diff stat/i.test(text)) changes.add("Prioritizes completion report, user goal, diff, changed files, and QA results when generating document context.");
   return [...changes].filter((change) => !isCodeLevelChange(change)).slice(0, 6);
 }
 
 function inferFileSpecificPipelineChanges(file: string, added: string[], removed: string[]): string[] {
-  const text = [...added, ...removed].join("\n");
   const changes = new Set<string>();
-  if (/^(AGENTS|CLAUDE)\.md$/.test(file)) {
-    changes.add("Updates agent startup instructions to read Read Map, Code Map, and Agent Brief before broad repository exploration.");
-    changes.add("Tells agents to open only targeted entry files after reading DevGuard context.");
-  }
-  if (/install-agent-instructions\.ts$/.test(file)) {
-    changes.add("Updates generated AGENTS.md / CLAUDE.md sections with the Before Agent pipeline.");
-    changes.add("Changes resume guidance to start from Read Map, Code Map, and Agent Brief.");
-  }
-  if (/paths\.ts$/.test(file) && /readMap|codeMap|agentBrief/i.test(text)) {
-    changes.add("Adds managed artifact paths for Read Map, Code Map, and Agent Brief.");
-  }
-  if (/paths\.ts$/.test(file) && /memoryDir|codeIndex|changeLog/i.test(text)) {
-    changes.add("Adds managed memory paths for code-index.json and change-log.jsonl.");
-  }
-  if (/index\.ts$/.test(file) && /readMapPath|codeMapPath|agentBriefPath|generateReadMap|generateCodeMap|generateAgentBrief/i.test(text)) {
-    changes.add("Shows Read Map, Code Map, and Agent Brief in done/handoff generated output.");
-    changes.add("Updates the new-session prompt to start from the Before Agent artifacts.");
-  }
-  if (/runtime-state\.ts$/.test(file) && /generateReadMap|generateCodeMap|generateAgentBrief|renderReadMap|renderCodeMap|renderAgentBrief/i.test(text)) {
-    if (/functionalCodeIndexSummary|developerImpact|userImpact|symbolInsight|indexedReadCandidates|codeMapSymbolPriority|Block Intelligence/i.test(text)) {
-      changes.add("Improves Agent Context Router output from diff fragments to functional read intelligence.");
-      changes.add("Adds user impact and developer impact to Code Index entries.");
-      changes.add("Prioritizes actionable generation functions and blocks over types, constants, and broad entry files.");
-      changes.add("Adds role, edit point, and QA point metadata to indexed symbols and blocks.");
-    } else {
-      changes.add("Adds rule-based Before Agent artifacts: Read Map, Code Map, and Agent Brief.");
-      changes.add("Connects the new Before Agent artifacts to done and handoff regeneration.");
-      changes.add("Reuses existing Change Intelligence instead of generating a second summary.");
-    }
+  // Path-only and project-neutral: any project may edit its own agent
+  // instruction files, and DevGuard cannot know what the new text says.
+  if (/(^|\/)(AGENTS|CLAUDE)\.md$/.test(file) && (added.length > 0 || removed.length > 0)) {
+    changes.add("Updates agent startup instructions.");
   }
   return [...changes];
 }
@@ -5777,19 +5783,12 @@ function inferFileSpecificPipelineChanges(file: string, added: string[], removed
 function inferUserImpact(file: string, changes: string[], types: ChangeType[]): string[] {
   const text = `${file}\n${changes.join("\n")}`;
   const impact = new Set<string>();
-  if (/Read Map|Code Map|Agent Brief|Before Agent/i.test(text)) impact.add("Agents can start from a smaller reading plan before opening source files.");
-  if (/targeted entry files|broad repository exploration/i.test(text)) impact.add("Expensive agents are less likely to spend tokens rediscovering the repository.");
-  if (/managed artifact paths/i.test(text)) impact.add("The new pipeline files are addressed through shared DevGuard path constants.");
-  if (/done\/handoff generated output|new-session prompt/i.test(text)) impact.add("Users can see the Before Agent artifacts immediately after done or handoff.");
-  if (/confidence/i.test(text)) impact.add("The UI avoids exposing an unclear confidence signal to users.");
   if (/collapsible details|<details|details sections/i.test(text)) impact.add("Long secondary content stays available without overwhelming the main screen.");
   if (/Theme Toggle/i.test(text)) impact.add("Users can switch visual theme from the visible UI control.");
   if (/Footer/i.test(text)) impact.add("The page has clearer bottom navigation or product framing.");
-  if (/Change Intelligence|feature-level/i.test(text)) impact.add("AI and human readers can resume from feature meaning instead of re-reading raw diffs.");
-  if (/Quality Report|Handoff|Working Context|Agent Context/i.test(text)) impact.add("Generated DevGuard documents share the same understanding of what changed.");
   if (types.includes("Docs")) impact.add("Readers get guidance that better matches the current workflow.");
   if (impact.size === 0 && types.includes("UI")) impact.add("The changed UI should be checked in the actual user flow.");
-  if (impact.size === 0 && types.includes("QA")) impact.add("Generated QA and handoff documents should be reviewed as the behavior under test.");
+  if (impact.size === 0 && types.includes("QA")) impact.add("Generated reports should be reviewed as the behavior under test.");
   return [...impact].slice(0, 4);
 }
 
@@ -5869,16 +5868,6 @@ function extractQuotedTerms(lines: string[]): string[] {
 function inferConcreteQA(file: string, types: ChangeType[], added: string[], removed: string[]): string[] {
   const checks = new Set<string>();
   const text = `${file}\n${added.join("\n")}\n${removed.join("\n")}`;
-  if (/runtime-state\.ts$/.test(file)) {
-    checks.add("Run `dev-guard done` and verify generated artifacts describe feature-level changes, not code-token changes.");
-    checks.add("Read Quality Report, Handoff, Working Context, and Agent Context for the same Change Intelligence summary.");
-    checks.add("Confirm feature examples inside the generator are not reported as actual product changes unless the related product files changed.");
-    return [...checks].slice(0, 5);
-  }
-  if (/ability hero|강점 활용법|보완하면 좋은 점|hero card/i.test(text)) checks.add("Verify the Ability Hero Card / strength-usage section communicates the intended guidance without overflowing.");
-  if (/back card|4장|four card/i.test(text)) checks.add("Verify the Back Card four-card order, spacing, and responsive layout.");
-  if (/avoidThis|doThis/i.test(text)) checks.add("Verify the UI now shows the intended doThis guidance and no longer depends on avoidThis copy.");
-  if (/confidence/i.test(text)) checks.add("Verify removing confidence does not leave empty spacing or stale labels.");
   if (/theme toggle/i.test(text)) checks.add("Click the Theme Toggle and confirm the selected theme is visible and persistent as intended.");
   if (/<details|<summary|details/i.test(text)) checks.add("Expand and collapse details sections and confirm long content remains readable.");
   if (types.includes("UI")) {
@@ -5891,8 +5880,7 @@ function inferConcreteQA(file: string, types: ChangeType[], added: string[], rem
   if (types.includes("i18n")) checks.add("Verify Korean and English labels are natural and consistent.");
   if (types.includes("Config") || types.includes("Release")) checks.add("Verify package versions, dependency specifiers, and lockfile are consistent.");
   if (types.includes("Docs")) checks.add("Confirm docs describe commands and artifacts that actually exist.");
-  if (types.includes("QA")) checks.add("Regenerate Quality Report, Handoff, Working Context, and Agent Context and read the generated output.");
-  if (/install-agent-instructions\.ts$/.test(file)) checks.add("Run `dev-guard install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.");
+  if (types.includes("QA")) checks.add("Regenerate the affected reports or outputs and read them.");
   return [...checks].slice(0, 5);
 }
 
@@ -5924,13 +5912,13 @@ function documentationOverview(files: DocumentationFileChange[], types: ChangeTy
  */
 function affectedAreasFromDocumentation(files: DocumentationFileChange[], types: ChangeType[]): string[] {
   const areas = new Set<string>();
-  if (types.includes("UI")) areas.add("Dashboard/UI");
-  if (types.includes("QA")) areas.add("Generated documentation");
+  if (types.includes("UI")) areas.add("UI");
+  if (types.includes("QA")) areas.add("Reports/generated output");
   if (types.includes("Docs")) areas.add("User docs");
   if (types.includes("Config")) areas.add("Package/config");
   if (types.includes("Release")) areas.add("Release metadata");
   if (types.includes("i18n")) areas.add("Locale/UI copy");
-  if (files.some((file) => /AGENTS|CLAUDE|install-agent-instructions/.test(file.file))) areas.add("Agent startup instructions");
+  if (files.some((file) => /(^|\/)(AGENTS|CLAUDE)\.md$/.test(file.file))) areas.add("Agent startup instructions");
   const domainAreas = classifyAreas(files.map((file) => file.file));
   if (domainAreas.includes("auth")) areas.add("Auth");
   if (domainAreas.includes("database")) areas.add("Database");
@@ -6050,8 +6038,8 @@ function documentationRemainingWork(
     if (entry.status === "FAIL") remaining.add(`Runtime smoke failed: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
     if (entry.status === "UNKNOWN") remaining.add(`Runtime smoke unresolved: ${entry.name}${entry.reason ? ` (${entry.reason})` : ""}.`);
   }
-  if (types.includes("Docs")) remaining.add("Read changed docs and confirm examples match current CLI output.");
-  if (types.includes("QA")) remaining.add("Read regenerated artifacts and confirm they describe feature-level changes instead of code-token changes.");
+  if (types.includes("Docs")) remaining.add("Read changed docs and confirm examples match current behavior.");
+  if (types.includes("QA")) remaining.add("Read the regenerated output and confirm it describes the actual change.");
   if (files.length === 0) remaining.add("No changed files were available; rerun after a real diff if this is unexpected.");
   // Evidence Binding diagnostic: real evidence exists but was recorded with
   // no active task, so it was excluded from the QA facts above — surfaced
@@ -6070,20 +6058,21 @@ function documentationRisk(files: DocumentationFileChange[], types: ChangeType[]
   if (files.length === 0) return { level: "None", reason: "No changed files were detected." };
   if (types.includes("Config") || types.includes("Release")) return { level: "Medium", reason: "Package or release metadata changed and should be checked before publishing." };
   if (types.includes("UI")) return { level: "Medium", reason: "UI changes need manual interaction and responsive checks." };
-  if (types.includes("QA")) return { level: "Medium", reason: "Generated documentation logic changed; build success does not prove the artifacts explain the actual feature changes." };
+  if (types.includes("QA")) return { level: "Medium", reason: "Report or QA generation code changed; review the generated output, not just the build result." };
   if (types.includes("Docs")) return { level: "Low", reason: "Documentation changed without direct runtime logic changes." };
   return { level: "Low", reason: "No high-risk area was detected from changed file paths and diff content." };
 }
 
-function documentationStructure(types: ChangeType[], files: DocumentationFileChange[] = []): string[] {
-  const text = files.flatMap((file) => file.changes).join("\n");
-  if (/Profile|Ability|Back Card|Hero|Meta Map|details/i.test(text)) {
-    return ["Profile Card", "├── Front: Hero / Ability / Strength / Growth", "├── Back: Meta Map / MBTI / Evidence / Details", "└── Excluded: DB / Auth / Routing / Engine"];
-  }
+/**
+ * Generic, project-neutral flow sketch. Never name a specific product's
+ * components or DevGuard's own artifacts here: this text is rendered into
+ * every project's Handoff/Quality Report.
+ */
+function documentationStructure(types: ChangeType[]): string[] {
   if (types.includes("UI")) return ["UI entry", "↓", "feature-level UI state", "↓", "user-visible interaction"];
-  if (types.includes("QA")) return ["dev-guard done", "↓", "Change Intelligence", "↓", "Quality Report / Handoff / Working Context / Agent Context"];
-  if (types.includes("Docs")) return ["User docs", "↓", "agent startup guidance", "↓", "current DevGuard workflow"];
-  return ["changed files", "↓", "Change Intelligence", "↓", "generated DevGuard artifacts"];
+  if (types.includes("QA")) return ["changed report/QA logic", "↓", "regenerated output", "↓", "reviewed result"];
+  if (types.includes("Docs")) return ["changed docs", "↓", "reader guidance"];
+  return ["changed files", "↓", "affected behavior"];
 }
 
 function documentationGoal(taskText: string, files: DocumentationFileChange[], types: ChangeType[], canonicalGoal?: string): string {
@@ -6344,23 +6333,8 @@ function truncateSummary(text: string): string {
 function inferDeveloperImpact(file: string, content: string, summary?: DocumentationFileChange): string[] {
   const impact = new Set<string>();
   const text = `${file}\n${content.slice(0, 20000)}\n${summary?.changes.join("\n") ?? ""}`;
-  if (/runtime-state\.ts$/.test(file)) {
-    impact.add("Keep Read Map, Code Map, Agent Brief, Quality Report, Handoff, and Working Context on the same DocumentationSummary source.");
-    impact.add("For router output changes, start from renderReadMap, renderCodeMap, renderAgentBrief, and updateCodeIndex before opening unrelated runtime paths.");
-    impact.add("Avoid watch, hook, and dashboard paths unless the changed file list includes those areas.");
-  }
-  if (/paths\.ts$/.test(file)) {
-    impact.add("Add generated artifact paths through devguardPaths and reuse them instead of hardcoding `.devguard` paths.");
-  }
-  if (/dashboard\.ts$/.test(file)) {
-    impact.add("Keep Dashboard rendering separate from report generation; verify API responses do not expose raw secret values.");
-  }
-  if (/install-agent-instructions\.ts$/.test(file)) {
-    impact.add("Update generated AGENTS.md / CLAUDE.md copy without changing the underlying command behavior.");
-  }
   if (/\.(tsx|jsx)$|components\//i.test(file) && /card|section|view|screen|layout|component|className|return\s*\(/i.test(text)) {
     impact.add("Start from visible user-facing sections before opening data, auth, or routing modules.");
-    if (/theme|getCardTheme|Theme/i.test(text)) impact.add("Theme changes should reuse the existing theme helper instead of introducing a parallel style path.");
   }
   if (impact.size === 0) impact.add("Start from the indexed symbols and blocks before reading the full file.");
   return [...impact].slice(0, 4);
@@ -7240,14 +7214,14 @@ async function assessCompletionQuality(
   checklist.push({
     label: "watch verification",
     status: watchChanged ? "WARN" : "PASS",
-    detail: watchChanged ? "watch changed; verify --poll and --depth behavior" : "watch implementation not changed"
+    detail: watchChanged ? "file-watching code changed; verify it still reacts to real file changes" : "watch implementation not changed"
   });
 
   const stateHistoryChanged = input.changedFiles.some((file) => /(runtime-state|history|state|prompt)\.[tj]sx?$/.test(file));
   checklist.push({
     label: "state/history verification",
     status: stateHistoryChanged ? "WARN" : "PASS",
-    detail: stateHistoryChanged ? "state/history/prompt generation changed; verify done/status output" : "state/history generation not changed"
+    detail: stateHistoryChanged ? "state/history/prompt code changed; verify it still reads and writes as intended" : "state/history generation not changed"
   });
 
   const codeChanged = input.changedFiles.some((file) => /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file));
@@ -7380,9 +7354,7 @@ export function mergeAIQualityReview(
   generated: AIQualityReview,
   options: { changedFiles: string[]; historicalPhrases?: string[] }
 ): QualityReport {
-  const shouldKeepSeedSummary =
-    isGenericAIQualitySummary(generated) ||
-    (isOpenAIKeyUXChange(options.changedFiles) && !aiReviewMentionsOpenAIKeyFlow(generated));
+  const shouldKeepSeedSummary = isGenericAIQualitySummary(generated);
   // Safety net against the AI restating a previous session's description as
   // if it were part of the current change (see qualityAISystemPrompt/
   // qualityAIUserPrompt, which already instruct the model not to do this —
@@ -7487,7 +7459,6 @@ function qualityAIUserPrompt(input: {
     sessionGoal: input.nextTaskTitle || "Needs confirmation",
     effectiveTask: input.summary || "Needs confirmation",
     changedFiles: input.changedFiles.map((file) => ({ path: file, purpose: fileRoleDescription(file, input.locale) })),
-    seedQualityContext: buildSeedQualityContext(input.changedFiles, input.locale),
     documentationSummary: input.documentationSummary,
     areas: input.areas,
     qualityVerdict: input.report.verdict,
@@ -7502,7 +7473,6 @@ function qualityAIUserPrompt(input: {
     constraints: [
       "Focus only on this change.",
       "Explain what matters, what the user should do now, and why.",
-      "Use seedQualityContext as the minimum concrete meaning to preserve.",
       "Use documentationSummary as the source of truth for what actually changed.",
       "handoffSummary and recentSessionContext are historical background from previous sessions; never state their content as something that happened in this change.",
       "Do not copy generic verification commands as the main next action unless they are directly relevant.",
@@ -7518,35 +7488,6 @@ function isGenericAIQualitySummary(review: AIQualityReview): boolean {
     return true;
   }
   return false;
-}
-
-function buildSeedQualityContext(changedFiles: string[], locale: DevGuardLocale): string[] {
-  if (!isOpenAIKeyUXChange(changedFiles)) return [];
-  return locale === "ko-KR"
-    ? [
-        "이번 변경의 핵심은 OpenAI API Key 설정을 CLI와 Dashboard에 추가한 것입니다.",
-        ".devguard/config.json, DEV_GUARD_OPENAI_API_KEY, OPENAI_API_KEY 우선순위를 적용했습니다.",
-        "API key raw value는 CLI 출력, Dashboard API, 로그에 노출되면 안 됩니다.",
-        "key가 없거나 잘못되었거나 네트워크/timeout이 발생해도 done/status/handoff는 실패하지 않고 rule-based Quality Report와 Handoff를 생성해야 합니다.",
-        "Dashboard API는 configured/source만 반환해야 합니다."
-      ]
-    : [
-        "This change adds OpenAI API key setup to the CLI and Dashboard.",
-        "Key resolution must prefer .devguard/config.json, then DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.",
-        "Raw API key values must not appear in CLI output, Dashboard API responses, or logs.",
-        "When the key is missing, invalid, unavailable, or times out, done/status/handoff must still succeed with rule-based Quality Report and Handoff generation.",
-        "Dashboard API should return configured/source only."
-      ];
-}
-
-function aiReviewMentionsOpenAIKeyFlow(review: AIQualityReview): boolean {
-  const text = [
-    ...review.summary,
-    ...review.why,
-    review.nextAction,
-    ...review.reviewItems.flatMap((item) => [item.title, ...item.body, ...item.checks])
-  ].join("\n").toLowerCase();
-  return /openai|api key|apikey|configured\/source|fallback|dashboard/.test(text);
 }
 
 export interface AIQualityReview {
@@ -7607,7 +7548,7 @@ function userFacingQualityLabel(label: string): string {
   if (label === "risky areas") return "Runtime-sensitive area changed";
   if (label === "CLI router/help verification") return "CLI command and help verification";
   if (label === "watch verification") return "Watch behavior verification";
-  if (label === "state/history verification") return "Report, history, and handoff generation verification";
+  if (label === "state/history verification") return "State and history code verification";
   if (label === "docs update candidate") return "Documentation update need";
   if (label === "drift clarity") return "Change scope clarity";
   return label;
@@ -7619,11 +7560,6 @@ function fileRoleDescription(file: string, locale: DevGuardLocale): string {
   if (role === "script/dependency config") return "스크립트 또는 의존성 설정";
   if (role === "lockfile/dependency snapshot") return "의존성 잠금 파일";
   if (role === "generated artifacts exclusion") return "생성 산출물 제외 설정";
-  if (role === "CLI command router / entrypoint") return "CLI 명령 라우터 또는 진입점";
-  if (role === "watch command / file watcher") return "watch 명령 또는 파일 감시";
-  if (role === "runtime state / history persistence") return "런타임 상태와 히스토리 저장";
-  if (role === "review command / drift analysis") return "리뷰 명령 또는 변경 범위 분석";
-  if (role === "docs update preview/write logic") return "문서 업데이트 미리보기 또는 쓰기 로직";
   if (role === "documentation") return "사용자 문서";
   if (role === "test file") return "테스트 파일";
   if (role === "API/server route") return "API 또는 서버 라우트";
@@ -7639,22 +7575,6 @@ function buildQualitySummary(input: {
   issueItems: QualityCheckItem[];
   requiredVerification: string[];
 }): string[] {
-  if (isQualityReportGenerationChange(input.changedFiles)) {
-    return [
-      "This change turns the generated Quality Report into a QA result document instead of a generic checklist.",
-      "The report should explain the verdict, summarize the change, describe what changed per file, and separate completed QA from missing QA.",
-      "Because the report generation logic changed, the regenerated markdown must be read directly after `dev-guard done`.",
-      "Build success alone cannot prove the generated QA wording is specific, natural, and free of internal rule labels."
-    ];
-  }
-  if (isOpenAIKeyUXChange(input.changedFiles)) {
-    return [
-      "This change adds OpenAI API key setup to both the CLI and Dashboard.",
-      "DevGuard should resolve keys in this order: .devguard/config.json, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.",
-      "Raw key values must stay hidden while the Dashboard API reports only configured/source.",
-      "If the key is missing, invalid, unavailable, or times out, done/status/handoff should still generate rule-based Quality Report and Handoff files."
-    ];
-  }
   if (input.verdict === "PASS") {
     return [
       "No blocking quality issues were detected.",
@@ -7681,20 +7601,6 @@ function buildQualityReasons(input: {
   if (input.verdict === "PASS") {
     return ["The change scope is small, verification commands are available, and no blocking local quality rule fired."];
   }
-  if (isQualityReportGenerationChange(input.changedFiles)) {
-    return [
-      "Quality Report generation changed, so the generated markdown itself is the behavior under test.",
-      "The report must show what changed, why the verdict was chosen, what QA is complete, and what QA remains.",
-      "The implementation should not expose internal analysis labels or replace QA reasoning with generic commands."
-    ];
-  }
-  if (isOpenAIKeyUXChange(input.changedFiles)) {
-    return [
-      "The change crosses CLI config, Dashboard settings, dashboard API responses, and Quality Report generation.",
-      "API key handling is security-sensitive because raw values must never appear in logs, terminal output, dashboard state, or generated reports.",
-      "The fallback path matters because DevGuard must remain useful without OpenAI access and must keep generating Quality Report and Handoff files."
-    ];
-  }
   const reasons = new Set<string>();
   for (const item of input.issueItems) {
     reasons.add(userFacingReason(item, input.changedFiles, input.areas));
@@ -7709,9 +7615,6 @@ function buildQualityReviewItems(input: {
   requiredVerification: string[];
 }): QualityReviewItem[] {
   const items: QualityReviewItem[] = [];
-  if (isOpenAIKeyUXChange(input.changedFiles)) {
-    items.push(openAIKeyQualityReviewItem(input.changedFiles));
-  }
   for (const issue of input.issueItems) {
     items.push(reviewItemForQualityCheck(issue, input.changedFiles, input.areas, input.requiredVerification));
   }
@@ -7733,12 +7636,6 @@ function buildQualityNextAction(input: {
   issueItems: QualityCheckItem[];
   requiredVerification: string[];
 }): string {
-  if (isQualityReportGenerationChange(input.changedFiles)) {
-    return "Regenerate the Quality Report, read the generated markdown, and confirm it explains the QA result, changed files, risks, and next QA without generic review wording.";
-  }
-  if (isOpenAIKeyUXChange(input.changedFiles)) {
-    return "Verify that config/env key priority works, raw key values are not exposed, and missing or invalid keys still fall back to rule-based Quality Report and Handoff generation.";
-  }
   if (input.verdict === "PASS") {
     return input.changedFiles.length > 0
       ? "Run the listed verification commands, then proceed with final review or commit."
@@ -7754,26 +7651,14 @@ function buildQualityNextAction(input: {
 }
 
 function qualityImpactSummary(changedFiles: string[], areas: string[]): string {
-  if (isQualityReportGenerationChange(changedFiles)) {
-    return "This change affects how DevGuard explains the current session's QA result in the generated Quality Report.";
-  }
-  if (isOpenAIKeyUXChange(changedFiles)) {
-    return "This change affects OpenAI API key setup, secret handling, Dashboard API state, and Quality Report fallback behavior.";
-  }
-  if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
-    return "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.";
-  }
-  if (changedFiles.some((file) => /locale|dashboard-i18n/i.test(file)) || changedFiles.some((file) => /dashboard/i.test(file) && /config|locale/i.test(changedFiles.join("\n")))) {
-    return "This change affects whether Dashboard language choices are reflected in generated reports and handoff files.";
+  if (changedFiles.some((file) => /locale|i18n|translation/i.test(file))) {
+    return "This change affects localized user-facing text.";
   }
   if (changedFiles.some((file) => /dashboard/i.test(file))) {
-    return "This change affects what users see or do in the Dashboard.";
+    return "This change affects what users see or do in a dashboard screen.";
   }
   if (changedFiles.some((file) => /auth|oauth|login|session/i.test(file)) || areas.includes("auth")) {
     return "This change affects the authentication or login flow, so the end-to-end sign-in behavior needs review.";
-  }
-  if (changedFiles.some((file) => /runtime-state|handoff|prompt|quality/i.test(file))) {
-    return "This change affects generated reports, handoff files, or next-session context.";
   }
   if (changedFiles.some((file) => /config|configure|\.devguard|package\.json|tsconfig/i.test(file)) || areas.includes("config")) {
     return "The change can affect configuration or runtime behavior.";
@@ -7785,39 +7670,6 @@ function qualityImpactSummary(changedFiles: string[], areas: string[]): string {
     return "The change can affect API behavior or external callers.";
   }
   return "The change should be reviewed against the current user request.";
-}
-
-function isOpenAIKeyUXChange(changedFiles: string[]): boolean {
-  const text = changedFiles.join("\n");
-  const touchesKeyConfig = /packages\/cli\/src\/config\.ts|packages\/cli\/src\/configure\.ts|packages\/core\/src\/types\.ts|packages\/core\/src\/defaults\.ts/.test(text);
-  const touchesDashboard = /packages\/cli\/src\/dashboard(?:-i18n)?\.ts/.test(text);
-  const touchesQualityFallback = /packages\/cli\/src\/runtime-state\.ts|packages\/cli\/src\/review\.ts|packages\/cli\/src\/task-ai\.ts/.test(text);
-  return touchesKeyConfig && (touchesDashboard || touchesQualityFallback);
-}
-
-function isQualityReportGenerationChange(changedFiles: string[]): boolean {
-  return changedFiles.some((file) => /packages\/cli\/src\/runtime-state\.ts$/.test(file));
-}
-
-function openAIKeyQualityReviewItem(changedFiles: string[]): QualityReviewItem {
-  const files = changedFiles.filter((file) =>
-    /packages\/cli\/src\/config\.ts|packages\/cli\/src\/configure\.ts|packages\/cli\/src\/dashboard(?:-i18n)?\.ts|packages\/cli\/src\/runtime-state\.ts|packages\/cli\/src\/review\.ts|packages\/cli\/src\/task-ai\.ts|packages\/core\/src\/types\.ts|packages\/core\/src\/defaults\.ts|README|docs\//.test(file)
-  ).slice(0, 10);
-  return {
-    title: "OpenAI API key safety and fallback",
-    body: [
-      "Confirm the CLI and Dashboard can store or report OpenAI key configuration without exposing the raw key value.",
-      "Confirm key resolution follows config, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.",
-      "Confirm missing, invalid, network-failed, or timed-out OpenAI calls still produce rule-based Quality Report and Handoff files."
-    ],
-    files,
-    checks: [
-      "dev-guard config set openaiApiKey <test-key>",
-      "dev-guard done with no OPENAI_API_KEY/DEV_GUARD_OPENAI_API_KEY",
-      "Dashboard /api/state exposes configured/source only",
-      "Quality Report and Project Handoff are generated after fallback"
-    ]
-  };
 }
 
 function userFacingReason(item: QualityCheckItem, changedFiles: string[], areas: string[]): string {
@@ -7845,19 +7697,16 @@ function userFacingReason(item: QualityCheckItem, changedFiles: string[], areas:
     return `CLI routing or help output changed. Verify that documented commands, help text, and status output still match the implementation.${fileText}`;
   }
   if (item.label === "watch verification") {
-    return `Watch behavior changed. Verify polling, depth handling, and settle/finalize output with a small file-change scenario.${fileText}`;
+    return `File-watching code changed. Verify it still reacts to a small real file change as intended.${fileText}`;
   }
   if (item.label === "state/history verification") {
-    if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
-      return `Quality Report generation changed. Confirm the regenerated report reads like a QA result, explains each relevant file role, and does not expose internal rule names.${fileText}`;
-    }
-    return `State, history, prompt, or report generation changed. Confirm done/status/handoff regenerate the expected files without stale state.${fileText}`;
+    return `State, history, or prompt code changed. Confirm the code that reads and writes that state still behaves as intended.${fileText}`;
   }
   if (item.label === "docs update candidate") {
     return `Source files changed without documentation changes. If user-facing behavior changed, update the relevant README or docs page.${fileText}`;
   }
   if (item.label === "drift clarity") {
-    return `The changed files should be checked against the current task. Confirm the diff is limited to Quality Report QA wording and generation behavior.${fileText}`;
+    return `The changed files should be checked against the current task. Confirm the diff is limited to that task.${fileText}`;
   }
   return `${item.detail}${fileText}`;
 }
@@ -7885,31 +7734,23 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
       title: "CLI command and help consistency",
       body: ["Confirm changed CLI routing or output still matches README/docs and the commands users will run."],
       files,
-      checks: ["dev-guard --help", "dev-guard help advanced", "dev-guard status"]
+      checks: requiredVerification.slice(0, 3)
     };
   }
   if (item.label === "watch verification") {
     return {
-      title: "Watch behavior check",
-      body: ["Confirm watch still tracks real project changes and ignores DevGuard internal files."],
+      title: "File-watching behavior check",
+      body: ["Confirm the changed file-watching code still reacts to a small real file change as intended."],
       files,
-      checks: ["dev-guard watch --stable-after 1 --compact", "dev-guard done", "dev-guard status"]
+      checks: requiredVerification.slice(0, 3)
     };
   }
   if (item.label === "state/history verification") {
-    if (changedFiles.some((file) => /runtime-state\.ts$/.test(file))) {
-      return {
-        title: "Quality Report output review",
-        body: ["Regenerate the Quality Report and confirm it reads like a QA result: verdict, change summary, file-level changes, completed QA, missing QA, risks, and next QA."],
-        files,
-        checks: ["dev-guard done", "Read .devguard/reports/quality-report.md", "Confirm no internal rule names or generic review-only phrases appear in the main sections."]
-      };
-    }
     return {
-      title: "Report and handoff regeneration",
-      body: ["Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly."],
+      title: "State and history code check",
+      body: ["Confirm the code that reads and writes the changed state, history, or prompt data still behaves as intended."],
       files,
-      checks: ["dev-guard done", "dev-guard status", "dev-guard handoff"]
+      checks: requiredVerification.slice(0, 3)
     };
   }
   if (item.label === "risky areas") {
@@ -7931,15 +7772,15 @@ function reviewItemForQualityCheck(item: QualityCheckItem, changedFiles: string[
   if (item.label === "docs update candidate") {
     return {
       title: "Documentation update need",
-      body: ["Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read."],
+      body: ["Check whether changed source behavior affects commands, configuration, or other user-facing text."],
       files,
-      checks: ["If behavior changed, update README.md, README.ko.md, docs/commands.md, or docs/configuration.md as appropriate."]
+      checks: ["If behavior changed, update the project's README or docs pages that describe it."]
     };
   }
   if (item.label === "drift clarity") {
     return {
       title: "Change scope check",
-      body: ["Confirm the diff is focused on Quality Report QA wording and generation behavior without changing Dashboard, Handoff, watch, hook, or release behavior."],
+      body: ["Confirm the diff is limited to the current task."],
       files,
       checks: ["Review git diff by file.", "Keep only changes required for the current task."]
     };
@@ -8860,7 +8701,7 @@ function reviewItemMatchesQualityItem(reviewItem: QualityReviewItem, item: Quali
   if (item.label === "package lock consistency" || item.label === "package manifest changed") return title.includes("package") || title.includes("패키지");
   if (item.label === "CLI router/help verification") return title.includes("cli");
   if (item.label === "watch verification") return title.includes("watch");
-  if (item.label === "state/history verification") return title.includes("report") || title.includes("handoff") || title.includes("보고서") || title.includes("인수");
+  if (item.label === "state/history verification") return title.includes("state") || title.includes("상태");
   if (item.label === "risky areas") return title.includes("runtime") || title.includes("런타임");
   if (item.label === "docs update candidate") return title.includes("documentation") || title.includes("문서");
   if (item.label === "drift clarity") return title.includes("scope") || title.includes("범위");
@@ -8873,10 +8714,8 @@ function localizeReviewTitle(value: string, locale: DevGuardLocale): string {
     "Generated file commit check": "생성 파일 커밋 여부 확인",
     "Package and release impact": "패키지와 배포 영향 확인",
     "CLI command and help consistency": "CLI 명령과 도움말 일치 여부",
-    "Watch behavior check": "watch 동작 확인",
-    "Report and handoff regeneration": "보고서와 인수인계 재생성 확인",
-    "Quality Report output review": "Quality Report 출력 검토",
-    "OpenAI API key safety and fallback": "OpenAI API Key 저장, 미노출, fallback 확인",
+    "File-watching behavior check": "파일 감시 동작 확인",
+    "State and history code check": "상태와 히스토리 코드 확인",
     "Runtime-sensitive behavior": "런타임 영향 확인",
     "Change breadth review": "변경 범위 확인",
     "Documentation update need": "문서 업데이트 필요 여부",
@@ -8902,7 +8741,7 @@ function qualityLabel(label: string, locale: DevGuardLocale): string {
     "risky areas": { en: "Runtime-sensitive areas", ko: "주의가 필요한 영역" },
     "CLI router/help verification": { en: "CLI command and help consistency", ko: "CLI 라우터와 도움말 검증" },
     "watch verification": { en: "Watch behavior", ko: "watch 동작 검증" },
-    "state/history verification": { en: "Report and state generation", ko: "상태와 히스토리 생성 검증" },
+    "state/history verification": { en: "State and history code", ko: "상태와 히스토리 코드 검증" },
     "docs update candidate": { en: "Documentation update need", ko: "문서 업데이트 후보" },
     "drift clarity": { en: "Change scope clarity", ko: "작업 범위 명확성" }
   };
@@ -8930,8 +8769,8 @@ function qualityDetail(item: QualityCheckItem, locale: DevGuardLocale): string {
   }
   if (item.label === "state/history verification" && item.status !== "PASS" && /changed/i.test(detail)) {
     return locale === "ko-KR"
-      ? "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff 출력과 생성 파일을 확인하세요."
-      : "State, history, prompt, or report generation changed. Confirm done/status/handoff output and generated files.";
+      ? "상태, 히스토리 또는 프롬프트 코드가 바뀌었습니다. 그 데이터를 읽고 쓰는 코드가 의도대로 동작하는지 확인하세요."
+      : "State, history, or prompt code changed. Confirm the code that reads and writes that data still behaves as intended.";
   }
   return locale === "ko-KR" ? localizeSentence(detail, locale) : humanizeInternalSentence(detail);
 }
@@ -8946,6 +8785,21 @@ function humanizeInternalSentence(value: string): string {
 function localizeSentence(value: string, locale: DevGuardLocale): string {
   if (locale === "en-US") return value;
   const exact: Record<string, string> = {
+    "Confirm the diff is limited to the current task.": "diff가 현재 작업 범위에만 한정되는지 확인하세요.",
+    "Check whether changed source behavior affects commands, configuration, or other user-facing text.": "변경된 소스 동작이 명령어, 설정, 기타 사용자 문구에 영향을 주는지 확인하세요.",
+    "If behavior changed, update the project's README or docs pages that describe it.": "동작이 바뀌었다면 이를 설명하는 프로젝트 README나 문서 페이지를 갱신하세요.",
+    "Confirm the changed file-watching code still reacts to a small real file change as intended.": "변경된 파일 감시 코드가 실제 작은 파일 변경에 의도대로 반응하는지 확인하세요.",
+    "Confirm the code that reads and writes the changed state, history, or prompt data still behaves as intended.": "변경된 상태, 히스토리, 프롬프트 데이터를 읽고 쓰는 코드가 의도대로 동작하는지 확인하세요.",
+    "Regenerate the affected reports or outputs and read them.": "영향받는 보고서나 출력물을 다시 생성한 뒤 직접 읽어 확인하세요.",
+    "Read changed docs and confirm examples match current behavior.": "변경된 문서를 읽고 예시가 현재 동작과 일치하는지 확인하세요.",
+    "Read the regenerated output and confirm it describes the actual change.": "재생성된 출력물이 실제 변경 내용을 설명하는지 확인하세요.",
+    "Report or QA generation code changed; review the generated output, not just the build result.": "보고서 또는 QA 생성 코드가 바뀌었습니다. 빌드 결과만이 아니라 생성된 출력물을 확인하세요.",
+    "Reports/generated output": "보고서/생성 출력물",
+    "Generated reports should be reviewed as the behavior under test.": "생성된 보고서 자체를 검증 대상 동작으로 검토해야 합니다.",
+    "Updates agent startup instructions.": "에이전트 시작 지침을 갱신합니다.",
+    "agent startup instructions": "에이전트 시작 지침",
+    "This change affects localized user-facing text.": "이번 변경은 다국어 사용자 문구에 영향을 줍니다.",
+    "This change affects what users see or do in a dashboard screen.": "이번 변경은 사용자가 대시보드 화면에서 보거나 하는 동작에 영향을 줍니다.",
     "none": "없음",
     "no generated runtime files in git changes": "git 변경 목록에 DevGuard 생성 파일이 포함되지 않았습니다.",
     "package/lockfile state does not look inconsistent": "package 파일과 lockfile 상태가 어긋나 보이지 않습니다.",
@@ -8968,30 +8822,17 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "No blocking quality issues were detected.": "차단 수준의 품질 문제는 감지되지 않았습니다.",
     "No source changes are currently pending.": "현재 대기 중인 소스 변경은 없습니다.",
     "Use the review items below to confirm the behavior before committing or publishing.": "커밋 또는 배포 전에 아래 검토 항목으로 실제 동작을 확인하세요.",
-    "This change adds OpenAI API key setup to both the CLI and Dashboard.": "이번 변경은 OpenAI API Key 설정을 CLI와 Dashboard에 추가합니다.",
     "DevGuard should resolve keys in this order: .devguard/config.json, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.": "DevGuard는 .devguard/config.json, DEV_GUARD_OPENAI_API_KEY, OPENAI_API_KEY 순서로 key를 읽어야 합니다.",
     "Raw key values must stay hidden while the Dashboard API reports only configured/source.": "Dashboard API는 configured/source만 반환하고 raw key 값은 숨겨야 합니다.",
-    "If the key is missing, invalid, unavailable, or times out, done/status/handoff should still generate rule-based Quality Report and Handoff files.": "key가 없거나 잘못되었거나 네트워크 실패/timeout이 발생해도 done/status/handoff는 rule-based Quality Report와 Handoff를 생성해야 합니다.",
-    "The change crosses CLI config, Dashboard settings, dashboard API responses, and Quality Report generation.": "이번 변경은 CLI config, Dashboard 설정, Dashboard API 응답, Quality Report 생성 흐름을 함께 바꿉니다.",
-    "API key handling is security-sensitive because raw values must never appear in logs, terminal output, dashboard state, or generated reports.": "API key는 민감 정보이므로 로그, 터미널 출력, Dashboard 상태, 생성 보고서에 raw value가 나타나면 안 됩니다.",
-    "The fallback path matters because DevGuard must remain useful without OpenAI access and must keep generating Quality Report and Handoff files.": "OpenAI에 접근할 수 없어도 DevGuard는 계속 유용해야 하며 Quality Report와 Handoff를 생성해야 하므로 fallback 경로 검증이 중요합니다.",
-    "Confirm the CLI and Dashboard can store or report OpenAI key configuration without exposing the raw key value.": "CLI와 Dashboard가 OpenAI key 설정 상태를 다루더라도 raw key 값을 노출하지 않는지 확인하세요.",
     "Confirm key resolution follows config, DEV_GUARD_OPENAI_API_KEY, then OPENAI_API_KEY.": "key 읽기 순서가 config, DEV_GUARD_OPENAI_API_KEY, OPENAI_API_KEY 순서인지 확인하세요.",
-    "Confirm missing, invalid, network-failed, or timed-out OpenAI calls still produce rule-based Quality Report and Handoff files.": "key 없음, 잘못된 key, 네트워크 실패, timeout 상황에서도 rule-based Quality Report와 Handoff가 생성되는지 확인하세요.",
     "Verify that config/env key priority works, raw key values are not exposed, and missing or invalid keys still fall back to rule-based Quality Report and Handoff generation.": "config/env key 우선순위, raw key 미노출, key 없음/오류 시 rule-based Quality Report와 Handoff fallback이 모두 동작하는지 확인하세요.",
     "The change can affect what users see in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보는 내용에 영향을 줄 수 있습니다.",
     "The change can affect generated reports, handoff files, or next-session context.": "이번 변경은 생성 보고서, 인수인계 파일, 다음 세션 컨텍스트에 영향을 줄 수 있습니다.",
-    "This change affects how DevGuard turns local checks into the user-facing Quality Report and handoff guidance.": "이번 변경은 DevGuard가 로컬 점검 결과를 사용자용 Quality Report와 인수인계 안내로 바꾸는 방식에 영향을 줍니다.",
-    "This change turns the generated Quality Report into a QA result document instead of a generic checklist.": "이번 변경은 생성되는 Quality Report를 일반 체크리스트가 아니라 QA 결과 보고서로 바꾸는 작업입니다.",
     "The report should explain the verdict, summarize the change, describe what changed per file, and separate completed QA from missing QA.": "보고서는 판정 이유, 변경 요약, 파일별 변경 내용, 완료된 QA와 남은 QA를 구분해서 설명해야 합니다.",
     "Because the report generation logic changed, the regenerated markdown must be read directly after `dev-guard done`.": "보고서 생성 로직이 바뀌었으므로 `dev-guard done` 후 재생성된 markdown을 직접 읽어야 합니다.",
     "Build success alone cannot prove the generated QA wording is specific, natural, and free of internal rule labels.": "빌드 통과만으로는 생성된 QA 문구가 구체적이고 자연스러우며 내부 rule label을 노출하지 않는지 보장할 수 없습니다.",
-    "Quality Report generation changed, so the generated markdown itself is the behavior under test.": "Quality Report 생성 로직이 바뀌었으므로 생성된 markdown 자체가 이번 QA 대상입니다.",
     "The report must show what changed, why the verdict was chosen, what QA is complete, and what QA remains.": "보고서는 무엇이 바뀌었는지, 왜 이 판정이 나왔는지, 어떤 QA가 끝났고 무엇이 남았는지 보여줘야 합니다.",
     "The implementation should not expose internal analysis labels or replace QA reasoning with generic commands.": "구현은 내부 분석 label을 노출하거나 QA 이유를 일반 명령 목록으로 대체하면 안 됩니다.",
-    "Regenerate the Quality Report, read the generated markdown, and confirm it explains the QA result, changed files, risks, and next QA without generic review wording.": "Quality Report를 재생성한 뒤 markdown을 직접 읽고, 일반적인 검토 문구 없이 QA 결과, 변경 파일, 위험 요소, 다음 QA를 설명하는지 확인하세요.",
-    "This change affects how DevGuard explains the current session's QA result in the generated Quality Report.": "이번 변경은 DevGuard가 현재 세션의 QA 결과를 생성된 Quality Report에서 설명하는 방식에 영향을 줍니다.",
-    "This change affects whether Dashboard language choices are reflected in generated reports and handoff files.": "이번 변경은 Dashboard 언어 선택이 생성 보고서와 인수인계 파일에 반영되는 흐름에 영향을 줍니다.",
     "This change affects what users see or do in the Dashboard.": "이번 변경은 사용자가 Dashboard에서 보고 실행하는 흐름에 영향을 줍니다.",
     "This change affects the authentication or login flow, so the end-to-end sign-in behavior needs review.": "이번 변경은 인증 또는 로그인 흐름에 영향을 주므로 실제 로그인 동작 검토가 필요합니다.",
     "This change affects generated reports, handoff files, or next-session context.": "이번 변경은 생성 보고서, 인수인계 파일, 다음 세션 컨텍스트에 영향을 줍니다.",
@@ -9004,20 +8845,10 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Confirm package scripts, dependencies, versions, and lockfile state match the intended release impact.": "package scripts, dependencies, version, lockfile 상태가 의도한 배포 영향과 맞는지 확인하세요.",
     "Confirm changed CLI routing or output still matches README/docs and the commands users will run.": "변경된 CLI 라우팅 또는 출력이 README/docs와 사용자가 실행할 명령과 일치하는지 확인하세요.",
     "CLI routing or help output changed. Verify that documented commands, help text, and status output still match the implementation.": "CLI 라우팅 또는 도움말 출력이 바뀌었습니다. 문서의 명령 설명과 실제 help/status 출력이 일치하는지 확인하세요.",
-    "Confirm watch still tracks real project changes and ignores DevGuard internal files.": "watch가 실제 프로젝트 변경만 추적하고 DevGuard 내부 파일은 무시하는지 확인하세요.",
-    "Confirm done/status/handoff read the latest runtime state and regenerate user-facing reports correctly.": "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요.",
-    "Regenerate the Quality Report and confirm the first screen tells the user what changed, what to do now, and why it matters.": "Quality Report를 재생성한 뒤 첫 화면에서 무엇이 바뀌었고 지금 무엇을 해야 하며 왜 중요한지 바로 보이는지 확인하세요.",
     "Quality Report or handoff generation changed. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names.": "Quality Report 또는 인수인계 생성 흐름이 바뀌었습니다. 재생성된 보고서가 사용자가 먼저 할 일을 알려주고, 관련 파일의 역할을 설명하며, 내부 규칙 이름을 노출하지 않는지 확인하세요.",
     "The changed files should be checked against the current task, not against a generic rule. Confirm the diff is only improving the Quality Report review experience.": "변경 파일은 일반 규칙이 아니라 현재 작업 목표를 기준으로 확인해야 합니다. diff가 Quality Report 리뷰 경험 개선에만 집중되어 있는지 확인하세요.",
-    "Confirm the diff is focused on Quality Report intelligence and does not change unrelated watch, hook, dashboard, or release behavior.": "diff가 Quality Report intelligence 개선에 집중되어 있고 관련 없는 watch, hook, Dashboard, release 동작을 바꾸지 않는지 확인하세요.",
-    "Quality Report generation changed. Confirm the regenerated report reads like a QA result, explains each relevant file role, and does not expose internal rule names.": "Quality Report 생성 흐름이 바뀌었습니다. 재생성된 보고서가 QA 결과처럼 읽히고, 관련 파일의 역할을 설명하며, 내부 rule 이름을 노출하지 않는지 확인하세요.",
-    "The changed files should be checked against the current task. Confirm the diff is limited to Quality Report QA wording and generation behavior.": "변경 파일을 현재 작업 기준으로 확인해야 합니다. diff가 Quality Report QA 문구와 생성 동작에만 한정되는지 확인하세요.",
-    "Regenerate the Quality Report and confirm it reads like a QA result: verdict, change summary, file-level changes, completed QA, missing QA, risks, and next QA.": "Quality Report를 재생성하고 판정, 변경 요약, 파일별 변경, 완료된 QA, 남은 QA, 위험 요소, 다음 QA를 설명하는 QA 결과 보고서처럼 읽히는지 확인하세요.",
-    "Confirm the diff is focused on Quality Report QA wording and generation behavior without changing Dashboard, Handoff, watch, hook, or release behavior.": "diff가 Dashboard, Handoff, watch, hook, release 동작을 바꾸지 않고 Quality Report QA 문구와 생성 동작에만 집중되어 있는지 확인하세요.",
     "Confirm no internal rule names appear in the main sections.": "주요 섹션에 내부 규칙 이름이 그대로 노출되지 않는지 확인하세요.",
     "Confirm docs describe commands and artifacts that actually exist.": "문서가 실제 존재하는 명령과 산출물을 설명하는지 확인하세요.",
-    "Run `dev-guard install-agent-instructions --force` and inspect AGENTS.md / CLAUDE.md.": "`dev-guard install-agent-instructions --force`를 실행한 뒤 AGENTS.md / CLAUDE.md를 확인하세요.",
-    "Check whether changed source behavior affects commands, Dashboard text, configuration, hooks, reports, or generated files that users read.": "변경된 소스 동작이 명령어, Dashboard 문구, 설정, hook, 보고서, 사용자가 읽는 생성 파일에 영향을 주는지 확인하세요.",
     "Confirm the changed files all support the current request and remove or split unrelated work before finishing.": "변경된 파일이 모두 현재 요청을 뒷받침하는지 확인하고, 관련 없는 작업은 제거하거나 분리하세요.",
     "Confirm the changed files still belong to one coherent task and split unrelated work if needed.": "변경 파일이 하나의 작업 목표에 속하는지 확인하고, 관련 없는 작업은 필요하면 분리하세요.",
     "Review the changed files once and confirm the implementation still matches the user request.": "변경 파일을 한 번 검토하고 구현이 여전히 사용자 요청과 일치하는지 확인하세요.",
@@ -9026,63 +8857,28 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     "Keep only changes required for the current task.": "현재 작업에 필요한 변경만 남기세요.",
     "Run the listed verification commands, then proceed with final review or commit.": "나열된 검증 명령을 실행한 뒤 최종 검토 또는 커밋을 진행하세요.",
     "No project changes need review right now.": "지금 검토할 프로젝트 변경은 없습니다.",
-    "State, history, prompt, or report generation changed. Confirm done/status/handoff regenerate the expected files without stale state.": "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff가 오래된 상태 없이 필요한 파일을 재생성하는지 확인하세요.",
     "The changed files may include work outside the current request. Confirm each changed file supports the same task before finishing.": "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.",
-    "Improve generated DevGuard documentation so it reflects concrete diff-based changes.": "DevGuard 생성 문서가 실제 diff 기반 변경 내용을 반영하도록 개선합니다.",
-    "Improve generated DevGuard documentation so it explains feature-level changes from the current session.": "DevGuard 생성 문서가 이번 세션의 기능 단위 변경을 설명하도록 개선합니다.",
     "Update QA/test-related files and verify the associated behavior still passes.": "QA/테스트 관련 파일을 업데이트하고 관련 동작이 여전히 통과하는지 확인하세요.",
     "Adds a shared Documentation Summary generated from git diff before artifacts render.": "문서 산출물을 렌더링하기 전에 git diff 기반 공통 Documentation Summary를 생성합니다.",
-    "Builds a shared Change Intelligence summary before generated artifacts are rendered.": "문서 산출물을 렌더링하기 전에 공통 Change Intelligence 요약을 생성합니다.",
-    "Routes the same summary into Quality Report, Handoff, Working Context, and Agent Context.": "같은 요약을 Quality Report, Handoff, Working Context, Agent Context에 전달합니다.",
-    "Uses the same feature-level summary in Quality Report, Handoff, Working Context, and Agent Context.": "Quality Report, Handoff, Working Context, Agent Context가 같은 기능 단위 요약을 사용합니다.",
-    "Introduces a shared documentation summary used by generated artifacts.": "생성 문서들이 함께 사용하는 공통 Documentation Summary를 추가합니다.",
-    "Turns generated DevGuard documents from diff/code summaries into feature-level Change Intelligence.": "DevGuard 생성 문서를 diff/code 요약이 아니라 기능 단위 Change Intelligence로 전환합니다.",
     "Adds file-level user and AI impact so generated documents explain why each change matters.": "파일별 사용자/AI 영향을 추가해 각 변경이 왜 중요한지 생성 문서가 설명하도록 합니다.",
-    "Keeps Quality Report, Handoff, Working Context, and Agent Context aligned on the same change summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 변경 요약으로 정렬되도록 합니다.",
     "generated documentation intelligence and DevGuard artifact generation": "DevGuard 문서 지능과 산출물 생성 로직",
-    "Generated documentation": "생성 문서",
-    "Generated documentation logic changed; build success does not prove output quality.": "생성 문서 로직이 바뀌었으므로 빌드 통과만으로 출력 품질을 보장할 수 없습니다.",
-    "Generated documentation logic changed; build success does not prove the artifacts explain the actual feature changes.": "생성 문서 로직이 바뀌었으므로 빌드 통과만으로 산출물이 실제 기능 변경을 설명하는지 보장할 수 없습니다.",
-    "Regenerate Quality Report, Handoff, Working Context, and Agent Context and read the generated output.": "Quality Report, Handoff, Working Context, Agent Context를 재생성한 뒤 출력 내용을 직접 읽어 확인하세요.",
     "Run `dev-guard done` and verify generated artifacts use concrete diff-based changes.": "`dev-guard done`을 실행하고 생성 산출물이 구체적인 diff 기반 변경 내용을 사용하는지 확인하세요.",
-    "Run `dev-guard done` and verify generated artifacts describe feature-level changes, not code-token changes.": "`dev-guard done`을 실행하고 생성 산출물이 코드 토큰 변경이 아니라 기능 단위 변경을 설명하는지 확인하세요.",
-    "Read Quality Report, Handoff, Working Context, and Agent Context for the same change summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 변경 요약을 사용하는지 확인하세요.",
-    "Read Quality Report, Handoff, Working Context, and Agent Context for the same Change Intelligence summary.": "Quality Report, Handoff, Working Context, Agent Context가 같은 Change Intelligence 요약을 사용하는지 확인하세요.",
-    "Confirm feature examples inside the generator are not reported as actual product changes unless the related product files changed.": "관련 제품 파일이 바뀌지 않았다면 생성기 내부의 feature 예시가 실제 제품 변경으로 보고되지 않는지 확인하세요.",
     "Read regenerated artifacts and confirm they describe concrete diff-based changes.": "재생성된 산출물을 읽고 실제 diff 기반 변경 내용을 설명하는지 확인하세요.",
-    "Read regenerated artifacts and confirm they describe feature-level changes instead of code-token changes.": "재생성된 산출물이 코드 토큰이 아니라 기능 단위 변경을 설명하는지 확인하세요.",
     "AI and human readers can resume from feature meaning instead of re-reading raw diffs.": "AI와 사람 모두 raw diff를 다시 읽지 않고 기능 의미를 기준으로 이어서 작업할 수 있습니다.",
-    "Generated DevGuard documents share the same understanding of what changed.": "DevGuard 생성 문서들이 무엇이 바뀌었는지 같은 이해를 공유합니다.",
     "Generated QA and handoff documents should be reviewed as the behavior under test.": "생성된 QA와 인수인계 문서 자체가 이번 테스트 대상입니다.",
     "Readers get guidance that better matches the current workflow.": "독자는 현재 워크플로우에 더 맞는 안내를 받습니다.",
-    "The UI avoids exposing an unclear confidence signal to users.": "사용자에게 의미가 불명확한 confidence 신호를 노출하지 않습니다.",
     "Long secondary content stays available without overwhelming the main screen.": "긴 보조 내용은 유지하되 메인 화면을 과하게 차지하지 않습니다.",
     "Users can switch visual theme from the visible UI control.": "사용자는 화면의 Theme Toggle로 테마를 전환할 수 있습니다.",
     "The page has clearer bottom navigation or product framing.": "페이지 하단의 탐색 또는 제품 맥락이 더 명확해집니다.",
-    "Uses doThis guidance instead of avoidThis guidance.": "avoidThis 대신 doThis 안내를 사용합니다.",
-    "Removes the visible confidence display.": "화면에 보이는 confidence 표시를 제거합니다.",
-    "Adds or updates the Ability Hero Card / strength-usage section.": "Ability Hero Card 또는 강점 활용법 영역을 추가하거나 조정합니다.",
-    "Renames the growth guidance from 보완하면 좋은 점 to 강점 활용법.": "성장 안내 문구를 ‘보완하면 좋은 점’에서 ‘강점 활용법’으로 바꿉니다.",
-    "Compresses the Back Card into a four-card structure.": "Back Card를 4장 카드 구조로 압축합니다.",
     "Moves long secondary content into collapsible details sections.": "긴 보조 내용을 접을 수 있는 details 영역으로 이동합니다.",
     "Adds or adjusts the Theme Toggle.": "Theme Toggle을 추가하거나 조정합니다.",
     "Adds or adjusts the Footer.": "Footer를 추가하거나 조정합니다.",
     "Prioritizes completion report, user goal, diff, changed files, and QA results when generating document context.": "문서 컨텍스트 생성 시 완료 보고, 사용자 목표, diff, 변경 파일, QA 결과를 우선 반영합니다."
     ,
-    "Updates agent startup instructions to read Read Map, Code Map, and Agent Brief before broad repository exploration.": "에이전트가 전체 저장소를 탐색하기 전에 Read Map, Code Map, Agent Brief를 먼저 읽도록 시작 지침을 갱신합니다.",
     "Tells agents to open only targeted entry files after reading DevGuard context.": "DevGuard 컨텍스트를 읽은 뒤 필요한 진입 파일만 열도록 안내합니다.",
-    "Updates generated AGENTS.md / CLAUDE.md sections with the Before Agent pipeline.": "생성되는 AGENTS.md / CLAUDE.md 섹션에 Before Agent 파이프라인을 반영합니다.",
-    "Changes resume guidance to start from Read Map, Code Map, and Agent Brief.": "새 세션 재개 안내가 Read Map, Code Map, Agent Brief에서 시작하도록 바꿉니다.",
-    "Adds managed artifact paths for Read Map, Code Map, and Agent Brief.": "Read Map, Code Map, Agent Brief의 관리 경로를 추가합니다.",
-    "Shows Read Map, Code Map, and Agent Brief in done/handoff generated output.": "done/handoff 생성 결과에 Read Map, Code Map, Agent Brief를 표시합니다.",
-    "Updates the new-session prompt to start from the Before Agent artifacts.": "새 세션 안내가 Before Agent 산출물에서 시작하도록 갱신합니다.",
-    "Adds rule-based Before Agent artifacts: Read Map, Code Map, and Agent Brief.": "rule-based Before Agent 산출물인 Read Map, Code Map, Agent Brief를 추가합니다.",
-    "Connects the new Before Agent artifacts to done and handoff regeneration.": "새 Before Agent 산출물을 done과 handoff 재생성 흐름에 연결합니다.",
-    "Reuses existing Change Intelligence instead of generating a second summary.": "별도 요약을 다시 만들지 않고 기존 Change Intelligence를 재사용합니다.",
     "Agents can start from a smaller reading plan before opening source files.": "에이전트는 소스 파일을 열기 전에 더 작은 읽기 계획에서 시작할 수 있습니다.",
     "Expensive agents are less likely to spend tokens rediscovering the repository.": "비싼 에이전트가 저장소를 다시 파악하는 데 쓰는 토큰을 줄일 수 있습니다.",
     "The new pipeline files are addressed through shared DevGuard path constants.": "새 파이프라인 파일은 공통 DevGuard 경로 상수로 관리됩니다.",
-    "Users can see the Before Agent artifacts immediately after done or handoff.": "사용자는 done 또는 handoff 직후 Before Agent 산출물을 바로 확인할 수 있습니다."
   };
   if (exact[value]) return exact[value];
   return value
@@ -9094,13 +8890,10 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     .replace(/^The change touches (.+) area\(s\)\. Confirm the runtime behavior still matches the intended workflow\./, "이번 변경은 $1 영역에 닿아 있습니다. 런타임 동작이 의도한 흐름과 일치하는지 확인하세요.")
     .replace(/^CLI routing or help output changed\. Verify that documented commands, help text, and status output still match the implementation\./, "CLI 라우팅 또는 도움말 출력이 바뀌었습니다. 문서의 명령 설명과 실제 help/status 출력이 일치하는지 확인하세요.")
     .replace(/^Confirm the (.+) area\(s\) still behave as intended in the actual workflow\.$/, "$1 영역이 실제 워크플로우에서 의도대로 동작하는지 확인하세요.")
-    .replace(/^State, history, prompt, or report generation changed\. Confirm done\/status\/handoff regenerate the expected files without stale state\./, "상태, 히스토리, 프롬프트 또는 보고서 생성 흐름이 바뀌었습니다. done/status/handoff가 오래된 상태 없이 필요한 파일을 재생성하는지 확인하세요.")
     .replace(/^The changed files may include work outside the current request\. Confirm each changed file supports the same task before finishing\./, "변경 파일에 현재 요청 밖의 작업이 섞였을 수 있습니다. 마무리 전에 각 파일이 같은 작업 목표를 뒷받침하는지 확인하세요.")
-    .replace(/^Quality Report or handoff generation changed\. Confirm the regenerated report tells the user what to do first, names the relevant file role, and does not expose internal rule names\./, "Quality Report 또는 인수인계 생성 흐름이 바뀌었습니다. 재생성된 보고서가 사용자가 먼저 할 일을 알려주고, 관련 파일의 역할을 설명하며, 내부 규칙 이름을 노출하지 않는지 확인하세요.")
-    .replace(/^The changed files should be checked against the current task, not against a generic rule\. Confirm the diff is only improving the Quality Report review experience\./, "변경 파일은 일반 규칙이 아니라 현재 작업 목표를 기준으로 확인해야 합니다. diff가 Quality Report 리뷰 경험 개선에만 집중되어 있는지 확인하세요.")
-    .replace(/^Quality Report generation changed\. Confirm the regenerated report reads like a QA result, explains each relevant file role, and does not expose internal rule names\./, "Quality Report 생성 흐름이 바뀌었습니다. 재생성된 보고서가 QA 결과처럼 읽히고, 관련 파일의 역할을 설명하며, 내부 rule 이름을 노출하지 않는지 확인하세요.")
-    .replace(/^The changed files should be checked against the current task\. Confirm the diff is limited to Quality Report QA wording and generation behavior\./, "변경 파일을 현재 작업 기준으로 확인해야 합니다. diff가 Quality Report QA 문구와 생성 동작에만 한정되는지 확인하세요.")
-    .replace(/^Confirm done\/status\/handoff read the latest runtime state and regenerate user-facing reports correctly\. Focus on (.+)\. Then run the required verification commands\.$/, "done/status/handoff가 최신 runtime state를 읽고 사용자용 보고서를 올바르게 재생성하는지 확인하세요. 관련 파일: $1. 그런 다음 필요한 검증 명령을 실행하세요.")
+    .replace(/^The changed files should be checked against the current task\. Confirm the diff is limited to that task\./, "변경 파일을 현재 작업 기준으로 확인해야 합니다. diff가 그 작업 범위에만 한정되는지 확인하세요.")
+    .replace(/^File-watching code changed\. Verify it still reacts to a small real file change as intended\./, "파일 감시 코드가 바뀌었습니다. 실제 작은 파일 변경에 여전히 의도대로 반응하는지 확인하세요.")
+    .replace(/^State, history, or prompt code changed\. Confirm the code that reads and writes that state still behaves as intended\./, "상태, 히스토리 또는 프롬프트 코드가 바뀌었습니다. 그 상태를 읽고 쓰는 코드가 의도대로 동작하는지 확인하세요.")
     .replace(/^(.+) Focus on (.+)\. Then run the required verification commands\.$/, "$1 관련 파일: $2. 그런 다음 필요한 검증 명령을 실행하세요.")
     .replace(/^Change types: /, "변경 유형: ")
     .replace(/^Run `pnpm run build`\.$/, "`pnpm run build`를 실행하세요.")
@@ -9133,8 +8926,8 @@ function localizeSentence(value: string, locale: DevGuardLocale): string {
     .replace(/package\.json changed but no lockfile change detected/g, "package.json은 변경되었지만 lockfile 변경이 감지되지 않았습니다")
     .replace(/package\.json changed; verify scripts\/dependencies and publish impact/g, "package.json이 변경되었습니다. scripts, dependencies, 배포 영향을 확인하세요")
     .replace(/risky area\(s\): ([\w, ]+)/g, "주의가 필요한 영역: $1")
-    .replace(/watch changed; verify --poll and --depth behavior/g, "watch가 변경되었습니다. --poll 및 --depth 동작을 확인하세요")
-    .replace(/state\/history\/prompt generation changed; verify done\/status output/g, "상태, 히스토리, 프롬프트 생성이 변경되었습니다. done/status 출력을 확인하세요")
+    .replace(/state\/history\/prompt code changed; verify it still reads and writes as intended/g, "상태, 히스토리, 프롬프트 코드가 변경되었습니다. 여전히 의도대로 읽고 쓰는지 확인하세요")
+    .replace(/file-watching code changed; verify it still reacts to real file changes/g, "파일 감시 코드가 변경되었습니다. 실제 파일 변경에 여전히 반응하는지 확인하세요")
     .replace(/source changed without docs changes; recorded as doc update candidate only/g, "소스 변경이 있지만 문서 변경은 없습니다. 문서 업데이트 후보로만 기록합니다")
     .replace(/drift candidate present; next task=/g, "작업 범위 이탈 후보가 있습니다. 다음 작업: ")
     .replace(/changed file\(s\)/g, "개 파일 변경");
@@ -9961,11 +9754,6 @@ function inferFileRole(file: string): string {
   if (file.endsWith("package.json")) return "script/dependency config";
   if (file.endsWith("pnpm-lock.yaml") || file.endsWith("package-lock.json") || file.endsWith("yarn.lock")) return "lockfile/dependency snapshot";
   if (file === ".gitignore") return "generated artifacts exclusion";
-  if (/src\/index\.tsx?$/.test(file) || /src\/index\.jsx?$/.test(file)) return "CLI command router / entrypoint";
-  if (/watch\.[tj]sx?$/.test(file)) return "watch command / file watcher";
-  if (/runtime-state\.[tj]sx?$/.test(file)) return "runtime state / history persistence";
-  if (/review\.[tj]sx?$/.test(file)) return "review command / drift analysis";
-  if (/update\.[tj]sx?$/.test(file)) return "docs update preview/write logic";
   if (/\.mdx?$/.test(file)) return "documentation";
   if (/(\.test|\.spec)\.[tj]sx?$/.test(file)) return "test file";
   if (/app\/api|pages\/api|route\.[tj]s$/.test(file)) return "API/server route";

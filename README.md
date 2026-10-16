@@ -303,10 +303,12 @@ Generated `AGENTS.md` and `CLAUDE.md` instructions tell agents to start with Rea
 
 The local dashboard starts automatically when `dev-guard watch` runs. It binds to `127.0.0.1` only, defaults to `http://127.0.0.1:3737`, and polls `/api/overview` every two seconds. It shows the current task and context status — not a telemetry wall. The first screen answers five questions:
 
-- **Now** — Health (is DevGuard set up and watching?), Thread (Room to continue / Next large task: new thread / New thread recommended), the current task in one line, the single biggest context problem, and one recommended action.
+- **Now** — Health (is DevGuard set up, watching, and able to save its state?), Thread (Room to continue / Next large task: new thread / New thread recommended), the current task in one line, the single biggest context problem, and one recommended action.
 - **This task** — at most five numbers: Context (the provider's observed usage only), Read plan (required / optional files), Suggestions used, Validation (recorded evidence), Files changed. Each is tagged observed, planned, inferred, or estimated.
 - **Context flow** — one chart of where this task's context went (estimated from file sizes, shown as `~18K`, never as exact tokens).
 - **Details** — collapsed: read plan, execution lineage, search activity, validation evidence, timeline, other issues, reports and prompts, setup and integration, project knowledge, raw telemetry.
+
+Health is about DevGuard itself, never your project's build or tests. It shows **Needs attention** when watch is stopped or when DevGuard cannot write `.devguard/runtime.json` (for example "DevGuard cannot save state because the disk is full."); the state file is never corrupted, repeated failures are logged at most once a minute, and health returns to normal on the next successful write without restarting watch. It shows **Warning** when a user-level agent instruction file (`~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`) still contains an obsolete "read DevGuard markdown first" block; `prepare_task_context` returns the same warning to the agent.
 
 The UI follows the browser language automatically and includes an English/Korean language toggle.
 
@@ -550,6 +552,8 @@ These files are project-level guidance for:
 - Codex (reads `AGENTS.md`)
 - Other agents that honor project-level instruction files
 
+User-level instruction files are yours: DevGuard never edits `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`. If one still contains an old "read `.devguard/reports/project-handoff.md` / `quality-report.md` / `next-codex-prompt.md` first" block, `dev-guard doctor`, `prepare_task_context` warnings, and Dashboard health report it — remove that block by hand, because it makes agents pass stale handoff files instead of your real inputs.
+
 The files contain suggestions, not enforced rules. They tell agents to call `prepare_task_context` first and read its TARGET ranges before any repository-wide search, not to read `.devguard` markdown when MCP succeeds (Agent Brief → Read Map → Code Map are the no-MCP fallback; handoff / quality report only on explicit request), and the hybrid thread policy above.
 
 ## Quality Flow
@@ -580,6 +584,8 @@ Read more in [docs/quality.md](./docs/quality.md).
 - `update` is preview-only; `update --write` is the only docs-write command and only touches managed blocks.
 - API providers are optional. Local heuristic mode works without an API key.
 - API keys are never printed. If stored in `.devguard/config.json`, that file must stay out of git.
+- DevGuard never edits user-level agent instruction files (`~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`); it only warns about obsolete DevGuard blocks in them.
+- The MCP server only serves the project it was started in (or a `projectRoot` inside it). A request for another project is rejected, never switched to; the error names the MCP root, the requested project, both git toplevels, and likely causes such as an empty or same-name sibling checkout opened as the workspace.
 
 ## Watch Notes
 

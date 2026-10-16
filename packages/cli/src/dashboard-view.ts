@@ -7,12 +7,24 @@
 import type { ContextEfficiencyReport, ContextGroup, ContextIssue, RolloverState } from "./context-efficiency.js";
 import type { EvidenceKind } from "./agent-activity.js";
 
-/** System/setup correctness only — never context or work quality. */
-export type OverviewHealth = "HEALTHY" | "SETTING_UP" | "ATTENTION";
-export type OverviewHealthReason = "ok" | "setup-running" | "not-initialized" | "watch-stopped";
+/**
+ * System/setup correctness only — never context or work quality, and never
+ * the project's own build/test/validation results. WARNING = DevGuard works
+ * but something will degrade it (e.g. an obsolete user-level instruction).
+ */
+export type OverviewHealth = "HEALTHY" | "SETTING_UP" | "WARNING" | "ATTENTION";
+export type OverviewHealthReason =
+  | "ok"
+  | "setup-running"
+  | "not-initialized"
+  | "watch-stopped"
+  | "runtime-write-disk-full"
+  | "runtime-write-permission"
+  | "runtime-write-failed"
+  | "legacy-instructions";
 /** User-facing thread levels (the raw rollover enum stays in details). */
 export type OverviewThread = "LOW" | "SOON" | "NEW_THREAD";
-export type OverviewActionId = "START_WATCH" | "WAIT_SETUP" | "NEW_THREAD" | "FIX_ISSUE" | "REVIEW_QUALITY" | "FINISH_THEN_NEW_THREAD" | "CONTINUE" | "START_TASK";
+export type OverviewActionId = "FIX_HEALTH" | "START_WATCH" | "WAIT_SETUP" | "NEW_THREAD" | "FIX_ISSUE" | "REVIEW_QUALITY" | "FINISH_THEN_NEW_THREAD" | "CONTINUE" | "START_TASK";
 export type OverviewMetricKey = "context" | "readPlan" | "suggestions" | "validation" | "filesChanged";
 
 export interface OverviewMetric {
@@ -24,7 +36,8 @@ export interface OverviewMetric {
 }
 
 export interface DashboardOverview {
-  health: { level: OverviewHealth; reason: OverviewHealthReason };
+  /** `detail`: affected path(s) for the reason, e.g. "~/.codex/AGENTS.md". */
+  health: { level: OverviewHealth; reason: OverviewHealthReason; detail?: string };
   thread: { level: OverviewThread; raw: RolloverState; reason: string; evidence: EvidenceKind };
   /** One line (the client truncates visually; the full goal is a tooltip). */
   task?: string;
@@ -46,9 +59,19 @@ export interface OverviewStateInput {
   setupActive: boolean;
   qualityVerdict?: string;
   sessionFileCount: number;
+  /** Active runtime-state write failure (Write Health), if any. */
+  writeFailure?: "disk-full" | "permission" | "write-failed";
+  /** Display paths of user-level instruction files with an obsolete DevGuard block. */
+  legacyInstructionPaths?: string[];
 }
 
 export const MAX_OVERVIEW_METRICS = 5;
+
+const RUNTIME_WRITE_ACTION: Partial<Record<OverviewHealthReason, string>> = {
+  "runtime-write-disk-full": "DevGuard cannot save state because the disk is full. Free disk space; DevGuard recovers on its own.",
+  "runtime-write-permission": "DevGuard cannot save state: no write permission for .devguard/. Fix the permission; DevGuard recovers on its own.",
+  "runtime-write-failed": "DevGuard cannot write runtime state. Check .devguard/logs/watch.log."
+};
 
 const THREAD_LEVEL: Record<RolloverState, OverviewThread> = {
   CONTINUE: "LOW",
@@ -57,13 +80,18 @@ const THREAD_LEVEL: Record<RolloverState, OverviewThread> = {
 };
 
 export function buildDashboardOverview(state: OverviewStateInput, report: ContextEfficiencyReport | undefined, readPlan?: { required: number; optional: number }): DashboardOverview {
+  const legacyPaths = state.legacyInstructionPaths ?? [];
   const health: DashboardOverview["health"] = state.setupActive
     ? { level: "SETTING_UP", reason: "setup-running" }
     : !state.initialized
       ? { level: "ATTENTION", reason: "not-initialized" }
       : !state.watchRunning
         ? { level: "ATTENTION", reason: "watch-stopped" }
-        : { level: "HEALTHY", reason: "ok" };
+        : state.writeFailure
+          ? { level: "ATTENTION", reason: `runtime-write-${state.writeFailure}` as OverviewHealthReason }
+          : legacyPaths.length > 0
+            ? { level: "WARNING", reason: "legacy-instructions", detail: legacyPaths.join(", ") }
+            : { level: "HEALTHY", reason: "ok" };
   const rollover = report?.now.thread ?? { state: "CONTINUE" as const, reason: "No DevGuard task recorded yet.", evidence: "INFERRED" as const };
   const thread: DashboardOverview["thread"] = { level: THREAD_LEVEL[rollover.state], raw: rollover.state, reason: rollover.reason, evidence: rollover.evidence };
   const primary = report?.now.primaryIssue;
@@ -78,6 +106,8 @@ export function buildDashboardOverview(state: OverviewStateInput, report: Contex
   const reviewPending = state.qualityVerdict === "BLOCKED" || state.qualityVerdict === "NEEDS_REVIEW";
   const action: DashboardOverview["action"] = health.level === "SETTING_UP"
     ? { id: "WAIT_SETUP", text: "DevGuard is preparing this project; it finishes on its own." }
+    : health.level === "ATTENTION" && health.reason.startsWith("runtime-write-")
+      ? { id: "FIX_HEALTH", text: RUNTIME_WRITE_ACTION[health.reason] ?? "DevGuard cannot write runtime state." }
     : health.level === "ATTENTION"
       ? { id: "START_WATCH", text: "Start DevGuard in this project.", command: "dev-guard watch" }
       : thread.level === "NEW_THREAD"

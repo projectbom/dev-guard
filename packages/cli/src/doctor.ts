@@ -1,7 +1,5 @@
 import { constants } from "node:fs";
-import { access, readFile, stat } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { access, stat } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { loadConfig, resolveAIAssistOptIn } from "./config.js";
 import { formatBytes, summarizeDevguardStorage } from "./artifact-retention.js";
@@ -15,6 +13,7 @@ import { readDriftTelemetryStats } from "./drift-telemetry.js";
 import { readRuntimeState } from "./runtime-state.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 import { formatNotifyCommand, getCodexNotifyConfigStatus } from "./codex-notify.js";
+import { findLegacyGlobalInstructions } from "./instruction-authority.js";
 
 export async function runDoctor(root: string, args: string[] = []): Promise<void> {
   if (args.includes("--agents")) {
@@ -191,30 +190,9 @@ async function runAgentDoctor(root: string): Promise<void> {
   await printInstructionAuthority();
 }
 
-export interface LegacyGlobalInstruction {
-  path: string;
-  lines: number[];
-}
-
-/**
- * Read-only audit of user-level agent instruction files. Older DevGuard
- * guides had users paste "read project-handoff.md / quality-report.md
- * first" into them, which now contradicts the project-managed section (MCP
- * first, no markdown reads). DevGuard does not own these files — no marker
- * section is ever written there — so this only reports; it never edits.
- */
-export async function findLegacyGlobalInstructions(home = homedir()): Promise<LegacyGlobalInstruction[]> {
-  const found: LegacyGlobalInstruction[] = [];
-  for (const path of [join(home, ".codex", "AGENTS.md"), join(home, ".claude", "CLAUDE.md")]) {
-    const text = await readFile(path, "utf8").catch(() => "");
-    if (!text || /prepare_task_context/.test(text)) continue;
-    const lines = text
-      .split(/\r?\n/)
-      .flatMap((line, index) => (/\.devguard\/(?:reports\/(?:project-handoff|quality-report|working-context)|prompts\/next-(?:codex|claude)-prompt)\.md/.test(line) ? [index + 1] : []));
-    if (lines.length > 0) found.push({ path, lines });
-  }
-  return found;
-}
+// Detection lives in instruction-authority.ts (shared with prepare and the
+// Dashboard); re-exported here for existing callers.
+export { findLegacyGlobalInstructions, type LegacyGlobalInstruction } from "./instruction-authority.js";
 
 async function printInstructionAuthority(): Promise<void> {
   const legacy = await findLegacyGlobalInstructions();

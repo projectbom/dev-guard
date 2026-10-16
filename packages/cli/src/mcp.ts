@@ -1,5 +1,7 @@
-import { access, readFile, realpath } from "node:fs/promises";
-import { resolve, relative, dirname, join } from "node:path";
+import { execFile } from "node:child_process";
+import { access, readdir, readFile, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -27,6 +29,8 @@ async function readOwnPackageVersion(): Promise<string> {
     return "unknown";
   }
 }
+
+const execFileAsync = promisify(execFile);
 
 const toolInputSchema = {
   task: z.string().min(1).describe("Current coding task. Call before searching or reading project source files. Keep any file paths the user named."),
@@ -104,18 +108,9 @@ export async function runMcpServer(root: string): Promise<void> {
           ]
         };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
         return {
           isError: true,
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify({
-                error: message,
-                next: "Run the MCP server from the project root or pass a projectRoot inside the configured working directory. Ensure .devguard exists and dev-guard done has generated a Code Index before relying on routed context."
-              }, null, 2)
-            }
-          ]
+          content: [{ type: "text", text: JSON.stringify(mcpErrorPayload(error), null, 2) }]
         };
       }
     }
@@ -161,10 +156,9 @@ export async function runMcpServer(root: string): Promise<void> {
           ]
         };
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
         return {
           isError: true,
-          content: [{ type: "text", text: JSON.stringify({ error: message }, null, 2) }]
+          content: [{ type: "text", text: JSON.stringify(mcpErrorPayload(error), null, 2) }]
         };
       }
     }
@@ -174,18 +168,110 @@ export async function runMcpServer(root: string): Promise<void> {
   await server.connect(transport);
 }
 
-async function resolveMcpProjectRoot(serverRoot: string, requestedRoot?: string): Promise<string> {
+export interface McpRootDiagnostics {
+  requestedRoot: string;
+  mcpRoot: string;
+  mcpRootGitToplevel?: string;
+  requestedGitToplevel?: string;
+  /** Short machine-readable findings, e.g. "mcp-root-not-git", "mcp-root-empty". */
+  findings: string[];
+}
+
+/**
+ * Wrong-root rejection with enough identity to self-diagnose (Codex opening
+ * an empty sibling checkout once cost a full manual handoff). Still
+ * fail-closed: DevGuard never switches to the requested root on its own.
+ */
+/** Root errors carry their own identity diagnostics and fix; never environment variables. */
+export function mcpErrorPayload(error: unknown): Record<string, unknown> {
+  if (error instanceof McpRootError) return { error: error.message, diagnostics: error.diagnostics, next: error.fix };
+  return {
+    error: error instanceof Error ? error.message : String(error),
+    next: "Run the MCP server from the project root or pass a projectRoot inside the configured working directory. Ensure .devguard exists and dev-guard done has generated a Code Index before relying on routed context."
+  };
+}
+
+export class McpRootError extends Error {
+  constructor(message: string, readonly diagnostics: McpRootDiagnostics, readonly fix: string) {
+    super(message);
+    this.name = "McpRootError";
+  }
+}
+
+export async function resolveMcpProjectRoot(serverRoot: string, requestedRoot?: string): Promise<string> {
   const configuredRoot = resolve(serverRoot);
   const candidate = resolve(configuredRoot, requestedRoot?.trim() || ".");
   const [configuredRealRoot, candidateRealRoot] = await Promise.all([
-    realpath(configuredRoot),
-    realpath(candidate)
+    realpath(configuredRoot).catch(() => undefined),
+    realpath(candidate).catch(() => undefined)
   ]);
-  const relativePath = relative(configuredRealRoot, candidateRealRoot);
-  if (relativePath === ".." || relativePath.startsWith("../") || relativePath.startsWith("..\\")) {
-    throw new Error("projectRoot must stay inside the MCP server working directory.");
+  if (!configuredRealRoot || !candidateRealRoot) {
+    const missing = !configuredRealRoot ? configuredRoot : candidate;
+    throw await rootError(
+      `${!configuredRealRoot ? "The DevGuard MCP working directory" : "The requested project"} does not exist: ${missing}`,
+      configuredRealRoot ?? configuredRoot,
+      candidateRealRoot ?? candidate,
+      "Reopen the intended project workspace, or re-register the DevGuard MCP server from that project root."
+    );
   }
-  await access(fromRoot(candidateRealRoot, devguardPaths.runtime));
+  const relativePath = relative(configuredRealRoot, candidateRealRoot);
+  if (relativePath === ".." || relativePath.startsWith("../") || relativePath.startsWith("..\\") || isAbsolute(relativePath)) {
+    throw await rootError(
+      "The requested project is outside this MCP root.",
+      configuredRealRoot,
+      candidateRealRoot,
+      "Start or re-register DevGuard MCP from the intended project root, or reopen the correct workspace. DevGuard does not switch roots automatically."
+    );
+  }
+  if (!(await access(fromRoot(candidateRealRoot, devguardPaths.runtime)).then(() => true, () => false))) {
+    throw await rootError(
+      `DevGuard is not set up in ${candidateRealRoot} (no ${devguardPaths.runtime}).`,
+      configuredRealRoot,
+      candidateRealRoot,
+      "Run `dev-guard watch` (or `dev-guard setup`) in the intended project root, or reopen the correct workspace."
+    );
+  }
   await access(fromRoot(candidateRealRoot, devguardPaths.codeIndex)).catch(() => undefined);
   return candidateRealRoot;
+}
+
+async function rootError(reason: string, mcpRoot: string, requestedRoot: string, fix: string): Promise<McpRootError> {
+  const [mcpRootGitToplevel, requestedGitToplevel, mcpRootEntries] = await Promise.all([
+    gitToplevel(mcpRoot),
+    gitToplevel(requestedRoot),
+    readdir(mcpRoot).catch(() => undefined)
+  ]);
+  const findings: string[] = [];
+  if (!mcpRootGitToplevel) findings.push("mcp-root-not-git");
+  if (mcpRootEntries && mcpRootEntries.filter((entry) => entry !== ".DS_Store").length === 0) findings.push("mcp-root-empty");
+  else if (mcpRootEntries && !mcpRootEntries.includes(".devguard")) findings.push("mcp-root-has-no-devguard");
+  if (mcpRootGitToplevel && requestedGitToplevel && mcpRootGitToplevel !== requestedGitToplevel) findings.push("different-git-repositories");
+  if (mcpRoot !== requestedRoot && basename(mcpRoot) === basename(requestedRoot)) findings.push("same-name-sibling-checkout");
+  const diagnostics: McpRootDiagnostics = {
+    requestedRoot,
+    mcpRoot,
+    ...(mcpRootGitToplevel ? { mcpRootGitToplevel } : {}),
+    ...(requestedGitToplevel ? { requestedGitToplevel } : {}),
+    findings
+  };
+  const lines = [
+    reason,
+    `DevGuard MCP is bound to: ${mcpRoot}${mcpRootGitToplevel ? ` (git toplevel ${mcpRootGitToplevel})` : " (not a git repository)"}`,
+    `Requested project: ${requestedRoot}${requestedGitToplevel ? ` (git toplevel ${requestedGitToplevel})` : ""}`
+  ];
+  if (findings.includes("mcp-root-empty")) lines.push("The MCP root directory is empty — likely a wrong or empty checkout opened as the workspace.");
+  else if (findings.includes("same-name-sibling-checkout")) lines.push("The MCP root and the requested project share a name — likely a sibling checkout opened as the workspace.");
+  lines.push(`Fix: ${fix}`);
+  return new McpRootError(lines.join("\n"), diagnostics, fix);
+}
+
+/** Read-only `git rev-parse --show-toplevel`; undefined when not a repo or git is unavailable. */
+async function gitToplevel(dir: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], { cwd: dir, timeout: 3000 });
+    const top = stdout.trim();
+    return top ? await realpath(top).catch(() => top) : undefined;
+  } catch {
+    return undefined;
+  }
 }
