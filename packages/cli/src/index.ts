@@ -306,7 +306,7 @@ All commands:
                   [--no-dashboard] [--stable-after <s>] [--depth <n>]
                   [--poll] [--include-lockfiles] [--compact|--ultra]
   dev-guard dashboard [--port <port>] [--no-open]
-  dev-guard doctor [--hooks] [--agents] [--dry-run]
+  dev-guard doctor [--hooks] [--agents [--fix]] [--dry-run]
   dev-guard telemetry                 task event counts + drift telemetry summary
   dev-guard report [--compact] [--copy] [--json] [--since <ref>]
   dev-guard review [--heuristic] [--fix-prompt] [--copy] [--output <file>] [--copy-fix]

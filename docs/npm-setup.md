@@ -127,7 +127,7 @@ dev-guard install-agent-instructions --force
 
 ## 5. Global Agent Instructions
 
-DevGuard never writes user-level instruction files such as `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`. Older DevGuard guides suggested pasting a "Read `project-handoff.md` / `quality-report.md` first" block there; that block now contradicts the project section above (MCP first, no markdown reads). If your global file still contains it, remove that block by hand — `dev-guard doctor --agents` reports it when present.
+DevGuard never writes user-level instruction files such as `~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`. Older DevGuard guides suggested pasting a "Read `project-handoff.md` / `quality-report.md` first" block there; that block now contradicts the project section above (MCP first, no markdown reads). If your global file still contains it, `dev-guard doctor --agents` reports it; `dev-guard doctor --agents --fix --dry-run` previews the removal and `dev-guard doctor --agents --fix` removes only that block after you confirm (a backup is written next to the file first). `watch` and `setup` never modify these files.
 
 ## 6. Verify Codex / Claude Hooks
 

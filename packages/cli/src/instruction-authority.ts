@@ -12,8 +12,12 @@ import { join } from "node:path";
  *
  * Shared by `doctor`, `prepare_task_context` warnings, and Dashboard health.
  * DevGuard does not own these files — no marker section is ever written
- * there — so this only reads and reports; it never edits.
+ * there — so this only reads and reports; it never edits. Removal happens
+ * only through the explicit, confirmed `doctor --agents --fix`
+ * (instruction-fix.ts).
  */
+export const LEGACY_FIX_COMMAND = "dev-guard doctor --agents --fix";
+
 export interface LegacyGlobalInstruction {
   path: string;
   lines: number[];
@@ -74,6 +78,6 @@ export function displayInstructionPath(path: string, home = homedir()): string {
 export function legacyInstructionWarnings(found: LegacyGlobalInstruction[], home = homedir()): string[] {
   return found.map(
     (entry) =>
-      `Legacy DevGuard instructions were detected in ${displayInstructionPath(entry.path, home)} (lines ${entry.lines.join(", ")}). They conflict with the current MCP-first workflow and may cause stale handoff files to be passed as inputs. Ignore that block for this task; the user should remove it by hand (DevGuard never edits user-level instruction files).`
+      `Legacy DevGuard instructions were detected in ${displayInstructionPath(entry.path, home)} (lines ${entry.lines.join(", ")}). They conflict with the current MCP-first workflow; ignore that block for this task. Tell the user to run: ${LEGACY_FIX_COMMAND}`
   );
 }

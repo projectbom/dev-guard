@@ -1,5 +1,12 @@
 # Changelog
 
+## DevGuard v0.11.2
+
+`@dev-guard/cli` 0.11.2 / `@dev-guard/core` 0.11.0 (unchanged, not republished) — legacy-instruction resolution UX. No new dependencies.
+
+- **Safe, explicit fix.** `dev-guard doctor --agents --fix` removes only a recognized obsolete DevGuard block from `~/.codex/AGENTS.md` / `~/.claude/CLAUDE.md`: preview first, `Continue? [y/N]` (default No), byte-identical backup next to the file (never overwritten; no backup → no edit), one write that keeps LF/CRLF and surrounding bytes, then the shared detector re-runs (`PARTIAL` instead of a second pass). Lines that only resemble DevGuard guidance are refused with the lines to review. `--dry-run` previews without writing. `watch`, `setup`, `prepare_task_context` and the Dashboard stay read-only toward these files.
+- **Remediation everywhere.** `doctor --agents` prints `WARN … File / Lines / Fix` or `PASS`; the `prepare_task_context` warning ends with the fix command; the Dashboard shows a compact note (title, path, collapsed details) and, while the conflict is active, makes it the primary issue with the fix command as the action — the displaced context issue (e.g. reads outside the plan) stays first in Details and returns once the file is fixed. The warning clears on the next prepare / Dashboard poll without restarting watch.
+
 ## DevGuard v0.11.1
 
 `@dev-guard/cli` 0.11.1 / `@dev-guard/core` 0.11.0 (unchanged, not republished) — reliability hotfix from the PartnerFlow dogfood audit. No new dependencies.

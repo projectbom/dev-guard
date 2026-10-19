@@ -13,9 +13,15 @@ import { readDriftTelemetryStats } from "./drift-telemetry.js";
 import { readRuntimeState } from "./runtime-state.js";
 import { formatStrategyFlag, getAgentStrategyReport } from "./agent-strategies.js";
 import { formatNotifyCommand, getCodexNotifyConfigStatus } from "./codex-notify.js";
-import { findLegacyGlobalInstructions } from "./instruction-authority.js";
+import { createInterface } from "node:readline";
+import { displayInstructionPath, findLegacyGlobalInstructions, LEGACY_FIX_COMMAND } from "./instruction-authority.js";
+import { applyLegacyInstructionFix, formatLineRanges, planLegacyInstructionFixes, type LegacyFilePlan } from "./instruction-fix.js";
 
 export async function runDoctor(root: string, args: string[] = []): Promise<void> {
+  if (args.includes("--agents") && args.includes("--fix")) {
+    await runLegacyInstructionFix({ dryRun: args.includes("--dry-run") });
+    return;
+  }
   if (args.includes("--agents")) {
     await runAgentDoctor(root);
     return;
@@ -199,13 +205,106 @@ async function printInstructionAuthority(): Promise<void> {
   console.log("");
   console.log("Instruction Authority");
   if (legacy.length === 0) {
-    console.log("- global instruction files: no conflicting DevGuard workflow found");
+    console.log("PASS Agent instructions are compatible with the current DevGuard workflow");
     return;
   }
   for (const entry of legacy) {
-    console.log(`- CONFLICT ${entry.path} (lines ${entry.lines.join(", ")}): tells agents to read DevGuard markdown first, which contradicts the project section (prepare_task_context first).`);
+    console.log("WARN Legacy DevGuard instructions detected");
+    console.log(`File: ${displayInstructionPath(entry.path)}`);
+    console.log(`Lines: ${formatLineRanges(entry.lines)}`);
+    console.log(`Fix: ${LEGACY_FIX_COMMAND}`);
   }
-  console.log("- next: remove that block by hand. DevGuard does not edit user-level instruction files.");
+}
+
+/**
+ * `doctor --agents --fix [--dry-run]`: the only DevGuard path that writes a
+ * user-level instruction file. Preview first, default answer NO, backup
+ * before the single write, detector re-run after it.
+ */
+export async function runLegacyInstructionFix(options: { dryRun: boolean; home?: string; ask?: (question: string) => Promise<string> }): Promise<void> {
+  const plans = await planLegacyInstructionFixes(options.home);
+  console.log(`dev-guard doctor --agents --fix${options.dryRun ? " --dry-run" : ""}`);
+  if (plans.length === 0) {
+    console.log("PASS Agent instructions are compatible with the current DevGuard workflow");
+    console.log("Nothing to fix.");
+    return;
+  }
+  const fixable = plans.filter((plan) => plan.status === "fixable");
+  for (const plan of plans.filter((entry) => entry.status === "ambiguous")) {
+    console.log("");
+    console.log(`REFUSE AUTO-FIX ${plan.displayPath}`);
+    console.log(`Lines to review by hand: ${formatLineRanges(plan.reviewLines)}`);
+    console.log(plan.unsafe ? `Reason: ${plan.unsafe}.` : "Reason: these lines mention DevGuard markdown but are not part of a recognized obsolete DevGuard block, so DevGuard will not remove them.");
+    process.exitCode = 1;
+  }
+  if (fixable.length === 0) return;
+  console.log("");
+  console.log("Found obsolete DevGuard instructions:");
+  for (const plan of fixable) printFixPlan(plan, options.dryRun);
+  console.log("");
+  console.log("These instructions conflict with the current MCP-first workflow.");
+  console.log("");
+  console.log("DevGuard will remove ONLY the obsolete DevGuard block.");
+  console.log("All other user instructions will be preserved.");
+  if (options.dryRun) {
+    console.log("");
+    console.log(`Dry run: nothing was changed. To remove it: ${LEGACY_FIX_COMMAND}`);
+    return;
+  }
+  console.log("");
+  const answer = await (options.ask ?? askLine)("Continue? [y/N] ");
+  if (!/^y(?:es)?$/i.test(answer.trim())) {
+    console.log("No changes made.");
+    return;
+  }
+  for (const plan of fixable) {
+    const outcome = await applyLegacyInstructionFix(plan, { home: options.home });
+    console.log("");
+    if (outcome.status === "FIXED") {
+      console.log(`✓ Removed obsolete DevGuard instructions (${plan.displayPath})`);
+      console.log(`✓ Backup: ${outcome.backupPath}`);
+      console.log("✓ MCP-first instruction conflict cleared");
+    } else if (outcome.status === "PARTIAL") {
+      console.log(`PARTIAL ${plan.displayPath}: the block was removed, but DevGuard still detects legacy lines ${formatLineRanges(outcome.remainingLines)}. Review them by hand; DevGuard will not edit again.`);
+      console.log(`Backup: ${outcome.backupPath}`);
+      process.exitCode = 1;
+    } else {
+      console.log(`FAILED ${plan.displayPath}: ${outcome.reason}`);
+      if (outcome.backupPath) console.log(`Backup: ${outcome.backupPath}`);
+      process.exitCode = 1;
+    }
+  }
+}
+
+function printFixPlan(plan: LegacyFilePlan, dryRun: boolean): void {
+  console.log("");
+  console.log(plan.displayPath);
+  console.log(`  conflicting lines ${formatLineRanges(plan.conflictLines)}`);
+  for (const block of plan.blocks) {
+    console.log(`  block to remove: lines ${block.startLine}–${block.endLine}${block.removeEnd > block.endLine || block.removeStart < block.startLine ? ` (plus the blank line(s) it leaves: ${block.removeStart}–${block.removeEnd} removed)` : ""}`);
+    if (dryRun) for (const line of block.preview) console.log(`    - ${line}`);
+  }
+  if (dryRun) {
+    const removed = plan.blocks.reduce((sum, block) => sum + block.removeEnd - block.removeStart + 1, 0);
+    const kept = plan.totalLines - removed;
+    console.log(kept > 0 ? `  will NOT touch: the other ${kept} line(s) of this file, or any other file` : "  will NOT touch: any other file. This file holds nothing else; it will be left empty (not deleted).");
+  }
+}
+
+/** Default NO: an empty answer, EOF, or a non-interactive stdin all mean no. */
+function askLine(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    let answered = false;
+    rl.question(question, (answer) => {
+      answered = true;
+      rl.close();
+      resolve(answer);
+    });
+    rl.on("close", () => {
+      if (!answered) resolve("");
+    });
+  });
 }
 
 async function printAgentStrategies(root: string): Promise<void> {

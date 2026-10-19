@@ -458,7 +458,15 @@ dev-guard install-agent-instructions --force
 - Codex (`AGENTS.md`를 참고)
 - 프로젝트 레벨 instruction 파일을 인식하는 기타 Agent
 
-사용자 전역 지침 파일은 사용자 소유입니다. DevGuard는 `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`를 수정하지 않습니다. 이 파일에 예전 "`.devguard/reports/project-handoff.md` / `quality-report.md` / `next-codex-prompt.md`를 먼저 읽으라"는 블록이 남아 있으면 `dev-guard doctor`, `prepare_task_context` 경고, 대시보드 상태가 이를 알려 줍니다. 에이전트가 실제 입력 대신 오래된 인수인계 파일을 넘기게 되므로 해당 블록은 직접 지워 주세요.
+사용자 전역 지침 파일은 사용자 소유입니다. `watch`, `setup`, `prepare_task_context`, 대시보드는 `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md`를 수정하지 않습니다. 이 파일에 예전 "`.devguard/reports/project-handoff.md` / `quality-report.md` / `next-codex-prompt.md`를 먼저 읽으라"는 블록이 남아 있으면 `dev-guard doctor --agents`, `prepare_task_context` 경고, 대시보드 상태가 이를 알려 줍니다. 이 블록이 있으면 에이전트가 실제 입력 대신 오래된 인수인계 파일을 넘기게 됩니다. 제거 방법:
+
+```bash
+dev-guard doctor --agents                   # 파일/줄 번호와 함께 WARN, 또는 PASS
+dev-guard doctor --agents --fix --dry-run   # 미리보기: 파일, 줄 범위, 인식된 블록, 건드리지 않을 부분
+dev-guard doctor --agents --fix             # "Continue? [y/N]" 확인(기본값 No) → 백업 → 해당 블록만 제거
+```
+
+알려진 예전 DevGuard 블록과 일치하는 텍스트만 지우며, 다른 지침·줄바꿈 형식(LF/CRLF)·공백은 그대로 둡니다. 수정 전에 파일 옆에 바이트 단위로 같은 백업(`AGENTS.md.devguard-backup-<timestamp>`, 기존 백업은 덮어쓰지 않음)을 만들고, 백업에 실패하면 원본을 건드리지 않습니다. 감지된 줄이 인식된 블록에 속하지 않으면 자동 수정을 거부하고 직접 확인할 줄 번호를 알려 줍니다. 수정 후 다음 `prepare_task_context` 호출과 대시보드 갱신에서 경고가 사라집니다(watch 재시작 불필요).
 
 이 파일은 강제 규칙이 아니라 **권장 사항**입니다. dev-guard 산출물을 먼저 참고하여 레포지토리 전체 재스캔을 줄이고 컨텍스트 재구축 비용을 낮추도록 유도하는 용도입니다. 기존 파일 내용은 유지하며, dev-guard는 자신의 섹션(HTML 주석 마커로 표시)만 추가하거나 갱신합니다.
 
@@ -483,7 +491,7 @@ Verdict:
 - `update`는 preview이며, `update --write`에서만 managed block을 수정합니다.
 - API provider는 선택 사항이며, 명시적 opt-in 없이는 OpenAI를 호출하지 않습니다.
 - 대시보드 상태는 프로젝트의 빌드/테스트가 아니라 DevGuard 자신의 상태만 보여 줍니다. `.devguard/runtime.json`을 쓸 수 없으면(예: "디스크 공간이 부족해 DevGuard 상태를 저장할 수 없습니다.") **확인 필요**로 표시되고, 상태 파일은 손상되지 않으며, 같은 실패는 1분에 한 번만 기록되고, 다음 쓰기가 성공하면 watch 재시작 없이 정상으로 돌아옵니다.
-- DevGuard는 사용자 전역 에이전트 지침 파일을 수정하지 않고, 예전 DevGuard 블록이 있을 때 경고만 합니다.
+- `watch`, `setup`, `prepare_task_context`, 대시보드는 사용자 전역 에이전트 지침 파일을 수정하지 않고, 예전 DevGuard 블록이 있을 때 경고만 합니다. 블록 제거는 사용자가 직접 실행하고 확인한 `dev-guard doctor --agents --fix`만 하며, 수정 전에 백업을 만듭니다. 경고가 있는 동안 대시보드는 이를 가장 큰 문제로 보여 주고 해결 명령을 표시하며(브라우저에서 파일을 수정하지는 않음), 원래의 컨텍스트 문제는 자세히 항목에 남습니다.
 - MCP 서버는 자신이 시작된 프로젝트(또는 그 안의 `projectRoot`)만 다룹니다. 다른 프로젝트 요청은 전환하지 않고 거부하며, 오류에 MCP 루트, 요청한 프로젝트, 양쪽 git toplevel, 비어 있거나 같은 이름의 형제 checkout 같은 가능성 있는 원인을 표시합니다.
 - `.devguard`의 생성 markdown은 고정 경로 단일 파일로 덮어쓰고, `history.jsonl` / `memory/change-log.jsonl`(8 MB) / `telemetry.jsonl`(4 MB)은 한도를 넘으면 원자적으로 `<file>.1`로 이름을 바꿔 회전합니다(1세대 보관, 읽을 때 두 파일을 합쳐 동시 쓰기나 중단에도 기록이 유실되지 않음). 새 프로젝트에는 `docs/PROJECT_STATE.md` 등 루트 템플릿을 더 이상 만들지 않으며, 기존 파일은 삭제하지 않습니다.
 

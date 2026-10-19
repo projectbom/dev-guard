@@ -127,7 +127,7 @@ dev-guard install-agent-instructions --force
 
 ## 5. 전역 agent 지시문
 
-DevGuard는 `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md` 같은 사용자 전역 지시문 파일을 쓰지 않습니다. 예전 가이드는 그곳에 "`project-handoff.md` / `quality-report.md`를 먼저 읽어라" 블록을 붙여넣도록 안내했는데, 이 블록은 위 프로젝트 섹션(MCP 우선, markdown 읽지 않음)과 충돌합니다. 전역 파일에 아직 남아 있다면 직접 제거하세요. `dev-guard doctor --agents`가 해당 블록을 발견하면 알려줍니다.
+DevGuard는 `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md` 같은 사용자 전역 지시문 파일을 쓰지 않습니다. 예전 가이드는 그곳에 "`project-handoff.md` / `quality-report.md`를 먼저 읽어라" 블록을 붙여넣도록 안내했는데, 이 블록은 위 프로젝트 섹션(MCP 우선, markdown 읽지 않음)과 충돌합니다. 전역 파일에 아직 남아 있으면 `dev-guard doctor --agents`가 알려 주고, `dev-guard doctor --agents --fix --dry-run`으로 미리 본 뒤 `dev-guard doctor --agents --fix`로 확인을 거쳐 해당 블록만 제거할 수 있습니다(수정 전 파일 옆에 백업 생성). `watch`와 `setup`은 이 파일을 수정하지 않습니다.
 
 ## 6. Codex / Claude hook 확인
 

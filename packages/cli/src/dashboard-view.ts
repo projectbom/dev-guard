@@ -6,6 +6,7 @@
 // serves; no repository scan, no extra I/O.
 import type { ContextEfficiencyReport, ContextGroup, ContextIssue, RolloverState } from "./context-efficiency.js";
 import type { EvidenceKind } from "./agent-activity.js";
+import { LEGACY_FIX_COMMAND } from "./instruction-authority.js";
 
 /**
  * System/setup correctness only — never context or work quality, and never
@@ -24,7 +25,7 @@ export type OverviewHealthReason =
   | "legacy-instructions";
 /** User-facing thread levels (the raw rollover enum stays in details). */
 export type OverviewThread = "LOW" | "SOON" | "NEW_THREAD";
-export type OverviewActionId = "FIX_HEALTH" | "START_WATCH" | "WAIT_SETUP" | "NEW_THREAD" | "FIX_ISSUE" | "REVIEW_QUALITY" | "FINISH_THEN_NEW_THREAD" | "CONTINUE" | "START_TASK";
+export type OverviewActionId = "FIX_HEALTH" | "FIX_INSTRUCTIONS" | "START_WATCH" | "WAIT_SETUP" | "NEW_THREAD" | "FIX_ISSUE" | "REVIEW_QUALITY" | "FINISH_THEN_NEW_THREAD" | "CONTINUE" | "START_TASK";
 export type OverviewMetricKey = "context" | "readPlan" | "suggestions" | "validation" | "filesChanged";
 
 export interface OverviewMetric {
@@ -42,7 +43,7 @@ export interface DashboardOverview {
   /** One line (the client truncates visually; the full goal is a tooltip). */
   task?: string;
   /** Exactly zero or one — the biggest actionable context/workflow problem. */
-  issue?: Pick<ContextIssue, "id" | "cause" | "severity" | "issue" | "why" | "action" | "evidence">;
+  issue?: OverviewIssue;
   /** Exactly one next user action. */
   action: { id: OverviewActionId; text: string; command?: string };
   /** At most five, in a fixed order. */
@@ -52,6 +53,9 @@ export interface DashboardOverview {
   /** Issues beyond the primary one — details only. */
   secondaryIssues: ContextIssue[];
 }
+
+/** A context issue, or the setup-level legacy instruction conflict shown in its place. */
+export type OverviewIssue = Omit<Pick<ContextIssue, "id" | "cause" | "severity" | "issue" | "why" | "action" | "evidence">, "id"> & { id: ContextIssue["id"] | "LEGACY_INSTRUCTIONS" };
 
 export interface OverviewStateInput {
   initialized: boolean;
@@ -95,7 +99,24 @@ export function buildDashboardOverview(state: OverviewStateInput, report: Contex
   const rollover = report?.now.thread ?? { state: "CONTINUE" as const, reason: "No DevGuard task recorded yet.", evidence: "INFERRED" as const };
   const thread: DashboardOverview["thread"] = { level: THREAD_LEVEL[rollover.state], raw: rollover.state, reason: rollover.reason, evidence: rollover.evidence };
   const primary = report?.now.primaryIssue;
-  const issue = primary ? { id: primary.id, ...(primary.cause ? { cause: primary.cause } : {}), severity: primary.severity, issue: primary.issue, why: primary.why, action: primary.action, evidence: primary.evidence } : undefined;
+  // While an obsolete user-level DevGuard block is active it is the primary
+  // issue: it is the one cause the user can remove in a single command, and
+  // it can steer agents toward stale markdown and off the read plan. It is
+  // not claimed to explain every issue — the context issue it displaces
+  // stays first in the secondary list and returns once the file is fixed.
+  const legacyActive = health.reason === "legacy-instructions";
+  const issue: OverviewIssue | undefined = legacyActive
+    ? {
+        id: "LEGACY_INSTRUCTIONS",
+        severity: "strong",
+        issue: "Obsolete DevGuard instructions conflict with the current MCP flow.",
+        why: `${legacyPaths.join(", ")} still tells agents to read DevGuard markdown first, which can pull agents toward stale files instead of the read plan.`,
+        action: `Run ${LEGACY_FIX_COMMAND} (previews and asks before changing anything).`,
+        evidence: "OBSERVED"
+      }
+    : primary
+      ? { id: primary.id, ...(primary.cause ? { cause: primary.cause } : {}), severity: primary.severity, issue: primary.issue, why: primary.why, action: primary.action, evidence: primary.evidence }
+      : undefined;
   const current = report?.current;
   const hasTask = Boolean(report?.now.task);
 
@@ -110,6 +131,8 @@ export function buildDashboardOverview(state: OverviewStateInput, report: Contex
       ? { id: "FIX_HEALTH", text: RUNTIME_WRITE_ACTION[health.reason] ?? "DevGuard cannot write runtime state." }
     : health.level === "ATTENTION"
       ? { id: "START_WATCH", text: "Start DevGuard in this project.", command: "dev-guard watch" }
+      : legacyActive
+        ? { id: "FIX_INSTRUCTIONS", text: "Remove the obsolete DevGuard instructions:", command: LEGACY_FIX_COMMAND }
       : thread.level === "NEW_THREAD"
         ? { id: "NEW_THREAD", text: "Start the next task in a fresh agent thread." }
         : issue && (issue.severity === "strong" || !reviewPending)
@@ -139,6 +162,6 @@ export function buildDashboardOverview(state: OverviewStateInput, report: Contex
     action,
     metrics: metrics.slice(0, MAX_OVERVIEW_METRICS),
     ...(groups && report?.currentTask ? { flow: { groups, approxTokens: report.currentTask.estimatedContextTokens, evidence: "ESTIMATED" as const } } : {}),
-    secondaryIssues: report?.now.otherIssues ?? []
+    secondaryIssues: [...(legacyActive && primary ? [primary] : []), ...(report?.now.otherIssues ?? [])]
   };
 }

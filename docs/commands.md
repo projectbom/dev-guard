@@ -118,11 +118,13 @@ Strategy and hook diagnostics:
 
 ```bash
 dev-guard doctor --agents
+dev-guard doctor --agents --fix --dry-run
+dev-guard doctor --agents --fix
 dev-guard doctor --hooks --dry-run
 dev-guard doctor --hooks
 ```
 
-Use `doctor --agents` to see Claude Stop Hook, Codex notify, Codex Stop Hook, Codex JSONL listener, and manual fallback status. Use the dry run to inspect file paths and command targets. Use the active check to execute the hook scripts directly; it can run `dev-guard done` and `dev-guard status`. If runtime completion still does not fire, use the manual fallback:
+Use `doctor --agents` to see Claude Stop Hook, Codex notify, Codex Stop Hook, Codex JSONL listener, and manual fallback status. It also checks `~/.codex/AGENTS.md` and `~/.claude/CLAUDE.md` for an obsolete "read DevGuard markdown first" block (`WARN` with file and lines, or `PASS`). `--fix --dry-run` previews the removal without writing; `--fix` asks `Continue? [y/N]` (default No; a non-interactive stdin means No), writes a byte-identical backup next to the file, removes only the recognized block in one pass, and re-runs the detector. Ambiguous text is refused with the lines to review by hand. `watch` and `setup` never edit these files. Use the dry run to inspect file paths and command targets. Use the active check to execute the hook scripts directly; it can run `dev-guard done` and `dev-guard status`. If runtime completion still does not fire, use the manual fallback:
 
 ```bash
 dev-guard done

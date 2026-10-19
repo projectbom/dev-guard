@@ -783,6 +783,10 @@ function renderPage(): string {
     .ov-now.health-WARNING { border-left-color: var(--warn); }
     .ov-pill.health-WARNING { background: var(--warn-bg); border-color: var(--warn-ring); }
     .ov-health-note { font-size: 13px; }
+    .ov-health-compact { display: grid; gap: 4px; min-width: 0; }
+    .ov-health-compact code { font: 12px var(--mono); overflow-wrap: anywhere; }
+    .ov-health-more summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+    .ov-health-more div { margin-top: 4px; color: var(--ink2); line-height: 1.45; }
     .ov-pills { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .ov-pill { display: flex; flex-direction: column; gap: 3px; padding: 8px 12px; border-radius: var(--r-sm); background: var(--ok-bg); border: 1px solid var(--ok-ring); min-width: 0; }
     .ov-pill b { font-size: 16px; line-height: 1.25; }
@@ -1331,7 +1335,11 @@ function renderOverview(data) {
       '<div class="ov-pill health-' + esc(o.health.level) + '" data-testid="ov-health" title="' + esc(t('ovHealthReason_' + o.health.reason)) + '"><span class="ov-k">' + esc(t('ovHealth')) + '</span><b>' + esc(t('ovHealth_' + o.health.level)) + '</b></div>' +
       '<div class="ov-pill thread-' + esc(o.thread.level) + '" data-testid="ov-thread" title="' + esc(o.thread.reason) + '"><span class="ov-k">' + esc(t('ovThread')) + '</span><b>' + esc(t('ovThread_' + o.thread.level)) + '</b></div>' +
     '</div>' +
-    ((o.health.level === 'WARNING' || String(o.health.reason).indexOf('runtime-write-') === 0)
+    (o.health.reason === 'legacy-instructions'
+      ? '<div class="ov-health-note ov-health-compact" data-testid="ov-health-note"><b>' + esc(t('ovHealthReason_legacy-instructions')) + '</b>' +
+        (o.health.detail ? '<div><code>' + esc(o.health.detail) + '</code></div>' : '') +
+        '<details class="ov-health-more"><summary>' + esc(t('ovHealthMore')) + '</summary><div>' + esc(t('ovHealthDetail_legacy-instructions')) + '</div></details></div>'
+      : (o.health.level === 'WARNING' || String(o.health.reason).indexOf('runtime-write-') === 0)
       ? '<div class="ov-line ov-health-note" data-testid="ov-health-note">' + esc(t('ovHealthReason_' + o.health.reason)) + (o.health.detail ? ' <code>' + esc(o.health.detail) + '</code>' : '') + '</div>'
       : '') +
     '<div class="ov-line"><span class="ov-k">' + esc(t('ovTask')) + '</span><div class="ov-task" data-testid="ov-task" title="' + esc(o.task || '') + '">' + esc(o.task || t('ovNoTask')) + '</div></div>' +
