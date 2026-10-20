@@ -28,6 +28,16 @@ That's it. The first `watch` prepares the project automatically and starts watch
 - **During work** — `dev-guard watch` tracks changes and opens a local dashboard (`127.0.0.1` only).
 - **After a task** — DevGuard records what changed and what was verified, so the next session picks up from there.
 
+## Verified Project State
+
+DevGuard is not "AI memory". It records small structured events (task started, validation recorded, outcome, user decision, task closed) and projects them into the current verified state that `prepare_task_context`, the Quality Report, the Handoff and the dashboard all read:
+
+- **Provenance** — `OBSERVED` (DevGuard saw the command and exit code in the agent's own transcript), `AGENT_REPORTED` (the agent's word only), `USER_DECISION` (an explicit user decision, carried — not enforced), `DERIVED` (computed from other evidence).
+- **Outcomes** — `PASS`, `FAIL`, `STOPPED` (a safety gate stopped the run on purpose), `BLOCKED` (waiting on approval or an external dependency), `UNKNOWN`. A deliberate stop is never shown as a failure.
+- **Freshness** — a validation goes `STALE` only when a file that supports it changes, and `SUPERSEDED` when a later result replaces it. An agent PASS the transcript contradicts is a `MISMATCH`, never "verified".
+
+Agents record outcomes with the MCP tool `record_task_outcome` and explicit user decisions with `record_user_decision` (CLI: `dev-guard record-outcome`, `dev-guard record-decision`). No vector DB, no embeddings, no LLM; everything stays in `.devguard/`, and the Markdown reports are views, not the source of truth.
+
 On first run, `watch` indexes the project (honoring `.gitignore`), builds Project Knowledge, registers the MCP server for Claude Code and Codex, adds a DevGuard section to `AGENTS.md` / `CLAUDE.md` (your own text is kept), and installs completion hooks. In a Git repository it also appends `.devguard/` and `devguard.backup-*/` to `.gitignore` when Git does not already ignore them (existing lines untouched; `AGENTS.md`, `CLAUDE.md` and MCP config are not ignored). An already-tracked `.devguard/` gets a warning — DevGuard never changes the Git index.
 
 ## Optional
@@ -44,3 +54,4 @@ dev-guard doctor            # check integrations
 - [Korean README](https://github.com/projectbom/dev-guard/blob/main/README.ko.md)
 - [English README](https://github.com/projectbom/dev-guard#readme)
 - npm install & usage guide: [English](https://github.com/projectbom/dev-guard/blob/main/docs/npm-setup.md) · [한국어](https://github.com/projectbom/dev-guard/blob/main/docs/npm-setup.ko.md)
+- [Verified Project State](https://github.com/projectbom/dev-guard/blob/main/docs/verified-project-state.md)

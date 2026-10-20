@@ -34,11 +34,38 @@ import { readTaskTelemetry, recordTaskTelemetry } from "./task-telemetry.js";
 import { jsonSections, markdownSections, scriptSections, type DocumentSection } from "./document-ranges.js";
 import { estimateRangeTokens, estimateTextTokens, isStructuredDocument, planReferences, resolveExplicitInputs, SCRIPT_RANGE_FILE, WHOLE_FILE_SCRIPT_TOKENS, wholeFileEligible, type ContextFileSource } from "./rehydration-plan.js";
 import { collectExecutionLineage, planExecutionLineage, type ExecutionLineage, type LineageSources } from "./execution-lineage.js";
-import { hashThreadId, observeThreadPressure, resolveCodexTaskOwner, taskBoundaryHeadroom, threadUserNotice, toOwner, type BoundaryHeadroom, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
+import { hashThreadId, identityFromShellEnv, observeThreadPressure, resolveCodexTaskOwner, taskBoundaryHeadroom, threadUserNotice, toOwner, type BoundaryHeadroom, type ObservedThreadIdentity, type ProviderName, type ProviderThreadOwner, type ThreadPressure } from "./thread-ownership.js";
 import { perfFlush, perfMark, perfReport, perfSpan } from "./perf-debug.js";
 import { rankShallowCandidates } from "./shallow-index.js";
 import { detectLegacyGlobalInstructions, legacyInstructionWarnings } from "./instruction-authority.js";
 import { isPersistentWriteError, noteWriteFailure, noteWriteSuccess } from "./write-health.js";
+import { matchReportedValidation, observeCommands, type ObservedCommand, type ValidationMatch, type Verification } from "./observed-commands.js";
+import {
+  appendProjectEvents,
+  bound,
+  computeProjectState,
+  computeValidationScope,
+  DECISION_SCOPES,
+  fingerprintFiles,
+  foldEvents,
+  gitAvailable,
+  isContinueRequest,
+  ledgerExists,
+  LIMITS as STATE_LIMITS,
+  listHash,
+  newEventId,
+  normalizeForLedger,
+  readProjectEvents,
+  TASK_OUTCOME_STATUSES,
+  VALIDATION_COMMAND,
+  validationIdentity,
+  validationLifecycleIndex,
+  type DecisionScope,
+  type Lifecycle,
+  type ProjectStateView,
+  type TaskOutcomeStatus
+} from "./project-state.js";
+import { compactVerifiedState, verifiedStateMarkdown, withVerifiedStateSection } from "./verified-state-view.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -182,6 +209,17 @@ export interface QAExecutionResult {
    * a late check.
    */
   bindingScope?: "completed-task";
+  /**
+   * Verified Project State provenance: OBSERVED only when DevGuard saw the
+   * command and its exit code in the agent's own transcript (or ran it
+   * itself, self-check); otherwise AGENT_REPORTED. Absent on pre-0.12
+   * evidence, which is never treated as OBSERVED.
+   */
+  provenance?: "OBSERVED" | "AGENT_REPORTED";
+  /** MATCHED / MISMATCH (transcript disagrees) / UNVERIFIED — see observed-commands.ts. */
+  verification?: Verification;
+  /** Exit code DevGuard observed in the transcript for the matched command. */
+  observedExitCode?: number;
 }
 
 export interface RecordValidationEvidenceInput {
@@ -432,6 +470,8 @@ export interface PreparedTaskContextResult extends BeforeAgentPreparationResult 
   readPlan: PreparedReadPlan;
   /** A new task in an already-used thread: does it likely fit (see taskBoundaryHeadroom)? */
   boundary?: BoundaryHeadroom;
+  /** The current-state projection (project-state.ts) this call computed — the same one Handoff/Quality/dashboard read. */
+  verifiedState?: ProjectStateView;
 }
 
 export interface PreparedReadPlan {
@@ -477,6 +517,7 @@ export function toAgentContextPayload(result: PreparedTaskContextResult): Record
       unboundCount: result.validation.unboundCount
     },
     openValidation: result.openValidation,
+    ...(compactVerifiedState(result.verifiedState) ? { state: compactVerifiedState(result.verifiedState) } : {}),
     indexFreshness: result.indexFreshness,
     coverage: result.coverage,
     warnings: result.warnings,
@@ -693,8 +734,16 @@ export interface HistoryRecord {
   qualityVerdict?: string;
   /** See DoneProcessingResult.taskScopedChangedFiles. */
   taskScopedChangedFiles?: string[];
-  /** See DoneProcessingResult.carriedOverChangedFiles. */
+  /** See DoneProcessingResult.carriedOverChangedFiles. Pre-0.12 rows only — see carriedDirtyCount. */
   carriedOverChangedFiles?: string[];
+  /** Carried-over dirty files: a count and a hash, never the list (history diet). */
+  carriedDirtyCount?: number;
+  carriedDirtyHash?: string;
+  /** Present when `changedFiles` was capped: the full count and a hash of the full list. */
+  changedFileCount?: number;
+  changedFilesHash?: string;
+  /** Present when `taskScopedChangedFiles` was capped. */
+  taskScopedCount?: number;
   /** A follow-up finalization of the task closed just before it (edits made after `done`), not a task of its own. */
   followUp?: boolean;
   /** Work finalized with no task open that is not the closed task's own files — never anyone's task. */
@@ -789,6 +838,8 @@ interface ContextTrust {
 interface ChangeLogEntry {
   timestamp: string;
   changedFiles: string[];
+  /** Present when `changedFiles` was capped (history diet). */
+  changedFileCount?: number;
   diffSummary: string[];
   relatedFiles: string[];
   qualityVerdict?: string;
@@ -995,13 +1046,20 @@ export async function recordQAExecutionResult(root: string, result: QAExecutionR
   const hasActiveTask = Boolean(current.currentTask?.text?.trim());
   const followUpOfCompletedTask = !hasActiveTask && !result.taskBinding && (await isCompletedTaskFollowUp(root, current, caller));
   const { gitHead, codeStateHash } = await resolveCurrentCodeState(root);
+  // Verified Project State: provenance from the agent's own transcript and
+  // the files that support this check (see recordValidationFacts).
+  await ensureProjectLedger(root, current).catch(() => undefined);
+  const facts = await recordValidationFacts(root, current, result, caller, codeStateHash, followUpOfCompletedTask).catch(() => undefined);
   const stamped: QAExecutionResult = {
     ...result,
     sessionId: result.sessionId ?? sessionId,
     taskBinding: result.taskBinding ?? (hasActiveTask || followUpOfCompletedTask ? "BOUND" : "UNBOUND"),
     ...(followUpOfCompletedTask ? { bindingScope: "completed-task" as const } : {}),
     gitHead: result.gitHead ?? (gitHead || undefined),
-    codeStateHash: result.codeStateHash ?? codeStateHash
+    codeStateHash: result.codeStateHash ?? codeStateHash,
+    provenance: facts?.match.provenance ?? "AGENT_REPORTED",
+    verification: facts?.match.verification ?? "UNVERIFIED",
+    ...(facts?.match.observed?.exitCode !== undefined ? { observedExitCode: facts.match.observed.exitCode } : {})
   };
   // Storage key MUST match the read-side identity (kind + name) — see
   // validationIdentityKey. Recording a second result under the same identity
@@ -1023,7 +1081,330 @@ export async function recordQAExecutionResult(root: string, result: QAExecutionR
       validationStatus: stamped.status
     });
   }
+  if (facts) {
+    const kind = resolveValidationKind(stamped);
+    await appendProjectEvents(root, [{
+      type: "VALIDATION_RECORDED",
+      taskId: stamped.sessionId,
+      provenance: facts.match.provenance,
+      // Ordered by completion, like qaResults' out-of-order rule.
+      timestamp: stamped.completedAt,
+      payload: {
+        identity: validationIdentity(kind, stamped.name),
+        kind,
+        name: stamped.name,
+        status: stamped.status,
+        ...normalizeForLedger(stamped.command),
+        ...(stamped.exitCode !== undefined ? { reportedExitCode: stamped.exitCode } : {}),
+        ...(facts.match.observed?.exitCode !== undefined ? { observedExitCode: facts.match.observed.exitCode } : {}),
+        ...(facts.match.observed ? { observedAt: facts.match.observed.at } : {}),
+        verification: facts.match.verification,
+        ...(facts.match.note ? { note: facts.match.note } : {}),
+        scope: facts.scope,
+        ...(bound(stamped.summary, STATE_LIMITS.summary) ? { summary: bound(stamped.summary, STATE_LIMITS.summary) } : {}),
+        binding: stamped.taskBinding === "UNBOUND" ? "UNBOUND" : stamped.bindingScope === "completed-task" ? "COMPLETED_TASK" : "BOUND",
+        completedAt: stamped.completedAt
+      }
+    }]).catch(() => undefined);
+    await computeProjectState(root, { codeStateHash, openTask: openTaskForProjection(root, current) }).catch(() => undefined);
+  }
   return qaResults[key];
+}
+
+/**
+ * Provenance + scope for one reported validation. Self-check results are
+ * DevGuard's own runs (OBSERVED). Everything else is matched against the
+ * commands the task's own thread executed since the task began; with no
+ * transcript evidence it stays AGENT_REPORTED — nothing is ever invented.
+ */
+async function recordValidationFacts(
+  root: string,
+  runtime: RuntimeState,
+  result: QAExecutionResult,
+  caller: ObservedThreadIdentity | undefined,
+  codeStateHash: string | undefined,
+  followUpOfCompletedTask: boolean
+): Promise<{ match: ValidationMatch; scope: Awaited<ReturnType<typeof computeValidationScope>> }> {
+  const baseline = runtime.currentTask ? undefined : (await readProjectState(root)).postCompletionBaseline;
+  let match: ValidationMatch;
+  if (result.source === "self-check") {
+    match = { provenance: "OBSERVED", verification: "MATCHED" };
+  } else {
+    const since = runtime.currentTask?.createdAt ?? (await taskStartedAt(root, runtime.sessionId)) ?? new Date(Date.now() - 6 * 3_600_000).toISOString();
+    const observed = await observeCommands({
+      root,
+      sinceIso: since,
+      caller,
+      ownerThreadHash: runtime.currentTask?.owner?.threadIdHash ?? baseline?.ownerThreadHash,
+      ownerProvider: runtime.currentTask?.owner?.provider
+    }).catch(() => undefined);
+    match = matchReportedValidation({ command: result.command, status: result.status, exitCode: result.exitCode }, observed);
+  }
+  const taskOwnedFiles = await taskOwnedFilesNow(root, runtime, followUpOfCompletedTask ? baseline : undefined);
+  const scope = await computeValidationScope(root, { command: result.command, taskOwnedFiles, codeStateHash, gitAvailable: await gitAvailable(root) });
+  return { match, scope };
+}
+
+/** The open task for the projection's "touched after the check" rule (undefined when no task is open). */
+function openTaskForProjection(root: string, runtime: RuntimeState): { taskId: string; touched: () => Promise<string[]> } | undefined {
+  if (!runtime.currentTask || !runtime.sessionId) return undefined;
+  return { taskId: runtime.sessionId, touched: () => taskOwnedFilesNow(root, runtime, undefined) };
+}
+
+async function taskStartedAt(root: string, taskId: string | undefined): Promise<string | undefined> {
+  if (!taskId) return undefined;
+  const folded = foldEvents(await readProjectEvents(root));
+  return folded.tasks.find((task) => task.taskId === taskId)?.startedAt;
+}
+
+/** Dirty files (porcelain, untracked expanded), without DevGuard/ignored noise. Cheap: no diff. */
+async function listDirtyFiles(root: string): Promise<string[]> {
+  try {
+    const { stdout } = await execFileAsync("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd: root, maxBuffer: 64 * 1024 * 1024 });
+    const parts = stdout.split("\0");
+    const files: string[] = [];
+    for (let index = 0; index < parts.length; index += 1) {
+      const entry = parts[index];
+      if (entry.length < 4) continue;
+      const status = entry.slice(0, 2);
+      files.push(entry.slice(3));
+      if (status.startsWith("R") || status.startsWith("C")) index += 1;
+    }
+    return [...new Set(files)].filter((file) => !isIgnoredWatchPath(file) && !isDevguardManagedDocPath(file) && !file.startsWith(".devguard/")).sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Files this task owns right now: dirty files that were not dirty when it
+ * began, plus baseline files it edited since (content changed). Only
+ * baseline files modified after the task began are hashed, so a 4,000-file
+ * carried-over tree costs a stat pass, not a hash pass. A completed-task
+ * follow-up owns the closed task's files.
+ */
+async function taskOwnedFilesNow(root: string, runtime: RuntimeState, followUpBaseline: PostCompletionBaseline | undefined): Promise<string[]> {
+  const dirty = await listDirtyFiles(root);
+  const task = runtime.currentTask;
+  if (task?.changedFilesAtCreation) return taskTouchedFiles(root, task, dirty);
+  if (followUpBaseline) {
+    const { changed } = await changedSinceCompletion(root, dirty, followUpBaseline);
+    return [...new Set([...(followUpBaseline.taskFiles ?? []).filter((file) => dirty.includes(file)), ...changed])];
+  }
+  return dirty;
+}
+
+/**
+ * Of `files`, those this task actually touched: not dirty when it began, or
+ * a baseline file whose content changed since (only baseline files modified
+ * after the task began are hashed — a stat pass, not a hash pass, over a
+ * large carried-over tree).
+ */
+async function taskTouchedFiles(root: string, task: BeforeAgentTask, files: string[]): Promise<string[]> {
+  const baseline = new Set(task.changedFilesAtCreation ?? []);
+  const own = files.filter((file) => !baseline.has(file));
+  const before = task.changedFileHashesAtCreation ?? {};
+  const sinceMs = Date.parse(task.createdAt) - 2000;
+  const touched = (await Promise.all(files.filter((file) => baseline.has(file)).map(async (file) => {
+    const info = await stat(join(root, file)).catch(() => undefined);
+    return info && info.mtimeMs >= sinceMs ? file : undefined;
+  }))).filter((file): file is string => Boolean(file));
+  const now = touched.length > 0 ? await hashWorkingFiles(root, touched) : {};
+  return [...own, ...touched.filter((file) => before[file] !== undefined && before[file] !== now[file])];
+}
+
+/**
+ * New ledger on an existing project: import the most recent pre-0.12
+ * validations once, marked legacy — AGENT_REPORTED/UNVERIFIED (DevGuard's
+ * own self-check stays OBSERVED), bound to the whole-tree fingerprint they
+ * were recorded with. Old files are never rewritten.
+ */
+const LEGACY_IMPORT_LIMIT = 40;
+async function ensureProjectLedger(root: string, runtime: RuntimeState): Promise<void> {
+  if (await ledgerExists(root)) return;
+  const entries = Object.values(runtime.qaResults ?? {})
+    .filter((entry) => entry.taskBinding === "BOUND" && entry.completedAt)
+    .sort((a, b) => a.completedAt.localeCompare(b.completedAt))
+    .slice(-LEGACY_IMPORT_LIMIT);
+  const events = entries.map((entry) => {
+    const kind = resolveValidationKind(entry);
+    const selfCheck = entry.source === "self-check";
+    return {
+      type: "VALIDATION_RECORDED" as const,
+      taskId: entry.sessionId,
+      provenance: selfCheck ? ("OBSERVED" as const) : ("AGENT_REPORTED" as const),
+      timestamp: entry.completedAt,
+      payload: {
+        identity: validationIdentity(kind, entry.name),
+        kind,
+        name: entry.name,
+        status: entry.status,
+        ...normalizeForLedger(entry.command),
+        ...(entry.exitCode !== undefined ? { reportedExitCode: entry.exitCode } : {}),
+        verification: (selfCheck ? "MATCHED" : "UNVERIFIED") as Verification,
+        note: "legacy-import",
+        scope: entry.codeStateHash ? { mode: "WORKTREE" as const, codeStateHash: entry.codeStateHash } : { mode: "SESSION" as const },
+        binding: entry.bindingScope === "completed-task" ? ("COMPLETED_TASK" as const) : ("BOUND" as const),
+        legacy: true,
+        completedAt: entry.completedAt
+      }
+    };
+  });
+  // An empty checkpoint marks the ledger as started even with nothing to import.
+  await appendProjectEvents(root, events.length > 0 ? events : [{ type: "STATE_CHECKPOINT", provenance: "DERIVED", payload: { folded: foldEvents([]) } }]);
+}
+
+/** History rows list at most this many paths (counts + hashes beyond it). */
+const HISTORY_FILE_LIMIT = 200;
+const HISTORY_DIFFSTAT_CHARS = 2000;
+
+async function readFinalizedFiles(root: string): Promise<string[] | undefined> {
+  const parsed = await readJsonFile<{ files?: unknown } | null>(fromRoot(root, devguardPaths.finalizedFiles), null);
+  return Array.isArray(parsed?.files) ? parsed.files.filter((file): file is string => typeof file === "string") : undefined;
+}
+
+/**
+ * TASK_CLOSED (task-owned changes + fingerprints, carried dirty work as a
+ * count/hash) and COMMAND_OBSERVED for validation-like commands the task's
+ * thread ran but never reported — e.g. a failing test it did not mention.
+ */
+async function recordTaskClosed(root: string, task: BeforeAgentTask, taskId: string, owned: string[], carried: string[]): Promise<void> {
+  const folded = foldEvents(await readProjectEvents(root));
+  const reported = new Set(folded.validations.filter((entry) => entry.taskId === taskId && entry.commandKey).map((entry) => entry.commandKey));
+  const lineageId = folded.tasks.find((entry) => entry.taskId === taskId)?.lineageId ?? taskId;
+  // The shell's own session counts only when it IS the task's owner (a
+  // watch started from some other Claude session must not lend its commands).
+  const shell = identityFromShellEnv(process.env);
+  const caller = shell && task.owner && toOwner(shell).threadIdHash === task.owner.threadIdHash ? shell : undefined;
+  const observed = await observeCommands({ root, sinceIso: task.createdAt, caller, ownerThreadHash: task.owner?.threadIdHash, ownerProvider: task.owner?.provider }).catch(() => undefined);
+  const latestByKey = new Map<string, ObservedCommand>();
+  for (const command of observed ?? []) {
+    if (!VALIDATION_COMMAND.test(command.command) || reported.has(command.key)) continue;
+    const previous = latestByKey.get(command.key);
+    if (!previous || previous.at <= command.at) latestByKey.set(command.key, command);
+  }
+  const commands = [...latestByKey.values()].sort((a, b) => b.at.localeCompare(a.at)).slice(0, STATE_LIMITS.observedCommandsPerTask);
+  const touched = await taskTouchedFiles(root, task, owned);
+  await appendProjectEvents(root, [
+    {
+      type: "TASK_CLOSED",
+      taskId,
+      lineageId,
+      provenance: "OBSERVED",
+      payload: {
+        taskOwnedChanges: owned.slice(0, STATE_LIMITS.ownedFilesListed),
+        taskOwnedCount: owned.length,
+        // Fingerprints only for what the task actually touched (done's
+        // task scope also keeps never-finalized pre-task work).
+        ...(touched.length > 0 && touched.length <= STATE_LIMITS.scopeFiles ? { ownedFingerprints: await fingerprintFiles(root, touched) } : {}),
+        carriedDirtyCount: carried.length,
+        ...(carried.length > 0 ? { carriedDirtyHash: listHash(carried) } : {})
+      }
+    },
+    ...commands.map((command) => ({
+      type: "COMMAND_OBSERVED" as const,
+      taskId,
+      lineageId,
+      provenance: "OBSERVED" as const,
+      payload: { command: command.command, commandKey: command.key, ...(command.exitCode !== undefined && !command.filtered ? { exitCode: command.exitCode } : {}), observedAt: command.at }
+    }))
+  ]);
+}
+
+export interface RecordTaskOutcomeInput {
+  root: string;
+  status: TaskOutcomeStatus;
+  reason?: string;
+  blockedOn?: string;
+  nextIntent?: string;
+  supersedes?: string[];
+}
+
+export interface RecordedStateChange {
+  taskId: string;
+  eventId: string;
+  provenance: "AGENT_REPORTED" | "USER_DECISION";
+  state?: ReturnType<typeof compactVerifiedState>;
+}
+
+/**
+ * The task's structured outcome — AGENT_REPORTED. Binds to the active task,
+ * or (after `done`, before the next prepare) to the task just closed. Not a
+ * report: bounded fields only.
+ */
+export async function recordTaskOutcome(input: RecordTaskOutcomeInput): Promise<RecordedStateChange & { status: TaskOutcomeStatus }> {
+  if (!TASK_OUTCOME_STATUSES.includes(input.status)) throw new Error(`status must be one of: ${TASK_OUTCOME_STATUSES.join(", ")}`);
+  const runtime = await readRuntimeState(input.root);
+  const taskId = runtime.sessionId;
+  if (!taskId) throw new Error("No DevGuard task to attach an outcome to: call prepare_task_context first.");
+  await ensureProjectLedger(input.root, runtime);
+  const folded = foldEvents(await readProjectEvents(input.root));
+  const supersedes = [...new Set((input.supersedes ?? []).map((value) => value.trim()).filter(Boolean))].slice(0, STATE_LIMITS.supersedes);
+  const reason = bound(input.reason, STATE_LIMITS.reason);
+  const blockedOn = bound(input.blockedOn, STATE_LIMITS.blockedOn);
+  const nextIntent = bound(input.nextIntent, STATE_LIMITS.nextIntent);
+  const [event] = await appendProjectEvents(input.root, [{
+    type: "TASK_OUTCOME_RECORDED",
+    taskId,
+    lineageId: folded.tasks.find((task) => task.taskId === taskId)?.lineageId ?? taskId,
+    provenance: "AGENT_REPORTED",
+    payload: { status: input.status, ...(reason ? { reason } : {}), ...(blockedOn ? { blockedOn } : {}), ...(nextIntent ? { nextIntent } : {}), ...(supersedes.length ? { supersedes } : {}) }
+  }]);
+  const view = await refreshVerifiedState(input.root, runtime);
+  return { taskId, eventId: event.eventId, status: input.status, provenance: "AGENT_REPORTED", state: compactVerifiedState(view) };
+}
+
+export interface RecordUserDecisionInput {
+  root: string;
+  decision: string;
+  scope?: DecisionScope;
+  supersedes?: string[];
+}
+
+/**
+ * An explicit user decision that materially affects continuation (e.g. "do
+ * not deploy production"). Carried, never enforced. Only for what the user
+ * actually said — never inferred from casual wording.
+ */
+export async function recordUserDecision(input: RecordUserDecisionInput): Promise<RecordedStateChange & { decisionId: string; scope: DecisionScope }> {
+  const decision = bound(input.decision, STATE_LIMITS.decision);
+  if (!decision) throw new Error("decision must be a non-empty sentence the user actually stated.");
+  const scope = input.scope ?? "LINEAGE";
+  if (!DECISION_SCOPES.includes(scope)) throw new Error(`scope must be one of: ${DECISION_SCOPES.join(", ")}`);
+  const runtime = await readRuntimeState(input.root);
+  const taskId = runtime.sessionId;
+  if (!taskId) throw new Error("No DevGuard task to attach a decision to: call prepare_task_context first.");
+  await ensureProjectLedger(input.root, runtime);
+  const folded = foldEvents(await readProjectEvents(input.root));
+  const decisionId = `dec_${newEventId().slice(3, 13)}`;
+  const supersedes = [...new Set((input.supersedes ?? []).map((value) => value.trim()).filter(Boolean))].slice(0, STATE_LIMITS.supersedes);
+  const [event] = await appendProjectEvents(input.root, [{
+    type: "USER_DECISION_RECORDED",
+    taskId,
+    lineageId: folded.tasks.find((task) => task.taskId === taskId)?.lineageId ?? taskId,
+    provenance: "USER_DECISION",
+    payload: { decisionId, decision, scope, ...(supersedes.length ? { supersedes } : {}) }
+  }]);
+  const view = await refreshVerifiedState(input.root, runtime);
+  return { taskId, eventId: event.eventId, decisionId, scope, provenance: "USER_DECISION", state: compactVerifiedState(view) };
+}
+
+/**
+ * Recompute the projection and, when no task is open (the reports describe
+ * the task just closed), re-render the Quality Report and Handoff from the
+ * SAME view so all surfaces agree immediately. With a task open, its `done`
+ * regenerates them.
+ */
+async function refreshVerifiedState(root: string, runtime: RuntimeState): Promise<ProjectStateView | undefined> {
+  const view = await computeProjectState(root, { resolveCodeStateHash: () => computeWorkingTreeContentHash(root), openTask: openTaskForProjection(root, runtime) }).catch(() => undefined);
+  if (!view || runtime.currentTask) return view;
+  const report = await readJsonFile<QualityReport | null>(fromRoot(root, devguardPaths.qualityReportState), null);
+  if (report) {
+    const locale = await refreshRuntimeLocale(root);
+    await writeTextFile(fromRoot(root, qualityReportPath), withVerifiedStateSection(renderQualityReport(report, locale), verifiedStateMarkdown(view, locale))).catch(() => undefined);
+    await generateProjectHandoff(root, { verifiedState: view }).catch(() => undefined);
+  }
+  return view;
 }
 
 function defaultNameForValidationKind(kind: ValidationEvidenceKind): string {
@@ -1165,7 +1546,14 @@ function isEvidenceFresh(entry: QAExecutionResult, current: { gitHead: string; c
  */
 function partitionQaResultsByFreshness(
   qaResults: Record<string, QAExecutionResult> | undefined,
-  current: { gitHead: string; codeStateHash?: string; sessionId?: string }
+  current: { gitHead: string; codeStateHash?: string; sessionId?: string },
+  /**
+   * Verified Project State lifecycle per `kind::name@completedAt` (see
+   * validationLifecycleIndex). When an entry has one, it decides freshness
+   * — the projection's task/evidence-scoped rule — so every surface reads
+   * the same answer; pre-0.12 entries without one keep the whole-tree rule.
+   */
+  lifecycle?: Map<string, Lifecycle>
 ): { fresh: Record<string, QAExecutionResult>; stale: Record<string, QAExecutionResult>; unbound: Record<string, QAExecutionResult> } {
   const fresh: Record<string, QAExecutionResult> = {};
   const stale: Record<string, QAExecutionResult> = {};
@@ -1174,9 +1562,13 @@ function partitionQaResultsByFreshness(
     // Legacy evidence recorded before taskBinding existed has no signal
     // either way; treated as UNBOUND (never assumed current) rather than
     // crashing or silently defaulting to BOUND.
+    const projected = lifecycle?.get(`${key}@${entry.completedAt}`);
     if (entry.taskBinding === "UNBOUND" || !entry.taskBinding) {
       unbound[key] = entry;
-    } else if (isEvidenceFresh(entry, current)) {
+    } else if (entry.verification === "MISMATCH") {
+      // The transcript contradicts the report: never current verification.
+      stale[key] = entry;
+    } else if (projected ? projected === "CURRENT" : isEvidenceFresh(entry, current)) {
       fresh[key] = entry;
     } else {
       stale[key] = entry;
@@ -1774,7 +2166,7 @@ export async function processDoneEvent(root: string, options: { completionSource
   // already reported (it is in the previous history record) and this task
   // has not edited since. A file that was dirty at prepare time but never
   // finalized is this task's own pre-prepare work and stays in scope.
-  const previouslyFinalized = new Set((await readHistoryRecords(root, 1)).at(-1)?.changedFiles ?? []);
+  const previouslyFinalized = new Set((await readFinalizedFiles(root)) ?? (await readHistoryRecords(root, 1)).at(-1)?.changedFiles ?? []);
   const isCarriedOver = (file: string) => Boolean(taskBaseline?.includes(file)) && previouslyFinalized.has(file) && !editedBaselineFiles.has(file);
   // A follow-up of a closed task is scoped by what changed since that
   // task's finalization (see changedSinceCompletion), not by a task baseline.
@@ -1792,7 +2184,16 @@ export async function processDoneEvent(root: string, options: { completionSource
   // filterDiffTextForFiles returns the WHOLE diff for an empty file list, so a
   // task with no scoped changes must get an explicitly empty diff.
   const documentDiffText = !taskScopedChangedFiles ? diffText : documentFiles.length === 0 ? "" : filterDiffTextForFiles(diffText, documentFiles);
-  const { fresh: freshQaResults, stale: staleQaResults, unbound: unboundQaResults } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
+  // Verified Project State: the closing task's owned changes enter the
+  // ledger, then this round's ONE projection drives Quality Report,
+  // Handoff and validation freshness alike.
+  await ensureProjectLedger(root, runtime).catch(() => undefined);
+  if (runtime.currentTask && runtime.sessionId) {
+    await recordTaskClosed(root, runtime.currentTask, runtime.sessionId, taskScopedChangedFiles ?? [], carriedOverChangedFiles ?? []).catch(() => undefined);
+  }
+  const verifiedState = await computeProjectState(root, { codeStateHash }).catch(() => undefined);
+  perfMark("done:verifiedState-computed");
+  const { fresh: freshQaResults, stale: staleQaResults, unbound: unboundQaResults } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState, validationLifecycleIndex(verifiedState));
   const diffStat = await getGitDiffStat(root).catch(() => "git diff stat unavailable");
   const [projectMarkdown, architectureMarkdown, decisionsMarkdown, tasksMarkdown, config, codeGraph] = await Promise.all([
     readTextFile(fromRoot(root, devguardPaths.project)),
@@ -1916,17 +2317,22 @@ export async function processDoneEvent(root: string, options: { completionSource
   const historyRecord: HistoryRecord = {
     id: `run_${timestamp.replace(/[-:.]/g, "").slice(0, 15)}_${hashRuntimeFiles(changedFiles).slice(0, 6)}`,
     timestamp,
-    changedFiles,
+    // History diet: a row never repeats thousands of carried dirty paths —
+    // counts + a hash stand in for them (the full finalized set lives once,
+    // overwritten, in .devguard/state/finalized-files.json).
+    changedFiles: changedFiles.length <= HISTORY_FILE_LIMIT ? changedFiles : documentFiles.slice(0, HISTORY_FILE_LIMIT),
+    ...(changedFiles.length > HISTORY_FILE_LIMIT ? { changedFileCount: changedFiles.length, changedFilesHash: listHash(changedFiles) } : {}),
     areas,
-    diffStat,
+    diffStat: diffStat.length > HISTORY_DIFFSTAT_CHARS ? `${diffStat.slice(0, HISTORY_DIFFSTAT_CHARS)}\n… (${changedFiles.length} files; truncated)` : diffStat,
     inferredSummary: summary,
     driftCandidates: judgments,
     docUpdateCandidates,
     testCandidates,
     generatedPromptPath: promptPath,
     reportPath,
-    taskScopedChangedFiles,
-    carriedOverChangedFiles,
+    ...(taskScopedChangedFiles ? { taskScopedChangedFiles: taskScopedChangedFiles.slice(0, HISTORY_FILE_LIMIT) } : {}),
+    ...(taskScopedChangedFiles && taskScopedChangedFiles.length > HISTORY_FILE_LIMIT ? { taskScopedCount: taskScopedChangedFiles.length } : {}),
+    ...(carriedOverChangedFiles ? { carriedDirtyCount: carriedOverChangedFiles.length, ...(carriedOverChangedFiles.length > 0 ? { carriedDirtyHash: listHash(carriedOverChangedFiles) } : {}) } : {}),
     ...(followUpDelta ? (followUpDelta.foreign.length > 0 ? { untasked: true } : { followUp: true }) : {}),
     ...(executionLineage ? { executionLineage } : {}),
     ...(runtime.currentTask?.workstreamContinued ? { continuesWorkstream: true } : {})
@@ -1974,9 +2380,10 @@ export async function processDoneEvent(root: string, options: { completionSource
   historyRecord.qualityVerdict = qualityReport.verdict;
   await appendChangeLog(root, {
     timestamp,
-    changedFiles,
+    changedFiles: changedFiles.length <= HISTORY_FILE_LIMIT ? changedFiles : documentFiles.slice(0, HISTORY_FILE_LIMIT),
+    ...(changedFiles.length > HISTORY_FILE_LIMIT ? { changedFileCount: changedFiles.length } : {}),
     diffSummary: documentationSummary.overview,
-    relatedFiles: relatedFilesFromCodeIndex(changedFiles, codeIndex),
+    relatedFiles: relatedFilesFromCodeIndex(changedFiles, codeIndex).slice(0, HISTORY_FILE_LIMIT),
     qualityVerdict: qualityReport.verdict
   });
   const reportMarkdown = renderLastRunReport({
@@ -1998,7 +2405,7 @@ export async function processDoneEvent(root: string, options: { completionSource
     candidates: decisionCandidates,
     changedFiles
   });
-  const qualityReportMarkdown = renderQualityReport(qualityReport, locale);
+  const qualityReportMarkdown = withVerifiedStateSection(renderQualityReport(qualityReport, locale), verifiedStateMarkdown(verifiedState, locale));
   const promptMarkdown = renderNextPrompt({
     projectContext,
     summary,
@@ -2027,6 +2434,7 @@ export async function processDoneEvent(root: string, options: { completionSource
     : undefined;
   await Promise.all([
     perfSpan("done:write:history", () => appendBoundedJsonl(fromRoot(root, historyPath), `${JSON.stringify(historyRecord)}\n`, HISTORY_RETENTION)),
+    perfSpan("done:write:finalizedFiles", () => writeTextFile(fromRoot(root, devguardPaths.finalizedFiles), JSON.stringify({ updatedAt: timestamp, files: changedFiles }))),
     perfSpan("done:write:lastRunReport", () => writeTextFile(fromRoot(root, reportPath), reportMarkdown)),
     perfSpan("done:write:historySummary", () => writeTextFile(fromRoot(root, historySummaryPath), historySummaryMarkdown)),
     perfSpan("done:write:decisionCandidates", () => writeTextFile(fromRoot(root, decisionCandidatesPath), decisionCandidatesMarkdown)),
@@ -2092,7 +2500,7 @@ export async function processDoneEvent(root: string, options: { completionSource
   await Promise.all([
     // This IS the completion event — Handoff reports which real trigger
     // produced it (see handoffVerificationLines / CompletionSource).
-    generateProjectHandoff(root, { completionSource }),
+    generateProjectHandoff(root, { completionSource, verifiedState }),
     generateReadMap(root, resumeRaw, resumeContext),
     generateCodeMap(root, resumeRaw, resumeContext),
     generateWorkingContext(root, resumeRaw, resumeContext),
@@ -2365,12 +2773,21 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   const { root, task, persistTask = true, continueCurrentTask = false, caller, observeCodexOwner = false } = input;
   await ensureDevguardWorkspace(root);
   perfMark("prepare:ensureWorkspace-done");
-  const text = task.trim();
-  if (!text) throw new Error("--task requires a non-empty task description.");
+  const requestedText = task.trim();
+  if (!requestedText) throw new Error("--task requires a non-empty task description.");
+  const current = await readRuntimeState(root);
+  // A bare "continue the current work" names nothing to route by. It is
+  // expanded (DERIVED, deterministic) with the goal of the task it
+  // continues, so routing, the workstream gate and the ledger lineage all
+  // follow that task instead of starting from nothing.
+  const previousGoal = !continueCurrentTask && current.sessionId && isContinueRequest(requestedText)
+    ? current.currentTask?.text ?? (await readProjectState(root)).lastClosedTaskGoal
+    : undefined;
+  const continuedGoal = previousGoal?.includes(" — continuing: ") ? previousGoal.slice(previousGoal.lastIndexOf(" — continuing: ") + 15) : previousGoal;
+  const text = continuedGoal ? `${requestedText.replace(/[.\s]+$/, "")} — continuing: ${truncateLine(continuedGoal, 400)}` : requestedText;
   // Shallow tier input (every project path, no content), enumerated
   // concurrently with the git baseline below.
   const enumerationPromise = enumerateProjectFiles(root).catch(() => undefined);
-  const current = await readRuntimeState(root);
   perfMark("prepare:readRuntimeState-done");
   // Task boundary contract: `prepare_task_context` is the one explicit signal
   // DevGuard has for "a task is starting." A bare call ALWAYS starts a new
@@ -2383,7 +2800,9 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
   const isContinuing = continueCurrentTask && Boolean(current.sessionId);
   // Explicit user inputs: validated paths only (never the prompt). A
   // continuing call without new ones keeps the lineage's own.
-  const explicitResolution = await resolveExplicitInputs(root, input.explicitInputs ?? [], isExcludedContextPath);
+  // A bare continuation inherits the continued task's user-named inputs.
+  const inheritedInputs = continuedGoal && !input.explicitInputs?.length ? await taskExplicitInputs(root, current.sessionId) : [];
+  const explicitResolution = await resolveExplicitInputs(root, input.explicitInputs?.length ? input.explicitInputs : inheritedInputs, isExcludedContextPath);
   const explicitInputs = explicitResolution.accepted.length > 0 || input.explicitInputs?.length
     ? explicitResolution.accepted
     : isContinuing ? current.currentTask?.explicitInputs ?? [] : [];
@@ -2567,11 +2986,23 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
         !isContinuing && owner && raw.state.lastTaskOwnerThreadHash === owner.threadIdHash && (context.workstreamPrior ?? []).length === 0
       )
     });
-    const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask, codeStateOnce());
+    // Verified Project State: a new task enters the ledger, then the ONE
+    // projection every surface shares is computed for this call.
+    if (persistTask) {
+      await ensureProjectLedger(root, current).catch(() => undefined);
+      if (!isContinuing) {
+        const continuesBy = current.sessionId ? (continuedGoal ? "continue-request" as const : sameWorkstream ? "workstream" as const : undefined) : undefined;
+        await recordTaskStarted(root, { taskId: sessionId, text, previousTaskId: continuesBy ? current.sessionId : undefined, continuesBy, at: currentTask.createdAt, explicitInputs }).catch(() => undefined);
+      }
+    }
+    const verifiedState = await computeProjectState(root, { write: persistTask, resolveCodeStateHash: async () => (await codeStateOnce()).codeStateHash, openTask: openTaskForProjection(root, runtimeWithTask) }).catch(() => undefined);
+    perfMark("prepare:verifiedState-done");
+    const lifecycle = validationLifecycleIndex(verifiedState);
+    const validation = await buildPreparedTaskValidationSummary(root, runtimeWithTask, codeStateOnce(), lifecycle);
     perfMark("prepare:validationSummary-done");
-    const openValidation = previousTaskOpenValidation(runtimeWithTask);
+    const openValidation = previousTaskOpenValidation(runtimeWithTask, lifecycle);
     const carriedOverDirtyFiles = currentTask.changedFilesAtCreation?.length ?? 0;
-    const nextAction = preparedNextAction(structuredFiles, openValidation);
+    const nextAction = preparedNextAction(structuredFiles, openValidation, verifiedState);
     const result: PreparedTaskContextResult = {
       task: text,
       source: currentTask.source,
@@ -2604,6 +3035,7 @@ export async function prepareTaskContext(input: PrepareTaskContextInput): Promis
       openValidation,
       readPlan: buildReadPlan(structuredFiles, contents, explicitResolution, input.explicitInputs?.length ?? 0),
       ...(boundary ? { boundary } : {}),
+      ...(verifiedState ? { verifiedState } : {}),
       readMapPath,
       codeMapPath,
       workingContextPath,
@@ -2782,8 +3214,11 @@ export function currentSessionQaCount(runtime: RuntimeState): number {
   return Object.values(runtime.qaResults ?? {}).filter((entry) => entry.sessionId === runtime.sessionId).length;
 }
 
-function previousTaskOpenValidation(runtime: RuntimeState): string[] {
-  const others = Object.values(runtime.qaResults ?? {}).filter((entry) => entry.sessionId && entry.sessionId !== runtime.sessionId);
+function previousTaskOpenValidation(runtime: RuntimeState, lifecycle?: Map<string, Lifecycle>): string[] {
+  // A result the projection marks SUPERSEDED is settled, never "open". (A
+  // STALE failure may still be unresolved, so it stays.)
+  const settled = (entry: QAExecutionResult) => lifecycle?.get(`${validationIdentityKey(resolveValidationKind(entry), entry.name)}@${entry.completedAt}`) === "SUPERSEDED";
+  const others = Object.values(runtime.qaResults ?? {}).filter((entry) => entry.sessionId && entry.sessionId !== runtime.sessionId && !settled(entry));
   if (others.length === 0) return [];
   const latest = others.reduce((a, b) => (Date.parse(b.completedAt) > Date.parse(a.completedAt) ? b : a));
   const sameSession = Object.fromEntries(
@@ -2792,7 +3227,7 @@ function previousTaskOpenValidation(runtime: RuntimeState): string[] {
   return canonicalValidationLines(sameSession, 3).map((line) => line.replace(/^- /, ""));
 }
 
-function preparedNextAction(files: PreparedTaskContextFile[], openValidation: string[]): string {
+function preparedNextAction(files: PreparedTaskContextFile[], openValidation: string[], view?: ProjectStateView): string {
   const targets = files.filter((file) => file.role === "TARGET");
   const first = targets[0];
   const listed = targets.slice(0, 4).map((file) => `${file.path}${file.ranges[0] ? `:${file.ranges[0].startLine}-${file.ranges[0].endLine}` : ""}`).join(", ");
@@ -2801,7 +3236,37 @@ function preparedNextAction(files: PreparedTaskContextFile[], openValidation: st
     : files.some((file) => file.role === "CANDIDATE")
       ? "No high-confidence target: open only the CANDIDATE that best matches the task, or search one specific area."
       : "No routed file — read the task's explicitly named files, then search only for the concrete gap.";
+  // A previous task's deliberate STOP/BLOCK (in force, not superseded) is
+  // stated as such — never as an unresolved failure.
+  const previous = view?.outcome && !view.outcome.isCurrentTask ? view.outcome : undefined;
+  if (previous && (previous.status === "STOPPED" || previous.status === "BLOCKED")) {
+    const detail = previous.blockedOn ? ` on ${previous.blockedOn}` : previous.reason ? `: ${previous.reason}` : "";
+    return `Previous task ${previous.status}${truncateLine(detail, 160)} (a deliberate stop, not a defect — see state). ${start}`;
+  }
   return openValidation.length > 0 ? `Previous task left unresolved: ${openValidation[0].replace(/[.\s]+$/, "")}. Check whether it affects this task. ${start}` : start;
+}
+
+/** TASK_STARTED: a new task joins its predecessor's lineage only when it continues it (workstream gate or a bare "continue" request). */
+async function taskExplicitInputs(root: string, taskId: string | undefined): Promise<string[]> {
+  if (!taskId) return [];
+  return foldEvents(await readProjectEvents(root)).tasks.find((task) => task.taskId === taskId)?.explicitInputs ?? [];
+}
+
+async function recordTaskStarted(root: string, input: { taskId: string; text: string; previousTaskId?: string; continuesBy?: "workstream" | "continue-request"; at: string; explicitInputs?: readonly string[] }): Promise<void> {
+  const folded = input.previousTaskId ? foldEvents(await readProjectEvents(root)) : undefined;
+  const lineageId = input.previousTaskId ? folded?.tasks.find((task) => task.taskId === input.previousTaskId)?.lineageId ?? input.previousTaskId : input.taskId;
+  await appendProjectEvents(root, [{
+    type: "TASK_STARTED",
+    taskId: input.taskId,
+    lineageId,
+    provenance: "OBSERVED",
+    timestamp: input.at,
+    payload: {
+      task: bound(input.text, STATE_LIMITS.taskText) ?? "",
+      ...(input.previousTaskId ? { continues: input.previousTaskId, continuesBy: input.continuesBy } : {}),
+      ...(input.explicitInputs?.length ? { explicitInputs: input.explicitInputs.slice(0, 30) } : {})
+    }
+  }]);
 }
 
 // --- TARGET vs CANDIDATE --------------------------------------------------
@@ -3018,10 +3483,10 @@ function capReferenceOnlyFiles(files: string[], summary: DocumentationSummary | 
  * current-task-fresh), per the same fail-closed default used elsewhere in
  * this file for missing provenance.
  */
-async function buildPreparedTaskValidationSummary(root: string, runtime: RuntimeState, codeState?: Promise<{ gitHead: string; codeStateHash?: string }>): Promise<PreparedTaskValidationSummary> {
+async function buildPreparedTaskValidationSummary(root: string, runtime: RuntimeState, codeState?: Promise<{ gitHead: string; codeStateHash?: string }>, lifecycle?: Map<string, Lifecycle>): Promise<PreparedTaskValidationSummary> {
   const { gitHead, codeStateHash } = await (codeState ?? resolveCurrentCodeState(root)).catch(() => ({ gitHead: "", codeStateHash: undefined }));
   const currentGitState = { gitHead, codeStateHash, sessionId: runtime.sessionId };
-  const { fresh, stale, unbound } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState);
+  const { fresh, stale, unbound } = partitionQaResultsByFreshness(runtime.qaResults, currentGitState, lifecycle);
   const taskFresh: Record<string, QAExecutionResult> = {};
   const otherTask: Record<string, QAExecutionResult> = {};
   for (const [key, entry] of Object.entries(fresh)) {
@@ -3041,7 +3506,7 @@ async function buildPreparedTaskValidationSummary(root: string, runtime: Runtime
   };
 }
 
-export async function generateProjectHandoff(root: string, options: { completionSource?: CompletionSource } = {}): Promise<string> {
+export async function generateProjectHandoff(root: string, options: { completionSource?: CompletionSource; verifiedState?: ProjectStateView } = {}): Promise<string> {
   perfMark("generateProjectHandoff:entry");
   await ensureDevguardWorkspace(root);
   const locale = await refreshRuntimeLocale(root);
@@ -3090,7 +3555,10 @@ export async function generateProjectHandoff(root: string, options: { completion
     completionSource: options.completionSource
   });
   perfMark("generateProjectHandoff:render-done");
-  await writeTextFile(fromRoot(root, projectHandoffPath), handoff);
+  // The same projection Quality Report/prepare/dashboard read: handed in by
+  // `done`, otherwise recomputed (and cached) from the ledger.
+  const verifiedState = options.verifiedState ?? (await computeProjectState(root, { resolveCodeStateHash: () => computeWorkingTreeContentHash(root), openTask: openTaskForProjection(root, runtime) }).catch(() => undefined));
+  await writeTextFile(fromRoot(root, projectHandoffPath), withVerifiedStateSection(handoff, verifiedStateMarkdown(verifiedState, locale)));
   perfMark("generateProjectHandoff:write-done");
   return projectHandoffPath;
 }
@@ -9003,7 +9471,7 @@ function renderProjectHandoff(input: {
   const nextSteps = handoffNextActions(quality, nextTask, changedFiles, input.locale, documentationSummary);
   const verification = handoffVerificationLines(quality, input.locale, changedFiles, documentationSummary?.constraints, input.completionSource, input.qualityReportState?.qaResults);
   const resumePrompt = handoffResumePrompt(goal, nextSteps, changedFiles, input.locale, documentationSummary?.constraints);
-  const carriedOverCount = input.records.at(-1)?.carriedOverChangedFiles?.length ?? 0;
+  const carriedOverCount = input.records.at(-1)?.carriedDirtyCount ?? input.records.at(-1)?.carriedOverChangedFiles?.length ?? 0;
   if (carriedOverCount > 0) {
     fileChanges.push(
       input.locale === "ko-KR"

@@ -60,5 +60,11 @@ export const devguardPaths = {
   taskContextState: `${DEVGUARD_DIR}/context/task-context.json`,
   projectKnowledge: `${DEVGUARD_DIR}/project/project-knowledge.json`,
   codeIndex: `${DEVGUARD_DIR}/memory/code-index.json`,
+  /** Verified Project State — append-only structured task events (canonical history, bounded). */
+  projectEvents: `${DEVGUARD_DIR}/events/task-events.jsonl`,
+  /** Verified Project State — the deterministic current-state projection (a rebuildable cache). */
+  projectStateCurrent: `${DEVGUARD_DIR}/state/current.json`,
+  /** Every file the last `done` finalized (overwritten), so history rows need not carry thousands of paths. */
+  finalizedFiles: `${DEVGUARD_DIR}/state/finalized-files.json`,
   changeLog: `${DEVGUARD_DIR}/memory/change-log.jsonl`
 } as const;

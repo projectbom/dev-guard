@@ -7,6 +7,7 @@
 import type { ContextEfficiencyReport, ContextGroup, ContextIssue, RolloverState } from "./context-efficiency.js";
 import type { EvidenceKind } from "./agent-activity.js";
 import { LEGACY_FIX_COMMAND } from "./instruction-authority.js";
+import type { DashboardVerifiedState } from "./verified-state-view.js";
 
 /**
  * System/setup correctness only — never context or work quality, and never
@@ -39,6 +40,8 @@ export interface OverviewMetric {
 export interface DashboardOverview {
   /** `detail`: affected path(s) for the reason, e.g. "~/.codex/AGENTS.md". */
   health: { level: OverviewHealth; reason: OverviewHealthReason; detail?: string };
+  /** Verified Project State (the shared projection): outcome, verified checks, blocker, decisions. */
+  verified?: DashboardVerifiedState;
   thread: { level: OverviewThread; raw: RolloverState; reason: string; evidence: EvidenceKind };
   /** One line (the client truncates visually; the full goal is a tooltip). */
   task?: string;
@@ -83,7 +86,7 @@ const THREAD_LEVEL: Record<RolloverState, OverviewThread> = {
   NEW_THREAD_RECOMMENDED: "NEW_THREAD"
 };
 
-export function buildDashboardOverview(state: OverviewStateInput, report: ContextEfficiencyReport | undefined, readPlan?: { required: number; optional: number }): DashboardOverview {
+export function buildDashboardOverview(state: OverviewStateInput, report: ContextEfficiencyReport | undefined, readPlan?: { required: number; optional: number }, verified?: DashboardVerifiedState): DashboardOverview {
   const legacyPaths = state.legacyInstructionPaths ?? [];
   const health: DashboardOverview["health"] = state.setupActive
     ? { level: "SETTING_UP", reason: "setup-running" }
@@ -156,6 +159,7 @@ export function buildDashboardOverview(state: OverviewStateInput, report: Contex
   const groups = report?.currentTask?.whereContextWent;
   return {
     health,
+    ...(verified ? { verified } : {}),
     thread,
     ...(report?.now.task ? { task: report.now.task.replace(/\s+/g, " ").trim() } : {}),
     ...(issue ? { issue } : {}),

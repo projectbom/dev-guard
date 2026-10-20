@@ -42,6 +42,33 @@ After AI
 
 DevGuard는 vector DB, background full-project indexer, cloud sync, IDE 전용 통합, 자동 코드 intercept를 구현하지 않습니다. 이런 항목은 현재 제품이 아니라 roadmap 수준의 아이디어로만 둡니다.
 
+## 검증된 프로젝트 상태 (Verified Project State)
+
+DevGuard는 AI의 영구 기억(persistent memory)이 아닙니다. 로컬 **검증된 프로젝트 상태 계층**입니다. 모델은 계획하고 코드를 쓰고, DevGuard는 실제로 일어난 일을 기록하고, 무엇이 아직 유효한지 판단해, 다음 agent에게 현재의 검증된 상태를 넘깁니다.
+
+```text
+작은 append-only 구조화 이벤트            .devguard/events/task-events.jsonl
+        ↓ 결정적(deterministic) projection
+현재 검증된 상태                           .devguard/state/current.json (재생성 가능한 cache)
+        ↓
+prepare_task_context `state` · Quality Report · Handoff · Dashboard
+```
+
+모든 사실에는 출처(provenance)가 붙습니다.
+
+| Provenance | 의미 |
+| --- | --- |
+| `OBSERVED` | DevGuard가 직접 확인: agent 자신의 transcript(Codex rollout / Claude Code 세션)에 남은 명령과 종료 코드, 파일 fingerprint, DevGuard self-check. |
+| `AGENT_REPORTED` | agent가 보고했지만 DevGuard가 확인하지 못함. 보존하되 격상하지 않음. |
+| `USER_DECISION` | agent를 통해 전달된 사용자의 명시적 결정(`record_user_decision`). 전달만 하고 강제하지 않음. |
+| `DERIVED` | 다른 증거에서 결정적으로 계산(stale, superseded, "차단 요인 먼저 해결"). |
+
+작업 결과(`record_task_outcome`)는 `PASS`, `FAIL`, `STOPPED`(설계된 안전 게이트가 의도적으로 실행을 멈춤), `BLOCKED`(외부 의존성·승인 대기), `UNKNOWN`을 구분합니다. 의도된 중단은 실패로 표시되지 않습니다.
+
+검증 결과는 `CURRENT`, `STALE`(그 검증을 뒷받침하는 파일이 바뀜 — 작업이 실제로 수정한 파일과 명령이 지목한 파일만 보므로, 큰 dirty tree의 무관한 변경은 stale을 만들지 않음), `SUPERSEDED`(같은 검증의 이후 결과, 또는 같은 연속 작업의 이후 결과)입니다. transcript와 모순되는 agent의 PASS는 `MISMATCH`이며 검증됨으로 세지 않습니다.
+
+vector DB, embedding, LLM, 네트워크 호출은 없습니다. 상태는 `.devguard/`에만 있습니다. Markdown 보고서는 projection의 view일 뿐 원본이 아닙니다. 자세한 내용: [docs/verified-project-state.md](./docs/verified-project-state.md).
+
 ## Context Pipeline
 
 DevGuard의 공식 파이프라인은 다음과 같습니다.
@@ -84,7 +111,8 @@ Prepare
 
 - `.devguard/` 로컬 컨텍스트 저장소
 - `setup`, `watch`, `done`, `status`, `handoff`
-- DevGuard MCP (`prepare_task_context`, `record_validation_result`) — 결정적 context broker, API key 불필요
+- DevGuard MCP (`prepare_task_context`, `record_validation_result`, `record_task_outcome`, `record_user_decision`) — 결정적 context broker, API key 불필요
+- 검증된 프로젝트 상태: 이벤트 ledger `.devguard/events/task-events.jsonl` → projection `.devguard/state/current.json`
 - Project Knowledge
 - Read Map, Code Map, Agent Brief
 - Change Intelligence

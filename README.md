@@ -42,6 +42,33 @@ After AI
 
 DevGuard does not implement a vector database, background full-project indexer, cloud sync, IDE integration, or automatic code interception. Those are roadmap-level ideas, not part of the current product.
 
+## Verified Project State
+
+DevGuard is not persistent AI memory. It is a local **verified project-state layer**: models plan and code; DevGuard records what actually happened, works out what is still valid, and hands the next agent the current verified state.
+
+```text
+small append-only structured events      .devguard/events/task-events.jsonl
+        ↓ deterministic projection
+current verified state                   .devguard/state/current.json (rebuildable cache)
+        ↓
+prepare_task_context `state` · Quality Report · Handoff · Dashboard
+```
+
+Every fact carries its provenance:
+
+| Provenance | Meaning |
+| --- | --- |
+| `OBSERVED` | DevGuard saw it itself: the command and its exit code in the agent's own transcript (Codex rollout / Claude Code session), file fingerprints, its own self-check. |
+| `AGENT_REPORTED` | An agent said so and DevGuard could not confirm it. Kept, never upgraded. |
+| `USER_DECISION` | An explicit user decision carried through the agent (`record_user_decision`). Carried, not enforced. |
+| `DERIVED` | Computed deterministically from other evidence (staleness, supersession, "resolve the blocker"). |
+
+Task outcomes (`record_task_outcome`) distinguish `PASS`, `FAIL`, `STOPPED` (a designed safety gate stopped the run on purpose), `BLOCKED` (waiting on an external dependency or approval) and `UNKNOWN`. A deliberate stop is never shown as a failure.
+
+Validation evidence is `CURRENT`, `STALE` (a file that supports it changed — only the files the task touched and the files the command names, so an unrelated change in a large dirty tree does not stale it) or `SUPERSEDED` (a later result for the same check, or a later outcome in the same continuation). An agent's PASS that the transcript contradicts is a `MISMATCH` and never counts as verified.
+
+No vector database, no embeddings, no LLM and no network calls are involved; the state stays in `.devguard/`. Markdown reports are views of the projection, never its source. See [docs/verified-project-state.md](./docs/verified-project-state.md).
+
 ## Context Pipeline
 
 The official DevGuard pipeline is:
@@ -84,7 +111,8 @@ One Change Intelligence summary is generated after `done`; downstream documents 
 
 - `.devguard/` local context store
 - `setup`, `watch`, `done`, `status`, `handoff`
-- DevGuard MCP (`prepare_task_context`, `record_validation_result`) — deterministic context broker, no API key
+- DevGuard MCP (`prepare_task_context`, `record_validation_result`, `record_task_outcome`, `record_user_decision`) — deterministic context broker, no API key
+- Verified Project State: event ledger `.devguard/events/task-events.jsonl` → projection `.devguard/state/current.json`
 - Code Index and Project Knowledge
 - Read Map, Code Map, Agent Brief
 - Change Intelligence

@@ -43,6 +43,8 @@ const ROTATE_LOCK_STALE_MS = 60_000;
 export const HISTORY_RETENTION: JsonlRetentionPolicy = { rotateBytes: 8 * MiB };
 export const CHANGE_LOG_RETENTION: JsonlRetentionPolicy = { rotateBytes: 8 * MiB };
 export const TELEMETRY_RETENTION: JsonlRetentionPolicy = { rotateBytes: 4 * MiB };
+/** Structured task events (~1 KB per task): a rotation re-seeds the live file with a state checkpoint. */
+export const PROJECT_EVENTS_RETENTION: JsonlRetentionPolicy = { rotateBytes: 2 * MiB };
 
 /** Suffix of the single rotated generation kept next to each bounded log. */
 export const ROTATED_SUFFIX = ".1";
@@ -121,7 +123,8 @@ export interface StorageSummary {
 const BOUNDED_LOGS: Array<{ path: string; policy: JsonlRetentionPolicy }> = [
   { path: devguardPaths.history, policy: HISTORY_RETENTION },
   { path: devguardPaths.changeLog, policy: CHANGE_LOG_RETENTION },
-  { path: devguardPaths.taskTelemetry, policy: TELEMETRY_RETENTION }
+  { path: devguardPaths.taskTelemetry, policy: TELEMETRY_RETENTION },
+  { path: devguardPaths.projectEvents, policy: PROJECT_EVENTS_RETENTION }
 ];
 
 /** Read-only size summary of `.devguard`, grouped by artifact lifecycle. */

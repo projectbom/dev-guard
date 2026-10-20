@@ -20,7 +20,8 @@ import { runCheck } from "./check.js";
 import { runDoctor } from "./doctor.js";
 import { runReview } from "./review.js";
 import { runTaskAI } from "./task-ai.js";
-import { recordQAExecutionResult, recordValidationEvidence, type ValidationEvidenceKind } from "./runtime-state.js";
+import { recordQAExecutionResult, recordTaskOutcome, recordUserDecision, recordValidationEvidence, type ValidationEvidenceKind } from "./runtime-state.js";
+import { DECISION_SCOPES, TASK_OUTCOME_STATUSES } from "./project-state.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -173,6 +174,30 @@ export async function runRecordValidation(root: string, args: string[]): Promise
   });
   console.log(`dev-guard record-validation: recorded ${result.kind} "${result.name}" as ${result.status}`);
   console.log("- next: run dev-guard done to regenerate Quality Report / Handoff with this evidence");
+}
+
+export async function runRecordOutcome(root: string, args: string[]): Promise<void> {
+  const options = parseFlags(args);
+  const status = TASK_OUTCOME_STATUSES.find((candidate) => candidate === options.get("status")?.toUpperCase());
+  if (!status) throw new Error(`--status is required and must be one of: ${TASK_OUTCOME_STATUSES.join(", ")}`);
+  const result = await recordTaskOutcome({
+    root,
+    status,
+    reason: options.get("reason"),
+    blockedOn: options.get("blocked-on"),
+    nextIntent: options.get("next-intent"),
+    supersedes: options.get("supersedes")?.split(",")
+  });
+  console.log(`dev-guard record-outcome: recorded ${result.status} for task ${result.taskId} (AGENT_REPORTED)`);
+}
+
+export async function runRecordDecision(root: string, args: string[]): Promise<void> {
+  const options = parseFlags(args);
+  const decision = options.get("decision");
+  if (!decision || decision === "true") throw new Error("--decision \"<the user's decision>\" is required");
+  const scope = DECISION_SCOPES.find((candidate) => candidate === options.get("scope")?.toUpperCase());
+  const result = await recordUserDecision({ root, decision, scope, supersedes: options.get("supersedes")?.split(",") });
+  console.log(`dev-guard record-decision: recorded ${result.decisionId} (${result.scope}, USER_DECISION)`);
 }
 
 function parseExitCode(raw: string | undefined): number | undefined {

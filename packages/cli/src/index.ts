@@ -16,7 +16,7 @@ import { runReport } from "./report.js";
 import { runFixPrompt, runReview } from "./review.js";
 import { runScan } from "./scan.js";
 import { runSetup } from "./setup.js";
-import { runSelf, runSelfCheck, runRecordValidation } from "./self.js";
+import { runSelf, runSelfCheck, runRecordDecision, runRecordOutcome, runRecordValidation } from "./self.js";
 import { runMcpServer } from "./mcp.js";
 import { runTaskAI } from "./task-ai.js";
 import { runTelemetry } from "./telemetry.js";
@@ -204,6 +204,16 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === "record-outcome") {
+    await runRecordOutcome(root, process.argv.slice(3));
+    return;
+  }
+
+  if (command === "record-decision") {
+    await runRecordDecision(root, process.argv.slice(3));
+    return;
+  }
+
   if (!command.startsWith("-")) {
     await runSelf(root, process.argv.slice(2));
     return;
@@ -326,6 +336,10 @@ All commands:
   dev-guard record-validation --kind <BUILD|TYPECHECK|TEST|LINT|MANUAL_QA|RUNTIME_SMOKE|CUSTOM>
                                --status <PASS|FAIL|UNKNOWN> [--name <name>] [--command <cmd>]
                                [--exit-code <n>] [--summary <text>] [--reason <text>]
+  dev-guard record-outcome --status <PASS|FAIL|STOPPED|BLOCKED|UNKNOWN> [--reason <text>]
+                           [--blocked-on <text>] [--next-intent <text>] [--supersedes <id,...>]
+  dev-guard record-decision --decision "<the user's decision>" [--scope <TASK|LINEAGE|PROJECT>]
+                            [--supersedes <decisionId,...>]
 
 Commands:
   watch                   Start here: prepares the project when needed (first run), then monitors the AI coding session
@@ -362,6 +376,8 @@ Advanced / recovery:
   record-validation       Record external validation evidence (build/test/typecheck/manual QA/runtime smoke)
                           for Quality Report and Handoff, e.g.:
                           dev-guard record-validation --kind BUILD --status PASS --command "pnpm build"
+  record-outcome          Record the task's structured outcome (STOPPED/BLOCKED are deliberate, not FAIL)
+  record-decision         Record an explicit user decision carried into later tasks (never enforced)
 `);
 }
 

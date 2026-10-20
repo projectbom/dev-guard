@@ -8,7 +8,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { fromRoot } from "./fs.js";
 import { devguardPaths } from "./paths.js";
-import { prepareTaskContext, recordValidationEvidence, threadStateForAgent, toAgentContextPayload } from "./runtime-state.js";
+import { prepareTaskContext, recordTaskOutcome, recordUserDecision, recordValidationEvidence, threadStateForAgent, toAgentContextPayload } from "./runtime-state.js";
+import { LIMITS } from "./project-state.js";
 import { identityFromMcpContext } from "./thread-ownership.js";
 
 /**
@@ -63,6 +64,26 @@ const recordValidationInputSchema = {
   exitCode: z.number().int().optional().describe("The process exit code you actually observed, if any. Do not guess or infer one — omit it if you didn't see it."),
   summary: z.string().optional().describe("One-line factual result, e.g. 'clicks 404 rows, ads/impression-click 145 rows'. No secrets or raw credentials/URLs."),
   reason: z.string().optional().describe("Root cause for FAIL/UNKNOWN, only if actually known/observed — do not guess."),
+  projectRoot: z.string().optional().describe("Optional project root. Defaults to the MCP server working directory.")
+};
+
+const recordTaskOutcomeInputSchema = {
+  status: z.enum(["PASS", "FAIL", "STOPPED", "BLOCKED", "UNKNOWN"]).describe(
+    "PASS: the task objective was completed. FAIL: the intended work was attempted and did not meet the expected result (e.g. a test expected 200 and got 500). STOPPED: execution intentionally stopped because a designed safety/gate condition was reached (e.g. a safety gate detected baseline drift). BLOCKED: work cannot continue until an external dependency, approval or prerequisite changes (e.g. a production mutation needs user approval). UNKNOWN: the outcome cannot be established reliably. Never report a deliberate STOP or a BLOCK as FAIL."
+  ),
+  reason: z.string().max(LIMITS.reason).optional().describe("One or two factual sentences: why this outcome. Not a report."),
+  blockedOn: z.string().max(LIMITS.blockedOn).optional().describe("BLOCKED/STOPPED only: the exact dependency, approval or condition that must change."),
+  nextIntent: z.string().max(LIMITS.nextIntent).optional().describe("The concrete next step this work needs, only if it is actually known. Omit rather than guess."),
+  supersedes: z.array(z.string().min(1).max(120)).max(LIMITS.supersedes).optional().describe(
+    "Ids this outcome explicitly settles: an earlier task id (e.g. a blocker's task from prepare_task_context `state`) or a validation identity like 'TEST::unit'. Only when this task actually resolved it."
+  ),
+  projectRoot: z.string().optional().describe("Optional project root. Defaults to the MCP server working directory.")
+};
+
+const recordUserDecisionInputSchema = {
+  decision: z.string().min(1).max(LIMITS.decision).describe("The user's explicit decision as one short sentence, e.g. 'Do not deploy to production.' Only what the user actually stated — never inferred from casual wording."),
+  scope: z.enum(["TASK", "LINEAGE", "PROJECT"]).optional().describe("TASK: this task and its continuations. LINEAGE (default): this line of continued work. PROJECT: every later task in this project."),
+  supersedes: z.array(z.string().min(1).max(64)).max(LIMITS.supersedes).optional().describe("decisionId(s) of earlier decisions the user explicitly replaced or revoked."),
   projectRoot: z.string().optional().describe("Optional project root. Defaults to the MCP server working directory.")
 };
 
@@ -121,7 +142,7 @@ export async function runMcpServer(root: string): Promise<void> {
     {
       title: "Record DevGuard validation evidence",
       description:
-        "Call this after you actually run a build, typecheck, test, lint, manual QA step, or runtime smoke check (e.g. a real API call, DB check, or browser check) outside of DevGuard. It records the real PASS/FAIL/UNKNOWN result so the next Quality Report and Handoff reflect actual evidence instead of showing 'not recorded'. Only call this for checks you actually ran — never to report work you did not verify. Call prepare_task_context before recording validation for a new task: results are bound to the currently active DevGuard task (see the returned `taskBinding` field). A check run right after `dev-guard done` in the same thread binds to the task just closed — no need to call prepare_task_context again for it. Otherwise, if there is no active task, the evidence is recorded as UNBOUND and will not be used as current-task PASS/FAIL verification, even once a task is later declared — call prepare_task_context first, then record again.",
+        "Call this after you actually run a build, typecheck, test, lint, manual QA step, or runtime smoke check (e.g. a real API call, DB check, or browser check) outside of DevGuard. It records the real PASS/FAIL/UNKNOWN result so the next Quality Report and Handoff reflect actual evidence instead of showing 'not recorded'. Only call this for checks you actually ran — never to report work you did not verify. Call prepare_task_context before recording validation for a new task: results are bound to the currently active DevGuard task (see the returned `taskBinding` field). A check run right after `dev-guard done` in the same thread binds to the task just closed — no need to call prepare_task_context again for it. Otherwise, if there is no active task, the evidence is recorded as UNBOUND and will not be used as current-task PASS/FAIL verification, even once a task is later declared — call prepare_task_context first, then record again. Pass the exact command you ran: DevGuard matches it against the command and exit code in your own transcript — a match is recorded as OBSERVED, anything else as AGENT_REPORTED, and a result the transcript contradicts as MISMATCH.",
       inputSchema: recordValidationInputSchema
     },
     async ({ kind, status, name, command, exitCode, summary, reason, projectRoot }, extra) => {
@@ -160,6 +181,44 @@ export async function runMcpServer(root: string): Promise<void> {
           isError: true,
           content: [{ type: "text", text: JSON.stringify(mcpErrorPayload(error), null, 2) }]
         };
+      }
+    }
+  );
+
+  server.registerTool(
+    "record_task_outcome",
+    {
+      title: "Record DevGuard task outcome",
+      description:
+        "Call once when a task ends (before `dev-guard done`, or right after it in the same thread) with its structured outcome: PASS, FAIL, STOPPED (a designed safety gate stopped it on purpose), BLOCKED (waiting on an external dependency or approval), or UNKNOWN. This is the task's current state for the next agent — not a report: keep reason/blockedOn/nextIntent to a sentence each. Recorded as AGENT_REPORTED.",
+      inputSchema: recordTaskOutcomeInputSchema
+    },
+    async ({ status, reason, blockedOn, nextIntent, supersedes, projectRoot }) => {
+      try {
+        const project = await resolveMcpProjectRoot(root, projectRoot);
+        const recorded = await recordTaskOutcome({ root: project, status, reason, blockedOn, nextIntent, supersedes });
+        return { content: [{ type: "text", text: JSON.stringify(recorded) }] };
+      } catch (error) {
+        return { isError: true, content: [{ type: "text", text: JSON.stringify(mcpErrorPayload(error), null, 2) }] };
+      }
+    }
+  );
+
+  server.registerTool(
+    "record_user_decision",
+    {
+      title: "Record a user decision",
+      description:
+        "Call when the user explicitly states a decision that must carry into later work (e.g. 'do not deploy production', 'local implementation only', 'maximum 3 correction attempts'), or explicitly replaces an earlier one (pass its decisionId in `supersedes`). DevGuard carries it to the next task as USER_DECISION; it does not enforce it. Never record your own inferences.",
+      inputSchema: recordUserDecisionInputSchema
+    },
+    async ({ decision, scope, supersedes, projectRoot }) => {
+      try {
+        const project = await resolveMcpProjectRoot(root, projectRoot);
+        const recorded = await recordUserDecision({ root: project, decision, scope, supersedes });
+        return { content: [{ type: "text", text: JSON.stringify(recorded) }] };
+      } catch (error) {
+        return { isError: true, content: [{ type: "text", text: JSON.stringify(mcpErrorPayload(error), null, 2) }] };
       }
     }
   );

@@ -8,6 +8,8 @@ import { devguardPaths } from "./paths.js";
 import { processDoneEvent, readHistoryRecords, readProjectState, readRuntimeState, refreshRuntimeLocale, type HistoryRecord, type RuntimeState } from "./runtime-state.js";
 import { readProjectKnowledge, type ProjectKnowledge } from "./knowledge.js";
 import { buildDashboardOverview } from "./dashboard-view.js";
+import { readProjectStateCache } from "./project-state.js";
+import { dashboardVerifiedState } from "./verified-state-view.js";
 import { detectLegacyGlobalInstructions, displayInstructionPath } from "./instruction-authority.js";
 import { getWriteHealth } from "./write-health.js";
 import { getAgentStrategyReport } from "./agent-strategies.js";
@@ -284,10 +286,13 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
   // both. /api/state and /api/efficiency stay available on their own.
   if (url.pathname === "/api/overview") {
     try {
-      const [state, efficiency, legacy] = await Promise.all([
+      // Verified state: the projection last written by prepare / validation /
+      // outcome / done — the same object Handoff and Quality Report rendered.
+      const [state, efficiency, legacy, projected] = await Promise.all([
         getDashboardState(root),
         getContextEfficiencyReport(root).catch(() => undefined),
-        detectLegacyGlobalInstructions().catch(() => [])
+        detectLegacyGlobalInstructions().catch(() => []),
+        readProjectStateCache(root).catch(() => undefined)
       ]);
       // Write Health is in-process: this server runs inside the watch
       // process, which is the one heartbeating runtime.json.
@@ -303,7 +308,8 @@ async function handleRequest(root: string, request: IncomingMessage, response: S
           legacyInstructionPaths: legacy.map((entry) => displayInstructionPath(entry.path))
         },
         efficiency,
-        efficiency?.taskCard?.readPlan
+        efficiency?.taskCard?.readPlan,
+        dashboardVerifiedState(projected)
       );
       sendJson(response, { state, efficiency: efficiency ?? null, overview });
     } catch (error) {
@@ -793,6 +799,8 @@ function renderPage(): string {
     .ov-pill.health-SETTING_UP { background: var(--accent-bg); border-color: #bfdbfe; }
     .ov-pill.health-ATTENTION, .ov-pill.thread-NEW_THREAD { background: var(--bad-bg); border-color: var(--bad-ring); }
     .ov-pill.thread-SOON { background: var(--warn-bg); border-color: var(--warn-ring); }
+    .ov-pill.state-FAIL { background: var(--bad-bg); border-color: var(--bad-ring); }
+    .ov-pill.state-STOPPED, .ov-pill.state-BLOCKED, .ov-pill.state-UNKNOWN { background: var(--warn-bg); border-color: var(--warn-ring); }
     .ov-k { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
     .ov-line { display: grid; grid-template-columns: 116px minmax(0, 1fr); gap: 10px; align-items: baseline; }
     .ov-task { font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1333,8 +1341,14 @@ function renderOverview(data) {
     '<div class="section-label">' + esc(t('ovNow')) + '</div>' +
     '<div class="ov-pills">' +
       '<div class="ov-pill health-' + esc(o.health.level) + '" data-testid="ov-health" title="' + esc(t('ovHealthReason_' + o.health.reason)) + '"><span class="ov-k">' + esc(t('ovHealth')) + '</span><b>' + esc(t('ovHealth_' + o.health.level)) + '</b></div>' +
+      (o.verified
+        ? '<div class="ov-pill state-' + esc(o.verified.state) + '" data-testid="ov-state" title="' + esc(o.verified.stateReason || '') + '"><span class="ov-k">' + esc(t('ovState')) + '</span><b>' + esc(t('ovState_' + o.verified.state)) + '</b></div>' +
+          '<div class="ov-pill' + (o.verified.mismatched ? ' state-FAIL' : '') + '" data-testid="ov-verified" title="' + esc(t('ovVerifiedHint')) + '"><span class="ov-k">' + esc(t('ovVerified')) + '</span><b>' + esc(o.verified.verified + ' ' + t('ovVerifiedObserved') + (o.verified.current > o.verified.verified ? ' · ' + (o.verified.current - o.verified.verified) + ' ' + t('ovVerifiedReported') : '') + (o.verified.mismatched ? ' · ' + o.verified.mismatched + ' ' + t('ovVerifiedMismatch') : '')) + '</b></div>'
+        : '') +
       '<div class="ov-pill thread-' + esc(o.thread.level) + '" data-testid="ov-thread" title="' + esc(o.thread.reason) + '"><span class="ov-k">' + esc(t('ovThread')) + '</span><b>' + esc(t('ovThread_' + o.thread.level)) + '</b></div>' +
     '</div>' +
+    (o.verified && o.verified.blockedOn ? '<div class="ov-line"><span class="ov-k">' + esc(t('ovBlockedOn')) + '</span><div data-testid="ov-blocked">' + esc(o.verified.blockedOn) + '</div></div>' : '') +
+    (o.verified && o.verified.decisions ? '<div class="ov-line"><span class="ov-k">' + esc(t('ovDecisions')) + '</span><div data-testid="ov-decisions" title="' + esc(o.verified.topDecision || '') + '">' + esc(o.verified.decisions + (o.verified.topDecision ? ' · ' + o.verified.topDecision : '')) + '</div></div>' : '') +
     (o.health.reason === 'legacy-instructions'
       ? '<div class="ov-health-note ov-health-compact" data-testid="ov-health-note"><b>' + esc(t('ovHealthReason_legacy-instructions')) + '</b>' +
         (o.health.detail ? '<div><code>' + esc(o.health.detail) + '</code></div>' : '') +
